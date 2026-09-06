@@ -23,11 +23,11 @@ ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
     "sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1"
 )
-CLAUDE_CODE_VERSION = "2.1.251"
-CLAUDE_CODE_INTEGRITY = "sha512-eG+ZPPpW2Dbmnntf1Fz9/T9ewS8I8SKfc1tcU2PqSwmftfjRPP7BXPaCyLuZ8kvgTdiPnJi/2/JnTvTRieneEQ=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-HJyCY1ynzlsBk+N02IJeBNNZmzyd43lMuff49IXtbUDGHlf2XFHcxwYJEWCwIW51J3Hl4MvrqM6Ye8PGpJRIiA=="
-CLAUDE_AGENT_ACP_VERSION = "0.70.0"
-CLAUDE_AGENT_ACP_INTEGRITY = "sha512-Psqj6fhV4pQ8IM480zpJ+xGiMMIqNLxlsTj5Mzn+T8KSURCVNJdl0ktcqLMjgHJC/QnOvDdDkFf3xTW9VIV9aQ=="
+CLAUDE_CODE_VERSION = "2.1.261"
+CLAUDE_CODE_INTEGRITY = "sha512-j6+AkfCl6/UJBcx66nlZUmWc4XGK3TscvW19Tiat+oDwkz3WqQfKzjvHO5FhR+shXTtktqs6vqSBrJmeSWpU3Q=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-t7yPrjZH7/xOPR0HYg8NDBr9dGqIi2y3dCDLKmx2zHedSHjAGxoX7HnHeXr1tdk3iw2a6sM/LsV9O7/+Ar86FA=="
+CLAUDE_AGENT_ACP_VERSION = "0.75.1"
+CLAUDE_AGENT_ACP_INTEGRITY = "sha512-Un6I4BRkhpCFS3I7kr5C/lkAm8Nc3VuGZU2YQ3xIpJAIxV94iWO0Q2CH2QABxMERpONRu4Le6XC9V+5PImQZ2A=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
 CLAUDE_ACP_PLUGIN_REVISION = "0526610a3945cc376ac517b63ca358a5b838a2fc"
 
@@ -126,6 +126,18 @@ class FleetImageReleaseTests(unittest.TestCase):
         ):
             self.assertIn(token, text)
         self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD|USER)\b")
+
+    def test_tooling_versions_match_build_and_workflow_inputs(self) -> None:
+        package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for name, dependency in (
+            ("CLAUDE_CODE_VERSION", "@anthropic-ai/claude-code"),
+            ("CLAUDE_AGENT_ACP_VERSION", "@agentclientprotocol/claude-agent-acp"),
+        ):
+            version = package["dependencies"][dependency]
+            self.assertIn(f"ARG {name}={version}\n", dockerfile)
+            self.assertIn(f'{name}: "{version}"', workflow)
 
     def test_claude_code_dependency_is_exact_and_integrity_locked(self) -> None:
         package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))

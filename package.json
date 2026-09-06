@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.70.0",
-    "@anthropic-ai/claude-code": "2.1.251"
+    "@agentclientprotocol/claude-agent-acp": "0.75.1",
+    "@anthropic-ai/claude-code": "2.1.261"
   }
 }
