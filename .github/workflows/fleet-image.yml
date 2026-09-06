@@ -278,7 +278,7 @@ jobs:
             release/vex-exceptions.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 2
 
       - name: Upload pre-publication evidence
         if: always()
