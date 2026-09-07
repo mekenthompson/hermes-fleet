@@ -46,7 +46,16 @@ class ExactMainCiGateTests(unittest.TestCase):
     def test_gate_rejects_empty_and_api_failure(self):
         self.assertFalse(self.module.latest_exact_main_ci_is_green([], SHA, ".github/workflows/ci.yml"))
         with self.assertRaises(RuntimeError):
-            self.module.fetch_runs("owner/repo", "ci.yml", lambda *_, **__: (_ for _ in ()).throw(RuntimeError("api failure")))
+            self.module.fetch_runs("owner/repo", "ci.yml", SHA, lambda *_, **__: (_ for _ in ()).throw(RuntimeError("api failure")))
+
+    def test_fetch_runs_filters_server_side_by_head_sha_without_filtering_status(self):
+        requested = []
+        pending = {"status": "in_progress", "conclusion": None}
+        result = type("Result", (), {"returncode": 0, "stdout": '{"workflow_runs": [{"status": "in_progress", "conclusion": null}]}'})()
+        self.assertEqual(self.module.fetch_runs("owner/repo", "ci.yml", SHA, lambda command, **_: requested.append(command) or result), [pending])
+        query = requested[0][-1]
+        self.assertIn(f"head_sha={SHA}", query)
+        self.assertNotIn("status=", query)
 
     def test_publish_job_effectively_has_actions_read(self):
         lines = (ROOT / ".github/workflows/" / self.workflow_name).read_text().splitlines()

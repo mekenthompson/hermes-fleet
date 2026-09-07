@@ -274,6 +274,13 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn('--workflow-path ".github/workflows/ci.yml"', text)
         self.assertIn("needs: preflight", text)
 
+    def test_publish_checks_out_the_gate_script_before_running_it(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertLess(publish.index("Checkout exact pushed commit"), publish.index("Verify exact main CI gate"))
+        self.assertIn("persist-credentials: false", publish.split("Verify exact main CI gate", 1)[0])
+        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("Log in to GHCR"))
+
     def test_preflight_consumes_handoff_and_verifies_runtime_isolation(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         for token in (
