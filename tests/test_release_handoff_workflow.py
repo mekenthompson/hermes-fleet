@@ -44,7 +44,7 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         header = job_header(self.text)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", header)
         self.assertIn("github.event.workflow_run.head_branch == 'main'", header)
-        self.assertIn("github.event.workflow_run.event != 'pull_request'", text)
+        self.assertIn("github.event.workflow_run.event != 'pull_request'", header)
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", header)
         self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", header)
         self.assertIn("group: release-handoff-stage-a", self.text)
