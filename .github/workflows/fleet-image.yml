@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # inspect CI for the exact selected commit; publication fails closed without it
 
 concurrency:
   group: fleet-image-${{ github.event.pull_request.number || github.sha }}
@@ -307,10 +308,20 @@ jobs:
     environment: fleet-image-publish
     permissions:
       contents: read
+      actions: read
       packages: write
       id-token: write
       attestations: write
     steps:
+      - name: Verify exact main CI gate
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-exact-main-ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "ci.yml" \
+            --sha "$GITHUB_SHA" \
+            --workflow-path ".github/workflows/ci.yml"
+
       - name: Checkout exact pushed commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
