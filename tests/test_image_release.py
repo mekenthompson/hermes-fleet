@@ -370,10 +370,14 @@ class FleetImageReleaseTests(unittest.TestCase):
     def test_exact_candidate_scan_and_publication_contract(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         publish = text.split("\n  publish:\n", 1)[1]
-        self.assertNotIn("docker save", text)
+        # The candidate is exported once, in-job, for the scanners; nothing is ever loaded back or
+        # transferred between jobs, and the push asserts the daemon image still has the scanned config.
         self.assertNotIn("docker load", text)
         self.assertNotIn("fleet-image.tar.gz", text)
         self.assertNotIn("actions/download-artifact@", publish)
+        self.assertIn("SCANNED_CONFIG_ID: ${{ steps.export.outputs.config-id }}", publish)
+        self.assertIn("local image config does not match the exported and scanned archive", publish)
+        self.assertLess(publish.index("scripts/scan-fleet-image.py export"), publish.index("scripts/scan-fleet-image.py trivy"))
         self.assertIn("Build and scan exact publish candidate", publish)
         self.assertIn("docker push \"$STAGING_IMAGE\"", publish)
         self.assertIn("docker buildx imagetools inspect --raw \"$IMMUTABLE_REF\"", publish)
@@ -459,8 +463,12 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertLess(scan, gate)
         self.assertLess(publish_scan, publish_verify)
         self.assertLess(publish_verify, push)
-        self.assertIn("aquasecurity/trivy-action@", text)
-        self.assertIn("severity: CRITICAL", text)
+        self.assertIn("aquasecurity/setup-trivy@", text)
+        self.assertEqual(text.count("scripts/scan-fleet-image.py trivy"), 2)
+        self.assertNotIn("aquasecurity/trivy-action@", text)
+        scanner = (ROOT / "scripts/scan-fleet-image.py").read_text(encoding="utf-8")
+        for flag in ('"--severity", "CRITICAL"', '"--scanners", "vuln"', '"--ignore-unfixed"', '"--skip-db-update"', '"--input"'):
+            self.assertIn(flag, scanner)
         self.assertIn("scripts/verify-trivy-vex.py", text)
         self.assertIn("release/vex-exceptions.json", text)
         self.assertGreaterEqual(text.count("vex-evaluation.json"), 2)
@@ -473,7 +481,7 @@ class FleetImageReleaseTests(unittest.TestCase):
             "scripts/compact-spdx-sbom.py",
             "--max-bytes 16777216",
             "trivy-image.json",
-            "severity: CRITICAL",
+            "scripts/scan-fleet-image.py",
             "actions/attest-build-provenance@",
             "actions/attest-sbom@",
             "sbom-path: fleet-image.attestation.spdx.json",
@@ -669,7 +677,16 @@ class FleetImageReleaseTests(unittest.TestCase):
             "fleet-image.attestation.spdx.json",
         ):
             self.assertIn(token, text)
-        self.assertLess(text.index("Validate full and compact SPDX 2.3 documents"), text.index("Push unique staging candidate and capture pushed digest"))
+        validate = "Collect SBOM and validate full and compact SPDX 2.3 documents"
+        self.assertEqual(text.count(f"- name: {validate}"), 2)
+        preflight = text.split("\n  preflight:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertLess(preflight.index(validate), preflight.index("Upload pre-publication evidence"))
+        # The SBOM finishes while the staging push is in flight and is validated before promotion,
+        # attestation and the handoff; the staging ref is run-unique and never consumed.
+        self.assertLess(publish.index("Push unique staging candidate and capture pushed digest"), publish.index(validate))
+        self.assertLess(publish.index(validate), publish.index("Promote immutable staging digest"))
+        self.assertLess(publish.index(validate), publish.index("Attest published SBOM"))
 
     def test_release_documentation_states_boundaries(self) -> None:
         text = (ROOT / "docs/image-release.md").read_text(encoding="utf-8").lower()
