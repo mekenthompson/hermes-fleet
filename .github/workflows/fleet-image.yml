@@ -63,7 +63,12 @@ jobs:
           password: ${{ github.token }}
 
       - name: Set up Docker Buildx
+        # Build straight into the runner's Docker engine. The docker-container driver re-pulled the
+        # multi-GB parent inside BuildKit (~30s), tarred and re-imported the result for load: true
+        # (35-75s) and exported every parent layer to the GHA cache (34-200s/run) to save ~8s of npm ci.
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker
 
       - name: Pull exact Agent parent
         run: |
@@ -89,8 +94,6 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
-          cache-from: type=gha,scope=fleet-public-amd64
-          cache-to: type=gha,mode=max,scope=fleet-public-amd64
 
       - name: Verify inherited runtime and provenance
         env:
@@ -319,8 +322,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Pull exact Agent parent
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          docker pull "$ONEPASSWORD_CLI_IMAGE"
+
       - name: Set up Docker Buildx
+        # Build straight into the runner's Docker engine. The docker-container driver re-pulled the
+        # multi-GB parent inside BuildKit (~30s), tarred and re-imported the result for load: true
+        # (35-75s) and exported every parent layer to the GHA cache (34-200s/run) to save ~8s of npm ci.
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker
 
       - name: Build and scan exact publish candidate
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -340,8 +354,6 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
-          cache-from: type=gha,scope=fleet-public-amd64
-          cache-to: type=gha,mode=max,scope=fleet-public-amd64
 
       - name: Verify exact scanned candidate runtime and provenance
         env:
@@ -357,7 +369,6 @@ jobs:
           EXPECTED_CLAUDE_ACP_PLUGIN_REVISION: ${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
         run: |
           set -euo pipefail
-          docker pull "$AGENT_IMAGE"
           python3 scripts/verify-inherited-runtime-config.py
           docker run --rm \
             --env EXPECTED_REVISION \
