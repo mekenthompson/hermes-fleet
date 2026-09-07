@@ -313,6 +313,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Verify exact main CI gate
         run: |
           set -euo pipefail
@@ -321,11 +326,6 @@ jobs:
             --workflow "ci.yml" \
             --sha "$GITHUB_SHA" \
             --workflow-path ".github/workflows/ci.yml"
-
-      - name: Checkout exact pushed commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
 
       - name: Revalidate immutable Agent handoff
         run: |

@@ -12,8 +12,8 @@ def latest_exact_main_ci_is_green(runs: Sequence[dict[str, Any]], sha: str, work
     latest = max(matching, key=lambda run: (str(run.get("created_at", "")), int(run.get("id", 0))))
     return latest.get("status") == "completed" and latest.get("conclusion") == "success"
 
-def fetch_runs(repository: str, workflow: str, call: Callable[..., Any] = subprocess.run) -> list[dict[str, Any]]:
-    result = call(["gh", "api", f"repos/{repository}/actions/workflows/{workflow}/runs?event=push&per_page=100"], text=True, capture_output=True, check=False)
+def fetch_runs(repository: str, workflow: str, sha: str, call: Callable[..., Any] = subprocess.run) -> list[dict[str, Any]]:
+    result = call(["gh", "api", f"repos/{repository}/actions/workflows/{workflow}/runs?event=push&head_sha={sha}&per_page=100"], text=True, capture_output=True, check=False)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "GitHub Actions API request failed")
     payload = json.loads(result.stdout)
@@ -27,7 +27,7 @@ def main() -> int:
     parser.add_argument("--repository", required=True); parser.add_argument("--workflow", required=True)
     parser.add_argument("--sha", required=True); parser.add_argument("--workflow-path", required=True)
     args = parser.parse_args()
-    if not latest_exact_main_ci_is_green(fetch_runs(args.repository, args.workflow), args.sha, args.workflow_path):
+    if not latest_exact_main_ci_is_green(fetch_runs(args.repository, args.workflow, args.sha), args.sha, args.workflow_path):
         raise SystemExit("latest exact-SHA main CI run is absent, incomplete, or not successful")
     return 0
 if __name__ == "__main__": raise SystemExit(main())
