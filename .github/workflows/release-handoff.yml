@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 20
     if: >-
       github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event != 'pull_request'
       && github.event.workflow_run.head_branch == 'main'
       && github.event.workflow_run.head_repository.full_name == github.repository
       && github.repository == 'mekenthompson/hermes-fleet'
