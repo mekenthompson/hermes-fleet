@@ -29,9 +29,9 @@ env:
 
 jobs:
   preflight:
-    # PRs never receive package write credentials and never write a registry ref.
+    # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
     if: >-
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet')
     runs-on: ubuntu-latest
@@ -443,6 +443,7 @@ jobs:
           assert not pathlib.Path("/var/run/docker.sock").exists()
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
+          docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
       - name: Generate full image SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
@@ -451,6 +452,11 @@ jobs:
           format: spdx-json
           output-file: fleet-image.spdx.json
           upload-artifact: false
+
+      - name: Set up Python for SPDX schema validation
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
 
       - name: Create and validate bounded attestation SBOM
         run: |
@@ -500,12 +506,7 @@ jobs:
           docker tag "$TEST_IMAGE" "$STAGING_IMAGE"
           push_output=$(docker push "$STAGING_IMAGE")
           printf '%s\n' "$push_output"
-          digest=$(printf '%s\n' "$push_output" | python3 -c '
-          import re, sys
-          matches = re.findall(r"(?:^|\\n)digest:\s*(sha256:[0-9a-f]{64})(?:\\s|$)", sys.stdin.read())
-          assert len(matches) == 1, matches
-          print(matches[0])
-          ')
+          digest=$(printf '%s\n' "$push_output" | python3 scripts/extract-pushed-image-digest.py)
           test -n "$digest"
           immutable_ref="$IMAGE_REPOSITORY@$digest"
           local_config_digest=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
@@ -540,8 +541,26 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools create \
+            --prefer-index=false \
             --tag "$IMAGE_REPOSITORY:sha-${{ github.sha }}" \
             "$IMMUTABLE_REF"
+
+      - name: Verify promoted SHA tag resolves to staged digest
+        env:
+          SHA_TAG: ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}
+          STAGED_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          promoted_digest=$(docker buildx imagetools inspect --format '{{.Digest}}' "$SHA_TAG")
+          test -n "$promoted_digest"
+          test "$promoted_digest" = "$STAGED_DIGEST" || {
+            printf '%s\n' 'promoted SHA tag does not resolve to staged digest' >&2
+            exit 1
+          }
+
+      - name: Emit exact Fleet handoff manifest
+        run: |
+          set -euo pipefail
           python3 scripts/emit-fleet-image-manifest.py \
             --repository "$IMAGE_REPOSITORY" \
             --revision "${{ github.sha }}" \
