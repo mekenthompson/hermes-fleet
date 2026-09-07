@@ -29,7 +29,11 @@ env:
 
 jobs:
   preflight:
-    if: github.repository == 'mekenthompson/hermes-fleet-public' || github.repository == 'mekenthompson/hermes-fleet'
+    # PRs never receive package write credentials and never write a registry ref.
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.repository == 'mekenthompson/hermes-fleet-public' ||
+      github.repository == 'mekenthompson/hermes-fleet')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -252,34 +256,6 @@ jobs:
             --component-image "$ONEPASSWORD_CLI_IMAGE" \
             --output vex-evaluation.json
 
-      - name: Save exact scanned candidate
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.publish == 'true' &&
-          github.ref == 'refs/heads/main'
-        run: |
-          set -euo pipefail
-          docker save "$TEST_IMAGE" | gzip -1 > fleet-image.tar.gz
-          test -s fleet-image.tar.gz
-
-      - name: Upload exact scanned candidate
-        if: >-
-          github.event_name == 'workflow_dispatch' &&
-          github.event.inputs.publish == 'true' &&
-          github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: fleet-image-candidate-${{ github.sha }}
-          path: |
-            fleet-image.tar.gz
-            fleet-image.spdx.json
-            fleet-image.attestation.spdx.json
-            trivy-image.json
-            vex-evaluation.json
-            release/vex-exceptions.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 2
 
       - name: Upload pre-publication evidence
         if: always()
@@ -296,7 +272,6 @@ jobs:
           retention-days: 30
 
   publish:
-    needs: preflight
     if: >-
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet') &&
@@ -334,11 +309,6 @@ jobs:
             --manifest release/agent-image-manifest.json \
             --github-env "$GITHUB_ENV"
 
-      - name: Download exact scanned candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: fleet-image-candidate-${{ github.sha }}
-
       - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
@@ -346,7 +316,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Load and verify exact scanned candidate
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and scan exact publish candidate
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            AGENT_IMAGE=${{ env.AGENT_IMAGE }}
+            ONEPASSWORD_CLI_IMAGE=${{ env.ONEPASSWORD_CLI_IMAGE }}
+            CLAUDE_CODE_VERSION=${{ env.CLAUDE_CODE_VERSION }}
+            CLAUDE_AGENT_ACP_VERSION=${{ env.CLAUDE_AGENT_ACP_VERSION }}
+            CLAUDE_ACP_PLUGIN_SOURCE=${{ env.CLAUDE_ACP_PLUGIN_SOURCE }}
+            CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
+            FLEET_GIT_SHA=${{ github.sha }}
+            FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          cache-from: type=gha,scope=fleet-public-amd64
+          cache-to: type=gha,mode=max,scope=fleet-public-amd64
+
+      - name: Verify exact scanned candidate runtime and provenance
         env:
           EXPECTED_REVISION: ${{ github.sha }}
           EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
@@ -361,7 +355,6 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "$AGENT_IMAGE"
-          gzip -dc fleet-image.tar.gz | docker load
           python3 scripts/verify-inherited-runtime-config.py
           docker run --rm \
             --env EXPECTED_REVISION \
@@ -451,6 +444,41 @@ jobs:
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
 
+      - name: Generate full image SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          format: spdx-json
+          output-file: fleet-image.spdx.json
+          upload-artifact: false
+
+      - name: Create and validate bounded attestation SBOM
+        run: |
+          set -euo pipefail
+          python3 scripts/compact-spdx-sbom.py \
+            --input fleet-image.spdx.json \
+            --output fleet-image.attestation.spdx.json \
+            --max-bytes 16777216
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            --requirement release/spdx-validation-requirements.txt
+          python3 scripts/validate-spdx-schema.py \
+            --schema release/spdx-2.3-schema.json \
+            fleet-image.spdx.json \
+            fleet-image.attestation.spdx.json
+
+      - name: Scan critical image vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.TEST_IMAGE }}
+          format: json
+          output: trivy-image.json
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: 0
+
       - name: Revalidate scoped VEX decision before publication
         run: |
           set -euo pipefail
@@ -463,26 +491,63 @@ jobs:
             --component-image "$ONEPASSWORD_CLI_IMAGE" \
             --output vex-publish-evaluation.json
 
-      - name: Push exact scanned candidate
+      - name: Push unique staging candidate and capture pushed digest
         id: publish
+        env:
+          STAGING_IMAGE: ${{ env.IMAGE_REPOSITORY }}:fleet-stage-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          docker push "$TEST_IMAGE"
-          immutable_ref=$(docker image inspect --format '{{json .RepoDigests}}' "$TEST_IMAGE" | python3 -c '
-          import json, os, sys
-          prefix = os.environ["IMAGE_REPOSITORY"] + "@sha256:"
-          matches = [item for item in json.load(sys.stdin) if item.startswith(prefix)]
+          docker tag "$TEST_IMAGE" "$STAGING_IMAGE"
+          push_output=$(docker push "$STAGING_IMAGE")
+          printf '%s\n' "$push_output"
+          digest=$(printf '%s\n' "$push_output" | python3 -c '
+          import re, sys
+          matches = re.findall(r"(?:^|\\n)digest:\s*(sha256:[0-9a-f]{64})(?:\\s|$)", sys.stdin.read())
           assert len(matches) == 1, matches
           print(matches[0])
           ')
-          digest=${immutable_ref#*@}
+          test -n "$digest"
+          immutable_ref="$IMAGE_REPOSITORY@$digest"
+          local_config_digest=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
+          test -n "$local_config_digest"
+          printf 'digest=%s\nimmutable_ref=%s\nlocal-config-digest=%s\nstaging-image=%s\n' \
+            "$digest" "$immutable_ref" "$local_config_digest" "$STAGING_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify remote immutable manifest identity
+        env:
+          IMMUTABLE_REF: ${{ steps.publish.outputs.immutable_ref }}
+          LOCAL_CONFIG_DIGEST: ${{ steps.publish.outputs.local-config-digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$IMMUTABLE_REF" > remote-manifest.json
+          remote_config_digest=$(python3 -c '
+          import json
+          manifest = json.load(open("remote-manifest.json", encoding="utf-8"))
+          digest = manifest.get("config", {}).get("digest")
+          assert isinstance(digest, str) and digest.startswith("sha256:"), manifest
+          print(digest)
+          ')
+          test -n "$remote_config_digest"
+          test "$remote_config_digest" = "$LOCAL_CONFIG_DIGEST" || {
+            printf '%s\n' 'remote manifest config does not match scanned candidate' >&2
+            exit 1
+          }
+          printf 'remote-config-digest=%s\n' "$remote_config_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Promote immutable staging digest
+        env:
+          IMMUTABLE_REF: ${{ steps.publish.outputs.immutable_ref }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$IMAGE_REPOSITORY:sha-${{ github.sha }}" \
+            "$IMMUTABLE_REF"
           python3 scripts/emit-fleet-image-manifest.py \
             --repository "$IMAGE_REPOSITORY" \
             --revision "${{ github.sha }}" \
-            --digest "$digest" \
+            --digest "${{ steps.publish.outputs.digest }}" \
             --agent-manifest release/agent-image-manifest.json \
             --output fleet-image-handoff.json
-          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest published digest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2

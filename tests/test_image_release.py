@@ -272,7 +272,9 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn("scripts/verify-exact-main-ci.py", text)
         self.assertIn('--workflow "ci.yml"', text)
         self.assertIn('--workflow-path ".github/workflows/ci.yml"', text)
-        self.assertIn("needs: preflight", text)
+        self.assertNotIn("needs: preflight", text)
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("Build and scan exact publish candidate"))
 
     def test_publish_checks_out_the_gate_script_before_running_it(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -331,30 +333,45 @@ class FleetImageReleaseTests(unittest.TestCase):
 
     def test_exact_candidate_scan_and_publication_contract(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(text.count("docker/build-push-action@"), 1)
-        self.assertIn('docker save "$TEST_IMAGE" | gzip -1 > fleet-image.tar.gz', text)
-        self.assertIn("set -euo pipefail", text)
-        self.assertIn("gzip -dc fleet-image.tar.gz | docker load", text)
-        self.assertIn('docker push "$TEST_IMAGE"', text)
         publish = text.split("\n  publish:\n", 1)[1]
-        self.assertNotIn("docker/build-push-action@", publish)
-        self.assertIn("Load and verify exact scanned candidate", publish)
+        self.assertNotIn("docker save", text)
+        self.assertNotIn("docker load", text)
+        self.assertNotIn("fleet-image.tar.gz", text)
+        self.assertNotIn("actions/download-artifact@", publish)
+        self.assertIn("Build and scan exact publish candidate", publish)
+        self.assertIn("docker push \"$STAGING_IMAGE\"", publish)
+        self.assertIn("docker buildx imagetools inspect --raw \"$IMMUTABLE_REF\"", publish)
+        self.assertIn("docker buildx imagetools create", publish)
+        self.assertIn("fleet-stage-${{ github.run_id }}-${{ github.run_attempt }}", text)
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertLess(dockerfile.index("ARG FLEET_GIT_SHA=development"), dockerfile.index("RUN python3 -c"))
+        self.assertLess(dockerfile.index("RUN npm ci"), dockerfile.index("ARG FLEET_GIT_SHA=development"))
+        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("docker push \"$STAGING_IMAGE\""))
+
+    def test_publication_fails_closed_on_remote_manifest_config_mismatch(self) -> None:
+        publish = WORKFLOW.read_text(encoding="utf-8").split("\n  publish:\n", 1)[1]
+        self.assertIn("Verify remote immutable manifest identity", publish)
+        self.assertIn("remote-config-digest", publish)
+        self.assertIn("local-config-digest", publish)
+        self.assertIn("remote manifest config does not match scanned candidate", publish)
+        self.assertIn("test -n \"$digest\"", publish)
+        self.assertIn("test -n \"$remote_config_digest\"", publish)
 
     def test_critical_scan_remains_mandatory_and_vex_is_revalidated(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         scan = text.index("- name: Scan critical image vulnerabilities")
         gate = text.index("- name: Enforce critical findings and scoped VEX policy")
-        save = text.index("- name: Save exact scanned candidate")
+        publish_scan = text.rindex("- name: Scan critical image vulnerabilities")
         publish_verify = text.index("- name: Revalidate scoped VEX decision before publication")
-        push = text.index("- name: Push exact scanned candidate")
+        push = text.index("- name: Push unique staging candidate and capture pushed digest")
         self.assertLess(scan, gate)
-        self.assertLess(gate, save)
+        self.assertLess(publish_scan, publish_verify)
         self.assertLess(publish_verify, push)
         self.assertIn("aquasecurity/trivy-action@", text)
         self.assertIn("severity: CRITICAL", text)
         self.assertIn("scripts/verify-trivy-vex.py", text)
         self.assertIn("release/vex-exceptions.json", text)
-        self.assertGreaterEqual(text.count("vex-evaluation.json"), 3)
+        self.assertGreaterEqual(text.count("vex-evaluation.json"), 2)
 
     def test_release_preserves_full_evidence_and_attests_bounded_sbom(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -560,7 +577,7 @@ class FleetImageReleaseTests(unittest.TestCase):
             "fleet-image.attestation.spdx.json",
         ):
             self.assertIn(token, text)
-        self.assertLess(text.index("Validate full and compact SPDX 2.3 documents"), text.index("Save exact scanned candidate"))
+        self.assertLess(text.index("Validate full and compact SPDX 2.3 documents"), text.index("Push unique staging candidate and capture pushed digest"))
 
     def test_release_documentation_states_boundaries(self) -> None:
         text = (ROOT / "docs/image-release.md").read_text(encoding="utf-8").lower()
