@@ -57,6 +57,16 @@ class ExactMainCiGateTests(unittest.TestCase):
         self.assertIn(f"head_sha={SHA}", query)
         self.assertNotIn("status=", query)
 
+    def test_gate_authenticates_github_api(self):
+        import yaml
+        text = (ROOT / ".github/workflows/" / self.workflow_name).read_text()
+        jobs = yaml.safe_load(text)["jobs"]
+        gates = [s for j in jobs.values() for s in j.get("steps", [])
+                 if "scripts/verify-exact-main-ci.py" in s.get("run", "")]
+        self.assertTrue(gates)
+        for gate in gates:
+            self.assertEqual(gate.get("env", {}).get("GH_TOKEN"), "${{ github.token }}")
+
     def test_publish_job_effectively_has_actions_read(self):
         lines = (ROOT / ".github/workflows/" / self.workflow_name).read_text().splitlines()
         publish = lines.index(f"  {self.job_name}:")
