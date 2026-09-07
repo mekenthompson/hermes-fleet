@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          # Full history is required: tests/test_public_product.py asserts the clean-history
+          # root commit with `git rev-list --max-parents=0`, which a shallow clone would misreport.
           fetch-depth: 0
       - name: Unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

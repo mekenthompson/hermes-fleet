@@ -29,12 +29,57 @@ env:
   CLAUDE_AGENT_ACP_VERSION: "0.75.1"
   CLAUDE_ACP_PLUGIN_SOURCE: https://github.com/mvdbastos/hermes-acp-agents
   CLAUDE_ACP_PLUGIN_REVISION: 0526610a3945cc376ac517b63ca358a5b838a2fc
+  # Scanner pins match the versions the previously used anchore/sbom-action v0.24.2 and
+  # aquasecurity/trivy-action v0.36.0 installed, so scan results are unchanged.
+  SYFT_VERSION: v1.51.1
+  TRIVY_VERSION: v0.70.0
+  # The built candidate is exported once and shared by Syft and Trivy (scripts/scan-fleet-image.py).
+  CANDIDATE_ARCHIVE: ${{ github.workspace }}/.scan/fleet-image.tar
+  SBOM_STATE: ${{ github.workspace }}/.scan/sbom-state
 
 jobs:
+  scope:
+    # First, cheap job: did this event change anything the image is built from? Docs-only and
+    # test-only commits skip the bake. Skipped preflight/publish jobs report "skipped", which the
+    # required status checks on main count as passing. Manual dispatches and any range git cannot
+    # resolve (new branch, force push) fail open to "run"; see scripts/fleet-image-change-scope.py.
+    if: >-
+      github.repository == 'mekenthompson/hermes-fleet-public' ||
+      github.repository == 'mekenthompson/hermes-fleet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.scope.outputs.image }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout with history for the changed range
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Match changed paths against the Fleet image input set
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/fleet-image-change-scope.py \
+            --event "$GITHUB_EVENT_NAME" \
+            --base "$BASE" \
+            --head "$HEAD" \
+            --github-output "$GITHUB_OUTPUT"
+
   preflight:
     # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
     # Pushes to main skip preflight: the publish job rebuilds and re-scans the exact commit itself.
+    needs: scope
     if: >-
+      !cancelled() &&
+      (needs.scope.outputs.image == 'true' || needs.scope.result == 'failure') &&
       (github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
@@ -74,11 +119,38 @@ jobs:
         with:
           driver: docker
 
-      - name: Pull exact Agent parent
+      - name: Set up Python for SPDX schema validation
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - name: Pull exact Agent parent and prefetch scan tooling
+        # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
+        # SPDX validator install ride alongside it. Every background job is waited on and fails closed.
         run: |
           set -euo pipefail
-          docker pull "$AGENT_IMAGE"
-          docker pull "$ONEPASSWORD_CLI_IMAGE"
+          docker pull "$AGENT_IMAGE" & agent_pull=$!
+          docker pull "$ONEPASSWORD_CLI_IMAGE" & op_pull=$!
+          python3 scripts/scan-fleet-image.py prefetch-db & trivy_db=$!
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            --requirement release/spdx-validation-requirements.txt & pip_install=$!
+          wait "$agent_pull"
+          wait "$op_pull"
+          wait "$trivy_db"
+          wait "$pip_install"
 
       - name: Build Fleet child without publishing
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -204,53 +276,31 @@ jobs:
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
-      - name: Generate full image SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
-        with:
-          image: ${{ env.TEST_IMAGE }}
-          format: spdx-json
-          output-file: fleet-image.spdx.json
-          upload-artifact: false
-
-      - name: Create bounded package SBOM for attestation
+      - name: Export built candidate and start SBOM generation
+        # One docker-save of the candidate, bound to its local config ID. Syft runs detached from
+        # here on (its status is collected fail-closed below) while Trivy scans the same archive.
+        id: export
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
         run: |
           set -euo pipefail
-          python3 scripts/compact-spdx-sbom.py \
-            --input fleet-image.spdx.json \
-            --output fleet-image.attestation.spdx.json \
-            --max-bytes 16777216
-
-      - name: Set up Python for SPDX schema validation
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.13"
-
-      - name: Install pinned SPDX schema validator
-        run: |
-          set -euo pipefail
-          python3 -m pip install \
-            --disable-pip-version-check \
-            --require-hashes \
-            --requirement release/spdx-validation-requirements.txt
-
-      - name: Validate full and compact SPDX 2.3 documents
-        run: |
-          set -euo pipefail
-          python3 scripts/validate-spdx-schema.py \
-            --schema release/spdx-2.3-schema.json \
-            fleet-image.spdx.json \
-            fleet-image.attestation.spdx.json
+          python3 scripts/scan-fleet-image.py export \
+            --image "$TEST_IMAGE" \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --github-output "$GITHUB_OUTPUT"
+          python3 scripts/scan-fleet-image.py start-sbom \
+            --syft "$SYFT" \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --output fleet-image.spdx.json \
+            --state "$SBOM_STATE"
 
       - name: Scan critical image vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.TEST_IMAGE }}
-          format: json
-          output: trivy-image.json
-          scanners: vuln
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: 0
+        # CRITICAL, fixed-only vulnerability scan of the exported archive with the prefetched database.
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py trivy \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --output trivy-image.json
 
       - name: Enforce critical findings and scoped VEX policy
         run: |
@@ -264,6 +314,20 @@ jobs:
             --component-image "$ONEPASSWORD_CLI_IMAGE" \
             --output vex-evaluation.json
 
+      - name: Collect SBOM and validate full and compact SPDX 2.3 documents
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py wait-sbom \
+            --output fleet-image.spdx.json \
+            --state "$SBOM_STATE"
+          python3 scripts/compact-spdx-sbom.py \
+            --input fleet-image.spdx.json \
+            --output fleet-image.attestation.spdx.json \
+            --max-bytes 16777216
+          python3 scripts/validate-spdx-schema.py \
+            --schema release/spdx-2.3-schema.json \
+            fleet-image.spdx.json \
+            fleet-image.attestation.spdx.json
 
       - name: Upload pre-publication evidence
         if: always()
@@ -280,8 +344,14 @@ jobs:
           retention-days: 30
 
   publish:
-    # Every push to main publishes once its exact-SHA CI run is green; dispatch with publish=true re-runs it.
+    # Every push to main that touches the image input set publishes once its exact-SHA CI run is
+    # green; dispatch with publish=true re-runs it for any main commit. A push whose scope job
+    # found no image inputs skips publication: the latest published digest is still the correct
+    # image for that commit (see docs/image-release.md, "Skipped publications").
+    needs: scope
     if: >-
+      !cancelled() &&
+      (needs.scope.outputs.image == 'true' || needs.scope.result == 'failure') &&
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet') &&
       github.ref == 'refs/heads/main' &&
@@ -318,12 +388,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Pull exact Agent parent
-        run: |
-          set -euo pipefail
-          docker pull "$AGENT_IMAGE"
-          docker pull "$ONEPASSWORD_CLI_IMAGE"
-
       - name: Set up Docker Buildx
         # Build straight into the runner's Docker engine. The docker-container driver re-pulled the
         # multi-GB parent inside BuildKit (~30s), tarred and re-imported the result for load: true
@@ -331,6 +395,39 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: docker
+
+      - name: Set up Python for SPDX schema validation
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+
+      - name: Install pinned Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - name: Pull exact Agent parent and prefetch scan tooling
+        # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
+        # SPDX validator install ride alongside it. Every background job is waited on and fails closed.
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE" & agent_pull=$!
+          docker pull "$ONEPASSWORD_CLI_IMAGE" & op_pull=$!
+          python3 scripts/scan-fleet-image.py prefetch-db & trivy_db=$!
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            --requirement release/spdx-validation-requirements.txt & pip_install=$!
+          wait "$agent_pull"
+          wait "$op_pull"
+          wait "$trivy_db"
+          wait "$pip_install"
 
       - name: Build and scan exact publish candidate
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -455,45 +552,31 @@ jobs:
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
-      - name: Generate full image SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
-        with:
-          image: ${{ env.TEST_IMAGE }}
-          format: spdx-json
-          output-file: fleet-image.spdx.json
-          upload-artifact: false
-
-      - name: Set up Python for SPDX schema validation
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.13"
-
-      - name: Create and validate bounded attestation SBOM
+      - name: Export scanned publish candidate and start SBOM generation
+        # One docker-save of the candidate, bound to its local config ID. Syft runs detached from
+        # here on (its status is collected fail-closed below) while Trivy scans the same archive.
+        id: export
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
         run: |
           set -euo pipefail
-          python3 scripts/compact-spdx-sbom.py \
-            --input fleet-image.spdx.json \
-            --output fleet-image.attestation.spdx.json \
-            --max-bytes 16777216
-          python3 -m pip install \
-            --disable-pip-version-check \
-            --require-hashes \
-            --requirement release/spdx-validation-requirements.txt
-          python3 scripts/validate-spdx-schema.py \
-            --schema release/spdx-2.3-schema.json \
-            fleet-image.spdx.json \
-            fleet-image.attestation.spdx.json
+          python3 scripts/scan-fleet-image.py export \
+            --image "$TEST_IMAGE" \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --github-output "$GITHUB_OUTPUT"
+          python3 scripts/scan-fleet-image.py start-sbom \
+            --syft "$SYFT" \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --output fleet-image.spdx.json \
+            --state "$SBOM_STATE"
 
       - name: Scan critical image vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ env.TEST_IMAGE }}
-          format: json
-          output: trivy-image.json
-          scanners: vuln
-          severity: CRITICAL
-          ignore-unfixed: true
-          exit-code: 0
+        # CRITICAL, fixed-only vulnerability scan of the exported archive with the prefetched database.
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py trivy \
+            --archive "$CANDIDATE_ARCHIVE" \
+            --output trivy-image.json
 
       - name: Revalidate scoped VEX decision before publication
         run: |
@@ -524,19 +607,26 @@ jobs:
             --interval-seconds 20
 
       - name: Push unique staging candidate and capture pushed digest
+        # Runs while the detached SBOM generation is still reading the exported archive; both
+        # describe the same local image config, which the remote manifest check binds to the push.
         id: publish
         env:
           STAGING_IMAGE: ${{ env.IMAGE_REPOSITORY }}:fleet-stage-${{ github.run_id }}-${{ github.run_attempt }}
+          SCANNED_CONFIG_ID: ${{ steps.export.outputs.config-id }}
         run: |
           set -euo pipefail
+          local_config_digest=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
+          test -n "$local_config_digest"
+          test "$local_config_digest" = "$SCANNED_CONFIG_ID" || {
+            printf '%s\n' 'local image config does not match the exported and scanned archive' >&2
+            exit 1
+          }
           docker tag "$TEST_IMAGE" "$STAGING_IMAGE"
           push_output=$(docker push "$STAGING_IMAGE")
           printf '%s\n' "$push_output"
           digest=$(printf '%s\n' "$push_output" | python3 scripts/extract-pushed-image-digest.py)
           test -n "$digest"
           immutable_ref="$IMAGE_REPOSITORY@$digest"
-          local_config_digest=$(docker image inspect --format '{{.Id}}' "$TEST_IMAGE")
-          test -n "$local_config_digest"
           printf 'digest=%s\nimmutable_ref=%s\nlocal-config-digest=%s\nstaging-image=%s\n' \
             "$digest" "$immutable_ref" "$local_config_digest" "$STAGING_IMAGE" >> "$GITHUB_OUTPUT"
 
@@ -561,7 +651,24 @@ jobs:
           }
           printf 'remote-config-digest=%s\n' "$remote_config_digest" >> "$GITHUB_OUTPUT"
 
+      - name: Collect SBOM and validate full and compact SPDX 2.3 documents
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py wait-sbom \
+            --output fleet-image.spdx.json \
+            --state "$SBOM_STATE"
+          python3 scripts/compact-spdx-sbom.py \
+            --input fleet-image.spdx.json \
+            --output fleet-image.attestation.spdx.json \
+            --max-bytes 16777216
+          python3 scripts/validate-spdx-schema.py \
+            --schema release/spdx-2.3-schema.json \
+            fleet-image.spdx.json \
+            fleet-image.attestation.spdx.json
+
       - name: Promote immutable staging digest
+        # Only after the SBOM of the scanned config has been validated; the staging ref is
+        # run/attempt-unique and is never consumed by anything.
         env:
           IMMUTABLE_REF: ${{ steps.publish.outputs.immutable_ref }}
         run: |
