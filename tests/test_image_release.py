@@ -259,11 +259,20 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertNotIn("packages: write", text.split("\n  publish:\n", 1)[0])
         self.assertRegex(
             text,
-            r"(?s)permissions:\n  contents: read.*?publish:.*?permissions:\n      contents: read\n      packages: write\n      id-token: write\n      attestations: write",
+            r"(?s)permissions:\n  contents: read.*?publish:.*?permissions:\n      contents: read\n      actions: read\n      packages: write\n      id-token: write\n      attestations: write",
         )
         self.assertNotIn("secrets.", text)
         for uses in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
             self.assertRegex(uses, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_publish_requires_a_successful_ci_run_for_this_exact_main_sha(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("Verify exact main CI gate", text)
+        self.assertIn("actions: read", text)
+        self.assertIn("scripts/verify-exact-main-ci.py", text)
+        self.assertIn('--workflow "ci.yml"', text)
+        self.assertIn('--workflow-path ".github/workflows/ci.yml"', text)
+        self.assertIn("needs: preflight", text)
 
     def test_preflight_consumes_handoff_and_verifies_runtime_isolation(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
