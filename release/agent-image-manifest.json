@@ -1,7 +1,7 @@
 {
-  "digest": "sha256:28018ce35a706541f5a010729a3ef985fb2c1fb6e9c48f85c3b4169e6c0c1f5d",
-  "immutable_ref": "ghcr.io/mekenthompson/hermes-agent@sha256:28018ce35a706541f5a010729a3ef985fb2c1fb6e9c48f85c3b4169e6c0c1f5d",
+  "digest": "sha256:234a31467e72cd1d809c3d1ddbfb570e264538efc2330f57b61597503c663183",
+  "immutable_ref": "ghcr.io/mekenthompson/hermes-agent@sha256:234a31467e72cd1d809c3d1ddbfb570e264538efc2330f57b61597503c663183",
   "repository": "ghcr.io/mekenthompson/hermes-agent",
-  "revision": "b84bf76bf5a93617b30c01a59812bf097871d4e4",
+  "revision": "ddec04d2b90d5db519c29993ec2b3a0fa7781d54",
   "schema_version": 1
 }
