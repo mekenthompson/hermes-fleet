@@ -15,6 +15,7 @@ AGENT_MANIFEST = ROOT / "release/agent-image-manifest.json"
 READ_MANIFEST = ROOT / "scripts/read-agent-image-manifest.py"
 EMIT_MANIFEST = ROOT / "scripts/emit-fleet-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
+EXTRACT_PUSH_DIGEST = ROOT / "scripts/extract-pushed-image-digest.py"
 AGENT_REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
 AGENT_REVISION = "b2b676ca3ae04ded170e32cd8872173f30348d3d"
 AGENT_DIGEST = "sha256:bc955c2ac9765ede2a9e4b5fda17ee38bf8c82a058ecd4247267d0acd23447d8"
@@ -347,6 +348,49 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertLess(dockerfile.index("ARG FLEET_GIT_SHA=development"), dockerfile.index("RUN python3 -c"))
         self.assertLess(dockerfile.index("RUN npm ci"), dockerfile.index("ARG FLEET_GIT_SHA=development"))
         self.assertLess(publish.index("Verify exact main CI gate"), publish.index("docker push \"$STAGING_IMAGE\""))
+
+    def test_push_digest_extractor_accepts_real_docker_push_summary(self) -> None:
+        digest = "sha256:" + "a" * 64
+        push_log = (
+            "The push refers to repository [ghcr.io/mekenthompson/hermes-fleet-public]\n"
+            "a0b1c2d3e4f5: Pushed\n"
+            "fleet-stage-123-1: digest: " + digest + " size: 742\n"
+        )
+        result = subprocess.run(
+            ["python3", str(EXTRACT_PUSH_DIGEST)],
+            cwd=ROOT,
+            input=push_log,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, digest + "\n")
+
+    def test_publish_false_dispatch_runs_read_only_bake_and_promotion_is_verified(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        preflight = text.split("\n  preflight:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertIn("github.event_name == 'workflow_dispatch'", preflight)
+        self.assertIn("push: false", preflight)
+        self.assertNotIn("packages: write", preflight)
+        self.assertIn("scripts/extract-pushed-image-digest.py", publish)
+        self.assertIn("--prefer-index=false", publish)
+        self.assertIn("Verify promoted SHA tag resolves to staged digest", publish)
+        self.assertIn("promoted SHA tag does not resolve to staged digest", publish)
+
+    def test_publish_repeats_preflight_runtime_and_supply_chain_gates(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        publish = text.split("\n  publish:\n", 1)[1]
+        for token in (
+            'docker run --rm --entrypoint hermes "$TEST_IMAGE" --version',
+            "Set up Python for SPDX schema validation",
+            "scripts/verify-inherited-runtime-config.py",
+            "scripts/validate-spdx-schema.py",
+            "scripts/verify-trivy-vex.py",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, publish)
 
     def test_publication_fails_closed_on_remote_manifest_config_mismatch(self) -> None:
         publish = WORKFLOW.read_text(encoding="utf-8").split("\n  publish:\n", 1)[1]
