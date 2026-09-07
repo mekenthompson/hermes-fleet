@@ -17,8 +17,13 @@ EMIT_MANIFEST = ROOT / "scripts/emit-fleet-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 EXTRACT_PUSH_DIGEST = ROOT / "scripts/extract-pushed-image-digest.py"
 AGENT_REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
-AGENT_REVISION = "b3ba643baaa4ef16587b453aa2a098fdde3c286b"
-AGENT_DIGEST = "sha256:53ef08d7ffa669deac194de98e9645fcda3ec5c917dab2f7686ea39cacc9b365"
+# The Agent revision and digest are read from the committed handoff manifest rather than
+# pinned here, so a release PR that bumps the manifest never needs a matching test edit.
+# The structural checks below (40-hex revision, sha256 digest, immutable_ref binding) are
+# what keep this from degrading into "the manifest equals itself".
+_AGENT_MANIFEST_DATA = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8"))
+AGENT_REVISION = _AGENT_MANIFEST_DATA["revision"]
+AGENT_DIGEST = _AGENT_MANIFEST_DATA["digest"]
 AGENT_REF = f"{AGENT_REPOSITORY}@{AGENT_DIGEST}"
 ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
@@ -52,6 +57,13 @@ class FleetImageReleaseTests(unittest.TestCase):
 
     def test_agent_handoff_is_exact_and_validator_is_fail_closed(self) -> None:
         manifest = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8"))
+        self.assertRegex(AGENT_REVISION, r"^[0-9a-f]{40}$")
+        self.assertRegex(AGENT_DIGEST, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(manifest["immutable_ref"], f"{manifest['repository']}@{manifest['digest']}")
+        self.assertEqual(
+            AGENT_MANIFEST.read_text(encoding="utf-8"),
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        )
         self.assertEqual(
             manifest,
             {
@@ -245,11 +257,20 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn(CLAUDE_ACP_PLUGIN_REVISION, plugin)
         self.assertIn("kind: model-provider", metadata)
 
-    def test_release_workflow_is_manual_publish_and_least_privilege(self) -> None:
+    def test_release_workflow_publishes_on_main_push_and_is_least_privilege(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("pull_request:", text)
         self.assertIn("workflow_dispatch:", text)
-        self.assertNotRegex(text, r"(?m)^\s*push:\s*$")
+        self.assertIn("on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n", text)
+        publish_if = text.split("\n  publish:\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("github.ref == 'refs/heads/main'", publish_if)
+        self.assertIn("github.event_name == 'push'", publish_if)
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'", publish_if)
+        preflight_if = text.split("\n  preflight:\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("'push'", preflight_if)
+        self.assertIn("github.event_name == 'pull_request'", preflight_if)
+        self.assertIn("group: fleet-image-${{ github.event.pull_request.number || github.sha }}", text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
         self.assertIn("github.repository == 'mekenthompson/hermes-fleet-public'", text)
         self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
         self.assertIn("ghcr.io/mekenthompson/hermes-fleet-public", text)
@@ -275,14 +296,28 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn('--workflow-path ".github/workflows/ci.yml"', text)
         self.assertNotIn("needs: preflight", text)
         publish = text.split("\n  publish:\n", 1)[1]
-        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("Build and scan exact publish candidate"))
+        gate = publish.split("Verify exact main CI gate", 1)[1].split("- name:", 1)[0]
+        self.assertIn("--wait", gate)
+        steps = [line for line in publish.splitlines() if line.startswith("      - name: ")]
+        names = [line.removeprefix("      - name: ") for line in steps]
+        gate_index = names.index("Verify exact main CI gate")
+        push_index = names.index("Push unique staging candidate and capture pushed digest")
+        promote_index = names.index("Promote immutable staging digest")
+        self.assertLess(gate_index, push_index)
+        self.assertLess(gate_index, promote_index)
+        self.assertEqual(gate_index + 1, push_index)
+        for name in ("Attest published digest", "Attest published SBOM"):
+            self.assertGreater(names.index(name), gate_index)
 
     def test_publish_checks_out_the_gate_script_before_running_it(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         publish = text.split("\n  publish:\n", 1)[1]
         self.assertLess(publish.index("Checkout exact pushed commit"), publish.index("Verify exact main CI gate"))
         self.assertIn("persist-credentials: false", publish.split("Verify exact main CI gate", 1)[0])
-        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("Log in to GHCR"))
+        # The GHCR login precedes the gate only because the build must pull the pinned Agent parent;
+        # the gate still sits before every registry write.
+        self.assertLess(publish.index("Log in to GHCR"), publish.index("Build and scan exact publish candidate"))
+        self.assertLess(publish.index("Verify exact main CI gate"), publish.index("docker push"))
 
     def test_preflight_consumes_handoff_and_verifies_runtime_isolation(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -639,6 +674,9 @@ class FleetImageReleaseTests(unittest.TestCase):
     def test_release_documentation_states_boundaries(self) -> None:
         text = (ROOT / "docs/image-release.md").read_text(encoding="utf-8").lower()
         for token in (
+            "every push to `main`",
+            "exact-sha ci",
+            "re-run",
             "exact agent digest",
             "without rebuilding",
             "full spdx",

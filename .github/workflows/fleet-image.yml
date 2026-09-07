@@ -2,10 +2,12 @@ name: Fleet Image
 
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the exact selected main commit to GHCR
+        description: Publish the exact selected main commit to GHCR (re-run; every main push publishes automatically)
         type: boolean
         required: true
         default: false
@@ -15,6 +17,7 @@ permissions:
   actions: read # inspect CI for the exact selected commit; publication fails closed without it
 
 concurrency:
+  # Per-SHA on main: a push publication is never cancelled by a later push or a dispatch re-run.
   group: fleet-image-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -30,6 +33,7 @@ env:
 jobs:
   preflight:
     # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
+    # Pushes to main skip preflight: the publish job rebuilds and re-scans the exact commit itself.
     if: >-
       (github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
@@ -276,12 +280,13 @@ jobs:
           retention-days: 30
 
   publish:
+    # Every push to main publishes once its exact-SHA CI run is green; dispatch with publish=true re-runs it.
     if: >-
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet') &&
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.publish == 'true' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: fleet-image-publish
@@ -297,17 +302,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify exact main CI gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 scripts/verify-exact-main-ci.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --workflow "ci.yml" \
-            --sha "$GITHUB_SHA" \
-            --workflow-path ".github/workflows/ci.yml"
-
       - name: Revalidate immutable Agent handoff
         run: |
           set -euo pipefail
@@ -316,6 +310,8 @@ jobs:
             --github-env "$GITHUB_ENV"
 
       - name: Log in to GHCR
+        # Needed before the build to pull the pinned Agent parent; nothing is written to the
+        # registry until the exact main CI gate below has passed.
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
@@ -510,6 +506,22 @@ jobs:
             --binary op-vex-publish.bin \
             --component-image "$ONEPASSWORD_CLI_IMAGE" \
             --output vex-publish-evaluation.json
+
+      - name: Verify exact main CI gate
+        # Last step before the first registry write: build and scans above overlap the CI run for
+        # this exact SHA, then publication waits for that run and fails closed unless it succeeded.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-exact-main-ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "ci.yml" \
+            --sha "$GITHUB_SHA" \
+            --workflow-path ".github/workflows/ci.yml" \
+            --wait \
+            --timeout-minutes 30 \
+            --interval-seconds 20
 
       - name: Push unique staging candidate and capture pushed digest
         id: publish
