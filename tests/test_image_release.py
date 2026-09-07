@@ -376,8 +376,21 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertNotIn("packages: write", preflight)
         self.assertIn("scripts/extract-pushed-image-digest.py", publish)
         self.assertIn("--prefer-index=false", publish)
+        self.assertIn("imagetools inspect --format '{{.Manifest.Digest}}'", publish)
+        self.assertNotIn("imagetools inspect --format '{{.Digest}}'", publish)
         self.assertIn("Verify promoted SHA tag resolves to staged digest", publish)
         self.assertIn("promoted SHA tag does not resolve to staged digest", publish)
+
+    def test_publishing_dispatch_does_not_duplicate_build_and_scans(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        preflight = text.split("\n  preflight:\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("github.event.inputs.publish != 'true'", preflight)
+        publish = text.split("\n  publish:\n", 1)[1]
+        self.assertIn("name: Upload publication evidence", publish)
+        evidence = publish.split("name: Upload publication evidence", 1)[1]
+        self.assertIn("if: always()", evidence)
+        for artifact in ("fleet-image.spdx.json", "trivy-image.json", "vex-publish-evaluation.json"):
+            self.assertIn(artifact, evidence)
 
     def test_publish_repeats_preflight_runtime_and_supply_chain_gates(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")

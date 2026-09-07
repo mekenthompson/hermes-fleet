@@ -31,7 +31,8 @@ jobs:
   preflight:
     # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
     if: >-
-      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
       (github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet')
     runs-on: ubuntu-latest
@@ -553,7 +554,7 @@ jobs:
           STAGED_DIGEST: ${{ steps.publish.outputs.digest }}
         run: |
           set -euo pipefail
-          promoted_digest=$(docker buildx imagetools inspect --format '{{.Digest}}' "$SHA_TAG")
+          promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$SHA_TAG")
           test -n "$promoted_digest"
           test "$promoted_digest" = "$STAGED_DIGEST" || {
             printf '%s\n' 'promoted SHA tag does not resolve to staged digest' >&2
@@ -584,6 +585,20 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest }}
           sbom-path: fleet-image.attestation.spdx.json
           push-to-registry: true
+
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fleet-image-publication-evidence-${{ github.sha }}
+          path: |
+            fleet-image.spdx.json
+            fleet-image.attestation.spdx.json
+            trivy-image.json
+            vex-publish-evaluation.json
+            remote-manifest.json
+            release/vex-exceptions.json
+          retention-days: 30
 
       - name: Upload private House handoff manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
