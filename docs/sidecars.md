@@ -26,7 +26,7 @@ ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256:<64 lowercase hex>
 - `sidecars/packages.json` is the machine-readable package list. It is not
   copied into the Fleet child image, so sidecar-only changes do not rebuild
   `hermes-fleet-public`.
-- Source lives under `services/<sidecar>/`.
+- Source lives under `sidecars/<sidecar>/`.
 - Path-filtered workflows under `.github/workflows/sidecar-*.yml` bake on this
   repository only.
 
