@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source_repository": "https://github.com/mekenthompson/hermes-fleet",
+  "require_digest_pin": true,
+  "packages": {
+    "rest-lock-proxy": {
+      "image": "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy",
+      "context": "services/rest-lock-proxy",
+      "visibility": "public",
+      "require_digest_pin": true,
+      "status": "publishing"
+    },
+    "tcp-proxy": {
+      "image": "ghcr.io/mekenthompson/hermes-fleet-tcp-proxy",
+      "context": "services/tcp-proxy",
+      "visibility": "public",
+      "require_digest_pin": true,
+      "status": "publishing"
+    },
+    "browser-broker": {
+      "image": "ghcr.io/mekenthompson/hermes-fleet-browser-broker",
+      "context": "services/browser-broker",
+      "visibility": "public",
+      "require_digest_pin": true,
+      "status": "planned"
+    },
+    "kokoro": {
+      "image": "ghcr.io/mekenthompson/hermes-fleet-kokoro",
+      "context": "services/kokoro",
+      "visibility": "public",
+      "require_digest_pin": true,
+      "status": "planned"
+    },
+    "camofox": {
+      "image": "ghcr.io/mekenthompson/hermes-fleet-camofox",
+      "context": "services/camofox",
+      "visibility": "public",
+      "require_digest_pin": true,
+      "status": "planned"
+    }
+  }
+}

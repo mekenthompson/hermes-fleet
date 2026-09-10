@@ -1,0 +1,21 @@
+# Synthetic example. Not a household topology.
+# Pin reviewed public sidecar digests before use.
+
+services:
+  example-rest-lock:
+    image: ${HERMES_FLEET_REST_LOCK_PROXY_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256 digest}
+    user: "65532:65532"
+    read_only: true
+    environment:
+      LISTEN_PORT: "9377"
+      TARGET: "example-browser:9377"
+      LOCK_FILE: /locks/takeover.lock
+    tmpfs:
+      - /tmp
+  example-tcp-proxy:
+    image: ${HERMES_FLEET_TCP_PROXY_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-tcp-proxy@sha256 digest}
+    user: "65534:65534"
+    read_only: true
+    environment:
+      LISTEN_PORT: "6080"
+      TARGET: "example-browser:6080"
