@@ -57,13 +57,13 @@ class SidecarContractTests(unittest.TestCase):
                 self.assertEqual(packages[key]["image"], image)
                 self.assertEqual(packages[key]["visibility"], "public")
                 self.assertTrue(packages[key]["require_digest_pin"])
+                self.assertEqual(packages[key]["context"], f"sidecars/{key}")
         self.assertEqual(packages["rest-lock-proxy"]["status"], "publishing")
         self.assertEqual(packages["tcp-proxy"]["status"], "publishing")
         self.assertEqual(packages["browser-broker"]["status"], "planned")
         self.assertEqual(packages["kokoro"]["status"], "planned")
         self.assertEqual(packages["camofox"]["status"], "planned")
-        self.assertEqual(packages["rest-lock-proxy"]["context"], "services/rest-lock-proxy")
-        self.assertEqual(packages["tcp-proxy"]["context"], "services/tcp-proxy")
+        self.assertFalse((ROOT / "services").exists())
 
     def test_sidecar_contract_does_not_publish_unprefixed_private_names(self) -> None:
         text = CONTRACT.read_text(encoding="utf-8")
@@ -75,7 +75,7 @@ class SidecarContractTests(unittest.TestCase):
 
     def test_publishing_sidecars_have_dockerfiles_and_public_source_label(self) -> None:
         for name in ("rest-lock-proxy", "tcp-proxy"):
-            dockerfile = ROOT / "services" / name / "Dockerfile"
+            dockerfile = ROOT / "sidecars" / name / "Dockerfile"
             with self.subTest(name=name):
                 text = dockerfile.read_text(encoding="utf-8")
                 self.assertIn("org.opencontainers.image.source=\"https://github.com/mekenthompson/hermes-fleet\"", text)
@@ -119,8 +119,8 @@ class SidecarScopeIsolationTests(unittest.TestCase):
 
     def test_sidecar_paths_do_not_trigger_fleet_child_bake(self) -> None:
         for path in (
-            "services/rest-lock-proxy/Dockerfile",
-            "services/tcp-proxy/entrypoint.sh",
+            "sidecars/rest-lock-proxy/Dockerfile",
+            "sidecars/tcp-proxy/entrypoint.sh",
             ".github/workflows/sidecar-rest-lock-proxy.yml",
             ".github/workflows/sidecar-tcp-proxy.yml",
             "sidecars/packages.json",
@@ -146,7 +146,8 @@ class SidecarScopeIsolationTests(unittest.TestCase):
                 self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
                 self.assertNotIn("hermes-fleet-private", text)
                 self.assertNotIn(f"ghcr.io/mekenthompson/hermes-{name}", text)
-                self.assertIn(f"services/{name}/**", text)
+                self.assertIn(f"sidecars/{name}/**", text)
+                self.assertNotIn(f"services/{name}", text)
                 self.assertNotIn("secrets.", text)
                 self.assertIn("github.token", text)
                 self.assertNotIn("Dockerfile\n", text.split("paths:")[1].split("jobs:")[0] if "paths:" in text else "")
@@ -155,7 +156,7 @@ class SidecarScopeIsolationTests(unittest.TestCase):
 class RestLockBehaviorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.lock = load(ROOT / "services/rest-lock-proxy/lock_proxy.py", "lock_proxy")
+        cls.lock = load(ROOT / "sidecars/rest-lock-proxy/lock_proxy.py", "lock_proxy")
 
     def test_missing_lock_file_is_unlocked(self) -> None:
         missing = Path(tempfile.mkdtemp()) / "lock"
@@ -170,7 +171,7 @@ class RestLockBehaviorTests(unittest.TestCase):
 
 class TcpProxyEntrypointTests(unittest.TestCase):
     def test_entrypoint_requires_listen_port_and_target(self) -> None:
-        script = ROOT / "services/tcp-proxy/entrypoint.sh"
+        script = ROOT / "sidecars/tcp-proxy/entrypoint.sh"
         self.assertTrue(script.is_file(), script)
         env = {**os.environ}
         env.pop("LISTEN_PORT", None)
