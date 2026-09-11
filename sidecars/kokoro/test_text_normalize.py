@@ -215,7 +215,7 @@ class IdentifierTests(NormalizeCaseMixin, unittest.TestCase):
     def test_file_line_and_ip_and_version(self) -> None:
         self.assertSpoken("server.py:604", "server dot py, line six zero four")
         self.assertSpoken(
-            "192.168.2.58", "one nine two dot one six eight dot two dot five eight"
+            "203.0.113.10", "two zero three dot zero dot one one three dot one zero"
         )
         self.assertSpoken("v0.21.9", "v zero point twenty-one point nine")
 
@@ -475,7 +475,7 @@ class PropertyTests(unittest.TestCase):
         "call +61 412 345 678 or ping @alice re: and/or the v0.21.9 tag",
         " weird  pua  everywhere ",
         "the 90s, the 1990s, 90s timeout, '90s music",
-        "voice_sidecar_dir / metadataCache / 08262924abc / 192.168.2.58:4010",
+        "voice_sidecar_dir / metadataCache / 08262924abc / 203.0.113.10:4010",
     ] + json.load(
         # The shipped replay fixture: synthetic messages in the SHAPES the
         # production corpus has (the corpus itself is real chat text and stays
@@ -527,7 +527,7 @@ class PerformanceTests(unittest.TestCase):
         # through it rather than hiding behind a slow test.
         worst = (
             "Deployed #4661 at 14:30 on 2026-08-14: 90s timeout, $1.6M spend, "
-            "16 m cable, voice_sidecar_dir, server.py:604, 192.168.2.58:4010, "
+            "16 m cable, voice_sidecar_dir, server.py:604, 203.0.113.10:4010, "
             "https://github.com/x/y, MERGEABLE, A$7.46, +61 412 345 678. "
         ) * 12
         timings = []
