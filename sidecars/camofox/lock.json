@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "git": "https://github.com/jo-inc/camofox-browser.git",
+  "commit": "e5a36f5cd0332fde6597de474329a308a53a0716",
+  "tag": "v1.14.0",
+  "package": "@askjo/camofox-browser",
+  "window": [1920, 1080]
+}
