@@ -1,0 +1,2 @@
+# Installed after removing kokoro-onnx's CPU onnxruntime dependency.
+onnxruntime-gpu==1.20.2

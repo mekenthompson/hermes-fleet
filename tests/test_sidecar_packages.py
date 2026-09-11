@@ -94,7 +94,7 @@ class SidecarContractTests(unittest.TestCase):
         self.assertEqual(packages["rest-lock-proxy"]["status"], "publishing")
         self.assertEqual(packages["tcp-proxy"]["status"], "publishing")
         self.assertEqual(packages["browser-broker"]["status"], "publishing")
-        self.assertEqual(packages["kokoro"]["status"], "planned")
+        self.assertEqual(packages["kokoro"]["status"], "publishing")
         self.assertEqual(packages["camofox"]["status"], "planned")
         self.assertFalse((ROOT / "services").exists())
 
@@ -107,7 +107,7 @@ class SidecarContractTests(unittest.TestCase):
         self.assertNotIn("private_house", text.lower())
 
     def test_publishing_sidecars_have_dockerfiles_and_public_source_label(self) -> None:
-        for name in ("rest-lock-proxy", "tcp-proxy", "browser-broker"):
+        for name in ("rest-lock-proxy", "tcp-proxy", "browser-broker", "kokoro"):
             dockerfile = ROOT / "sidecars" / name / "Dockerfile"
             with self.subTest(name=name):
                 text = dockerfile.read_text(encoding="utf-8")
@@ -496,9 +496,12 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "sidecars/tcp-proxy/entrypoint.sh",
             "sidecars/browser-broker/Dockerfile",
             "sidecars/browser-broker/public_config.py",
+            "sidecars/kokoro/Dockerfile",
+            "sidecars/kokoro/server.py",
             ".github/workflows/sidecar-rest-lock-proxy.yml",
             ".github/workflows/sidecar-tcp-proxy.yml",
             ".github/workflows/sidecar-browser-broker.yml",
+            ".github/workflows/sidecar-kokoro.yml",
             "sidecars/packages.json",
             "scripts/sidecar_image_ref.py",
             "docs/sidecars.md",
@@ -515,6 +518,7 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "rest-lock-proxy": ROOT / ".github/workflows/sidecar-rest-lock-proxy.yml",
             "tcp-proxy": ROOT / ".github/workflows/sidecar-tcp-proxy.yml",
             "browser-broker": ROOT / ".github/workflows/sidecar-browser-broker.yml",
+            "kokoro": ROOT / ".github/workflows/sidecar-kokoro.yml",
         }
         for name, path in mapping.items():
             text = path.read_text(encoding="utf-8")
@@ -528,6 +532,44 @@ class SidecarScopeIsolationTests(unittest.TestCase):
                 self.assertNotIn("secrets.", text)
                 self.assertIn("github.token", text)
                 self.assertNotIn("Dockerfile\n", text.split("paths:")[1].split("jobs:")[0] if "paths:" in text else "")
+
+
+class KokoroPublicTests(unittest.TestCase):
+    def test_dockerfile_copies_runtime_helpers_and_uses_public_name(self) -> None:
+        dockerfile = (ROOT / "sidecars/kokoro/Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY server.py /opt/voice-sidecar/server.py", dockerfile)
+        self.assertIn("COPY worker_lane.py /opt/voice-sidecar/worker_lane.py", dockerfile)
+        self.assertIn("COPY text_normalize.py /opt/voice-sidecar/text_normalize.py", dockerfile)
+        self.assertIn("COPY overrides.json /opt/voice-sidecar/overrides.json", dockerfile)
+        self.assertIn("USER 65532:65532", dockerfile)
+        self.assertIn("nvidia/cuda:", dockerfile)
+        self.assertNotIn("hermes-kokoro", dockerfile)
+        self.assertNotIn("Ken Thompson", dockerfile)
+        self.assertNotIn("compose.ts", dockerfile)
+        self.assertNotIn("services/kokoro", dockerfile)
+
+    def test_public_kokoro_tree_has_no_household_or_private_strings(self) -> None:
+        prohibited = (
+            "car" + "rie",
+            "over" + "lord",
+            "klank" + "er",
+            "gr" + "unt",
+            "cl" + "erk",
+            "gym" + "bro",
+            "mar" + "ko",
+            "law" + "gpt",
+            "ag" + "gie",
+            "switch" + "room",
+            "hermes-fleet-private",
+        )
+        root = ROOT / "sidecars/kokoro"
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            for needle in prohibited:
+                with self.subTest(path=str(path.relative_to(ROOT)), needle=needle):
+                    self.assertNotIn(needle.lower(), text)
 
 
 class RestLockBehaviorTests(unittest.TestCase):
