@@ -1,0 +1,10 @@
+--- a/server.js
++++ b/server.js
+@@ -1127,6 +1127,7 @@
+         geoip: !!launchProxy,
+         virtual_display: vdDisplay,
+         exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
++        window: [1920, 1080],
+       });
+       options.proxy = normalizePlaywrightProxy(options.proxy);
+       // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,

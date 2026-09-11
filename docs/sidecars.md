@@ -11,7 +11,7 @@ not baked into the agent child image. Deployments pin an immutable digest.
 | TCP / noVNC proxy | `ghcr.io/mekenthompson/hermes-fleet-tcp-proxy` | publishing |
 | Browser broker | `ghcr.io/mekenthompson/hermes-fleet-browser-broker` | publishing |
 | Kokoro | `ghcr.io/mekenthompson/hermes-fleet-kokoro` | publishing |
-| Camofox | `ghcr.io/mekenthompson/hermes-fleet-camofox` | planned |
+| Camofox | `ghcr.io/mekenthompson/hermes-fleet-camofox` | publishing |
 
 Pin form:
 
@@ -38,3 +38,6 @@ examples only. Browser-broker chrome reads `BRAND`, `LOCAL_TZ`, and a required
 matching `PUBLIC_BASE`/`PUBLIC_ORIGIN` from the environment.
 
 Kokoro is a CUDA runtime image. Model weights are not baked into the image.
+
+Camofox bakes pinned `jo-inc/camofox-browser` plus window and media patches
+from `sidecars/camofox`. Overlay entrypoints and secret loaders stay private.

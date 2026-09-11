@@ -36,7 +36,7 @@
       "context": "sidecars/camofox",
       "visibility": "public",
       "require_digest_pin": true,
-      "status": "planned"
+      "status": "publishing"
     }
   }
 }
