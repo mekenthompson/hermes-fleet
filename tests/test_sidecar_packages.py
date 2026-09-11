@@ -536,6 +536,27 @@ class SidecarScopeIsolationTests(unittest.TestCase):
                 self.assertIn("github.token", text)
                 self.assertNotIn("Dockerfile\n", text.split("paths:")[1].split("jobs:")[0] if "paths:" in text else "")
 
+    def test_sidecar_bake_paths_exclude_shared_catalog_and_tests(self) -> None:
+        shared = (
+            "sidecars/packages.json",
+            "scripts/sidecar_image_ref.py",
+            "tests/test_sidecar_packages.py",
+        )
+        mapping = {
+            "rest-lock-proxy": ROOT / ".github/workflows/sidecar-rest-lock-proxy.yml",
+            "tcp-proxy": ROOT / ".github/workflows/sidecar-tcp-proxy.yml",
+            "browser-broker": ROOT / ".github/workflows/sidecar-browser-broker.yml",
+            "kokoro": ROOT / ".github/workflows/sidecar-kokoro.yml",
+            "camofox": ROOT / ".github/workflows/sidecar-camofox.yml",
+        }
+        for name, path in mapping.items():
+            header = path.read_text(encoding="utf-8").split("jobs:", 1)[0]
+            with self.subTest(name=name):
+                for shared_path in shared:
+                    self.assertNotIn(shared_path, header)
+                self.assertIn(f"sidecars/{name}/**", header)
+                self.assertIn(f".github/workflows/sidecar-{name}.yml", header)
+
 
 class KokoroPublicTests(unittest.TestCase):
     def test_dockerfile_copies_runtime_helpers_and_uses_public_name(self) -> None:

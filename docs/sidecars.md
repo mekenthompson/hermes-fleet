@@ -27,8 +27,10 @@ ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256:<64 lowercase hex>
   copied into the Fleet child image, so sidecar-only changes do not rebuild
   `hermes-fleet-public`.
 - Source lives under `sidecars/<sidecar>/`.
-- Path-filtered workflows under `.github/workflows/sidecar-*.yml` bake on this
-  repository only.
+- Path-filtered workflows under `.github/workflows/sidecar-*.yml` bake only that
+  sidecar directory and its workflow file. Shared catalog files
+  (`sidecars/packages.json`, `scripts/sidecar_image_ref.py`,
+  `tests/test_sidecar_packages.py`) are covered by source CI, not by image bakes.
 
 ## Out of scope
 
