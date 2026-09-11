@@ -60,10 +60,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # bundles the espeak-ng shared library + data inside the wheel, so the
 # phonemizer backend finds them without a system package (keeps the apt
 # layer minimal and the espeak-ng version pinned with the pip deps).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3 python3-pip ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# CI GitHub-hosted runners often hash-mismatch a slow archive.ubuntu.com
+# fetch. Retry apt-get update after clearing the lists; keep the package
+# set identical.
+RUN set -eux; \
+    printf '%s\n' \
+      'Acquire::Retries "5";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::https::Timeout "30";' \
+      > /etc/apt/apt.conf.d/80-retries; \
+    i=0; \
+    until apt-get update; do \
+      i=$((i + 1)); \
+      [ "$i" -lt 5 ]; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep $((i * 5)); \
+    done; \
+    apt-get install -y --no-install-recommends \
+        python3 python3-pip ffmpeg ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
 
 # faster-whisper pulls in ctranslate2 (with bundled CUDA kernels). Pin so
 # the image is reproducible; Dependabot bumps it.
