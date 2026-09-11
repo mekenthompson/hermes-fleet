@@ -579,7 +579,8 @@ class KokoroPublicTests(unittest.TestCase):
 
 
 class CamofoxPublicTests(unittest.TestCase):
-    COMMIT = "e5a36f5cd0332fde6597de474329a308a53a0716"
+    COMMIT = "771b610a7b5994759c138b912741de58b0edd588"
+    TAG = "v1.15.0"
     GIT = "https://github.com/jo-inc/camofox-browser.git"
 
     def test_lock_pins_upstream_commit_without_household_state(self) -> None:
@@ -588,12 +589,13 @@ class CamofoxPublicTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["git"], self.GIT)
         self.assertEqual(payload["commit"], self.COMMIT)
+        self.assertEqual(payload["tag"], self.TAG)
         self.assertEqual(payload["window"], [1920, 1080])
         text = lock_path.read_text(encoding="utf-8").lower()
         for needle in ("mar" + "ko", "over" + "lord", "klank" + "er", "hermes-fleet-private", "sha256:"):
             self.assertNotIn(needle, text)
 
-    def test_patches_pin_window_and_media_runtime(self) -> None:
+    def test_patches_pin_window_screen_and_media_runtime(self) -> None:
         window = (ROOT / "sidecars/camofox/patches/camofox-window-1920x1080.patch").read_text(
             encoding="utf-8"
         )
@@ -601,6 +603,10 @@ class CamofoxPublicTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("window: [1920, 1080]", window)
+        self.assertIn(
+            "screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }",
+            window,
+        )
         self.assertIn("ffmpeg", media)
         self.assertIn("fonts-noto-cjk", media)
 
@@ -612,6 +618,7 @@ class CamofoxPublicTests(unittest.TestCase):
         self.assertIn("camofox-browser/Dockerfile", workflow)
         self.assertIn("sidecars/camofox/patches/camofox-window-1920x1080.patch", workflow)
         self.assertIn("sidecars/camofox/patches/camofox-media-runtime.patch", workflow)
+        self.assertIn("screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }", workflow)
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", workflow)
         self.assertNotIn("load-secrets", workflow)
         self.assertNotIn("MAR" + "KO_", workflow)
