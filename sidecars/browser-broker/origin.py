@@ -24,6 +24,7 @@ import sys
 import jwt
 from jwt import PyJWKClient
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from session_policy import (
     AccessPrincipal,
     BrokerError,
@@ -34,7 +35,6 @@ from session_policy import (
 from ux import shell_page, status_page
 from rollout_contract import RolloutContractError, RolloutVersions, preflight, verify_running_plugin_protocol
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rfb_filter import ObserveRfb, ProtocolError, WebSocketClientFrames, client_binary_frame
 from origin_routing import (  # noqa: E402
     cap_may_mint,

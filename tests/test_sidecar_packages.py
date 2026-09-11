@@ -8,7 +8,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,35 @@ def load(path: Path, name: str):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@contextmanager
+def environ(**overrides: str | None):
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def stub_jwt() -> None:
+    jwt_mod = types.ModuleType("jwt")
+
+    class PyJWKClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    jwt_mod.PyJWKClient = PyJWKClient  # type: ignore[attr-defined]
+    sys.modules["jwt"] = jwt_mod
 
 
 class SidecarContractTests(unittest.TestCase):
@@ -130,7 +161,7 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         previous_base = os.environ.get("PUBLIC_BASE")
         previous_origin = os.environ.get("PUBLIC_ORIGIN")
         os.environ["PUBLIC_BASE"] = "https://browser.example.test"
-        os.environ.pop("PUBLIC_ORIGIN", None)
+        os.environ["PUBLIC_ORIGIN"] = "https://browser.example.test"
         try:
             config = load(
                 ROOT / "sidecars/browser-broker/public_config.py",
@@ -153,6 +184,48 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         previous_origin = os.environ.pop("PUBLIC_ORIGIN", None)
         try:
             config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_missing_url")
+            with self.assertRaises(config.PublicUrlError):
+                config.canonical_public_url()
+        finally:
+            if previous_base is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_canonical_public_url_rejects_missing_public_origin(self) -> None:
+        previous_base = os.environ.get("PUBLIC_BASE")
+        previous_origin = os.environ.pop("PUBLIC_ORIGIN", None)
+        os.environ["PUBLIC_BASE"] = "https://browser.example.test"
+        try:
+            config = load(
+                ROOT / "sidecars/browser-broker/public_config.py",
+                "public_config_missing_origin",
+            )
+            with self.assertRaises(config.PublicUrlError):
+                config.canonical_public_url()
+        finally:
+            if previous_base is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_canonical_public_url_rejects_missing_public_base(self) -> None:
+        previous_origin = os.environ.get("PUBLIC_ORIGIN")
+        previous_base = os.environ.pop("PUBLIC_BASE", None)
+        os.environ["PUBLIC_ORIGIN"] = "https://browser.example.test"
+        try:
+            config = load(
+                ROOT / "sidecars/browser-broker/public_config.py",
+                "public_config_missing_base",
+            )
             with self.assertRaises(config.PublicUrlError):
                 config.canonical_public_url()
         finally:
@@ -236,7 +309,7 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         previous_base = os.environ.get("PUBLIC_BASE")
         previous_origin = os.environ.get("PUBLIC_ORIGIN")
         os.environ["PUBLIC_BASE"] = "https://browser.example.test"
-        os.environ.pop("PUBLIC_ORIGIN", None)
+        os.environ["PUBLIC_ORIGIN"] = "https://browser.example.test"
         try:
             policy = load(ROOT / "sidecars/browser-broker/session_policy.py", "session_policy_mint_url")
             invocation = policy.Invocation(
@@ -272,6 +345,103 @@ class BrowserBrokerPublicTests(unittest.TestCase):
                 os.environ.pop("PUBLIC_ORIGIN", None)
             else:
                 os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_origin_startup_rejects_missing_public_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            state.write_text(
+                json.dumps({"aud": "aud", "issuer": "https://issuer.example.test"}),
+                encoding="utf-8",
+            )
+            stub_jwt()
+            with environ(
+                HANDOFF_STATE_FILE=None,
+                HANDOFF_SESSION_STORE=None,
+                ACCESS_STATE=str(state),
+                HANDOFF_PLUGIN_PROTOCOL_VERSION="1",
+                HANDOFF_BROKER_PROTOCOL_VERSION="1",
+                HANDOFF_POLICY_VERSION="1",
+                HANDOFF_AGENT="example",
+                PUBLIC_BASE="https://browser.example.test",
+                PUBLIC_ORIGIN=None,
+            ):
+                origin = load(ROOT / "sidecars/browser-broker/origin.py", "origin_missing_origin")
+                with self.assertRaises(SystemExit) as raised:
+                    origin.main()
+            self.assertIn("PUBLIC_ORIGIN", str(raised.exception))
+
+    def test_origin_startup_rejects_missing_public_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            state.write_text(
+                json.dumps({"aud": "aud", "issuer": "https://issuer.example.test"}),
+                encoding="utf-8",
+            )
+            stub_jwt()
+            with environ(
+                HANDOFF_STATE_FILE=None,
+                HANDOFF_SESSION_STORE=None,
+                ACCESS_STATE=str(state),
+                HANDOFF_PLUGIN_PROTOCOL_VERSION="1",
+                HANDOFF_BROKER_PROTOCOL_VERSION="1",
+                HANDOFF_POLICY_VERSION="1",
+                HANDOFF_AGENT="example",
+                PUBLIC_BASE=None,
+                PUBLIC_ORIGIN="https://browser.example.test",
+            ):
+                origin = load(ROOT / "sidecars/browser-broker/origin.py", "origin_missing_base")
+                with self.assertRaises(SystemExit) as raised:
+                    origin.main()
+            self.assertIn("PUBLIC_BASE", str(raised.exception))
+
+    def test_csrf_rejects_noncanonical_origin(self) -> None:
+        stub_jwt()
+        with environ(
+            PUBLIC_BASE="https://browser.example.test",
+            PUBLIC_ORIGIN="https://browser.example.test",
+        ):
+            origin = load(ROOT / "sidecars/browser-broker/origin.py", "origin_csrf")
+
+            class FakeHandler:
+                headers = {"Origin": "https://evil.example.test"}
+                denied: tuple[int, bytes] | None = None
+
+                def _deny(self, status: int, body: bytes) -> None:
+                    self.denied = (status, body)
+
+            for method_name in ("_uuid_mode", "_uuid_extend", "_uuid_end"):
+                with self.subTest(method=method_name):
+                    fake = FakeHandler()
+                    method = getattr(origin.Handler, method_name)
+                    if method_name == "_uuid_mode":
+                        method(fake, "example", "11111111-1111-4111-8111-111111111111", True)
+                    else:
+                        method(fake, "example", "11111111-1111-4111-8111-111111111111")
+                    self.assertEqual(fake.denied, (403, b"csrf\n"))
+
+    def test_csrf_accepts_canonical_origin(self) -> None:
+        stub_jwt()
+        with environ(
+            PUBLIC_BASE="https://browser.example.test",
+            PUBLIC_ORIGIN="https://browser.example.test",
+        ):
+            origin = load(ROOT / "sidecars/browser-broker/origin.py", "origin_csrf_ok")
+
+            class FakeHandler:
+                headers = {"Origin": "https://browser.example.test"}
+                denied: tuple[int, bytes] | None = None
+
+                def _deny(self, status: int, body: bytes) -> None:
+                    self.denied = (status, body)
+
+                def _email(self) -> str:
+                    raise RuntimeError("no jwt")
+
+            fake = FakeHandler()
+            origin.Handler._uuid_mode(
+                fake, "example", "11111111-1111-4111-8111-111111111111", True
+            )
+            self.assertEqual(fake.denied, (401, b"unauthorized\n"))
 
     def test_browser_broker_workflow_targets_new_public_package(self) -> None:
         path = ROOT / ".github/workflows/sidecar-browser-broker.yml"

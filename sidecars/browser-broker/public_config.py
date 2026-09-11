@@ -23,9 +23,8 @@ def local_tz() -> str:
 def canonical_public_url() -> str:
     origin = _strip("PUBLIC_ORIGIN")
     base = _strip("PUBLIC_BASE")
-    if origin and base and origin != base:
-        raise PublicUrlError("PUBLIC_ORIGIN and PUBLIC_BASE disagree")
-    value = origin or base
-    if not value:
+    if not origin or not base:
         raise PublicUrlError("missing PUBLIC_ORIGIN or PUBLIC_BASE")
-    return value
+    if origin != base:
+        raise PublicUrlError("PUBLIC_ORIGIN and PUBLIC_BASE disagree")
+    return origin
