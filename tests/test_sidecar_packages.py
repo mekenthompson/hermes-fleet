@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +40,7 @@ def load(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -60,7 +62,7 @@ class SidecarContractTests(unittest.TestCase):
                 self.assertEqual(packages[key]["context"], f"sidecars/{key}")
         self.assertEqual(packages["rest-lock-proxy"]["status"], "publishing")
         self.assertEqual(packages["tcp-proxy"]["status"], "publishing")
-        self.assertEqual(packages["browser-broker"]["status"], "planned")
+        self.assertEqual(packages["browser-broker"]["status"], "publishing")
         self.assertEqual(packages["kokoro"]["status"], "planned")
         self.assertEqual(packages["camofox"]["status"], "planned")
         self.assertFalse((ROOT / "services").exists())
@@ -74,7 +76,7 @@ class SidecarContractTests(unittest.TestCase):
         self.assertNotIn("private_house", text.lower())
 
     def test_publishing_sidecars_have_dockerfiles_and_public_source_label(self) -> None:
-        for name in ("rest-lock-proxy", "tcp-proxy"):
+        for name in ("rest-lock-proxy", "tcp-proxy", "browser-broker"):
             dockerfile = ROOT / "sidecars" / name / "Dockerfile"
             with self.subTest(name=name):
                 text = dockerfile.read_text(encoding="utf-8")
@@ -82,6 +84,76 @@ class SidecarContractTests(unittest.TestCase):
                 self.assertIn(f"org.opencontainers.image.title=\"hermes-fleet-{name}\"", text)
                 self.assertNotIn("hermes-fleet-private", text)
                 self.assertNotIn("KEN-", text)
+
+
+class BrowserBrokerPublicTests(unittest.TestCase):
+    def test_browser_broker_is_publishing_with_public_dockerfile(self) -> None:
+        payload = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        self.assertEqual(payload["packages"]["browser-broker"]["status"], "publishing")
+        dockerfile = ROOT / "sidecars/browser-broker/Dockerfile"
+        self.assertTrue(dockerfile.is_file(), dockerfile)
+        text = dockerfile.read_text(encoding="utf-8")
+        self.assertIn(
+            'org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet"',
+            text,
+        )
+        self.assertIn('org.opencontainers.image.title="hermes-fleet-browser-broker"', text)
+        self.assertNotIn("hermes-fleet-private", text)
+        self.assertNotIn("KEN-", text)
+
+    def test_browser_broker_source_has_no_house_topology(self) -> None:
+        root = ROOT / "sidecars/browser-broker"
+        self.assertTrue(root.is_dir(), root)
+        prohibited = (
+            "switchroom",
+            "car" + "rie",
+            "over" + "lord",
+            "klank" + "er",
+            "gr" + "unt",
+            "cl" + "erk",
+            "gym" + "bro",
+            "mar" + "ko",
+            "law" + "gpt",
+            "ag" + "gie",
+            "KEN-",
+        )
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            lowered = text.lower()
+            for ident in prohibited:
+                with self.subTest(path=str(path.relative_to(ROOT)), ident=ident):
+                    self.assertNotIn(ident.lower() if ident != "KEN-" else ident, lowered if ident != "KEN-" else text)
+
+    def test_browser_broker_public_base_comes_from_env(self) -> None:
+        previous = os.environ.get("PUBLIC_BASE")
+        os.environ["PUBLIC_BASE"] = "https://browser.example.test"
+        try:
+            policy = load(
+                ROOT / "sidecars/browser-broker/session_policy.py",
+                "session_policy_public_base",
+            )
+            self.assertEqual(policy.PUBLIC_BASE, "https://browser.example.test")
+            self.assertNotIn("switchroom", policy.PUBLIC_BASE.lower())
+        finally:
+            if previous is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous
+
+    def test_browser_broker_workflow_targets_new_public_package(self) -> None:
+        path = ROOT / ".github/workflows/sidecar-browser-broker.yml"
+        self.assertTrue(path.is_file(), path)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("ghcr.io/mekenthompson/hermes-fleet-browser-broker", text)
+        self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
+        self.assertNotIn("hermes-fleet-private", text)
+        self.assertNotIn("ghcr.io/mekenthompson/hermes-browser-broker", text)
+        self.assertIn("sidecars/browser-broker/**", text)
+        self.assertNotIn("services/browser-broker", text)
+        self.assertNotIn("secrets.", text)
+        self.assertIn("github.token", text)
 
 
 class SidecarImageRefTests(unittest.TestCase):
@@ -121,8 +193,10 @@ class SidecarScopeIsolationTests(unittest.TestCase):
         for path in (
             "sidecars/rest-lock-proxy/Dockerfile",
             "sidecars/tcp-proxy/entrypoint.sh",
+            "sidecars/browser-broker/Dockerfile",
             ".github/workflows/sidecar-rest-lock-proxy.yml",
             ".github/workflows/sidecar-tcp-proxy.yml",
+            ".github/workflows/sidecar-browser-broker.yml",
             "sidecars/packages.json",
             "scripts/sidecar_image_ref.py",
             "docs/sidecars.md",
@@ -138,6 +212,7 @@ class SidecarScopeIsolationTests(unittest.TestCase):
         mapping = {
             "rest-lock-proxy": ROOT / ".github/workflows/sidecar-rest-lock-proxy.yml",
             "tcp-proxy": ROOT / ".github/workflows/sidecar-tcp-proxy.yml",
+            "browser-broker": ROOT / ".github/workflows/sidecar-browser-broker.yml",
         }
         for name, path in mapping.items():
             text = path.read_text(encoding="utf-8")
