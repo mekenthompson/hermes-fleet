@@ -4,14 +4,19 @@ from __future__ import annotations
 from datetime import datetime
 import html
 import json
-import os
+import sys
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-PUBLIC = os.environ.get("PUBLIC_BASE") or os.environ.get("PUBLIC_ORIGIN", "")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from public_config import brand, canonical_public_url, local_tz
 
 OG_TITLE = "Secure browser sign-in"
 END_BUTTON = "End takeover"
-LOCAL_TZ = os.environ.get("LOCAL_TZ", "UTC")
+
+
+def _brand_markup() -> str:
+    return f'<div class="brand">{html.escape(brand(), quote=True)}</div>'
 
 _STYLE = (
     "*{box-sizing:border-box}"
@@ -420,8 +425,7 @@ def _page(title: str, body: str) -> str:
         "<!doctype html><html lang=\"en\"><head>"
         f"<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<title>{OG_TITLE}</title><meta property=\"og:title\" content=\"{OG_TITLE}\">"
-        f"<style>{_STYLE}</style></head><body>"
-        "<header><div class=\\\"brand\\\">Browser</div></header>"
+        f"<style>{_STYLE}</style></head><body><header>{_brand_markup()}</header>"
         f"<div class=\"overlay show\"><div class=\"card\"><h1>{title}</h1>{body}</div></div>"
         "</body></html>"
     )
@@ -469,7 +473,7 @@ def is_slack_webview(user_agent: str) -> bool:
 
 
 def session_url(session_id: str | None, agent_id: str | None = None) -> str:
-    return f"{PUBLIC}/{agent_id}/{session_id}" if session_id and agent_id else PUBLIC
+    return f"{canonical_public_url()}/{agent_id}/{session_id}" if session_id and agent_id else canonical_public_url()
 
 
 def bounce_page(session_id: str | None = None, *, agent_id: str | None = None) -> str:
@@ -506,9 +510,7 @@ def viewer_page(
         "<!doctype html><html lang=\"en\"><head>"
         "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<title>{OG_TITLE}</title><meta property=\"og:title\" content=\"{OG_TITLE}\">"
-        f"<style>{_STYLE}</style></head><body>"
-        "<header>"
-        "<div class=\\\"brand\\\">Browser</div>"
+        f"<style>{_STYLE}</style></head><body><header>{_brand_markup()}"
         f"<div class=\"ctx\">{agent_label}&#8217;s browser</div>"
         "<div id=\"status\" class=\"pill\" role=\"status\" aria-live=\"polite\">Connecting</div>"
         "<div id=\"timer\" aria-live=\"polite\"></div>"
@@ -545,14 +547,14 @@ def _local_time(expires_at: float | None) -> str:
     if not expires_at:
         return ""
     try:
-        return datetime.fromtimestamp(float(expires_at), ZoneInfo(LOCAL_TZ)).strftime("%-I:%M %p")
+        return datetime.fromtimestamp(float(expires_at), ZoneInfo(local_tz())).strftime("%-I:%M %p")
     except (OverflowError, OSError, ValueError):
         return ""
 
 
 def slack_message(url: str, expires_at: float | None = None, *, agent: str | None = None) -> str:
     """Copy for the human. Holds the scoped link; never a fragment or a VNC password."""
-    link = (url or "").split("#", 1)[0] or PUBLIC
+    link = (url or "").split("#", 1)[0] or canonical_public_url()
     who = agent or "the agent"
     when = _local_time(expires_at)
     lines = [

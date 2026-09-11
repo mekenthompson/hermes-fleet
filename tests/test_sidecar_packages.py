@@ -127,20 +127,151 @@ class BrowserBrokerPublicTests(unittest.TestCase):
                     self.assertNotIn(ident.lower() if ident != "KEN-" else ident, lowered if ident != "KEN-" else text)
 
     def test_browser_broker_public_base_comes_from_env(self) -> None:
-        previous = os.environ.get("PUBLIC_BASE")
+        previous_base = os.environ.get("PUBLIC_BASE")
+        previous_origin = os.environ.get("PUBLIC_ORIGIN")
         os.environ["PUBLIC_BASE"] = "https://browser.example.test"
+        os.environ.pop("PUBLIC_ORIGIN", None)
         try:
-            policy = load(
-                ROOT / "sidecars/browser-broker/session_policy.py",
-                "session_policy_public_base",
+            config = load(
+                ROOT / "sidecars/browser-broker/public_config.py",
+                "public_config_public_base",
             )
-            self.assertEqual(policy.PUBLIC_BASE, "https://browser.example.test")
-            self.assertNotIn("switchroom", policy.PUBLIC_BASE.lower())
+            self.assertEqual(config.canonical_public_url(), "https://browser.example.test")
+            self.assertNotIn("switchroom", config.canonical_public_url().lower())
         finally:
-            if previous is None:
+            if previous_base is None:
                 os.environ.pop("PUBLIC_BASE", None)
             else:
-                os.environ["PUBLIC_BASE"] = previous
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_canonical_public_url_requires_env(self) -> None:
+        previous_base = os.environ.pop("PUBLIC_BASE", None)
+        previous_origin = os.environ.pop("PUBLIC_ORIGIN", None)
+        try:
+            config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_missing_url")
+            with self.assertRaises(config.PublicUrlError):
+                config.canonical_public_url()
+        finally:
+            if previous_base is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_canonical_public_url_rejects_mismatch(self) -> None:
+        previous_base = os.environ.get("PUBLIC_BASE")
+        previous_origin = os.environ.get("PUBLIC_ORIGIN")
+        os.environ["PUBLIC_BASE"] = "https://browser.example.test"
+        os.environ["PUBLIC_ORIGIN"] = "https://other.example.test"
+        try:
+            config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_mismatch")
+            with self.assertRaises(config.PublicUrlError):
+                config.canonical_public_url()
+        finally:
+            if previous_base is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
+
+    def test_brand_defaults_to_browser(self) -> None:
+        previous = os.environ.pop("BRAND", None)
+        try:
+            config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_brand_default")
+            self.assertEqual(config.brand(), "Browser")
+        finally:
+            if previous is None:
+                os.environ.pop("BRAND", None)
+            else:
+                os.environ["BRAND"] = previous
+
+    def test_brand_comes_from_env(self) -> None:
+        previous = os.environ.get("BRAND")
+        os.environ["BRAND"] = "Example"
+        try:
+            config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_brand_env")
+            self.assertEqual(config.brand(), "Example")
+        finally:
+            if previous is None:
+                os.environ.pop("BRAND", None)
+            else:
+                os.environ["BRAND"] = previous
+
+    def test_local_tz_defaults_to_utc(self) -> None:
+        previous = os.environ.pop("LOCAL_TZ", None)
+        try:
+            config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_tz_default")
+            self.assertEqual(config.local_tz(), "UTC")
+        finally:
+            if previous is None:
+                os.environ.pop("LOCAL_TZ", None)
+            else:
+                os.environ["LOCAL_TZ"] = previous
+
+    def test_viewer_page_uses_brand_env(self) -> None:
+        previous = os.environ.get("BRAND")
+        os.environ["BRAND"] = "Example"
+        try:
+            ux = load(ROOT / "sidecars/browser-broker/ux.py", "ux_brand_env")
+            page = ux.viewer_page("11111111-1111-4111-8111-111111111111", agent_id="example")
+            self.assertIn(">Example</div>", page)
+            self.assertNotIn(">Browser</div>", page)
+        finally:
+            if previous is None:
+                os.environ.pop("BRAND", None)
+            else:
+                os.environ["BRAND"] = previous
+
+    def test_minted_url_uses_canonical_public_url(self) -> None:
+        previous_base = os.environ.get("PUBLIC_BASE")
+        previous_origin = os.environ.get("PUBLIC_ORIGIN")
+        os.environ["PUBLIC_BASE"] = "https://browser.example.test"
+        os.environ.pop("PUBLIC_ORIGIN", None)
+        try:
+            policy = load(ROOT / "sidecars/browser-broker/session_policy.py", "session_policy_mint_url")
+            invocation = policy.Invocation(
+                profile="example",
+                platform="slack",
+                user_id="1",
+                chat_id="1",
+                thread_id="",
+                chat_type="im",
+            )
+            sess = policy._Session(
+                "11111111-1111-4111-8111-111111111111",
+                "example",
+                "default",
+                "principal",
+                "user@example.test",
+                invocation,
+                "pending",
+                0.0,
+                1.0,
+            )
+            minted = policy.HandoffBroker._minted(sess)
+            self.assertEqual(
+                minted.url,
+                "https://browser.example.test/example/11111111-1111-4111-8111-111111111111",
+            )
+        finally:
+            if previous_base is None:
+                os.environ.pop("PUBLIC_BASE", None)
+            else:
+                os.environ["PUBLIC_BASE"] = previous_base
+            if previous_origin is None:
+                os.environ.pop("PUBLIC_ORIGIN", None)
+            else:
+                os.environ["PUBLIC_ORIGIN"] = previous_origin
 
     def test_browser_broker_workflow_targets_new_public_package(self) -> None:
         path = ROOT / ".github/workflows/sidecar-browser-broker.yml"
@@ -194,6 +325,7 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "sidecars/rest-lock-proxy/Dockerfile",
             "sidecars/tcp-proxy/entrypoint.sh",
             "sidecars/browser-broker/Dockerfile",
+            "sidecars/browser-broker/public_config.py",
             ".github/workflows/sidecar-rest-lock-proxy.yml",
             ".github/workflows/sidecar-tcp-proxy.yml",
             ".github/workflows/sidecar-browser-broker.yml",
