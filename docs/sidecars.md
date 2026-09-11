@@ -9,7 +9,7 @@ not baked into the agent child image. Deployments pin an immutable digest.
 |---|---|---|
 | REST lock-proxy | `ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy` | publishing |
 | TCP / noVNC proxy | `ghcr.io/mekenthompson/hermes-fleet-tcp-proxy` | publishing |
-| Browser broker | `ghcr.io/mekenthompson/hermes-fleet-browser-broker` | planned |
+| Browser broker | `ghcr.io/mekenthompson/hermes-fleet-browser-broker` | publishing |
 | Kokoro | `ghcr.io/mekenthompson/hermes-fleet-kokoro` | planned |
 | Camofox | `ghcr.io/mekenthompson/hermes-fleet-camofox` | planned |
 
