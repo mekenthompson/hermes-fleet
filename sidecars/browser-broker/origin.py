@@ -42,11 +42,11 @@ from origin_routing import (  # noqa: E402
     route_for_agent,
     take_automation_lock,
 )
+from public_config import canonical_public_url, PublicUrlError
 
 STATE = Path(os.environ.get("ACCESS_STATE", "/state/browser-access-state.json"))
 PORT = int(os.environ.get("BROKER_PORT", "9131"))
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "9134"))
-PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN") or os.environ.get("PUBLIC_BASE", "")
 AGENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 DESKTOP_TOKEN_RE = re.compile(r"[^\s\x00-\x1f*]{1,256}\Z")
 SYNTHETIC_DESKTOP_ROUTES = frozenset({
@@ -766,7 +766,7 @@ class Handler(BaseHTTPRequestHandler):
         self._html(shell_page(ua, session_id=session_id, agent_id=route_agent, remaining=remaining, max_remaining=max_remaining, agent=agent))
 
     def _uuid_mode(self, route_agent: str, session_id: str, takeover: bool, workspace: str = "default") -> None:
-        if (self.headers.get("Origin") or "") != PUBLIC_ORIGIN:
+        if (self.headers.get("Origin") or "") != canonical_public_url():
             self._deny(403, b"csrf\n")
             return
         try:
@@ -811,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _uuid_extend(self, route_agent: str, session_id: str, workspace: str = "default") -> None:
-        if (self.headers.get("Origin") or "") != PUBLIC_ORIGIN:
+        if (self.headers.get("Origin") or "") != canonical_public_url():
             self._deny(403, b"csrf\n")
             return
         try:
@@ -834,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _uuid_end(self, route_agent: str, session_id: str, workspace: str = "default") -> None:
-        if (self.headers.get("Origin") or "") != PUBLIC_ORIGIN:
+        if (self.headers.get("Origin") or "") != canonical_public_url():
             self._deny(403, b"csrf\n")
             return
         try:
@@ -1125,6 +1125,10 @@ def main() -> int:
     configured_agent = (os.environ.get("HANDOFF_AGENT") or "").strip()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", configured_agent):
         raise SystemExit("missing or invalid HANDOFF_AGENT")
+    try:
+        canonical_public_url()
+    except PublicUrlError as exc:
+        raise SystemExit(str(exc)) from exc
     principals = load_principals(configured_agent)
     try:
         public_bind = configured_bind("PUBLIC_BIND_HOST")

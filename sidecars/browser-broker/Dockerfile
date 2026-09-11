@@ -11,7 +11,7 @@ WORKDIR /
 # Both dependencies have wheels for the pinned CPython/Alpine platform. Refuse
 # mutable source builds and their compiler toolchain.
 RUN python3 -m pip install --no-cache-dir --only-binary=:all: PyJWT==2.13.0 cryptography==50.0.1
-COPY origin.py origin_routing.py rfb_filter.py rollout_contract.py session_policy.py ux.py /
+COPY origin.py origin_routing.py public_config.py rfb_filter.py rollout_contract.py session_policy.py ux.py /
 USER 65532:65532
 EXPOSE 9131 9134
 CMD ["python3", "-u", "/origin.py"]

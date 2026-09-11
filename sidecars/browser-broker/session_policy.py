@@ -6,17 +6,20 @@ is authentication. The model cannot supply email, profile, or agent.
 from __future__ import annotations
 
 import hashlib
-import os
 import threading
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from public_config import canonical_public_url
 
 
 DEFAULT_TTL = 900
 MAX_TTL = 1800
-PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "")
 TERMINAL_STATES = frozenset({"expired", "revoked", "ended"})
 ACTIVE_STATES = frozenset({"pending", "active"})
 # After a failed terminal checkpoint the background reaper waits this long
@@ -332,7 +335,7 @@ class HandoffBroker:
     @staticmethod
     def _minted(sess):
         path = f'{sess.agent_id}/{sess.session_id}' if sess.browser_workspace_id == 'default' else f'{sess.agent_id}/{sess.browser_workspace_id}/{sess.session_id}'
-        return Minted(sess.session_id, f'{PUBLIC_BASE}/{path}', sess.expires_at)
+        return Minted(sess.session_id, f'{canonical_public_url()}/{path}', sess.expires_at)
 
     def _current(self, invocation, *, include_ended=False):
         principal = self._authorized_principal(invocation)

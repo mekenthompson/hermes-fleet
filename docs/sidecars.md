@@ -34,4 +34,5 @@ ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256:<64 lowercase hex>
 
 Household compose, identities, secret names, and live digest pins stay in the
 private deployment overlay. This tree ships generic images and synthetic
-examples only.
+examples only. Browser-broker chrome reads `BRAND`, `LOCAL_TZ`, and a required
+matching `PUBLIC_BASE`/`PUBLIC_ORIGIN` from the environment.
