@@ -4,17 +4,11 @@ on:
   pull_request:
     paths:
       - "sidecars/tcp-proxy/**"
-      - "sidecars/packages.json"
-      - "scripts/sidecar_image_ref.py"
-      - "tests/test_sidecar_packages.py"
       - ".github/workflows/sidecar-tcp-proxy.yml"
   push:
     branches: [main]
     paths:
       - "sidecars/tcp-proxy/**"
-      - "sidecars/packages.json"
-      - "scripts/sidecar_image_ref.py"
-      - "tests/test_sidecar_packages.py"
       - ".github/workflows/sidecar-tcp-proxy.yml"
   workflow_dispatch:
 

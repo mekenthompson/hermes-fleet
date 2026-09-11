@@ -20,9 +20,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          # Full history is required: tests/test_public_product.py asserts the clean-history
-          # root commit with `git rev-list --max-parents=0`, which a shallow clone would misreport.
-          fetch-depth: 0
+          fetch-depth: 1
       - name: Unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Compose syntax
@@ -41,3 +39,16 @@ jobs:
             --dry-run
       - name: Public tree policy
         run: python3 scripts/verify-public-tree.py
+
+  history-root:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          # tests.test_public_product.PublicProductTests.test_repository_has_no_remote_and_clean_history_contract
+          # uses `git rev-list --max-parents=0`, which a shallow clone would misreport.
+          fetch-depth: 0
+      - name: Clean-history root
+        run: python3 -m unittest tests.test_public_product.PublicProductTests.test_repository_has_no_remote_and_clean_history_contract -v

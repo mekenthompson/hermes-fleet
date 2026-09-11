@@ -11,6 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _workflow_job(text: str, job: str) -> str:
+    marker = f"  {job}:\n"
+    start = text.index(marker) + len(marker)
+    rest = text[start:]
+    nxt = re.search(r"\n  [A-Za-z0-9_-]+:\n", rest)
+    return rest[: nxt.start()] if nxt else rest
+
+
 class PublicProductTests(unittest.TestCase):
     def test_required_public_product_files_exist(self) -> None:
         for relative in (
@@ -59,6 +67,13 @@ class PublicProductTests(unittest.TestCase):
                 self.assertTrue((ROOT / relative).is_file())
 
     def test_repository_has_no_remote_and_clean_history_contract(self) -> None:
+        shallow = subprocess.check_output(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+        if shallow == "true":
+            self.skipTest("shallow clone cannot assert the clean-history root")
         roots = subprocess.check_output(
             ["git", "rev-list", "--max-parents=0", "HEAD"],
             cwd=ROOT,
@@ -362,7 +377,6 @@ class PublicProductTests(unittest.TestCase):
     def test_ci_is_source_only_and_pinned(self) -> None:
         text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("permissions:\n  contents: read", text)
-        self.assertIn("fetch-depth: 0", text)
         self.assertIn("python3 -m unittest discover", text)
         self.assertIn("scripts/verify-public-tree.py", text)
         self.assertIn("python3 scripts/compose.py config -q", text)
@@ -370,6 +384,17 @@ class PublicProductTests(unittest.TestCase):
         self.assertNotIn("docker/build-push-action", text)
         for uses in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
             self.assertRegex(uses, r"^[^@]+@[0-9a-f]{40}$")
+        source = _workflow_job(text, "source-checks")
+        history = _workflow_job(text, "history-root")
+        self.assertIn("fetch-depth: 1", source)
+        self.assertNotIn("fetch-depth: 0", source)
+        self.assertIn("python3 -m unittest discover", source)
+        self.assertIn("fetch-depth: 0", history)
+        self.assertIn(
+            "tests.test_public_product.PublicProductTests.test_repository_has_no_remote_and_clean_history_contract",
+            history,
+        )
+        self.assertNotIn("unittest discover", history)
 
 
 if __name__ == "__main__":
