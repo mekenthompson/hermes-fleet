@@ -1,10 +1,15 @@
 --- a/server.js
 +++ b/server.js
-@@ -1127,6 +1127,7 @@
+@@ -1155,6 +1155,12 @@
          geoip: !!launchProxy,
          virtual_display: vdDisplay,
          exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
++        // Pin the BrowserForge-generated screen/window fingerprint to the
++        // headed Xvfb geometry (VNC_RESOLUTION, default 1920x1080). Camoufox
++        // derives inner dimensions from this real window size; do not
++        // override them with page JavaScript.
++        screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 },
 +        window: [1920, 1080],
-       });
-       options.proxy = normalizePlaywrightProxy(options.proxy);
-       // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,
+       }, {
+         attempt,
+         proxyServer: launchProxy?.server || null,

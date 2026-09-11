@@ -21,7 +21,7 @@ concurrency:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-camofox
-  CAMOFOX_COMMIT: e5a36f5cd0332fde6597de474329a308a53a0716
+  CAMOFOX_COMMIT: 771b610a7b5994759c138b912741de58b0edd588
 
 jobs:
   test:
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: jo-inc/camofox-browser
-          ref: e5a36f5cd0332fde6597de474329a308a53a0716
+          ref: 771b610a7b5994759c138b912741de58b0edd588
           path: camofox-browser
           persist-credentials: false
       - name: Verify lock commit
@@ -81,6 +81,7 @@ jobs:
           git -C camofox-browser apply --check ../sidecars/camofox/patches/camofox-window-1920x1080.patch
           git -C camofox-browser apply ../sidecars/camofox/patches/camofox-window-1920x1080.patch
           grep -F "window: [1920, 1080]" camofox-browser/server.js
+          grep -F "screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }" camofox-browser/server.js
           git -C camofox-browser apply --check ../sidecars/camofox/patches/camofox-media-runtime.patch
           git -C camofox-browser apply ../sidecars/camofox/patches/camofox-media-runtime.patch
           grep -F "ffmpeg" camofox-browser/Dockerfile
