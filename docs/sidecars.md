@@ -10,7 +10,7 @@ not baked into the agent child image. Deployments pin an immutable digest.
 | REST lock-proxy | `ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy` | publishing |
 | TCP / noVNC proxy | `ghcr.io/mekenthompson/hermes-fleet-tcp-proxy` | publishing |
 | Browser broker | `ghcr.io/mekenthompson/hermes-fleet-browser-broker` | publishing |
-| Kokoro | `ghcr.io/mekenthompson/hermes-fleet-kokoro` | planned |
+| Kokoro | `ghcr.io/mekenthompson/hermes-fleet-kokoro` | publishing |
 | Camofox | `ghcr.io/mekenthompson/hermes-fleet-camofox` | planned |
 
 Pin form:
@@ -36,3 +36,5 @@ Household compose, identities, secret names, and live digest pins stay in the
 private deployment overlay. This tree ships generic images and synthetic
 examples only. Browser-broker chrome reads `BRAND`, `LOCAL_TZ`, and a required
 matching `PUBLIC_BASE`/`PUBLIC_ORIGIN` from the environment.
+
+Kokoro is a CUDA runtime image. Model weights are not baked into the image.

@@ -1,0 +1,13 @@
+# Runtime roots copied from the upstream voice sidecar Dockerfile at
+# fa05da221514fd83512e95150aab75e999eed636. requirements.lock freezes
+# the transitive resolution for linux/amd64 Python 3.12.
+faster-whisper==1.0.3
+huggingface_hub==0.25.2
+requests==2.32.3
+kokoro-onnx==0.5.0
+misaki==0.9.4
+num2words==0.5.14
+spacy==3.8.7
+click==8.1.7
+numpy>=2.0.2
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

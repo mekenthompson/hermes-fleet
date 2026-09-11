@@ -1,0 +1,245 @@
+# Public local GPU speech sidecar.
+#
+# Wraps `faster-whisper` (CTranslate2, STT) and `kokoro-onnx` (Kokoro, TTS)
+# behind a tiny stdlib HTTP server (sidecars/kokoro/server.py) so a fleet
+# can transcribe inbound voice notes AND synthesize spoken replies on a
+# LOCAL GPU. The private host overlay decides when to run it.
+#
+# Two endpoints (/stt, /tts), one port (8126), one image.
+#
+# Why a CUDA *runtime* base (not devel): CTranslate2 ships prebuilt CUDA
+# kernels in its wheel, so we only need the CUDA + cuDNN runtime libs at
+# image time — not the full toolkit. Keeps the image far smaller.
+#
+# Model weights are NOT baked in. They are fetched once on first boot into
+# the `voice-model-cache` named volume (compose mounts it at /models) and
+# reused thereafter. Baking them would bloat the image AND raise weight-
+# redistribution licensing questions; the model id is pinned via
+# VOICE_STT_MODEL and (optionally) checksum-verified fail-closed via
+# VOICE_STT_MODEL_SHA256. See server.py:_load_model.
+#
+# Base: nvidia/cuda 12.9.2 cudnn *runtime* on ubuntu24.04 (Python 3.12).
+# ubuntu22.04/py3.10 is EOL-track for this image line; 24.04/3.12 is the
+# maintained base. CUDA is kept on the 12.x / cuDNN 9 line deliberately —
+# BOTH GPU libs here are CUDA-12-only: ctranslate2 (via faster-whisper, STT)
+# and onnxruntime-gpu (Kokoro TTS) ship CUDA-12/cuDNN-9 wheels and do NOT
+# support CUDA 13 (which is why the CUDA-13 attempt in #4225 was wrong and
+# is closed). 12.9 keeps both on supported ground.
+#
+# sec: pinned by digest — a CUDA `:runtime` tag from nvidia is mutable.
+# Dependabot tracks bumps. (Replace the digest when bumping the tag.)
+# Pinned to the MULTI-ARCH INDEX digest — that is what dependabot writes, and
+# what `docker buildx imagetools inspect
+# nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04` reports. The builder selects
+# the amd64 child manifest out of it (CI builds amd64-only). Do NOT re-pin a
+# per-arch manifest digest here: this line used to carry one, and hand-pinning
+# it back flip-flops the pin kind against every dependabot bump.
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="hermes-fleet-kokoro" \
+      org.opencontainers.image.description="Hermes local GPU speech sidecar (faster-whisper STT + Kokoro TTS)" \
+      org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.vendor="Hermes Fleet"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONUNBUFFERED=1 \
+    VOICE_MODEL_CACHE=/models \
+    HF_HOME=/models/hf
+
+# ffmpeg normalizes arbitrary inbound audio (OGG/Opus from Telegram, mp3,
+# m4a, …) to 16kHz mono WAV before whisper, AND transcodes Kokoro's 24kHz
+# PCM out to mono OGG/Opus (Telegram sendVoice requires OGG/Opus). python3
+# runs the server.
+#
+# No apt `espeak-ng`: kokoro-onnx phonemizes via `espeakng-loader`, which
+# bundles the espeak-ng shared library + data inside the wheel, so the
+# phonemizer backend finds them without a system package (keeps the apt
+# layer minimal and the espeak-ng version pinned with the pip deps).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# faster-whisper pulls in ctranslate2 (with bundled CUDA kernels). Pin so
+# the image is reproducible; Dependabot bumps it.
+#
+# `requests` is an UNDECLARED runtime dependency of faster-whisper 1.0.3:
+# faster_whisper/utils.py does `import requests` at module load (it catches
+# requests.exceptions.ConnectionError in its model-download retry path) but
+# omits it from requires_dist. Older huggingface_hub used to drag requests
+# in transitively, but huggingface_hub>=1.0 migrated off requests (httpx)
+# and no longer does — so on a clean image the model-load path dies with
+# `ModuleNotFoundError: No module named 'requests'` (bug #2706). Pin
+# `requests` explicitly. huggingface_hub is also pinned (0.25.2 still hard-
+# depends on requests) to keep the resolved download API stable; Dependabot
+# bumps all three.
+# kokoro-onnx is the Kokoro TTS engine on the ONNX runtime path — it avoids
+# torch entirely (pulling onnxruntime + numpy + phonemizer-fork +
+# espeakng-loader), which is materially lighter than the torch-based
+# `kokoro` package for an inference-only sidecar. Pinned for a reproducible
+# image; Dependabot bumps it. The Kokoro weights themselves are NOT baked in
+# — they're fetched on first boot into /models (see server.py:_load_tts).
+# GPU TTS: kokoro-onnx depends on plain `onnxruntime` (CPU-only) by default,
+# which pins Kokoro to the CPU (providers = [CPUExecutionProvider]) even on a
+# CUDA host — the confirmed root cause of slow synth. We uninstall that CPU
+# wheel and install `onnxruntime-gpu` instead so the ONNX/TTS path can use
+# CUDAExecutionProvider (server.py builds the InferenceSession with an
+# explicit CUDA->CPU provider list + graceful fallback). onnxruntime-gpu 1.20.x
+# is built for CUDA 12.x + cuDNN 9, matching this image's
+# nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 base — no extra CUDA libs are
+# needed (STT/CTranslate2 already proves CUDA 12 + cuDNN 9 runtime are present).
+# NB: keep the base on CUDA 12 / cuDNN 9 — onnxruntime-gpu (and ctranslate2 for
+# STT) have no CUDA-13 wheels, so a CUDA-13 base would silently drop TTS+STT to
+# CPU (server.py's graceful fallback hides it) or fail to load the provider.
+# Installing onnxruntime-gpu AFTER kokoro-onnx replaces the transitively-pulled
+# CPU onnxruntime with the GPU build (same import name, so kokoro-onnx picks it
+# up unchanged). Dependabot bumps all four pins.
+#
+# PEP 668: ubuntu24.04's system python3 is externally-managed, so a bare
+# `pip3 install` (and the onnxruntime uninstall/reinstall below) would abort
+# with `error: externally-managed-environment`. The container IS the
+# environment, so a global install is correct here — PIP_BREAK_SYSTEM_PACKAGES
+# (set in the ENV block above) opts in for all three pip3 calls, matching the
+# `--break-system-packages` precedent in Dockerfile.agent.
+# misaki is the POS-aware grapheme→phoneme engine that fixes English
+# heteronyms Kokoro's built-in espeak phonemizer mispronounces (espeak is not
+# part-of-speech aware): the verb "live" /lˈɪv/ vs the adjective "live"
+# /lˈaɪv/, "read" present /ɹˈid/ vs past /ɹˈɛd/, etc. server.py runs it
+# in-process and feeds the phoneme string to Kokoro via is_phonemes=True.
+#
+# Deliberately NOT `misaki[en]`: that extra pulls spacy-curated-transformers,
+# which drags in torch — undoing the whole no-torch design of the kokoro-onnx
+# path above (lines ~64-69). We install BASE misaki + spaCy (tok2vec + tagger
+# only; misaki runs with trf=False so no transformer pipeline is needed) +
+# num2words. espeakng-loader / phonemizer-fork are already pinned transitively
+# by kokoro-onnx and stay — misaki's OOV EspeakFallback (and the non-English
+# path) use them.
+#
+# en_core_web_sm is baked as a WHEEL rather than fetched at runtime because
+# misaki.en.G2P.__init__ otherwise calls spacy.cli.download() on first use — a
+# network fetch AND a site-packages write that fails under the non-root runtime
+# UID (65532) and breaks offline boots. Its major.minor (3.8) MUST match the
+# spacy pin (3.8.x); a mismatch makes spaCy refuse to load the model.
+#
+# `click` is an UNDECLARED runtime dependency of spaCy's CLI here: spacy/cli/
+# _util.py does `from click import NoSuchOption`, but the transitive chain
+# (typer 0.27 no longer hard-depends on click) leaves it uninstalled on a clean
+# image, so `import spacy` — which misaki does at module load — dies with
+# `ModuleNotFoundError: No module named 'click'`. Same class of bug as the
+# `requests`/faster-whisper pin above. Pin it explicitly.
+#
+# numpy floor: spaCy 3.8 + kokoro-onnx 0.5.0 both build against numpy 2; the
+# resolver lands 2.2.x. Pin the >=2.0.2 floor so a resolver wobble can never
+# drag the image back to numpy 1.x (which the Kokoro ONNX path can't use).
+#
+# DEPENDABOT: keep misaki pinned at 0.9.4. misaki's `main` branch imports
+# torch/transformers at the TOP of en.py; 0.9.4 does not. Any bump MUST re-check
+# misaki/en.py's module-level imports stay torch-free, or the no-torch design
+# regresses silently.
+COPY requirements.lock requirements-gpu.lock /tmp/
+RUN pip3 install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && pip3 uninstall -y onnxruntime \
+    && pip3 install --no-cache-dir --require-hashes -r /tmp/requirements-gpu.lock
+
+# Build-time OUTCOME guard (fail-loud) — proves misaki's POS-aware G2P actually
+# emits DIFFERENT phonemes for the two senses of each heteronym, which is the
+# entire point of this dependency. A bare `import misaki` check would stay green
+# even if spaCy silently failed to load the tagger and every word collapsed to
+# the espeak fallback, so we assert the exact phoneme substrings, verified
+# empirically against misaki 0.9.4 in a python:3.10 container:
+#   verb "live"  → lˈɪv   vs  adjective "live" → lˈIv   (capital I = /aɪ/)
+#   base "read"  → ɹˈid   vs  past      "read" → ɹˈɛd
+# Two independent pairs so one lexicon change can't quietly vacate the guard.
+# This also transitively proves the two load-bearing assumptions: (a) misaki's
+# English path is torch-free with trf=False (torch is never installed here, so
+# an import of it would ImportError), and (b) the baked en_core_web_sm wheel
+# loads offline under spaCy. If any of that regresses, THIS build turns red.
+#
+# KNOWN GAP (#4270) — "lead" is NOT fixed, and CANNOT be fixed by misaki 0.9.4
+# (nor by enabling the trf/transformer POS pipeline): misaki's us_gold.json has
+# `"lead": "lˈid"` as a PLAIN STRING, not a POS-keyed dict like live/read, and
+# Lexicon.lookup only consults the POS tag when the entry is a dict — a forced
+# perfect tag (NN/VB/JJ/…) still returns lˈid for every sense. Upstream misaki
+# `main` has the same plain-string entry, so a version bump doesn't close it
+# either. It is also not purely POS-reducible: the metal ("made of lead",
+# lˈɛd) and the leed-nouns ("took the lead", "dog on a lead", lˈid) are BOTH
+# tagged NN, so a naive {NN: lˈɛd} override would regress common phrases —
+# closing it needs a lexicon-level word-sense fix upstream. Until then we PIN
+# the wrong-but-current behaviour below so the gap is explicit: if a misaki
+# bump ever starts emitting lˈɛd for the metal, THIS build turns red and
+# forces the guard + test_g2p.py xfail + docs to flip to a real assertion.
+RUN python3 -c "\
+from misaki import en, espeak; \
+g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False)); \
+lv, _ = g2p('They live in Sydney.'); \
+la, _ = g2p('It was a live show.'); \
+rp, _ = g2p('Please read this book.'); \
+rd, _ = g2p('He read it yesterday.'); \
+assert 'lˈɪv' in lv and 'lˈIv' in la, ('live sense collapsed', lv, la); \
+assert 'ɹˈid' in rp and 'ɹˈɛd' in rd, ('read sense collapsed', rp, rd); \
+lm, _ = g2p('The pipe is made of lead.'); \
+lw, _ = g2p('Lead the way.'); \
+assert 'lˈid' in lw, ('lead verb sense broke', lw); \
+assert 'lˈid' in lm and 'lˈɛd' not in lm, ('lead KNOWN GAP (#4270) closed? metal sense changed - flip this guard, the test_g2p.py xfail, and the docs to real assertions', lm); \
+print('misaki G2P heteronym guard OK:', lv, '|', la, '|', rp, '|', rd); \
+print('KNOWN GAP (#4270): lead metal sense still lˈid (should be lˈɛd) — misaki lexicon lacks a POS-keyed entry:', lm)"
+
+# server.py imports text_normalize (Stage B token normalisation) as a sibling
+# module and reads overrides.json from the same directory, so all three ship
+# together. A missing text_normalize degrades to raw-token speech (server.py
+# guards the import) — the guard below makes that impossible to ship unnoticed.
+COPY server.py /opt/voice-sidecar/server.py
+COPY worker_lane.py /opt/voice-sidecar/worker_lane.py
+COPY text_normalize.py /opt/voice-sidecar/text_normalize.py
+COPY overrides.json /opt/voice-sidecar/overrides.json
+# Preserve the upstream MIT attribution with the redistributed source.
+COPY LICENSE /opt/voice-sidecar/LICENSE
+
+# Keep sibling modules importable when the runtime smoke invokes
+# `python3 -c 'import server'` rather than executing the server script.
+WORKDIR /opt/voice-sidecar
+
+# Build-time OUTCOME guard for Stage B: proves the normaliser imports (with its
+# num2words dependency), actually rewrites tokens, is idempotent, and — the
+# load-bearing one — that EVERY phoneme in overrides.json is inside Kokoro's
+# vocabulary. An out-of-vocab symbol is dropped SILENTLY by kokoro-onnx's
+# tokenizer, so an unvalidated table deletes whole words from the audio. This
+# is the cheapest place to notice.
+RUN cd /opt/voice-sidecar && python3 -c "\
+import text_normalize as tn; \
+from kokoro_onnx.config import DEFAULT_VOCAB; \
+out = tn.normalize('90s timeout, 16 m frontage, #4661'); \
+assert out == 'ninety seconds timeout, sixteen metres frontage, hash 4661', out; \
+assert tn.normalize(out) == out, ('not idempotent', out, tn.normalize(out)); \
+ok, bad = tn.load_overrides(vocab=DEFAULT_VOCAB.keys()); \
+assert not bad, ('overrides.json rejected entries', bad); \
+assert len(ok) >= 1, 'overrides.json loaded empty'; \
+print('Stage B guard OK:', len(ok), 'overrides |', out)"
+
+# Pre-create the model-cache dir owned by the runtime uid BEFORE the VOLUME
+# instruction. Docker initializes a fresh named volume from the ownership of
+# the image directory at the mount point — if /models is left root:root, the
+# non-root runtime uid (65532) cannot write the first-boot model download and
+# faster-whisper dies with `PermissionError: [Errno 13] ... '/models/...'`
+# (bug #2707). Chowning it here makes the inherited volume ownership writable.
+RUN mkdir -p /models && chown -R 65532:65532 /models
+
+# Weights land in this volume on first boot; never baked into the image.
+VOLUME ["/models"]
+
+# STT listener. compose publishes this on the host-gateway-reachable
+# interface and gates access on the X-Voice-Token shared secret.
+EXPOSE 8126
+
+# Run as a non-root uid — the sidecar needs no privilege beyond the GPU
+# device (granted via the compose deploy.resources reservation) and write
+# access to the model-cache volume (compose sets ownership / the volume is
+# created writable on first run).
+USER 65532:65532
+
+ENTRYPOINT ["python3", "/opt/voice-sidecar/server.py"]

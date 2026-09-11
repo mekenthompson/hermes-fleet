@@ -29,7 +29,7 @@
       "context": "sidecars/kokoro",
       "visibility": "public",
       "require_digest_pin": true,
-      "status": "planned"
+      "status": "publishing"
     },
     "camofox": {
       "image": "ghcr.io/mekenthompson/hermes-fleet-camofox",
