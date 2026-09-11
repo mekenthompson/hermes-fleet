@@ -9,7 +9,7 @@
   "The ratio is 16:1 and the score is 183/183 — neither is a time.",
   "Open a PR against origin/main, check MERGEABLE/CLEAN, then squash.",
   "Look at server.py:604 and tui_gateway/methods_session.py:14 for the call site.",
-  "Box is 192.168.2.58:4010, loopback is 127.0.0.1, and the tag is v0.21.9.",
+  "Box is 203.0.113.10:4010, loopback is 127.0.0.1, and the tag is v0.21.9.",
   "Commit 1b8d00b landed after 6694eb63; run wf_2f0e6072-af3 for the rest.",
   "Set HINDSIGHT_API_EMBEDDINGS_* and grep ^VOICE_ to see what the sidecar reads.",
   "The helper is get_recent_messages and the field is crossSessionInbound.",
