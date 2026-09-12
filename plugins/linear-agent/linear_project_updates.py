@@ -23,9 +23,14 @@ from typing import TypedDict
 try:
     from .linear_activity import LinearActivityClient, LinearGraphQLError
     from .linear_oauth import make_oauth, validate_private_directory
+    from .linear_policy import PUBLISHER_POLICY_PATH, read_publisher_policy
 except ImportError:  # direct script invocation
     from linear_activity import LinearActivityClient, LinearGraphQLError
     from linear_oauth import make_oauth, validate_private_directory
+    from linear_policy import PUBLISHER_POLICY_PATH, read_publisher_policy
+
+
+_PUBLISHER_POLICY_PATH = PUBLISHER_POLICY_PATH
 
 
 class ProjectUpdateError(RuntimeError):
@@ -271,14 +276,14 @@ class LinearProjectUpdatePublisher:
                 if reconciled is None:
                     raise
                 if reconciled['health'] != health:
-                    raise ProjectUpdateError('project health readback differs from the carried-forward value')
+                    raise ProjectUpdateError('project health readback differs from the previous value')
                 results.append(reconciled)
                 continue
             readback = self._checked_update(update_id, project_id=project_id, body=body, actor=actor)
             if readback is None:
                 raise ProjectUpdateError("project update create readback is absent")
             if readback['health'] != health:
-                raise ProjectUpdateError('project health readback differs from the carried-forward value')
+                raise ProjectUpdateError('project health readback differs from the previous value')
             readback["status"] = "created"
             results.append(readback)
         results.extend({'status': 'skipped_no_project', 'issue_id': issue_id} for issue_id in self._unprojected)
@@ -325,9 +330,9 @@ def _publisher_settings(config: object, session_profile: str | None) -> dict[str
 def _publisher_binding(profile: str, workspace: str, vault_id: str, item_id: str) -> PublisherBinding:
     """Resolve a publisher-only roster; it never changes worker dispatch scope."""
     try:
-        policy = json.loads(Path(__file__).with_name("linear-publishers.json").read_text(encoding="utf-8"))
+        policy = read_publisher_policy(_PUBLISHER_POLICY_PATH)
         matches = [entry for entry in policy.get("publishers", []) if isinstance(entry, dict) and entry.get("profile") == profile]
-    except (OSError, ValueError, AttributeError) as exc:
+    except (RuntimeError, ValueError, AttributeError) as exc:
         raise ProjectUpdateError("immutable Linear publishing policy is unavailable") from exc
     if len(matches) != 1:
         raise ProjectUpdateError("current profile is not authorized to publish Linear project updates")

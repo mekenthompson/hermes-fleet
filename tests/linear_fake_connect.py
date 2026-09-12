@@ -22,7 +22,7 @@ def login_item(vault_id: str, item_id: str, *, client_id="client", client_secret
 
 
 def canonical_item(vault_id: str, item_id: str, *, client_id="client", client_secret="secret", refresh_token="refresh-0", title="Linear OAuth") -> dict[str, Any]:
-    """Klanker-style layout: opaque ids with canonical labels alongside unrelated generic fields."""
+    """Profile-style layout: opaque ids with canonical labels alongside unrelated generic fields."""
     return {
         "id": item_id, "title": title, "vault": {"id": vault_id},
         "fields": [

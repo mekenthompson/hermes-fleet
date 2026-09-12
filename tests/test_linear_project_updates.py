@@ -194,8 +194,10 @@ class ProjectUpdatePublisherTests(unittest.TestCase):
                     }
                 ]
             }
-            (policy_dir / "linear-publishers.json").write_text(json.dumps(policy), encoding="utf-8")
-            with mock.patch.object(linear_project_updates, "__file__", str(policy_dir / "linear_project_updates.py")):
+            policy_path = policy_dir / "linear-publishers.json"
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
+            policy_path.chmod(0o444)
+            with mock.patch.object(linear_project_updates, "_PUBLISHER_POLICY_PATH", policy_path):
                 binding = _publisher_binding(
                     "operator", "demo-space", "cccccccccccccccccccccccccc", "dddddddddddddddddddddddddd"
                 )

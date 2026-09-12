@@ -32,7 +32,8 @@ class TrackingError(RuntimeError):
 
 _VIEWER = "query LinearTrackingViewer { viewer { id app organization { id } } }"
 _ISSUE = """query IssueLookup($id: String!) { issue(id: $id) { id archivedAt title description team { id organization { id } states { nodes { id name type } } } parent { id } project { id } assignee { id } delegate { id } state { id name type } } }"""
-_UPDATE = """mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }"""
+_UPDATE = """mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { id assignee { id } delegate { id } state { id name type } } } }"""
+
 _CREATE = """mutation IssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id } } }"""
 _PROJECT = """query ProjectLookup($id: String!) { project(id: $id) { id archivedAt teams(first: 50) { nodes { id } pageInfo { hasNextPage } } } }"""
 _TERMINAL = {"completed", "canceled", "cancelled", "duplicate"}
@@ -96,13 +97,19 @@ class LinearTracking:
             return
         try:
             updated = self._query(_UPDATE, {"id": canonical_id, "input": update})
-            if not updated.get("data", {}).get("issueUpdate", {}).get("success"):
+            data = updated.get("data")
+            payload = data.get("issueUpdate") if isinstance(data, dict) else None
+            if not isinstance(payload, dict) or payload.get("success") is not True:
                 raise TrackingError("Linear rejected claim update")
-            readback = self._issue(canonical_id)
+            readback = payload.get("issue")
+            if not isinstance(readback, dict):
+                raise TrackingError("Linear claim update returned no issue")
             if self._assignee_id(readback) != original_assignee:
                 raise TrackingError("Linear assignee readback mismatch")
             if "delegateId" in update and self._delegate_id(readback) != app_id:
-                raise TrackingError("Linear delegate readback mismatch")
+                raise TrackingError(
+                    f"Linear delegate readback mismatch: expected {app_id!r}, got {self._delegate_id(readback)!r}"
+                )
             if "stateId" in update:
                 state = readback.get("state") if isinstance(readback.get("state"), dict) else {}
                 if state.get("id") != update["stateId"] and state.get("type") != "started":
@@ -110,7 +117,7 @@ class LinearTracking:
         except TrackingError:
             # Known Linear outcome. Reconcile would block native Agent Sessions
             # with issue_requires_reconciliation after Linear already accepted
-            # the mutation (LIFE-49 / HF-288).
+            # the mutation.
             self.ownership.release(canonical_id, self.owner_session_id, record.generation)
             raise
         except Exception:
@@ -423,9 +430,10 @@ def _configured_tracker() -> LinearTracking:
     if not vault_id or not item_id:
         raise TrackingError("managed OAuth policy identifiers are unavailable")
     try:
-        policy = json.loads(Path(__file__).with_name("linear-agents.json").read_text(encoding="utf-8"))
+        from linear_policy import AGENT_POLICY_PATH, read_agent_policy
+        policy = read_agent_policy(AGENT_POLICY_PATH)
         matches = [item for item in policy.get("agents", []) if isinstance(item, dict) and item.get("profile") == profile]
-    except (OSError, ValueError, AttributeError) as exc:
+    except (RuntimeError, ValueError, AttributeError) as exc:
         raise TrackingError("managed OAuth policy is unavailable") from exc
     if len(matches) != 1 or matches[0].get("workspace") != workspace or matches[0].get("oauth", {}).get("vault_id") != vault_id or matches[0].get("oauth", {}).get("item_id") != item_id:
         raise TrackingError("active Linear OAuth does not match managed policy")

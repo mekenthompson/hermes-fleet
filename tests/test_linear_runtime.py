@@ -79,7 +79,7 @@ from hermes_plugins.linear_agent_runtime_test.linear_runtime import (
     ProfileLinearRuntime,
 )
 
-from scripts.linear_ingress import IngressStore, Route
+from tests.linear_ingress_fixture import IngressStore, Route
 
 ALLOWED_USER_ID = "11111111-1111-4111-8111-111111111111"
 DENIED_USER_ID = "22222222-2222-4222-8222-222222222222"

@@ -18,11 +18,12 @@ from linear_activity import LinearActivityClient
 from linear_agent import unauthorized_response_body_from_entry
 from linear_handoff import FLEET_AUTHORITY_STORE
 from linear_oauth import ConnectItem, LinearOAuth, load_connect_env, validate_private_directory
+from linear_policy import AGENT_POLICY_PATH, read_agent_policy
 from linear_project_updates import _publisher_binding
 
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}$")
 _ID = re.compile(r"[A-Za-z0-9-]{3,64}$")
-_POLICY_PATH = Path(__file__).with_name("linear-agents.json")
+_POLICY_PATH = AGENT_POLICY_PATH
 
 
 def expected_container_hostname(profile: str) -> str:
@@ -115,7 +116,7 @@ def provision(
         raise ValueError("Linear profile or workspace is invalid")
     if _ID.fullmatch(vault_id) is None or _ID.fullmatch(item_id) is None:
         raise ValueError("Linear OAuth binding is invalid")
-    manifest = json.loads(_POLICY_PATH.read_text(encoding="utf-8"))
+    manifest = read_agent_policy(_POLICY_PATH)
     agents = manifest.get("agents") if isinstance(manifest, dict) else None
     matches = [entry for entry in agents or [] if isinstance(entry, dict) and entry.get("profile") == profile]
     expected_oauth = {

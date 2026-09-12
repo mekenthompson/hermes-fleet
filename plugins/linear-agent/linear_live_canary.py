@@ -176,7 +176,8 @@ def main() -> int:
     from linear_tracking import _tracking_config
     from linear_project_updates import _configured_publisher
     _home, _entry, profile, _workspace, database = _tracking_config()
-    manifest = json.loads(Path(__file__).with_name("linear-agents.json").read_text())
+    from linear_policy import AGENT_POLICY_PATH, read_agent_policy
+    manifest = read_agent_policy(AGENT_POLICY_PATH)
     matches = [item for item in manifest.get("agents", []) if isinstance(item, dict) and item.get("profile") == profile]
     if len(matches) != 1: parser.error("Linear canary execution profile is not registered")
     publisher = _configured_publisher()

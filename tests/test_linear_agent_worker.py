@@ -307,7 +307,7 @@ class LinearAgentWorkerTests(unittest.TestCase):
             self.assertEqual(recovered.delivery_state("delivery-1"), "completed")
 
     def test_import_marks_selected_logical_agent_when_name_differs_from_profile(self) -> None:
-        from scripts.linear_ingress import IngressStore, Route
+        from tests.linear_ingress_fixture import IngressStore, Route
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             inbox = root / "inbox"

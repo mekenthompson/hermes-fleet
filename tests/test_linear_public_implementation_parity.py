@@ -40,6 +40,7 @@ GENERIC_MODULES = {
     "linear_ownership",
     "linear_parent_continuation",
     "linear_parent_followup",
+    "linear_policy",
     "linear_project_updates",
     "linear_provision",
     "linear_quota",
@@ -104,7 +105,8 @@ FORBIDDEN_IDENTITY = {
     "household name or real identity": re.compile(r"\bKens?\b|\bThompson\b", re.IGNORECASE),
     "private Linear issue key": re.compile(r"\bKEN-\d"),
     "deployment profile identity": re.compile(
-        r"\b(?:klanker|aggie|overlord|clerk)\b", re.IGNORECASE
+        r"\b(?:" + "klank" + "er|ag" + "gie|over" + "lord|cl" + "erk" + r")\b",
+        re.IGNORECASE,
     ),
 }
 

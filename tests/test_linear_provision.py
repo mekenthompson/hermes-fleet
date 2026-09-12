@@ -43,6 +43,7 @@ class LinearProvisionTests(unittest.TestCase):
                 "oauth": {"mode": "managed_oauth_v1", "vault_id": vault_id, "item_id": item_id,
                           "local_state": "/opt/data/secrets/linear-oauth.json", "connect_env_file": "/opt/data/.op.env"},
             }]}), encoding="utf-8")
+            policy.chmod(0o444)
             item = Mock()
             item.credentials.return_value = {"client_id": "client", "client_secret": "secret", "refresh_token": "refresh"}
             verified = []
@@ -69,6 +70,7 @@ class LinearProvisionTests(unittest.TestCase):
                 "oauth": {"mode": "managed_oauth_v1", "vault_id": vault_id, "item_id": item_id,
                           "local_state": "/opt/data/secrets/linear-oauth.json", "connect_env_file": "/opt/data/.op.env"},
             }]}), encoding="utf-8")
+            policy.chmod(0o444)
             with (
                 patch.dict(os.environ, {"HERMES_PROFILE": "alpha"}),
                 patch.object(linear_provision.socket, "gethostname", return_value="hermes-alpha"),
@@ -139,6 +141,7 @@ class LinearProvisionTests(unittest.TestCase):
                     "connect_env_file": "/opt/data/.op.env",
                 },
             }]}), encoding="utf-8")
+            policy.chmod(0o444)
             settings = []
             enabled = []
             verified = []
@@ -174,7 +177,9 @@ class LinearProvisionTests(unittest.TestCase):
             del policy_data["agents"][0]["terminal_issue_status"]
             del policy_data["agents"][0]["reassign_to_requester"]
             del policy_data["agents"][0]["heartbeat_seconds"]
+            policy.chmod(0o644)
             policy.write_text(json.dumps(policy_data), encoding="utf-8")
+            policy.chmod(0o444)
             unset_keys: list[str] = []
             with patch.dict(os.environ, {"HERMES_PROFILE": "alpha"}), patch.object(linear_provision.socket, "gethostname", return_value="hermes-alpha"), patch.object(linear_provision, "_POLICY_PATH", policy):
                 linear_provision.provision(profile_home=home, profile="alpha", workspace="demo-space", vault_id=vault_id, item_id=item_id, auth_verify=lambda oauth: verified.append(oauth.cache_path), config_set=lambda key, value: settings.append((key, value)), config_unset=unset_keys.append, plugin_enable=lambda name: enabled.append(name))
@@ -224,6 +229,7 @@ class LinearProvisionTests(unittest.TestCase):
                     "connect_env_file": "/opt/data/.op.env",
                 },
             }]}), encoding="utf-8")
+            policy.chmod(0o444)
             expected_settings = {
                 "profile": "alpha",
                 "workspace": "demo-space",
@@ -337,7 +343,10 @@ class LinearProvisionTests(unittest.TestCase):
                         },
                         key: value,
                     }
+                    if policy.exists():
+                        policy.chmod(0o644)
                     policy.write_text(json.dumps({"agents": [entry]}), encoding="utf-8")
+                    policy.chmod(0o444)
                     with patch.dict(os.environ, {"HERMES_PROFILE": "alpha"}), patch.object(linear_provision.socket, "gethostname", return_value="hermes-alpha"), patch.object(linear_provision, "_POLICY_PATH", policy), self.assertRaisesRegex(RuntimeError, message):
                         linear_provision.provision(
                             profile_home=home,

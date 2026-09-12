@@ -26,10 +26,14 @@ from linear_tracking import (
 )
 
 
+_UNSET = object()
+
+
 class FakeLinear:
-    def __init__(self, *, delegate_id=None, state_type="started", update_success=True, readback_delegate=None, readback_description=None, archived_at=None, issue_id="123e4567-e89b-42d3-a456-426614174001", viewer_app=True, viewer_org="org-1", issue_org="org-1", project_team_ids=("team-1",), project_response=None):
+    def __init__(self, *, delegate_id=None, state_type="started", update_success=True, readback_delegate=None, payload_delegate=_UNSET, readback_description=None, archived_at=None, issue_id="123e4567-e89b-42d3-a456-426614174001", viewer_app=True, viewer_org="org-1", issue_org="org-1", project_team_ids=("team-1",), project_response=None):
         self.delegate_id, self.state_type = delegate_id, state_type
         self.update_success, self.readback_delegate = update_success, readback_delegate
+        self.payload_delegate = payload_delegate
         self.readback_description = readback_description
         self.archived_at, self.issue_id = archived_at, issue_id
         self.viewer_app, self.viewer_org, self.issue_org = viewer_app, viewer_org, issue_org
@@ -62,7 +66,15 @@ class FakeLinear:
         if "IssueUpdate" in query:
             if self.update_success:
                 self.applied.update(variables["input"])
-            return {"data": {"issueUpdate": {"success": self.update_success}}}
+            delegate = self.applied.get("delegateId") if self.payload_delegate is _UNSET else self.payload_delegate
+            state_id = self.applied.get("stateId", "state-progress")
+            assignee = None if any("IssueCreate" in prior for prior, _ in self.calls) else {"id": "human-1"}
+            return {"data": {"issueUpdate": {"success": self.update_success, "issue": {
+                "id": self.issue_id,
+                "assignee": assignee,
+                "delegate": ({"id": delegate} if delegate else None),
+                "state": {"id": state_id, "name": "In Progress", "type": "started"},
+            }}}}
         if "IssueCreate" in query:
             return {"data": {"issueCreate": {"success": True, "issue": {"id": variables["input"]["id"]}}}}
         raise AssertionError(query)
@@ -270,7 +282,9 @@ class LinearTrackingTests(unittest.TestCase):
             self.assertEqual(update["stateId"], "state-progress")
             self.assertNotIn("assigneeId", update)
             lookups = [variables for query, variables in api.calls if "query IssueLookup" in query]
-            self.assertGreaterEqual(len(lookups), 2)
+            self.assertEqual(len(lookups), 1)
+            update_query = next(query for query, _ in api.calls if "mutation IssueUpdate" in query)
+            self.assertIn("issue { id assignee { id } delegate { id } state { id name type } }", update_query)
 
     def test_takeover_replaces_foreign_delegate_without_assignee(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -339,13 +353,24 @@ class LinearTrackingTests(unittest.TestCase):
 
     def test_readback_mismatch_releases_claim_without_fencing(self):
         with tempfile.TemporaryDirectory() as temp:
-            api = FakeLinear(readback_delegate=None)
+            api = FakeLinear(payload_delegate=None)
             tracking = self._tracking(Path(temp), api)
-            with self.assertRaisesRegex(TrackingError, "readback"):
+            with self.assertRaisesRegex(TrackingError, r"readback mismatch: expected 'app-1', got None"):
                 tracking.claim("ENG-1")
             record = tracking.ownership.get("123e4567-e89b-42d3-a456-426614174001")
             self.assertIsNotNone(record)
             self.assertEqual(record.mode, "released")
+
+    def test_claim_accepts_delegate_from_issue_update_payload_when_lookup_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            api = FakeLinear(readback_delegate=None)
+            tracking = self._tracking(Path(temp), api)
+            result = tracking.claim("ENG-1")
+            self.assertEqual(result["status"], "claimed")
+            record = tracking.ownership.get("123e4567-e89b-42d3-a456-426614174001")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.mode, "active")
+            self.assertEqual(sum("query IssueLookup" in query for query, _ in api.calls), 1)
 
     def test_update_timeout_keeps_claim_for_reconciliation(self):
         class TimeoutLinear(FakeLinear):
@@ -363,7 +388,8 @@ class LinearTrackingTests(unittest.TestCase):
 class LinearTrackingCliTests(unittest.TestCase):
     @staticmethod
     def _write_policy(home: Path, *, vault_id: str, item_id: str) -> None:
-        (home / "linear-agents.json").write_text(
+        policy = home / "linear-agents.json"
+        policy.write_text(
             json.dumps(
                 {
                     "agents": [
@@ -377,6 +403,7 @@ class LinearTrackingCliTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        policy.chmod(0o444)
 
     def test_configured_tracker_builds_oauth_from_profile_home_and_binding(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -397,12 +424,12 @@ class LinearTrackingCliTests(unittest.TestCase):
                     _configured_tracker.__globals__,
                     {
                         "_tracking_config": mock.Mock(return_value=(home, entry, "alpha", "demo-space", state)),
-                        "__file__": str(home / "linear_tracking.py"),
                         "_publisher_binding": resolve_binding,
                         "make_oauth": factory,
                         "LinearActivityClient": client_factory,
                     },
                 ),
+                mock.patch("linear_policy.AGENT_POLICY_PATH", home / "linear-agents.json"),
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "chat-1"}, clear=False),
             ):
                 _configured_tracker()
@@ -425,11 +452,11 @@ class LinearTrackingCliTests(unittest.TestCase):
                     _configured_tracker.__globals__,
                     {
                         "_tracking_config": mock.Mock(return_value=(home, entry, "alpha", "demo-space", state)),
-                        "__file__": str(home / "linear_tracking.py"),
                         "_publisher_binding": mock.Mock(side_effect=TrackingError("binding refused")),
                         "make_oauth": mock.Mock(side_effect=AssertionError("credentials read before binding")),
                     },
                 ),
+                mock.patch("linear_policy.AGENT_POLICY_PATH", home / "linear-agents.json"),
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "chat-1"}, clear=False),
             ):
                 with self.assertRaisesRegex(TrackingError, "binding refused"):
@@ -518,5 +545,12 @@ class LinearTrackingCliTests(unittest.TestCase):
     def test_status_is_local_and_does_not_construct_oauth_tracker(self):
         with tempfile.TemporaryDirectory() as temp:
             tracker = LinearTracking(Path(temp) / "state.db", profile="alpha", workspace="demo", owner_session_id="chat-1", graphql=FakeLinear(), health=mock.Mock())
-            with mock.patch("linear_tracking._local_tracker", return_value=tracker), mock.patch("linear_tracking._configured_tracker", side_effect=AssertionError("OAuth must not be used")):
+            local_factory = mock.Mock(return_value=tracker)
+            oauth_factory = mock.Mock(side_effect=AssertionError("OAuth must not be used"))
+            with mock.patch.dict(main.__globals__, {
+                "_local_tracker": local_factory,
+                "_configured_tracker": oauth_factory,
+            }):
                 self.assertEqual(main(["status", "--issue", "123e4567-e89b-42d3-a456-426614174001"]), 0)
+            local_factory.assert_called_once_with()
+            oauth_factory.assert_not_called()

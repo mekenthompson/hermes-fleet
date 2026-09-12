@@ -136,9 +136,9 @@ class LinearActivityClientTests(unittest.TestCase):
     def test_project_update_with_no_project_is_an_ordinary_skip(self) -> None:
         from linear_project_updates import NoProjectUpdate
         def no_project(*_args, **_kwargs):
-            raise NoProjectUpdate("source issue KEN-503 has no project")
+            raise NoProjectUpdate("source issue TEAM-503 has no project")
         self.assertFalse(LinearActivityClient("test-token", project_update_publisher=no_project).dispatch(
-            "KEN-503", "project_update", json.dumps({"session_key": "closeout", "summary": "Done."})
+            "TEAM-503", "project_update", json.dumps({"session_key": "closeout", "summary": "Done."})
         ))
 
     def test_project_update_rejects_malformed_payload_without_native_publish(self) -> None:

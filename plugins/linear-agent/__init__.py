@@ -4,11 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import json
 import logging
 import math
-import os
-import stat
 from pathlib import Path
 
 from .linear_activity import DEFAULT_WAITING_STATE_NAME, LinearActivityClient, board_statuses
@@ -20,6 +17,7 @@ from .linear_chat_closeout import ChatCloseoutRegistry, ChatCloseoutRetryService
 from .linear_guard_health import WorkerGuardHealth
 from .linear_oauth import ConnectItem, LinearOAuth, load_connect_env, validate_private_directory
 from .linear_parent_followup import lookup_parent_issue_id
+from .linear_policy import AGENT_POLICY_PATH, read_agent_policy
 from .linear_project_updates import _publisher_binding, publish_session_updates
 from .linear_quota import IDLE_POLL_SECONDS, LinearQuotaGate
 from .linear_runtime import (
@@ -29,43 +27,7 @@ from .linear_runtime import (
     pin_issue_worktree_cwd,
 )
 
-_POLICY_PATH = Path(__file__).with_name("linear-agents.json")
-_POLICY_LIMIT = 1_048_576
-
-
-def _read_policy(path: Path) -> object:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise RuntimeError("linear-agent immutable managed OAuth policy is unavailable") from exc
-    try:
-        metadata = os.fstat(descriptor)
-        mode = stat.S_IMODE(metadata.st_mode)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError("linear-agent policy must be a regular file")
-        if metadata.st_uid not in {0, os.geteuid()}:
-            raise RuntimeError("linear-agent policy owner is invalid")
-        if mode & 0o022 or (metadata.st_uid == os.geteuid() and mode & 0o200):
-            raise RuntimeError("linear-agent policy is writable by the runtime")
-        if metadata.st_size > _POLICY_LIMIT:
-            raise RuntimeError("linear-agent policy is too large")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(descriptor, min(65_536, _POLICY_LIMIT + 1 - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > _POLICY_LIMIT:
-                raise RuntimeError("linear-agent policy is too large")
-    finally:
-        os.close(descriptor)
-    try:
-        return json.loads(b"".join(chunks).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("linear-agent immutable managed OAuth policy is unavailable") from exc
+_POLICY_PATH = AGENT_POLICY_PATH
 
 
 def _require_gateway_stop_capability(gateway: object) -> None:
@@ -121,7 +83,7 @@ def _require_policy(
     reassign_to_requester: object = False,
     heartbeat_seconds: object = 600,
 ) -> dict[str, object]:
-    manifest = _read_policy(_POLICY_PATH)
+    manifest = read_agent_policy(_POLICY_PATH)
     agents = manifest.get("agents") if isinstance(manifest, dict) else None
     matches = [entry for entry in agents or [] if isinstance(entry, dict) and entry.get("profile") == profile]
     expected_oauth = {

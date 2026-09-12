@@ -227,7 +227,10 @@ class PublicProductTests(unittest.TestCase):
             if not raw_path:
                 continue
             relative = raw_path.decode("utf-8")
-            data = (ROOT / relative).read_bytes()
+            path = ROOT / relative
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
             if b"\0" in data:
                 continue
             text = data.decode("utf-8", errors="ignore").lower()

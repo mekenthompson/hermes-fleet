@@ -2,14 +2,16 @@
 
 The Fleet image bundles a generic, disabled-by-default Linear Agent Session worker. It does not contain routes, profile names, workspace names, OAuth bindings, requester allowlists, or webhook secrets.
 
-A deployment that enables the plugin must provide its worker and publisher policies as read-only data mounts at:
+A deployment that enables the plugin must supply its worker and publisher policies at these default locations:
 
 ```text
-/opt/hermes/plugins/linear-agent/linear-agents.json
-/opt/hermes/plugins/linear-agent/linear-publishers.json
+/opt/hermes-fleet/policy/linear-agents.json
+/opt/hermes-fleet/policy/linear-publishers.json
 ```
 
-Both policy files are deliberately absent from the image. Enabling the plugin without the worker policy fails closed before OAuth or inbox processing. The runtime accepts only a bounded regular file opened with no symlink following. It must be owned by root or the runtime UID, must not be group/world writable, and when runtime-owned must not be owner-writable. A root-owned `0644` bind mount is therefore readable but not writable by the UID 1000 worker.
+Set `HERMES_LINEAR_AGENT_POLICY_PATH` or `HERMES_LINEAR_PUBLISHER_POLICY_PATH` before starting the process to override the corresponding path. Policies may be supplied by a private deployment image or read-only data mounts; they are never included in the public Fleet image. They must contain policy and secret references, not secret values.
+
+Enabling the plugin without the worker policy fails closed before OAuth or inbox processing. The reader accepts at most 1 MiB from a regular file, refuses symlinks, and rejects special files without waiting for a writer. Files must be owned by root or the runtime UID and have no owner, group, or other write bits. Use mode `0444` (or another readable non-writable mode). A root-owned `0644` file is rejected even when supplied by a read-only mount.
 
 The policy entry and profile-local plugin settings must agree exactly on:
 

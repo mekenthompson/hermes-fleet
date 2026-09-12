@@ -266,7 +266,7 @@ class LinearOAuthTokenTests(_Case):
 class ConnectItemTests(_Case):
     def test_extra_vaults_and_any_title_are_accepted(self) -> None:
         self.fake.items[("other-vault", "other-item")] = login_item("other-vault", "other-item")
-        self.fake.items[(VAULT, ITEM)]["title"] = "Whatever Ken renamed it to"
+        self.fake.items[(VAULT, ITEM)]["title"] = "Whatever the operator renamed it to"
         self.assertEqual(self.item().credentials()["client_id"], "client")
 
     def test_login_and_canonical_layouts_resolve_case_insensitively(self) -> None:
