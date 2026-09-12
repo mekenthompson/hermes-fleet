@@ -6,9 +6,11 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "model-providers" / "claude-acp"
@@ -25,6 +27,46 @@ def load_client():
 
 
 class ConnectorHydrationTests(unittest.TestCase):
+    def test_every_sdk_input_and_live_alias_is_denied(self) -> None:
+        client = load_client()
+        fixture = (ROOT / "tests/fixtures/claude-tool-inputs.txt").read_text()
+        self.assertIn(client._REVIEWED_SDK_TOOLS_SHA256, fixture)
+        union = re.search(r"export type ToolInputSchemas\s*=([^;]+);", fixture)
+        assert union is not None
+        declared = set(re.findall(r"\b([A-Za-z]+)Input\b", union.group(1)))
+        self.assertGreater(len(declared), 40)
+        aliases = {"Edit", "Read", "Write", "Task", "Skill", "ToolSearch",
+                   "DesignSync", "ListAgents", "SendMessage", "ShareOnboardingGuide"}
+        with tempfile.TemporaryDirectory() as tmp:
+            options = client.claude_code_session_options(set(), tmp)
+        self.assertEqual(
+            (declared | aliases) - set(options["disallowedTools"]),
+            {"ToolSearch"},
+        )
+
+    def test_create_rejects_unreviewed_runtime_before_any_spawn(self) -> None:
+        client = load_client()
+        with patch.object(client, "assert_reviewed_claude_code_version", side_effect=RuntimeError("runtime drift")) as guard:
+            with patch.object(client.subprocess, "Popen") as spawn:
+                instance = client.ClaudeACPClient()
+                with self.assertRaisesRegex(RuntimeError, "runtime drift"):
+                    instance.chat.completions.create(messages=[{"role": "user", "content": "hello"}])
+                guard.assert_called_once_with()
+                spawn.assert_not_called()
+
+    def test_installed_sdk_union_matches_reviewed_fixture_when_present(self) -> None:
+        client = load_client()
+        if not client._CLAUDE_SDK_TOOLS.exists():
+            self.skipTest("installed SDK checked in the image environment")
+        source = client._CLAUDE_SDK_TOOLS.read_text()
+        fixture = (ROOT / "tests/fixtures/claude-tool-inputs.txt").read_text()
+        pattern = r"export type ToolInputSchemas\s*=([^;]+);"
+        source_union = re.search(pattern, source)
+        fixture_union = re.search(pattern, fixture)
+        assert source_union is not None and fixture_union is not None
+        self.assertEqual(source_union.group(0), fixture_union.group(0))
+        self.assertEqual(hashlib.sha256(client._CLAUDE_SDK_TOOLS.read_bytes()).hexdigest(), client._REVIEWED_SDK_TOOLS_SHA256)
+
     def test_reviewed_claude_code_version_guard_fails_closed(self) -> None:
         client = load_client()
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,6 +153,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             "Agent", "Artifact", "AskUserQuestion", "Bash", "ClaudeDesign",
             "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit",
             "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree",
+            "FileEdit", "FileRead", "FileWrite",
             "Glob", "Grep", "ListAgents", "ListMcpResources", "Mcp", "Monitor",
             "NotebookEdit", "Projects", "ProposeGoal", "ProposeSkills",
             "PushNotification", "Read", "ReadMcpResource", "ReadMcpResourceDir",
