@@ -55,12 +55,14 @@ Signal: off-plan model-call rate. Shape: share of turns that billed a path the p
 
 ## The customer model
 
-Last revised: 2026-09-12 – successor interview. Confidence: **2** (directional). Dogfood principal+operator evidence is strong; public-adopter evidence is [GUESS].
+Last revised: 2026-09-12 – successor interview. Confidence: **2** (directional). Dogfood principal+operator evidence is single-source. Public-adopter evidence is [GUESS].
 
 **Who hires the job.** Two people, often the same human on different days.
 
-- Principal: already paying for a model plan, wants a standing team they can text, that remembers them, that asks before consequences.
-- Operator: stands the team up, isolates them, upgrades them, and needs a change to stay local.
+- Principal: When they already pay for a model plan, they want a standing team they can text, so they can get work done without sitting through every turn, on the plan they already pay for.
+- Operator: When they run more than one agent on one host, they want each change to stay local, so they can upgrade or recover one without taking the rest down.
+
+The principal already pays the model plan. Fleet is not a second invoice. The operator is judged on agents staying up and not leaking.
 
 **Forces**
 
@@ -79,18 +81,18 @@ Last revised: 2026-09-12 – successor interview. Confidence: **2** (directional
 
 **What must be true to win**
 
-- Principals will text specialists rather than one generalist. If they will not, standing-team is the wrong outcome.
-- Operators will run one isolated agent rather than one Hermes with many profiles. If they will not, on-a-leash is the wrong outcome.
-- The public product can carry generic capability without household identity.
-- Live state can be read independently of the author.
-- Telegram, Slack, and Desktop can meet one bar. If Desktop cannot, it is not first-class.
+- Principals will text specialists rather than one generalist. Evidence: successor interview. [GUESS] for public adopters. Wrong if they keep one generalist chat.
+- Operators will run one isolated agent rather than one Hermes with many profiles. Evidence: public isolation default plus interview. Wrong if they keep a shared runtime.
+- The public product can carry generic capability without household identity. Evidence: current public/overlay split. Wrong if every useful integration is deployment-specific.
+- Live state can be read independently of the author. Evidence: first Job Spec bet; unproven. Wrong if stock tools already suffice and nobody will score intended-change.
+- Telegram, Slack, and Desktop can meet one bar. Evidence: interview. Wrong if Desktop cannot, in which case it is not first-class.
 
 **Known unknowns**
 
-- Public-adopter demand and buying committee.
-- Whether stock runtime tools already satisfy "understand what is running."
-- What private drift proof already covers (HF-107, HF-163 not reviewer-readable from the public tree).
-- How TUTR will be scored on Desktop versus Telegram and Slack. Close: first UAT for there-when-you-reach, not a number invented here.
+- Public-adopter demand and buying committee. Close: later adopter conversations, not this interview.
+- Whether stock runtime tools already satisfy "understand what is running." Close: the first Job Spec's abandon signal.
+- What private drift proof already covers. Close: overlay inventory before any new proof surface. Public tree cannot read those issues.
+- How TUTR will be scored on Desktop versus Telegram and Slack. Close: first UAT for there-when-you-reach, after that job is specified. No number invented here.
 
 ## How it functions, at a high level
 

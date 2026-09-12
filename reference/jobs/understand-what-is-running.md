@@ -2,6 +2,7 @@
 title: Understand what is running
 job: understand-what-is-running
 serves: on-a-leash
+outcome: After an intended one-agent change, a person who did not make the change can state live state, whether the target has the change, and that neighbours did not move.
 stakes: full
 invariants:
   - built-published-deployed-are-different
@@ -9,7 +10,6 @@ invariants:
   - public-image-has-no-deployment-identity
   - no-shared-credentials
   - no-off-plan-model-call
-last_reviewed: 2026-09-12
 ---
 
 # Job Spec: understand what is running and whether the intended change actually took effect
@@ -38,11 +38,9 @@ This job assumes: operators cannot trust intended-change hold rate without an in
 
 ## Evidence & confidence
 
-- Operator interview 2026-09-12: first job chosen because live intended-change cannot be scored without it. Successor interview kept the job and moved it under on-a-leash.
-- Public product already treats publication and rollout as different claims. That supports the distinction. It does not independently prove operators conflate the two.
-- Private overlay work on drift exists. It was not reviewer-readable from the public tree, so it is not counted as verified evidence.
+Single-source operator interview plus public docs that already separate publication from rollout. Overlay drift work exists and was not independently verified from the public tree.
 
-Confidence: 2 (directional) for the struggling moment. 2 for the shape of a public, topology-free proof. Not 3: one interview plus public docs, no independently readable observation of the claimed operator behaviour.
+Confidence: 2 (directional). Not 3.
 
 ## Measures of success
 
@@ -78,27 +76,25 @@ Where the number lives: rolls into on-a-leash's intended-change hold rate (produ
 - Show the live state of a named agent and whether the intended change is present.
 - Show that in-scope neighbours were not disturbed.
 - Be repeatable by a fresh-process reviewer with no access to the author's narrative.
-- Fail closed when live state cannot be read, rather than inferring it from source or CI.
+- Fail closed when live state cannot be read, rather than inferring it from source or a non-live artefact.
 
 ### Won't
 
 - Add a control-plane UI, ledger, or confidence score.
 - Put household topology, profile identities, or secret names into the public product.
 - Change publication policy merely so two documents agree.
-- Treat unit tests as outcome UAT.
-- Build a new public harness before checking what the private deployment already exercises.
+- Treat non-live checks as proof that the intended change took effect.
+- Invent a new proof surface before checking what already exists.
 
 ## Prove it
 
-Outcome-level acceptance, named by job × surface. Independent of unit tests.
+**This Job Spec is not complete and is not ratified.** No runnable job × surface scenarios exist. Do not invent them here. Do not treat the job as done until those scenarios exist, name Watch and Invariant, cover the silent failure, and can be run by a fresh-process reviewer.
 
-**This Job Spec is not complete.** No runnable public scenarios exist. Do not invent them here. Do not treat the job as done until those scenarios exist and a fresh-process reviewer can run them.
-
-Coverage still required, each with a named invariant:
+Until then, the coverage still required is outcome-level only:
 
 - After a one-agent change, the target read shows the intended live state and neighbours do not. Invariant: `one-agent-change-is-local`.
-- A published artefact, a skipped docs-only publish, and a running agent are three different answers. Invariant: `built-published-deployed-are-different`.
-- A tool that survives as files but fails when invoked is a failed read. Invariant: persistence includes working tools.
+- A published artefact and a running agent are different answers. Invariant: `built-published-deployed-are-different`.
+- A tool that survives as files but fails when invoked is a failed read. Principle 5 (working tools), not an invariant.
 - A second process, not the author, can complete the read from the artefact alone.
 
 ## Verdict

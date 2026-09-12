@@ -36,7 +36,7 @@ The same job that lived on a Claude-native specialist runtime now runs on isolat
 
 Outcome and Signal pairs. No numeric targets. Signals are defined in the product spec; repeated here so the vision can be read alone.
 
-- **standing-team.** Named specialists, each with its own identity, memory, tools, and credentials. Signal: independently addressable specialists that still remember and authenticate as themselves.
+- **standing-team.** Named specialists, each with its own identity, memory, tools, and credentials. Signal: share of in-scope specialists that a principal can address as themselves, with unshared memory and credentials.
 - **on-a-leash.** One agent cannot see another's secrets; a change to A leaves B alone; failed upgrades recover without touching the others. Signal: intended-change hold rate.
 - **there-when-you-reach.** Telegram, Slack, and Desktop all work; a move or restart does not drop identity, tools, or sessions. Signal: first-class surface hold rate.
 - **subscription-honest.** Claude stays on the granted plan login, not a silent API meter. Signal: off-plan model-call rate.

@@ -16,8 +16,8 @@ The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pi
 - GitHub CLI 2.98.0 from the official release tarball
 - 1Password CLI 2.39.0 from its digest-pinned official image (no vault config)
 - The Agent `honcho` extra, with no workspace identifiers
-- Codex, Grok, and OpenCode from the committed lockfile
-- Optional plugins, **disabled by default**: Perplexity search, Linear Agent (policy mounted at deploy time), Claude ACP
+- Codex, Grok, OpenCode, and Claude Code from the committed lockfile
+- Optional plugins, **disabled by default**: Perplexity search, Linear Agent (policy mounted at deploy time), Claude ACP, Kokoro voice
 
 Consume it only as:
 
