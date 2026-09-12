@@ -17,7 +17,7 @@ Opinionated isolated Hermes. One agent per container and gateway. No shared cred
 
 **Metric:** trusted unsupervised turns (TUTR)
 
-**Definition:** of all turns the principal did not sit through, the share that were Trusted. A turn is Trusted when it was Unsupervised, completed without a human rescue, stayed inside the granted tools, and made no off-plan model call. Telegram, Slack, and Desktop use the same definition.
+**Definition:** of unsupervised principal turns on Telegram, Slack, and Desktop in a scoring window chosen when the metric is instrumented, the share that were Trusted. A turn is Trusted when it was Unsupervised, completed without a human rescue, stayed inside the granted tools, and made no off-plan model call. The window is not a number invented here.
 
 **Now → Target:** unmeasured → to validate once dogfood runs the public Fleet image and principals text the team on those three surfaces. No numeric target was ratified.
 
@@ -51,7 +51,7 @@ Signal: first-class surface hold rate. Shape: after an isolation, restart, or in
 
 Claude stays on the granted plan login (ACP/OAuth), not a silent API meter. Other billed subscriptions follow the same rule: the principal's granted plan is the ceiling unless they opt a specific account into overage.
 
-Signal: off-plan model-call rate. Shape: share of turns that billed a path the principal did not grant. Now: unmeasured. Target: zero, to validate. Guardrail: do not "make it work" by dropping to an API key.
+Signal: off-plan model-call rate. Shape: share of turns that billed a path the principal did not grant. Now: unmeasured. Target: to validate. Guardrail: do not "make it work" by dropping to an API key.
 
 ## The customer model
 
@@ -98,34 +98,13 @@ Each specialist stays independently bounded. The principal reaches them on Teleg
 
 ## The job index
 
+Only jobs with a Job Spec are indexed.
+
 ### on-a-leash
 
 - [understand-what-is-running.md](jobs/understand-what-is-running.md) – share of intended changes where a fresh-process reader can state the target's live state and whether it matches intent. Job metric: unmeasured. Rolls into on-a-leash's Signal. **Specified.** Retargeted from `change-recoverable` by [rfcs/successor-vision.md](rfcs/successor-vision.md).
 
-Queued, not yet specified:
-
-- change-one-agent-without-disturbing-another
-- upgrade-and-recover
-
-### standing-team
-
-Queued, not yet specified:
-
-- run-a-fleet-of-specialists
-- feel-like-a-colleague
-
-### there-when-you-reach
-
-Queued, not yet specified:
-
-- talk-to-agents-from-anywhere (Telegram, Slack, Desktop)
-- bring-existing-agent-under-management
-
-### subscription-honest
-
-Queued, not yet specified:
-
-- keep-subscription-honest
+Further jobs are not indexed until they have Job Specs. The successor interview named work that is still unwritten; it lives in the decision record, not here.
 
 ## Evidence & confidence
 

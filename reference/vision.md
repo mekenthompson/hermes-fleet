@@ -9,7 +9,10 @@ Opinionated isolated Hermes. One agent per container and gateway. No shared cred
 
 The public product is that isolation layer. A standing team of specialists you text is an **outcome**, not the tagline. A private deployment may dogfood it. The household is not the product.
 
-Principal and operator both hire it. The principal lives with the team. The operator stands it up, then mostly lives as a principal too.
+## Personas
+
+- **Principal.** Lives with the team. Texts specialists, expects the same one back, on the plan they already pay for, asking before consequences. Success: Trusted turns they did not sit through.
+- **Operator.** Stands the team up, isolates them, changes one without touching the others. Often the same human on a different day. Success: after an intended change, every in-scope agent still independently working and the target has the change.
 
 ## North Star
 
@@ -31,11 +34,12 @@ The same job that lived on a Claude-native specialist runtime now runs on isolat
 
 ## What winning looks like
 
-- A standing team: named specialists, each with its own identity, memory, tools, and credentials.
-- On a leash: one agent cannot see another's secrets; a change to A leaves B alone; failed upgrades recover without touching the others; no self-escalation.
-- There when you reach for it: Telegram, Slack, and Desktop all work; a move or restart does not drop identity, tools, or sessions.
-- Subscription-honest: Claude stays on the granted plan login, not a silent API meter.
-- After a change, a fresh-process reviewer can tell what is running. Built, published, and deployed are not treated as the same claim.
+Outcome and Signal pairs. No numeric targets. Signals are defined in the product spec; repeated here so the vision can be read alone.
+
+- **standing-team.** Named specialists, each with its own identity, memory, tools, and credentials. Signal: independently addressable specialists that still remember and authenticate as themselves.
+- **on-a-leash.** One agent cannot see another's secrets; a change to A leaves B alone; failed upgrades recover without touching the others. Signal: intended-change hold rate.
+- **there-when-you-reach.** Telegram, Slack, and Desktop all work; a move or restart does not drop identity, tools, or sessions. Signal: first-class surface hold rate.
+- **subscription-honest.** Claude stays on the granted plan login, not a silent API meter. Signal: off-plan model-call rate.
 
 ## What losing looks like
 
@@ -46,3 +50,11 @@ The same job that lived on a Claude-native specialist runtime now runs on isolat
 - Recreating a profile or borrowing another agent's credentials to get past a blocker.
 - Off-plan model calls billed as if they were the subscription.
 - Docs, CI, and live state telling three different stories, with the author grading their own work.
+
+## Not this product
+
+- Household identity, live topology, bot tokens, or vault IDs in the public tree.
+- Buzz as a Hermes surface.
+- Another Hermes. Fleet isolates and operates it.
+- A control-plane UI, ledger, or scoreboard.
+- Telegram-only, or Slack replacing Telegram.
