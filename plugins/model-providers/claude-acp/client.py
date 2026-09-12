@@ -1,0 +1,1081 @@
+"""OpenAI-compatible Claude ACP client with a non-executing MCP tool bridge.
+
+Hermes policy travels as ACP system metadata. Claude sees Hermes tools as actual MCP
+tools, but the MCP server does not execute them. The parent launches the trusted MCP
+server directly and consumes its private capture stream before Hermes receives a call.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import contextvars
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections.abc import Mapping
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+ACP_MARKER_BASE_URL = "acp://claude"
+_DEFAULT_TIMEOUT_SECONDS = 900.0
+_CANCEL_DRAIN_SECONDS = 2.0
+_MAX_FRAME_CHARS = 1024 * 1024
+_MAX_SCHEMA_BYTES = 1024 * 1024
+_MAX_TOOLS = 128
+_MAX_UPDATES = 4096
+_MAX_RESPONSE_CHARS = 8 * 1024 * 1024
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CONTEXT_HINT_SUFFIX_RE = re.compile(r"-(\d+m)$", re.I)
+_ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
+_BRIDGE_PREFIX = "mcp__hermes_bridge__"
+_CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
+
+
+class BridgeCaptureError(RuntimeError):
+    """Raised when the trusted MCP bridge capture channel fails."""
+
+
+_BRIDGE_POLICY = (
+    "Hermes owns all local side effects. Claude-native filesystem, shell, browser, "
+    "delegation, and write tools are unavailable. Hermes-controlled tools are actual "
+    "tools supplied by the MCP server named hermes_bridge. Use those tools when needed; "
+    "the host application will validate, approve, execute, and audit each request. Do "
+    "not emit XML or fabricated OpenAI tool-call markup. Authenticated account connectors "
+    "retain their profile policy."
+)
+_REJECT_KINDS = {"reject_once", "reject_always", "deny", "denied", "reject", "rejected"}
+
+
+def _content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("content") or "")
+    if isinstance(value, list):
+        parts = [_content(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    return str(value or "")
+
+
+def _tool_call_dict(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        call_id = value.get("id")
+        call_type = value.get("type") or "function"
+        function = value.get("function")
+    else:
+        call_id = getattr(value, "id", None)
+        call_type = getattr(value, "type", "function")
+        function = getattr(value, "function", None)
+    if isinstance(function, dict):
+        name = function.get("name")
+        arguments = function.get("arguments")
+    else:
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, (str, dict)):
+        arguments = str(arguments or "")
+    return {
+        "id": call_id,
+        "type": str(call_type or "function"),
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
+def split_messages(
+    messages: list[dict[str, Any]],
+    *,
+    tool_choice: Any = None,
+) -> tuple[str, str]:
+    """Return trusted policy and a lossless-enough untrusted conversation transcript."""
+    del tool_choice  # Enforcement happens structurally in select_bridge_tools and _create.
+    policy: list[str] = []
+    transcript: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        text = _content(message.get("content")).strip()
+        if role in {"system", "developer"}:
+            if text:
+                policy.append(text)
+            continue
+
+        historical: dict[str, Any] = {}
+        if text:
+            historical["content"] = text
+        if role == "assistant":
+            calls = [
+                normalized
+                for item in message.get("tool_calls") or []
+                if (normalized := _tool_call_dict(item)) is not None
+            ]
+            if calls:
+                historical["tool_calls"] = calls
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            name = message.get("name")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                historical["tool_call_id"] = tool_call_id
+            if isinstance(name, str) and name:
+                historical["name"] = name
+        if not historical:
+            continue
+        if set(historical) == {"content"}:
+            rendered = historical["content"]
+        else:
+            rendered = json.dumps(historical, ensure_ascii=True, separators=(",", ":"))
+        transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
+
+    return "\n\n".join([*policy, _BRIDGE_POLICY]), "\n\n".join(transcript)
+
+
+def build_subprocess_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a small runtime allowlist without inherited provider or fleet secrets."""
+    source = os.environ if source is None else source
+    allowed = (
+        "HOME", "PATH", "LANG", "LC_ALL", "TERM", "TMPDIR", "USER", "LOGNAME", "SHELL",
+        "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "CLAUDE_CONFIG_DIR",
+    )
+    environment = {key: source[key] for key in allowed if source.get(key)}
+    # ACP otherwise resolves its bundled Agent SDK Claude binary. This image's
+    # reviewed standalone CLI must be selected explicitly and cannot be
+    # replaced by caller-controlled environment input.
+    environment["CLAUDE_CODE_EXECUTABLE"] = _CLAUDE_CODE_EXECUTABLE
+    return environment
+
+
+def canonicalize_model_id(value: str) -> str:
+    """Normalize trailing -1m / [1m] spellings the way claude-agent-acp 0.76.0 does."""
+    return _CONTEXT_HINT_SUFFIX_RE.sub(
+        lambda match: f"[{match.group(1).lower()}]",
+        str(value or "").strip().lower(),
+    )
+
+
+def select_offered_model(offered: set[str], requested: str) -> str | None:
+    """Return the adapter-offered spelling for requested, or None if unmatched."""
+    requested = str(requested or "").strip()
+    if not requested:
+        return None
+    offered_values = sorted({str(item) for item in offered})
+    if requested in offered_values:
+        return requested
+    canonical = canonicalize_model_id(requested)
+    for value in offered_values:
+        if canonicalize_model_id(value) == canonical:
+            return value
+    return None
+
+
+def permission_response(params: dict[str, Any]) -> dict[str, Any]:
+    """Choose an adapter-offered reject option; otherwise fail closed."""
+    for option in params.get("options") or []:
+        if not isinstance(option, dict):
+            continue
+        option_id = str(option.get("optionId") or option.get("id") or "").strip()
+        tokens = {
+            str(option.get(key) or "").strip().lower()
+            for key in ("name", "label", "kind", "optionId", "id")
+        }
+        if option_id and tokens & _REJECT_KINDS:
+            return {"outcome": {"outcome": "selected", "optionId": option_id}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
+def _timeout(value: Any) -> float:
+    """Scalar budgets bound the whole call; HTTP objects use their inference/read budget.
+
+    Connect and pool budgets are not model-generation limits. When read is
+    unspecified, an explicit total or write budget wins before the ACP default.
+    """
+    if isinstance(value, (int, float)):
+        return max(0.01, float(value))
+    for field in ("read", "timeout", "write"):
+        seconds = getattr(value, field, None)
+        if isinstance(seconds, (int, float)):
+            return max(0.01, float(seconds))
+    return _DEFAULT_TIMEOUT_SECONDS
+
+
+def _mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate OpenAI tool definitions before exposing them to the capture MCP."""
+    if len(tools) > _MAX_TOOLS:
+        raise ValueError(f"tool schema list exceeds {_MAX_TOOLS} entries")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in tools:
+        function = entry.get("function") if isinstance(entry, dict) else None
+        if not isinstance(function, dict):
+            raise TypeError("tool schema entry must contain a function mapping")
+        name = function.get("name")
+        parameters = function.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(name, str) or not _TOOL_NAME_RE.fullmatch(name):
+            raise ValueError("tool name must contain 1-64 safe characters")
+        if name in seen:
+            raise ValueError(f"duplicate tool name: {name}")
+        if not isinstance(parameters, dict):
+            raise TypeError(f"tool schema for {name} must be a mapping")
+        seen.add(name)
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": str(function.get("description") or "Hermes tool")[:4096],
+                "parameters": parameters,
+            },
+        })
+    encoded = json.dumps(result, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _MAX_SCHEMA_BYTES:
+        raise ValueError("tool schema payload is too large")
+    return result
+
+
+def select_bridge_tools(
+    tools: list[dict[str, Any]], tool_choice: Any
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return structurally exposed tools and the required name (`*` means any)."""
+    validated = _mcp_tools(tools)
+    if tool_choice in (None, "auto"):
+        return validated, None
+    if tool_choice == "none":
+        return [], None
+    if tool_choice == "required":
+        if not validated:
+            raise ValueError("tool_choice required but no tools were advertised")
+        return validated, "*"
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not _TOOL_NAME_RE.fullmatch(name):
+            raise ValueError("named tool_choice is invalid")
+        selected = [entry for entry in validated if entry["function"]["name"] == name]
+        if not selected:
+            raise ValueError(f"named tool_choice '{name}' was not advertised")
+        return selected, name
+    raise ValueError(f"unsupported tool_choice: {tool_choice!r}")
+
+
+def openai_tool_call(tool_call_id: str, name: str, arguments: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=tool_call_id,
+        type="function",
+        function=SimpleNamespace(
+            name=name,
+            arguments=json.dumps(arguments, ensure_ascii=True, separators=(",", ":")),
+        ),
+    )
+
+
+class StreamChunks:
+    """Iterator/context-manager shape accepted by Hermes streaming wrappers."""
+
+    def __init__(self, chunks: list[Any]):
+        self._chunks = chunks
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
+
+
+def completion_to_stream_chunks(completion: Any) -> StreamChunks:
+    """Return an OpenAI-shaped pseudo-stream, including indexed tool-call deltas."""
+    choice = completion.choices[0]
+    message = choice.message
+    tool_call_deltas = None
+    if message.tool_calls:
+        tool_call_deltas = [
+            SimpleNamespace(
+                index=index,
+                id=call.id,
+                type="function",
+                function=SimpleNamespace(
+                    name=call.function.name,
+                    arguments=call.function.arguments,
+                ),
+            )
+            for index, call in enumerate(message.tool_calls)
+        ]
+    delta = SimpleNamespace(
+        role="assistant",
+        content=message.content or None,
+        tool_calls=tool_call_deltas,
+        reasoning=getattr(message, "reasoning", None),
+        reasoning_content=getattr(message, "reasoning_content", None),
+    )
+    model = getattr(completion, "model", "claude-acp")
+    data = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, delta=delta, finish_reason=choice.finish_reason)],
+        model=model,
+        usage=None,
+    )
+    usage = SimpleNamespace(choices=[], model=model, usage=completion.usage)
+    return StreamChunks([data, usage])
+
+
+class LiveStream:
+    """Bounded producer stream; closing an abandoned stream cancels its owned call."""
+
+    def __init__(self, complete, cancel, model, deadline):
+        self._queue = queue.Queue(maxsize=64)
+        self._stopped = threading.Event()
+        self._cancel = cancel
+        self._finished = threading.Event()
+        self._error = None
+
+        def put(value):
+            while not self._stopped.is_set():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("ACP stream consumer exceeded request deadline")
+                try:
+                    self._queue.put(value, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+            raise RuntimeError("ACP stream closed")
+
+        emitted = [0, 0]
+
+        def publish(text, reasoning):
+            emitted[int(reasoning)] += len(text)
+            delta = SimpleNamespace(role="assistant", content=None if reasoning else text,
+                reasoning=text if reasoning else None, reasoning_content=text if reasoning else None,
+                tool_calls=None)
+            put(SimpleNamespace(choices=[SimpleNamespace(index=0, delta=delta, finish_reason=None)],
+                model=model, usage=None))
+
+        def run():
+            try:
+                completion = complete(publish)
+                message = completion.choices[0].message
+                message.content = (message.content or "")[emitted[0]:] or None
+                message.reasoning = (message.reasoning or "")[emitted[1]:] or None
+                message.reasoning_content = message.reasoning
+                for chunk in completion_to_stream_chunks(completion):
+                    put(chunk)
+            except BaseException as exc:
+                if not self._stopped.is_set():
+                    self._error = exc
+            finally:
+                self._finished.set()
+
+        context = contextvars.copy_context()
+        self._worker = threading.Thread(target=context.run, args=(run,), daemon=True)
+        self._worker.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while not self._stopped.is_set():
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                if self._finished.is_set():
+                    # A final put can race the timed get returning Empty. Once
+                    # finished is set the producer cannot append again.
+                    if not self._queue.empty():
+                        continue
+                    if self._error is not None:
+                        error, self._error = self._error, None
+                        raise error
+                    raise StopIteration
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        raise StopIteration
+
+    def close(self):
+        self._stopped.set()
+        if not self._finished.is_set():
+            self._cancel()
+        self._worker.join(timeout=3)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False
+
+
+def _usage_value(usage: Mapping[str, Any], *names: str) -> int:
+    for name in names:
+        value = usage.get(name)
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    return 0
+
+
+def _completion_usage(prompt_result: Mapping[str, Any]) -> SimpleNamespace | None:
+    usage: Any = prompt_result.get("usage")
+    if not isinstance(usage, dict):
+        meta = prompt_result.get("_meta")
+        usage = meta.get("usage") if isinstance(meta, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    known = {
+        "inputTokens", "input_tokens", "promptTokens", "prompt_tokens",
+        "outputTokens", "output_tokens", "completionTokens", "completion_tokens",
+        "totalTokens", "total_tokens", "cachedTokens", "cached_tokens",
+        "cacheReadInputTokens",
+    }
+    if not known.intersection(usage):
+        return None
+    prompt_tokens = _usage_value(usage, "inputTokens", "input_tokens", "promptTokens", "prompt_tokens")
+    completion_tokens = _usage_value(usage, "outputTokens", "output_tokens", "completionTokens", "completion_tokens")
+    total_tokens = _usage_value(usage, "totalTokens", "total_tokens") or prompt_tokens + completion_tokens
+    cached_tokens = _usage_value(usage, "cachedTokens", "cached_tokens", "cacheReadInputTokens")
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+    )
+
+
+def _finish_reason(prompt_result: Mapping[str, Any], has_tool_calls: bool) -> str:
+    if has_tool_calls:
+        return "tool_calls"
+    reason = str(prompt_result.get("stopReason") or prompt_result.get("stop_reason") or "end_turn").lower()
+    if reason in {"max_tokens", "max_output_tokens", "length"}:
+        return "length"
+    if reason in {"refusal", "content_filter", "safety"}:
+        return "content_filter"
+    return "stop"
+
+
+class ClaudeACPClient:
+    HERMES_SKIP_TRANSPORT_WRAP = True
+    HERMES_SKIP_ASYNC_WRAP = True
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        default_headers: dict[str, str] | None = None,
+        acp_command: str | None = None,
+        acp_args: list[str] | tuple[str, ...] | None = None,
+        acp_cwd: str | None = None,
+        command: str | None = None,
+        args: list[str] | tuple[str, ...] | None = None,
+        **_: Any,
+    ):
+        self.api_key = api_key or "claude-acp"
+        self.base_url = base_url or ACP_MARKER_BASE_URL
+        self.default_headers = dict(default_headers or {})
+        self._command = acp_command or command or "claude-agent-acp"
+        self._acp_args = list(acp_args if acp_args is not None else args if args is not None else ())
+        self._args = self._acp_args
+        self._cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self._process: subprocess.Popen[str] | None = None
+        self._active_session_id = ""
+        self._lock = threading.RLock()
+        self._io_lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self.is_closed = False
+        self._cancelled = threading.Event()
+        self._deadline = float("inf")
+
+    def _send(self, proc: subprocess.Popen[str], message: dict[str, Any]) -> None:
+        cancelled = self._cancelled
+        # A blocked TextIOWrapper write must never hold the cancellation path.
+        # Killing the owned process group releases the writer on every error path.
+        deadline = time.monotonic() + 0.1 if message.get("method") == "session/cancel" else self._deadline
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def write() -> None:
+            try:
+                with self._io_lock:
+                    if proc.stdin is None:
+                        raise RuntimeError("Claude ACP stdin is unavailable")
+                    proc.stdin.write(json.dumps(message, ensure_ascii=True, separators=(",", ":")) + "\n")
+                    proc.stdin.flush()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if cancelled.is_set() and proc.stdin:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+                done.set()
+
+        if cancelled.is_set() or time.monotonic() >= deadline:
+            raise TimeoutError("Claude ACP request cancelled or deadline exceeded")
+        threading.Thread(target=write, daemon=True).start()
+        while not done.wait(min(0.01, max(0, deadline - time.monotonic()))):
+            if cancelled.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError("Claude ACP write cancelled or deadline exceeded")
+        if errors:
+            raise errors[0]
+
+    def _notify_cancel(self, proc: subprocess.Popen[str], session_id: str) -> None:
+        self._send(proc, {
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id},
+        })
+
+    def hermes_abort_request(self) -> None:
+        """Thread-safe process cancellation for the core request lifecycle."""
+        self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self._cancelled.set()
+            proc, self._process = self._process, None
+            session_id, self._active_session_id = self._active_session_id, ""
+            self.is_closed = True
+        if proc is None:
+            return
+        leader_running = proc.poll() is None
+        # The ACP process starts a new session and may leave descendants behind
+        # after its leader exits. Signal the process group regardless of the
+        # leader's state, then escalate so cleanup remains bounded.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        if leader_running:
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=2)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        if proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=1)
+        # Reader threads close their own wrappers. Never acquire a live reader's
+        # TextIO lock here: even an inherited pipe must not block cancellation.
+        if self._io_lock.acquire(blocking=False):
+            try:
+                if proc.stdin:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+            finally:
+                self._io_lock.release()
+
+    def _spawn(self) -> subprocess.Popen[str]:
+        if self._cancelled.is_set():
+            raise RuntimeError("Claude ACP request cancelled")
+        proc = subprocess.Popen(
+            [self._command, *self._acp_args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self._cwd,
+            env=build_subprocess_env(),
+            start_new_session=True,
+        )
+        if proc.stdin is None or proc.stdout is None:
+            proc.kill()
+            raise RuntimeError("Claude ACP process did not expose stdin/stdout pipes")
+        with self._lock:
+            self._process = proc
+            cancelled = self._cancelled.is_set()
+            self.is_closed = False
+        if cancelled:
+            self.close()
+            raise RuntimeError("Claude ACP request cancelled")
+        return proc
+
+    def _create(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        timeout: Any = None,
+        stream: bool = False,
+        **_: Any,
+    ) -> Any:
+        bridge_tools, requirement = select_bridge_tools(tools or [], tool_choice)
+        deadline = time.monotonic() + _timeout(timeout)
+        if not self._request_lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise TimeoutError("Claude ACP request deadline exceeded waiting for active request")
+        with self._lock:
+            self._cancelled = cancelled = threading.Event()
+            self._deadline = deadline
+
+        def cancel():
+            with self._lock:
+                if self._cancelled is cancelled:
+                    self.close()
+
+        def complete(publish=None):
+            try:
+                return self._complete(model, messages, bridge_tools, requirement, publish)
+            finally:
+                self._request_lock.release()
+
+        if stream:
+            return LiveStream(complete, cancel, model or "claude-acp", self._deadline)
+        return complete()
+
+    def _complete(self, model, messages, bridge_tools, requirement, publish):
+        text, reasoning, tool_calls, prompt_result = self._run(
+            messages or [], bridge_tools, requirement, model,
+            max(0, self._deadline - time.monotonic()), publish,
+        )
+        if requirement and not tool_calls:
+            label = "a tool" if requirement == "*" else f"tool '{requirement}'"
+            raise RuntimeError(f"tool_choice required {label}, but Claude ACP returned no Hermes tool call")
+        if requirement not in (None, "*") and any(
+            call.function.name != requirement for call in tool_calls
+        ):
+            raise RuntimeError(f"Claude ACP returned a tool other than required tool '{requirement}'")
+        message = SimpleNamespace(
+            content=text if publish else text.strip(),
+            tool_calls=tool_calls or None,
+            reasoning=(reasoning if publish else reasoning.strip()) or None,
+            reasoning_content=(reasoning if publish else reasoning.strip()) or None,
+            reasoning_details=None,
+        )
+        completion = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=message,
+                finish_reason=_finish_reason(prompt_result, bool(tool_calls)),
+            )],
+            model=model or "claude-acp",
+            usage=_completion_usage(prompt_result),
+            acp_stop_reason=prompt_result.get("stopReason") or prompt_result.get("stop_reason"),
+        )
+        return completion
+
+    def _run(
+        self,
+        messages: list[dict[str, Any]],
+        bridge_tools: list[dict[str, Any]],
+        requirement: str | None,
+        model: str | None,
+        timeout: float,
+        publish=None,
+    ) -> tuple[str, str, list[SimpleNamespace], dict[str, Any]]:
+        del requirement, timeout  # The completion owns the shared absolute deadline.
+        schema_path = ""
+        bridge_dir = ""
+        bridge_socket = ""
+        proc: subprocess.Popen[str] | None = None
+        bridge_proc: subprocess.Popen[str] | None = None
+        if bridge_tools:
+            try:
+                encoded = json.dumps(bridge_tools, ensure_ascii=True, separators=(",", ":"))
+                if len(encoded.encode("utf-8")) > _MAX_SCHEMA_BYTES:
+                    raise ValueError("tool schema payload is too large")
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", prefix="hermes-claude-tools-", suffix=".json", delete=False
+                ) as schema_file:
+                    schema_file.write(encoded)
+                    schema_path = schema_file.name
+                os.chmod(schema_path, 0o600)
+                bridge_dir = tempfile.mkdtemp(prefix="hermes-claude-bridge-")
+                os.chmod(bridge_dir, 0o700)
+                bridge_socket = str(Path(bridge_dir) / "mcp.sock")
+            except Exception:
+                if schema_path:
+                    with contextlib.suppress(OSError):
+                        os.unlink(schema_path)
+                if bridge_dir:
+                    with contextlib.suppress(OSError):
+                        os.rmdir(bridge_dir)
+                raise
+
+        stopped = threading.Event()
+        pumps = []
+
+        def enqueue(sink, value):
+            while not stopped.is_set() and not self._cancelled.is_set():
+                try:
+                    sink.put(value, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def start_pump(target, pipe):
+            def run():
+                try:
+                    target()
+                finally:
+                    if pipe:
+                        pipe.close()
+            thread = threading.Thread(target=run, daemon=True, name="claude-acp-pump")
+            pumps.append(thread)
+            thread.start()
+
+        inbox: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=256)
+        session_id = ""
+        prompt_active = False
+        cancel_sent = False
+        output: list[str] = []
+        reasoning: list[str] = []
+        captured_calls: list[SimpleNamespace] = []
+        pending_bridge_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        completed_call_ids: set[str] = set()
+        bridge_captures: queue.Queue[dict[str, Any] | str] = queue.Queue(maxsize=_MAX_TOOLS + 1)
+        updates_seen = 0
+        response_chars = 0
+        request_ids = iter(range(1, 1 << 30))
+        advertised_names = {entry["function"]["name"] for entry in bridge_tools}
+
+        def bridge_capture_matches(name: str, arguments: dict[str, Any]) -> bool:
+            try:
+                record = bridge_captures.get(timeout=max(0, min(1, self._deadline - time.monotonic())))
+            except queue.Empty:
+                return False
+            if isinstance(record, str):
+                raise BridgeCaptureError(record)
+            return record.get("name") == name and record.get("arguments") == arguments
+
+        try:
+            if bridge_tools:
+                bridge_proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).with_name("tool_bridge_mcp.py")),
+                        "--server",
+                        schema_path,
+                        bridge_socket,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=build_subprocess_env(),
+                    start_new_session=True,
+                )
+
+                def bridge_capture_pump() -> None:
+                    assert bridge_proc is not None
+                    if bridge_proc.stdout is None:
+                        return
+                    while True:
+                        line = bridge_proc.stdout.readline(_MAX_FRAME_CHARS + 1)
+                        if not line:
+                            return
+                        if len(line) > _MAX_FRAME_CHARS:
+                            enqueue(bridge_captures, "Hermes bridge capture frame is too large")
+                            return
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            enqueue(bridge_captures, "Hermes bridge emitted malformed capture JSON")
+                            return
+                        if not isinstance(record, dict):
+                            enqueue(bridge_captures, "Hermes bridge emitted a non-object capture")
+                            return
+                        if not enqueue(bridge_captures, record):
+                            return
+
+                start_pump(bridge_capture_pump, bridge_proc.stdout)
+                def bridge_stderr_pump() -> None:
+                    assert bridge_proc is not None
+                    if bridge_proc.stderr is not None:
+                        bridge_proc.stderr.read(_MAX_FRAME_CHARS)
+
+                start_pump(bridge_stderr_pump, bridge_proc.stderr)
+                bridge_deadline = min(self._deadline, time.monotonic() + 2)
+                while not Path(bridge_socket).exists():
+                    if bridge_proc.poll() is not None:
+                        raise RuntimeError(f"Hermes bridge exited early with code {bridge_proc.returncode}")
+                    if self._cancelled.is_set() or time.monotonic() >= bridge_deadline:
+                        raise TimeoutError("Timed out waiting for Hermes bridge socket")
+                    time.sleep(0.01)
+            proc = self._spawn()
+
+            def stdout_pump() -> None:
+                assert proc is not None
+                while True:
+                    line = proc.stdout.readline(_MAX_FRAME_CHARS + 1) if proc.stdout else ""
+                    if not line:
+                        return
+                    if len(line) > _MAX_FRAME_CHARS:
+                        enqueue(inbox, {"_hermes_error": "Claude ACP response frame is too large"})
+                        return
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError:
+                        enqueue(inbox, {"_hermes_error": "Claude ACP emitted malformed JSON"})
+                        return
+                    if not isinstance(value, dict):
+                        enqueue(inbox, {"_hermes_error": "Claude ACP emitted a non-object frame"})
+                        return
+                    if not enqueue(inbox, value):
+                        return
+
+            def stderr_pump() -> None:
+                assert proc is not None
+                if proc.stderr is None:
+                    return
+                while proc.stderr.readline(_MAX_FRAME_CHARS + 1):
+                    pass
+
+            start_pump(stdout_pump, proc.stdout)
+            start_pump(stderr_pump, proc.stderr)
+
+            def cancel_prompt() -> None:
+                nonlocal cancel_sent
+                assert proc is not None
+                if session_id and not cancel_sent and proc.poll() is None:
+                    self._notify_cancel(proc, session_id)
+                    cancel_sent = True
+
+            def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                nonlocal updates_seen, response_chars
+                assert proc is not None
+                request_id = next(request_ids)
+                self._send(proc, {
+                    "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+                })
+                deadline = self._deadline
+                captured_drain = False
+                while True:
+                    now = time.monotonic()
+                    if self._cancelled.is_set():
+                        raise RuntimeError("Claude ACP request cancelled")
+                    if now >= deadline:
+                        if captured_calls and captured_drain and now < self._deadline:
+                            return {"stopReason": "cancelled"}
+                        raise TimeoutError(f"Timed out waiting for Claude ACP response to {method}")
+                    try:
+                        message = inbox.get(timeout=min(0.05, max(0.001, deadline - now)))
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            if method == "session/prompt" and captured_calls:
+                                return {"stopReason": "cancelled"}
+                            raise RuntimeError(f"Claude ACP exited early with code {proc.returncode}")
+                        continue
+                    internal_error = message.get("_hermes_error")
+                    if internal_error:
+                        raise RuntimeError(str(internal_error))
+
+                    server_method = message.get("method")
+                    if server_method == "session/request_permission":
+                        raw_params = message.get("params")
+                        permission_params = raw_params if isinstance(raw_params, dict) else {}
+                        if permission_params.get("sessionId") != session_id:
+                            raise RuntimeError("Claude ACP permission request does not match the active session")
+                        self._send(proc, {
+                            "jsonrpc": "2.0",
+                            "id": message.get("id"),
+                            "result": permission_response(permission_params),
+                        })
+                        continue
+                    if server_method and message.get("id") is not None and server_method != "session/update":
+                        self._send(proc, {
+                            "jsonrpc": "2.0",
+                            "id": message.get("id"),
+                            "error": {"code": -32601, "message": "Unsupported ACP client method"},
+                        })
+                        continue
+
+                    if server_method == "session/update":
+                        updates_seen += 1
+                        if updates_seen > _MAX_UPDATES:
+                            raise RuntimeError("Claude ACP emitted too many session updates")
+                        raw_params = message.get("params")
+                        if not isinstance(raw_params, dict):
+                            raise RuntimeError("Claude ACP session update params must be an object")
+                        if raw_params.get("sessionId") != session_id:
+                            raise RuntimeError("Claude ACP session update does not match the active session")
+                        update = raw_params.get("update")
+                        if not isinstance(update, dict):
+                            raise RuntimeError("Claude ACP session update must be an object")
+                        update_type = update.get("sessionUpdate")
+                        if update_type in {"tool_call", "tool_call_update"} and method != "session/prompt":
+                            raise RuntimeError("Claude ACP emitted a tool event outside an active prompt")
+                        if update_type == "agent_message_chunk":
+                            chunk = _content(update.get("content"))
+                            response_chars += len(chunk)
+                            if response_chars > _MAX_RESPONSE_CHARS:
+                                raise RuntimeError("Claude ACP response exceeded the size limit")
+                            output.append(chunk)
+                            if publish:
+                                publish(chunk, False)
+                        elif update_type == "agent_thought_chunk":
+                            chunk = _content(update.get("content"))
+                            response_chars += len(chunk)
+                            if response_chars > _MAX_RESPONSE_CHARS:
+                                raise RuntimeError("Claude ACP response exceeded the size limit")
+                            reasoning.append(chunk)
+                            if publish:
+                                publish(chunk, True)
+                        elif update_type in {"tool_call", "tool_call_update"}:
+                            meta = update.get("_meta")
+                            claude_meta = meta.get("claudeCode") if isinstance(meta, dict) else None
+                            tool_name = claude_meta.get("toolName") if isinstance(claude_meta, dict) else None
+                            if isinstance(tool_name, str) and tool_name.startswith(_BRIDGE_PREFIX):
+                                name = tool_name[len(_BRIDGE_PREFIX):]
+                                tool_call_id = update.get("toolCallId")
+                                if not isinstance(tool_call_id, str) or not tool_call_id:
+                                    raise RuntimeError("Hermes bridge tool event has no valid toolCallId")
+                                if tool_call_id in completed_call_ids:
+                                    raise RuntimeError(f"Duplicate Hermes bridge toolCallId: {tool_call_id}")
+                                if name not in advertised_names:
+                                    raise RuntimeError(f"Unadvertised Hermes bridge tool event: {name}")
+                                if update_type == "tool_call":
+                                    if tool_call_id in pending_bridge_calls:
+                                        raise RuntimeError(f"Duplicate Hermes bridge toolCallId: {tool_call_id}")
+                                    arguments = update.get("rawInput")
+                                    if not isinstance(arguments, dict):
+                                        raise RuntimeError("Hermes bridge tool arguments must be an object")
+                                    pending_bridge_calls[tool_call_id] = (name, arguments)
+                                else:
+                                    pending = pending_bridge_calls.get(tool_call_id)
+                                    if pending is None:
+                                        raise RuntimeError("Hermes bridge update has no initial tool_call")
+                                    if pending[0] != name:
+                                        raise RuntimeError("Hermes bridge tool name changed during the call")
+                                    if "rawInput" in update:
+                                        arguments = update.get("rawInput")
+                                        if not isinstance(arguments, dict):
+                                            raise RuntimeError("Hermes bridge tool arguments must be an object")
+                                        pending_bridge_calls[tool_call_id] = (name, arguments)
+                                if update.get("status") == "completed":
+                                    pending = pending_bridge_calls.pop(tool_call_id, None)
+                                    if pending is None:
+                                        raise RuntimeError("Completed Hermes bridge event has no captured input")
+                                    completed_name, completed_arguments = pending
+                                    if completed_name != name or not bridge_capture_matches(name, completed_arguments):
+                                        raise RuntimeError("ACP tool event was not proven by the Hermes bridge capture")
+                                    completed_call_ids.add(tool_call_id)
+                                    if len(captured_calls) >= _MAX_TOOLS:
+                                        raise RuntimeError("Claude ACP emitted too many tool calls")
+                                    captured_calls.append(openai_tool_call(
+                                        tool_call_id, completed_name, completed_arguments
+                                    ))
+                                    cancel_prompt()
+                                    captured_drain = True
+                                    deadline = min(deadline, time.monotonic() + _CANCEL_DRAIN_SECONDS)
+                        continue
+
+                    if message.get("id") != request_id:
+                        continue
+                    if "error" in message:
+                        raise RuntimeError(f"Claude ACP {method} failed")
+                    result = message.get("result") or {}
+                    if not isinstance(result, dict):
+                        raise TypeError(f"Claude ACP {method} returned a non-object result")
+                    return result
+
+            request("initialize", {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
+            })
+            system, prompt = split_messages(messages)
+            bridge_config: dict[str, Any] = {}
+            if bridge_tools:
+                bridge_config = {
+                    "hermes_bridge": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [
+                            str(Path(__file__).with_name("tool_bridge_mcp.py")),
+                            "--proxy",
+                            bridge_socket,
+                        ],
+                    }
+                }
+            session = request("session/new", {
+                "cwd": self._cwd,
+                "mcpServers": [],
+                "_meta": {
+                    "disableBuiltInTools": True,
+                    "systemPrompt": {"type": "preset", "preset": "claude_code", "append": system},
+                    "claudeCode": {
+                        "options": {
+                            "tools": [],
+                            "allowedTools": [f"{_BRIDGE_PREFIX}{name}" for name in sorted(advertised_names)],
+                            "settingSources": ["user"],
+                            "settings": {"disableAllHooks": True},
+                            "mcpServers": bridge_config,
+                        },
+                    },
+                },
+            })
+            session_id = str(session.get("sessionId") or "").strip()
+            if not session_id:
+                raise RuntimeError("Claude ACP did not return a sessionId")
+            with self._lock:
+                self._active_session_id = session_id
+
+            if model:
+                options = [
+                    item for item in session.get("configOptions") or []
+                    if isinstance(item, dict) and "model" in {item.get("category"), item.get("id")}
+                ]
+                if options:
+                    offered = {
+                        str(item.get("value"))
+                        for item in options[0].get("options") or []
+                        if isinstance(item, dict) and item.get("value") is not None
+                    }
+                    selected = select_offered_model(offered, model)
+                    if selected is None:
+                        raise ValueError(f"Claude ACP model '{model}' was not offered by the adapter")
+                    request("session/set_config_option", {
+                        "sessionId": session_id,
+                        "configId": str(options[0].get("id") or "model"),
+                        "value": selected,
+                    })
+                else:
+                    request("session/set_model", {"sessionId": session_id, "modelId": model})
+
+            prompt_active = True
+            prompt_result = request("session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            })
+            prompt_active = False
+            return "".join(output), "".join(reasoning), captured_calls, prompt_result
+        finally:
+            stopped.set()
+            if proc is not None and prompt_active and not cancel_sent:
+                with contextlib.suppress(Exception):
+                    if session_id:
+                        self._notify_cancel(proc, session_id)
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            proc.wait(timeout=0.1)
+            with self._lock:
+                self._active_session_id = ""
+            self.close()
+            if bridge_proc is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(bridge_proc.pid, signal.SIGTERM)
+                with contextlib.suppress(Exception):
+                    bridge_proc.wait(timeout=1)
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(bridge_proc.pid, signal.SIGKILL)
+                if bridge_proc.poll() is None:
+                    with contextlib.suppress(Exception):
+                        bridge_proc.wait(timeout=1)
+            for thread in pumps:
+                thread.join(timeout=0.2)
+            for path in (schema_path, bridge_socket):
+                if path:
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
+            if bridge_dir:
+                with contextlib.suppress(OSError):
+                    os.rmdir(bridge_dir)

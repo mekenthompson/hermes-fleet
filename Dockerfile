@@ -47,6 +47,7 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
     && test -x /usr/local/bin/opencode
 ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
 COPY plugins/model-providers/claude-acp/ /opt/hermes/plugins/model-providers/claude-acp/
+RUN python3 -m py_compile /opt/hermes/plugins/model-providers/claude-acp/*.py
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/
 RUN python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py \
@@ -57,6 +58,13 @@ RUN test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json \
     && python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py
 COPY plugins/kokoro-voice/ /opt/hermes/plugins/kokoro-voice/
 RUN python3 -m py_compile /opt/hermes/plugins/kokoro-voice/*.py
+COPY plugins/browser-handoff/ /opt/hermes/plugins/browser-handoff/
+RUN python3 -m py_compile /opt/hermes/plugins/browser-handoff/*.py \
+    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/browser-handoff --ci
+COPY plugins/readonly-source/ /opt/hermes/plugins/readonly-source/
+RUN python3 -m py_compile /opt/hermes/plugins/readonly-source/*.py \
+    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/readonly-source --ci
+COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
 COPY contracts/ /opt/hermes-fleet/contracts/

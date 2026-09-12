@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Fail-closed Hermes pre_tool_call hook for fleet package policy.
+
+Always prints one JSON object to stdout. In audit mode the tool call is
+never blocked; violations are classified and logged. In enforce mode
+high-confidence install/system mutations are blocked.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+def audit_log_path() -> Path:
+    override = os.environ.get("HERMES_TOOLING_AUDIT_LOG")
+    if override:
+        return Path(override)
+    return Path(os.environ.get("HERMES_HOME", "/opt/data")) / "logs" / "tooling-policy.jsonl"
+
+_OS_INSTALL = re.compile(
+    r"\b(?:apt-get|apk|dnf|yum|pacman|brew|winget|choco(?:latey)?)\b"
+    r"|\bapt\s+(?:install|upgrade|remove|autoremove|full-upgrade|dist-upgrade)\b",
+    re.I,
+)
+_PIP = re.compile(
+    r"\b(?:pip3?|python3?(?:\.\d+)?)\s+-m\s+pip\s+install\b|\bpip3?\s+install\b|\bpipx\s+install\b",
+    re.I,
+)
+_UV_TOOL = re.compile(r"\buv\s+tool\s+install\b|\buv\s+pip\s+install\b", re.I)
+_NPM_GLOBAL = re.compile(r"\bnpm\s+(?:install|i)\s+(?:-g|--global)\b", re.I)
+_LANG_INSTALL = re.compile(r"\b(?:cargo|go|gem)\s+install\b", re.I)
+_CURL_SH = re.compile(
+    r"(?:curl|wget)\b[^\n|;]*\|\s*(?:sudo\s+)?(?:ba)?sh\b",
+    re.I,
+)
+_UVX = re.compile(r"\buvx\b", re.I)
+_NPX = re.compile(r"\bnpx\b", re.I)
+_PINNED_UVX = re.compile(r"\buvx\b.*(?:==|--from\s+\S+==)", re.I)
+_PINNED_NPX = re.compile(r"\bnpx\b.*@", re.I)
+_PROJECT_OK = re.compile(
+    r"\b(?:uv\s+sync(?:\s+--frozen)?|uv\s+lock|npm\s+ci|"
+    r"pnpm\s+(?:install|i)\s+--frozen-lockfile|hermes-tooling)\b",
+    re.I,
+)
+_SYSTEM_PREFIXES = (
+    "/usr/",
+    "/usr",
+    "/bin/",
+    "/sbin/",
+    "/lib/",
+    "/lib64/",
+    "/opt/hermes/",
+    "/opt/hermes",
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log(entry: dict[str, Any]) -> None:
+    path = audit_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def classify_command(command: str, cwd: str = "") -> str:
+    """Return allow, project, or block."""
+    text = command or ""
+    if _OS_INSTALL.search(text) or _CURL_SH.search(text) or _LANG_INSTALL.search(text):
+        return "block"
+    if _NPM_GLOBAL.search(text) or _PIP.search(text) or _UV_TOOL.search(text):
+        return "block"
+    if _UVX.search(text) and not _PINNED_UVX.search(text):
+        return "block"
+    if _NPX.search(text) and not _PINNED_NPX.search(text):
+        return "block"
+    if _PROJECT_OK.search(text):
+        return "project"
+    workspace = os.environ.get("HERMES_HOME", "/opt/data") + "/workspace"
+    if cwd.startswith(workspace) and re.search(r"\b(?:uv|npm|pnpm)\b", text):
+        return "project"
+    return "allow"
+
+
+def classify_path(path: str) -> str:
+    if not path:
+        return "allow"
+    resolved = path if path.startswith("/") else path
+    for prefix in _SYSTEM_PREFIXES:
+        if resolved == prefix.rstrip("/") or resolved.startswith(prefix if prefix.endswith("/") else prefix + "/"):
+            return "block"
+    return "allow"
+
+
+def classify_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    tool = str(payload.get("tool_name") or "")
+    args = payload.get("tool_input") or payload.get("args") or {}
+    if not isinstance(args, dict):
+        args = {}
+    cwd = str(payload.get("cwd") or "")
+    if tool == "terminal":
+        command = str(args.get("command") or "")
+        return classify_command(command, cwd), command[:300]
+    if tool == "execute_code":
+        code = str(args.get("code") or "")
+        return classify_command(code, cwd), "execute_code"
+    if tool in {"write_file", "patch"}:
+        path = str(args.get("path") or "")
+        return classify_path(path), path
+    return "allow", tool
+
+
+def decide(payload: dict[str, Any], mode: str) -> dict[str, Any]:
+    verdict, detail = classify_payload(payload)
+    entry = {
+        "ts": _utc_now(),
+        "mode": mode,
+        "tool": payload.get("tool_name"),
+        "verdict": verdict,
+        "detail": detail,
+        "session_id": payload.get("session_id"),
+    }
+    _log(entry)
+    if mode == "enforce" and verdict == "block":
+        return {
+            "decision": "block",
+            "reason": (
+                "Blocked by persistent-agent-tools policy. Classify the "
+                "dependency and use hermes-tooling against a committed lock. "
+                f"detail={detail!r}"
+            ),
+        }
+    return {}
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("audit", "enforce"), default="audit")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        result = decide(payload, args.mode)
+    except Exception as exc:  # noqa: BLE001 — hook must always emit JSON
+        result = {}
+        if args.mode == "enforce":
+            result = {
+                "decision": "block",
+                "reason": f"tooling-policy-hook failed closed: {type(exc).__name__}",
+            }
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

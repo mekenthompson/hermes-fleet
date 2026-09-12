@@ -35,6 +35,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "release/spdx-validation-requirements.txt",
         "release/vex-exceptions.json",
         "scripts/claude-acp-subscription",
+        "scripts/tooling-policy-hook",
         "scripts/compact-spdx-sbom.py",
         "scripts/emit-fleet-image-manifest.py",
         "scripts/extract-pushed-image-digest.py",
@@ -57,6 +58,8 @@ IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
     "plugins/model-providers/claude-acp/",
     "plugins/web/perplexity/",
     "plugins/kokoro-voice/",
+    "plugins/browser-handoff/",
+    "plugins/readonly-source/",
 )
 
 
