@@ -134,6 +134,9 @@ class FleetImageReleaseTests(unittest.TestCase):
             "claude_acp_plugin_revision",
             "COPY plugins/model-providers/claude-acp/ /opt/hermes/plugins/model-providers/claude-acp/",
             "COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription",
+            "COPY plugins/browser-handoff/ /opt/hermes/plugins/browser-handoff/",
+            "COPY plugins/readonly-source/ /opt/hermes/plugins/readonly-source/",
+            "COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook",
             "ln -s /opt/coding-clis/node_modules/.bin/claude-agent-acp /usr/local/bin/claude-agent-acp",
             "/etc/hermes-fleet/image-provenance.json",
         ):
@@ -358,6 +361,8 @@ class FleetImageReleaseTests(unittest.TestCase):
             'subprocess.check_output(["/usr/local/bin/claude", "--version"]',
             'pathlib.Path("/opt/coding-clis/node_modules/@agentclientprotocol/claude-agent-acp/package.json")',
             "/opt/hermes/plugins/model-providers/claude-acp/__init__.py",
+            "/opt/hermes/plugins/model-providers/claude-acp/client.py",
+            "ClaudeACPClient",
             'get_provider_profile("claude-acp")',
             "resolve_external_process_provider_credentials",
             "hermes-claude-acp-subscription",

@@ -63,10 +63,48 @@
       ]
     },
     {
-      "id": "browser-handoff",
-      "target": "undecided",
+      "id": "claude-acp-provider",
+      "target": "standalone_public_plugin",
       "default_enabled": false,
-      "decision_gate": "separate_generic_protocol_from_deployment_policy"
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
+      "id": "browser-handoff",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "env_skinned_public_origin",
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
+      "id": "readonly-source",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
+      "id": "tooling-policy-hook",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "no_deployment_identity"
+      ]
     },
     {
       "id": "voice-provider",
