@@ -5,6 +5,7 @@ import json
 import re
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
@@ -184,6 +185,94 @@ class PublicFattenContractTests(unittest.TestCase):
         contract = json.loads(PLUGINS_CONTRACT.read_text(encoding="utf-8"))
         self.assertNotIn("honcho", json.dumps(contract).lower())
         self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
+
+    def test_inherited_runtime_keeps_entrypoint_and_requires_uid_1000(self) -> None:
+        text = (ROOT / "scripts/verify-inherited-runtime-config.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('if field == ".Config.User":', text)
+        self.assertIn('if current != "1000:1000":', text)
+        self.assertIn(".Config.Entrypoint", text)
+        self.assertIn(".Config.Cmd", text)
+        self.assertIn("if parent != current:", text)
+
+
+class InheritedRuntimeBehaviorTests(unittest.TestCase):
+    def _module(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "verify_inherited_runtime_config",
+            ROOT / "scripts/verify-inherited-runtime-config.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    def test_uid_1000_passes_when_entrypoint_and_cmd_match(self) -> None:
+        module = self._module()
+        values = {
+            ("agent", ".Config.User"): "root",
+            ("child", ".Config.User"): "1000:1000",
+            ("agent", ".Config.Entrypoint"): ["/opt/hermes/bin/hermes"],
+            ("child", ".Config.Entrypoint"): ["/opt/hermes/bin/hermes"],
+            ("agent", ".Config.Cmd"): None,
+            ("child", ".Config.Cmd"): None,
+        }
+
+        def inspect(image: str, field: str):
+            return values[(image, field)]
+
+        module.inspect = inspect  # type: ignore[method-assign]
+        with mock.patch.dict(
+            "os.environ", {"AGENT_IMAGE": "agent", "TEST_IMAGE": "child"}, clear=False
+        ):
+            self.assertEqual(module.main(), 0)
+
+    def test_parent_user_equality_is_not_required(self) -> None:
+        module = self._module()
+        values = {
+            ("agent", ".Config.User"): "root",
+            ("child", ".Config.User"): "root",
+            ("agent", ".Config.Entrypoint"): ["/opt/hermes/bin/hermes"],
+            ("child", ".Config.Entrypoint"): ["/opt/hermes/bin/hermes"],
+            ("agent", ".Config.Cmd"): None,
+            ("child", ".Config.Cmd"): None,
+        }
+
+        def inspect(image: str, field: str):
+            return values[(image, field)]
+
+        module.inspect = inspect  # type: ignore[method-assign]
+        with mock.patch.dict(
+            "os.environ", {"AGENT_IMAGE": "agent", "TEST_IMAGE": "child"}, clear=False
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+            self.assertIn("1000:1000", str(raised.exception))
+
+    def test_entrypoint_mismatch_still_fails(self) -> None:
+        module = self._module()
+        values = {
+            ("agent", ".Config.User"): "root",
+            ("child", ".Config.User"): "1000:1000",
+            ("agent", ".Config.Entrypoint"): ["/opt/hermes/bin/hermes"],
+            ("child", ".Config.Entrypoint"): ["/bin/sh"],
+            ("agent", ".Config.Cmd"): None,
+            ("child", ".Config.Cmd"): None,
+        }
+
+        def inspect(image: str, field: str):
+            return values[(image, field)]
+
+        module.inspect = inspect  # type: ignore[method-assign]
+        with mock.patch.dict(
+            "os.environ", {"AGENT_IMAGE": "agent", "TEST_IMAGE": "child"}, clear=False
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+            self.assertIn("Entrypoint", str(raised.exception))
 
 
 if __name__ == "__main__":

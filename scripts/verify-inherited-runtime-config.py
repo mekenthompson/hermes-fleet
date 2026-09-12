@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail unless the child image inherited the Agent runtime config."""
+"""Fail unless the child image kept Agent entrypoint/cmd and UID 1000."""
 
 from __future__ import annotations
 
@@ -26,7 +26,9 @@ def main() -> int:
         parent = inspect(agent, field)
         current = inspect(child, field)
         print(f"{field}: parent={parent!r} child={current!r}", flush=True)
-        if field == ".Config.User" and parent in ("", None) and current in ("", None):
+        if field == ".Config.User":
+            if current != "1000:1000":
+                raise SystemExit("child runtime user must be 1000:1000")
             continue
         if parent != current:
             raise SystemExit(f"inherited {field} mismatch")
