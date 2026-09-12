@@ -1,8 +1,8 @@
 # Hermes Fleet
 
-Opinionated Docker isolation for running multiple [Hermes Agent](https://github.com/NousResearch/hermes-agent) profiles as separate containers.
+Opinionated isolated Hermes. One agent per container and gateway. No shared credentials.
 
-Hermes Fleet is the public distribution: a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout.
+The public distribution is a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout. A standing team of specialists you text is an outcome, not the tagline.
 
 ## Why
 

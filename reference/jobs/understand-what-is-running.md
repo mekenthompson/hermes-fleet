@@ -28,19 +28,19 @@ Job story: When I change one agent, I want to read what is live on the target an
 
 ## Today's alternatives
 
-Today they: inspect the host runtime, read the docs, trust the implementing agent's report, or use a private overlay that already knows the topology.
+Today they: inspect the live host themselves, read whatever explanation shipped with the change, trust the person who made it, or use a private layout they already know.
 
-The bar: those work when the operator already knows which host and name to look at, and when they remember that published is not deployed. They fail when docs drift from the workflow, when stored files survived but a tool no longer does its job, or when the author grades their own work. Switching cost is giving up a private read that already knows the household.
+The bar: those work when the operator already knows where to look, and when they remember that published is not deployed. They fail when the explanation drifts from the live agent, when stored files survived but a tool no longer does its job, or when the author grades their own work. Switching cost is giving up a private read that already knows the household.
 
 ## The bet
 
-This job assumes: operators cannot trust the North Star without an independent live read that distinguishes built, published, and deployed, and that names whether the target matches intent. If that's false, don't build: if stock runtime tools already answer this honestly for a Fleet layout, this job is documentation, not a product surface.
+This job assumes: operators cannot trust intended-change hold rate without an independent live read that distinguishes built, published, and deployed, and that names whether the target matches intent. If that's false, don't build: if stock tools already answer this honestly for a Fleet layout, this job is documentation, not a product surface.
 
 ## Evidence & confidence
 
 - Operator interview 2026-09-12: first job chosen because live intended-change cannot be scored without it. Successor interview kept the job and moved it under on-a-leash.
-- Public docs already separate publication from rollout (`docs/image-release.md`). That supports the claim distinction. It does not independently prove operators conflate the two.
-- Related overlay issues exist (HF-107, HF-163). Their contents were not reviewer-readable from the public tree, so they are not counted as verified evidence.
+- Public product already treats publication and rollout as different claims. That supports the distinction. It does not independently prove operators conflate the two.
+- Private overlay work on drift exists. It was not reviewer-readable from the public tree, so it is not counted as verified evidence.
 
 Confidence: 2 (directional) for the struggling moment. 2 for the shape of a public, topology-free proof. Not 3: one interview plus public docs, no independently readable observation of the claimed operator behaviour.
 
@@ -90,35 +90,32 @@ Where the number lives: rolls into on-a-leash's intended-change hold rate (produ
 
 ## Prove it
 
-Outcome-level acceptance, named by job × surface. Independent of unit tests. **Runnable public scenarios for this job are not authored yet.** Do not invent them in this spec. Inventory private overlay proof before adding a harness. Treat HF-107 and HF-163 as pointers, not as verified coverage.
+Outcome-level acceptance, named by job × surface. Independent of unit tests.
 
-Coverage to author, each with a named invariant:
+**This Job Spec is not complete.** No runnable public scenarios exist. Do not invent them here. Do not treat the job as done until those scenarios exist and a fresh-process reviewer can run them.
 
-- intended-change-present (operator live read): after a one-agent change, the target read shows the intended live state and neighbours do not. Invariant: `one-agent-change-is-local` plus intended state on the target.
-- built-published-deployed-distinct (docs + live read): a published artefact, a skipped docs-only publish, and a running agent are three different answers. Invariant: `built-published-deployed-are-different`.
-- working-tool-path (cold and warm): a tool that survives as files but fails when invoked is a failed read. Invariant: persistence includes working tools (principle 5), not a green volume.
-- fresh-process-reviewer: a second process, not the author, can complete the read from the artefact alone.
+Coverage still required, each with a named invariant:
 
-Fuzz corpus: vary change kind × publish skipped vs published × cold empty vs warm existing state × whether tools still execute. Invariants must hold across the corpus, not just the happy path.
+- After a one-agent change, the target read shows the intended live state and neighbours do not. Invariant: `one-agent-change-is-local`.
+- A published artefact, a skipped docs-only publish, and a running agent are three different answers. Invariant: `built-published-deployed-are-different`.
+- A tool that survives as files but fails when invoked is a failed read. Invariant: persistence includes working tools.
+- A second process, not the author, can complete the read from the artefact alone.
 
 ## Verdict
 
-Done when: after an intended change, a fresh-process reviewer can state what is running, whether the target has the change, and that neighbours did not move, without trusting the author, proven by the scenarios above once they exist.
+Done when: after an intended change, a fresh-process reviewer can state what is running, whether the target has the change, and that neighbours did not move, without trusting the author, proven by runnable scenarios that do not yet exist.
 
 ## Abandon signal
 
-We named the wrong job if operators already trust live state from stock tools, never conflate published with deployed, and still cannot (or will not) score the North Star for some other reason.
+We named the wrong job if operators already trust live state from stock tools, never conflate published with deployed, and still cannot (or will not) score intended-change hold rate for some other reason.
 
 ## Production-readiness
 
 Honesty: a path that cannot read live state fails closed. It does not guess from source.
 
-Isolation: the public proof uses synthetic profiles only. No household names.
-
-Before a new harness: inventory private evidence and say what is already proven.
+Isolation: public proof uses synthetic identities only.
 
 ## Related
 
-- Queued jobs: change-one-agent-without-disturbing-another, upgrade-and-recover, bring-existing-agent-under-management.
-- Overlay pointers: HF-107, HF-163. Private; not independently verified here. Those are not this Job Spec.
-- Implementation: not yet. An RFC that `serves: understand-what-is-running` will carry the how.
+- Decision: [../rfcs/successor-vision.md](../rfcs/successor-vision.md)
+- Implementation RFC: not yet. An RFC that `serves: understand-what-is-running` will carry the how, including any private-proof inventory.
