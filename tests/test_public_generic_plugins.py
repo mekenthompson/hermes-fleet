@@ -65,6 +65,16 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertIn('parsed.scheme not in {"http", "https"}', source)
         self.assertIn("not parsed.hostname", source)
         self.assertIn("HERMES_KOKORO_SIDECAR_URL is not set", source)
+        workflow = (ROOT / ".github" / "workflows" / "fleet-image.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            workflow.count('pathlib.Path("/opt/hermes/plugins/kokoro-voice")'),
+            2,
+        )
+        self.assertIn("kokoro_module.KokoroProvider()", workflow)
+        self.assertIn("assert not kokoro.is_available()", workflow)
+        self.assertIn("assert callable(kokoro_module.register)", workflow)
 
     def test_generic_plugin_trees_have_no_household_literals(self) -> None:
         roots = (LINEAR, ACP, KOKORO, ROOT / "plugins" / "web" / "perplexity")
