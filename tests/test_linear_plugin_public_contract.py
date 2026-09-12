@@ -25,15 +25,21 @@ SOURCE_FILES = {
     "linear_guard_health.py",
     "linear_handoff.py",
     "linear_limits.py",
+    "linear_live_canary.py",
     "linear_oauth.py",
     "linear_ownership.py",
     "linear_parent_continuation.py",
     "linear_parent_followup.py",
+    "linear_policy.py",
+    "linear_project_updates.py",
+    "linear_provision.py",
     "linear_quota.py",
     "linear_readiness.py",
+    "linear_reconcile.py",
     "linear_resume.py",
     "linear_runtime.py",
     "linear_stop.py",
+    "linear_tracking.py",
     "plugin.yaml",
 }
 
@@ -186,7 +192,21 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             )
             asyncio.run(asyncio.wait_for(service(runtime), timeout=0.1))
 
-    def test_runtime_writable_house_policy_is_rejected(self) -> None:
+    def test_all_policy_consumers_use_shared_immutable_reader(self) -> None:
+        for name in (
+            "__init__.py",
+            "linear_live_canary.py",
+            "linear_project_updates.py",
+            "linear_provision.py",
+            "linear_tracking.py",
+        ):
+            with self.subTest(name=name):
+                source = (PLUGIN / name).read_text(encoding="utf-8")
+                self.assertIn("linear_policy", source)
+                self.assertNotIn('with_name("linear-agents.json")', source)
+                self.assertNotIn('with_name("linear-publishers.json")', source)
+
+    def test_writable_house_policy_is_rejected(self) -> None:
         module = load_plugin()
         with tempfile.TemporaryDirectory() as temp:
             policy = Path(temp) / "linear-agents.json"

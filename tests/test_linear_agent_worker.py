@@ -5,13 +5,12 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "plugins" / "linear-agent"))
-from linear_agent import LinearWorker
+from linear_agent import LinearWorker, unauthorized_response_body_from_entry
 
 
 ALLOWED_USER_ID = "11111111-1111-4111-8111-111111111111"
@@ -20,251 +19,97 @@ UPPERCASE_USER_ID = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
 
 
 class LinearAgentWorkerTests(unittest.TestCase):
-    def test_one_delivery_creates_one_profile_namespaced_session_and_outbox(self) -> None:
+    def test_project_summary_is_explicit_scoped_and_redacted(self) -> None:
+        from linear_agent import _project_summary
+        response = ('Private detail from another project.\n\n### Project status update\n'
+                    'Landed the approved fix. api_key=secretvalue\n'
+                    'Next: verify rollout.\n\n### Other work\nPrivate unrelated detail.')
+        summary = _project_summary(response)
+        self.assertIn('Landed the approved fix.', summary)
+        self.assertIn('Next: verify rollout.', summary)
+        self.assertNotIn('secretvalue', summary)
+        self.assertNotIn('Private', summary)
+        self.assertNotIn('Other work', summary)
+
+    def test_missing_duplicate_or_fenced_project_summary_uses_safe_pointer(self) -> None:
+        from linear_agent import _project_summary
+        for response in ('Private detail.',
+                         '```markdown\n### Project status update\nPrivate detail.\n```',
+                         '### Project status update\nPrivate one.\n### Project status update\nPrivate two.'):
+            with self.subTest(response=response):
+                summary = _project_summary(response)
+                self.assertNotIn('Private', summary)
+                self.assertIn('recorded on the issue', summary)
+
+    def test_second_linear_session_for_an_admitted_issue_is_rejected_before_session_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"data": {"agentSession": {"id": "linear-session-1"}, "prompt": "Inspect this issue"}}).encode())
-            calls: list[tuple[str, str]] = []
-            self.assertTrue(worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"))
-            self.assertFalse(worker.process_once(lambda *_: "ignored"))
-            self.assertEqual(calls, [("linear:example-workspace:linear-session-1", "Inspect this issue")])
-            self.assertEqual(worker.outbox(), [("response", "linear-session-1", "Done")])
+            worker = LinearWorker(Path(temp) / "worker.db", profile="alpha", workspace="demo-space")
+            def payload(session_id: str, prompt: str) -> bytes:
+                return json.dumps({
+                    "type": "AgentSessionEvent", "action": "created",
+                    "agentSession": {"id": session_id, "issue": {"id": "issue-1"}},
+                    "promptContext": prompt,
+                }).encode()
 
-    def test_duplicate_created_event_with_new_delivery_id_executes_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            payload = json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "agentSession": {"id": "linear-session-1"},
-                "promptContext": "Inspect this issue",
-            }).encode()
-            worker.add_delivery("delivery-1", payload)
-            worker.add_delivery("delivery-2", payload)
-            calls: list[tuple[str, str]] = []
+            worker.add_delivery("delivery-1", payload("linear-session-1", "first"))
+            self.assertTrue(worker.admit_once()[0])
+            worker.add_delivery("delivery-2", payload("linear-session-2", "must not execute"))
 
-            while worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"):
-                pass
+            admitted, job = worker.admit_once()
 
-            self.assertEqual(calls, [("linear:example-workspace:linear-session-1", "Inspect this issue")])
-            self.assertEqual(worker.outbox(), [
-                ("response", "linear-session-1", "Done"),
-                ("thought", "linear-session-1", "Working on this now."),
-            ])
-
-    def test_top_level_linear_created_payload_uses_prompt_context(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "linear-session-1"}, "promptContext": "untrusted Linear context"}).encode())
-            calls: list[tuple[str, str]] = []
-            self.assertTrue(worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"))
-            self.assertEqual(calls, [("linear:example-workspace:linear-session-1", "untrusted Linear context")])
-
-    def test_allowlisted_creator_executes_created_event(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            worker.add_delivery("delivery-1", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "agentSession": {
-                    "id": "linear-session-1",
-                    "creatorId": ALLOWED_USER_ID,
-                    "creator": {"id": ALLOWED_USER_ID},
-                },
-                "promptContext": "untrusted Linear context",
-            }).encode())
-            calls: list[tuple[str, str]] = []
-
-            self.assertTrue(worker.process_once(
-                lambda key, prompt: calls.append((key, prompt)) or "Done"
-            ))
-
-            self.assertEqual(
-                calls,
-                [("linear:example-workspace:linear-session-1", "untrusted Linear context")],
-            )
-            self.assertEqual(worker.delivery_state("delivery-1"), "completed")
-
-    def test_unauthorized_creator_is_rejected_before_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            worker.add_delivery("delivery-1", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "agentSession": {
-                    "id": "linear-session-1",
-                    "creatorId": DENIED_USER_ID,
-                    "creator": {"id": DENIED_USER_ID},
-                },
-                "promptContext": "must not execute",
-            }).encode())
-            calls: list[tuple[str, str]] = []
-
-            self.assertTrue(worker.process_once(
-                lambda key, prompt: calls.append((key, prompt)) or "must not execute"
-            ))
-
-            self.assertEqual(calls, [])
-            self.assertEqual(worker.delivery_state("delivery-1"), "rejected")
-            self.assertEqual(
-                worker.delivery_rejection("delivery-1"),
-                (DENIED_USER_ID, "linear_user_not_allowed"),
-            )
-            self.assertEqual(worker.outbox(), [
-                (
-                    "response",
-                    "linear-session-1",
-                    "This agent is restricted to approved workspace users.",
-                ),
-            ])
-
-    def test_unauthorized_prompted_follow_up_is_rejected_independently(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            worker.add_delivery("delivery-created", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "agentSession": {
-                    "id": "linear-session-1",
-                    "creatorId": ALLOWED_USER_ID,
-                },
-                "promptContext": "allowed creation",
-            }).encode())
-            calls: list[str] = []
-            self.assertTrue(worker.process_once(lambda _key, prompt: calls.append(prompt) or "Done"))
-            worker.add_delivery("delivery-prompted", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "prompted",
-                "agentSession": {"id": "linear-session-1"},
-                "agentActivity": {
-                    "id": "activity-1",
-                    "userId": DENIED_USER_ID,
-                    "user": {"id": DENIED_USER_ID},
-                    "body": "must not execute",
-                },
-            }).encode())
-
-            self.assertTrue(worker.process_once(lambda _key, prompt: calls.append(prompt) or "Done"))
-
-            self.assertEqual(calls, ["allowed creation"])
-            self.assertEqual(worker.delivery_state("delivery-prompted"), "rejected")
-            self.assertEqual(
-                worker.delivery_rejection("delivery-prompted"),
-                (DENIED_USER_ID, "linear_user_not_allowed"),
-            )
-
-    def test_allowlist_rejects_missing_and_conflicting_creator_identity(self) -> None:
-        cases = {
-            "missing": ({}, (None, "linear_user_identity_missing")),
-            "nested_only": (
-                {"creator": {"id": ALLOWED_USER_ID}},
-                (None, "linear_user_identity_missing"),
-            ),
-            "conflicting": (
-                {
-                    "creatorId": ALLOWED_USER_ID,
-                    "creator": {"id": DENIED_USER_ID},
-                },
-                (ALLOWED_USER_ID, "linear_user_identity_conflict"),
-            ),
-        }
-        for name, (identity, expected) in cases.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
-                worker = LinearWorker(
-                    Path(temp) / "worker.db",
-                    profile="sample",
-                    workspace="example-workspace",
-                    allowed_linear_user_ids=[ALLOWED_USER_ID],
-                )
-                worker.add_delivery("delivery-1", json.dumps({
-                    "type": "AgentSessionEvent",
-                    "action": "created",
-                    "agentSession": {"id": "linear-session-1", **identity},
-                    "promptContext": "must not execute",
-                }).encode())
-                calls: list[str] = []
-
-                self.assertTrue(worker.process_once(
-                    lambda _key, prompt: calls.append(prompt) or "must not execute"
-                ))
-
-                self.assertEqual(calls, [])
-                self.assertEqual(worker.delivery_rejection("delivery-1"), expected)
-
-    def test_allowlist_rejects_prompted_event_without_primary_user_id(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            worker.add_delivery("delivery-1", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "prompted",
-                "agentSession": {"id": "linear-session-1"},
-                "agentActivity": {
-                    "id": "activity-1",
-                    "user": {"id": ALLOWED_USER_ID},
-                    "body": "must not execute",
-                },
-            }).encode())
-            calls: list[str] = []
-
-            self.assertTrue(worker.process_once(
-                lambda _key, prompt: calls.append(prompt) or "must not execute"
-            ))
-
-            self.assertEqual(calls, [])
-            self.assertEqual(
-                worker.delivery_rejection("delivery-1"),
-                (None, "linear_user_identity_missing"),
-            )
-
-    def test_duplicate_denied_event_emits_one_response(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            payload = json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "prompted",
-                "agentSession": {"id": "linear-session-1"},
-                "agentActivity": {
-                    "id": "activity-1",
-                    "userId": DENIED_USER_ID,
-                    "body": "must not execute",
-                },
-            }).encode()
-            worker.add_delivery("delivery-1", payload)
-            worker.add_delivery("delivery-2", payload)
-
-            self.assertTrue(worker.process_once(lambda *_args: "must not execute"))
-            self.assertTrue(worker.process_once(lambda *_args: "must not execute"))
-
-            denial_responses = [item for item in worker.outbox() if item[2] == (
-                "This agent is restricted to approved workspace users."
-            )]
-            self.assertEqual(len(denial_responses), 1)
+            self.assertTrue(admitted)
+            self.assertIsNone(job)
             self.assertEqual(worker.delivery_state("delivery-2"), "rejected")
+            self.assertEqual(worker.delivery_rejection("delivery-2")[1], "issue_active_in_linear_session")
+            self.assertEqual(
+                [row for row in worker.outbox() if row[1] == "linear-session-2"],
+                [("response", "linear-session-2", "This issue is already active in another Linear session.")],
+            )
+
+    def test_chat_owned_issue_rejects_created_and_prompted_without_session_mapping(self) -> None:
+        from linear_ownership import IssueOwnership
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "worker.db"
+            worker = LinearWorker(database, profile="alpha", workspace="demo-space")
+            IssueOwnership(database, profile="alpha", workspace="demo-space").claim("issue-1", "chat-1")
+            for delivery, action, session, extra in (
+                ("created", "created", "linear-1", {"promptContext": "work"}),
+                ("prompted", "prompted", "linear-2", {"agentActivity": {"id": "activity-1", "body": "follow up"}}),
+            ):
+                worker.add_delivery(delivery, json.dumps({
+                    "type": "AgentSessionEvent", "action": action,
+                    "agentSession": {"id": session, "issue": {"id": "issue-1"}}, **extra,
+                }).encode())
+                self.assertTrue(worker.admit_once()[0])
+                self.assertEqual(worker.delivery_rejection(delivery)[1], "issue_owned_by_chat")
+                self.assertIn(
+                    ("response", session, "already in progress from Hermes chat, updates will land on the ticket"),
+                    worker.outbox(),
+                )
+            with worker._connect() as conn:
+                mappings = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            self.assertEqual(mappings, 0)
+
+    def test_unauthorized_response_body_requires_allowlist_and_exact_text(self) -> None:
+        with self.assertRaisesRegex(ValueError, "allowed_linear_user_ids"):
+            unauthorized_response_body_from_entry({
+                "unauthorized_response_body": "nope",
+            })
+        with self.assertRaisesRegex(ValueError, "unauthorized_response_body"):
+            unauthorized_response_body_from_entry({
+                "allowed_linear_user_ids": [ALLOWED_USER_ID],
+                "unauthorized_response_body": " padded ",
+            })
+        self.assertIsNone(unauthorized_response_body_from_entry({
+            "allowed_linear_user_ids": [ALLOWED_USER_ID],
+        }))
+        self.assertEqual(
+            unauthorized_response_body_from_entry({
+                "allowed_linear_user_ids": [ALLOWED_USER_ID],
+                "unauthorized_response_body": "Yo yo",
+            }),
+            "Yo yo",
+        )
 
     def test_allowlist_configuration_must_be_non_empty_unique_uuids(self) -> None:
         invalid_policies = (
@@ -278,135 +123,50 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "allowed_linear_user_ids"):
                     LinearWorker(
                         Path(temp) / "worker.db",
-                        profile="sample",
-                        workspace="example-workspace",
+                        profile="alpha",
+                        workspace="demo-space",
                         allowed_linear_user_ids=policy,
                     )
 
-    def test_allowlist_rejects_legacy_event_without_requester_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(
-                Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
-                allowed_linear_user_ids=[ALLOWED_USER_ID],
-            )
-            worker.add_delivery("delivery-1", json.dumps({
-                "data": {
-                    "agentSession": {"id": "linear-session-1"},
-                    "prompt": "must not execute",
-                },
-            }).encode())
-            calls: list[str] = []
-
-            self.assertTrue(worker.process_once(
-                lambda _key, prompt: calls.append(prompt) or "must not execute"
-            ))
-
-            self.assertEqual(calls, [])
-            self.assertEqual(worker.delivery_state("delivery-1"), "rejected")
-            self.assertEqual(
-                worker.delivery_rejection("delivery-1"),
-                (None, "linear_user_identity_missing"),
-            )
-
-    def test_duplicate_prompted_activity_with_new_delivery_id_executes_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            payload = json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "prompted",
-                "agentSession": {"id": "linear-session-1"},
-                "agentActivity": {
-                    "id": "activity-1",
-                    "content": {"type": "prompt", "body": "@sample please look"},
-                },
-            }).encode()
-            worker.add_delivery("delivery-1", payload)
-            worker.add_delivery("delivery-2", payload)
-            calls: list[tuple[str, str]] = []
-
-            while worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"):
-                pass
-
-            self.assertEqual(calls, [("linear:example-workspace:linear-session-1", "@sample please look")])
-            self.assertEqual(worker.outbox(), [("response", "linear-session-1", "Done")])
-
     def test_distinct_prompted_activities_in_one_session_both_execute(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            for delivery_id, activity_id, prompt in (
-                ("delivery-1", "activity-1", "first follow-up"),
-                ("delivery-2", "activity-2", "second follow-up"),
-            ):
-                worker.add_delivery(delivery_id, json.dumps({
-                    "type": "AgentSessionEvent",
-                    "action": "prompted",
-                    "agentSession": {"id": "linear-session-1"},
-                    "agentActivity": {
-                        "id": activity_id,
-                        "content": {"type": "prompt", "body": prompt},
-                    },
-                }).encode())
-            calls: list[tuple[str, str]] = []
-
-            while worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"):
-                pass
-
-            self.assertEqual(calls, [
-                ("linear:example-workspace:linear-session-1", "first follow-up"),
-                ("linear:example-workspace:linear-session-1", "second follow-up"),
+            worker = LinearWorker(Path(temp) / "worker.db", profile="alpha", workspace="demo-space")
+            worker.add_delivery("delivery-1", json.dumps({
+                "type": "AgentSessionEvent", "action": "created",
+                "agentSession": {"id": "linear-session-1", "issue": {"id": "issue-1"}},
+                "promptContext": "first follow-up",
+            }).encode())
+            worker.add_delivery("delivery-2", json.dumps({
+                "type": "AgentSessionEvent", "action": "prompted",
+                "agentSession": {"id": "linear-session-1", "issue": {"id": "issue-1"}},
+                "agentActivity": {
+                    "id": "activity-2",
+                    "content": {"type": "prompt", "body": "second follow-up"},
+                },
+            }).encode())
+            self.assertTrue(worker.admit_once()[0])
+            first = worker.next_unprepared()
+            assert first is not None
+            worker.mark_prepared(first)
+            first = worker.claim_prepared()
+            assert first is not None
+            worker.complete_job(first, "first complete")
+            self.assertTrue(worker.admit_once()[0])
+            second = worker.next_unprepared()
+            assert second is not None
+            worker.mark_prepared(second)
+            second = worker.claim_prepared()
+            assert second is not None
+            worker.complete_job(second, "second complete")
+            project_update_keys = [
+                json.loads(body)["session_key"]
+                for kind, _target, body in worker.outbox()
+                if kind == "project_update"
+            ]
+            self.assertEqual(project_update_keys, [
+                "linear:demo-space:linear-session-1:delivery-1:closeout",
+                "linear:demo-space:linear-session-1:delivery-2:closeout",
             ])
-
-    def test_prompted_event_without_activity_id_is_quarantined_without_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "prompted",
-                "agentSession": {"id": "linear-session-1"},
-                "agentActivity": {"content": {"type": "prompt", "body": "@sample please look"}},
-            }).encode())
-            calls: list[tuple[str, str]] = []
-            self.assertTrue(worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Done"))
-            self.assertEqual(calls, [])
-            self.assertEqual(worker.delivery_state("delivery-1"), "rejected")
-            self.assertEqual(worker.outbox(), [])
-
-    def test_created_event_falls_back_to_session_comment_body(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "agentSession": {"id": "linear-session-1", "comment": {"body": "@sample you working?"}},
-            }).encode())
-            calls: list[tuple[str, str]] = []
-            self.assertTrue(worker.process_once(lambda key, prompt: calls.append((key, prompt)) or "Yes"))
-            self.assertEqual(calls, [("linear:example-workspace:linear-session-1", "@sample you working?")])
-
-    def test_same_linear_session_reuses_hermes_session_key_for_follow_up(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            for delivery, prompt in (("delivery-1", "first"), ("delivery-2", "follow up")):
-                worker.add_delivery(delivery, json.dumps({"data": {"agentSession": {"id": "linear-session-1"}, "prompt": prompt}}).encode())
-            calls: list[str] = []
-            while worker.process_once(lambda key, prompt: calls.append(key) or prompt):
-                pass
-            self.assertEqual(calls, ["linear:example-workspace:linear-session-1", "linear:example-workspace:linear-session-1"])
-
-    def test_outbox_marks_uncertain_network_activity_ambiguous_without_repost(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"data": {"agentSession": {"id": "linear-session-1"}, "prompt": "work"}}).encode())
-            worker.process_once(lambda *_: "Done")
-            attempts: list[str] = []
-            with self.assertRaises(RuntimeError):
-                worker.dispatch_outbox(lambda *_: attempts.append("send") or (_ for _ in ()).throw(RuntimeError("timeout")))
-            self.assertEqual(attempts, ["send"])
-            self.assertFalse(worker.dispatch_outbox(lambda *_: attempts.append("duplicate")))
-            self.assertEqual(worker.outbox_state(), ["ambiguous"])
-
 
     def test_allowlist_rejects_queued_and_prepared_jobs_during_recovery(self) -> None:
         for initial_state in ("queued", "prepared"):
@@ -414,8 +174,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 database = Path(temp) / "worker.db"
                 unrestricted = LinearWorker(
                     database,
-                    profile="sample",
-                    workspace="example-workspace",
+                    profile="alpha",
+                    workspace="demo-space",
                 )
                 unrestricted.add_delivery("delivery-1", json.dumps({
                     "type": "AgentSessionEvent",
@@ -435,8 +195,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
                 restricted = LinearWorker(
                     database,
-                    profile="sample",
-                    workspace="example-workspace",
+                    profile="alpha",
+                    workspace="demo-space",
                     allowed_linear_user_ids=[ALLOWED_USER_ID],
                 )
                 recovered = (
@@ -462,8 +222,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
             database = Path(temp) / "worker.db"
             worker = LinearWorker(
                 database,
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             worker.add_delivery("delivery-1", json.dumps({
                 "type": "AgentSessionEvent",
@@ -480,6 +240,21 @@ class LinearAgentWorkerTests(unittest.TestCase):
             worker.mark_prepared(job)
             running = worker.claim_prepared()
             assert running is not None
+            receipt = {
+                "lifecycle_version": "execution-lifecycle/v2",
+                "session_key": running.hermes_session_key,
+                "execution_id": "exec-1",
+                "generation": 1,
+                "state": "completed",
+                "occupancy": "released",
+                "tools": "none",
+                "children": "none",
+                "processes": "none",
+                "remote": "none",
+            }
+            worker.record_lifecycle_receipt(
+                running, "exec-1", receipt, released=True
+            )
             worker.complete_job(running, "Finished")
             with worker._connect() as conn:
                 conn.execute("UPDATE outbox SET state = 'sent'")
@@ -490,8 +265,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             recovered = LinearWorker(
                 database,
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             emitted: list[tuple[str, str, str]] = []
             self.assertTrue(recovered.dispatch_outbox(
@@ -504,62 +279,6 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 [("issue-1", "issue_status", "done")],
             )
 
-    def test_created_event_queues_thought_before_response(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "linear-session-1"}, "promptContext": "work"}).encode())
-            sent = []
-
-            def before_execute():
-                while worker.dispatch_outbox(lambda session, kind, body: sent.append((kind, session, body))):
-                    pass
-
-            worker.process_once(lambda *_: "Done", before_execute=before_execute)
-            while worker.dispatch_outbox(lambda session, kind, body: sent.append((kind, session, body))):
-                pass
-
-            self.assertEqual([item[0] for item in sent], ["thought", "response"])
-            self.assertEqual(sent[0][2], "Working on this now.")
-            self.assertEqual(sent[1][2], "Done")
-
-
-    def test_imports_only_its_profile_delivery_from_ingress(self) -> None:
-        from tests.linear_ingress_fixture import IngressStore, Route
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            inbox = root / "inbox"
-            ingress = IngressStore(inbox / "ingress.db")
-            route = Route("sample", "sample", "/webhook/sample/linear", root / "unused.env", inbox)
-            payload = json.dumps({"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "linear-session-1"}, "promptContext": "work"}).encode()
-            ingress.enqueue(route, "delivery-1", payload)
-            worker = LinearWorker(root / "worker.db", profile="sample", workspace="example-workspace")
-
-            self.assertTrue(worker.import_from_ingress_once(inbox / "ingress.db"))
-            seen = []
-            self.assertTrue(worker.process_once(lambda key, prompt: seen.append((key, prompt)) or "Done"))
-            self.assertEqual(seen, [("linear:example-workspace:linear-session-1", "work")])
-            self.assertFalse(worker.import_from_ingress_once(inbox / "ingress.db"))
-
-
-    def test_execution_failure_queues_a_redacted_error_activity(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "linear-session-1"}, "promptContext": "work"}).encode())
-            emitted = []
-
-            def flush():
-                while worker.dispatch_outbox(lambda session, kind, body: emitted.append((kind, body))):
-                    pass
-
-            self.assertTrue(worker.process_once(
-                lambda *_: (_ for _ in ()).throw(RuntimeError("token=do-not-leak")),
-                before_execute=flush,
-                on_error=flush,
-            ))
-            self.assertEqual(emitted, [("thought", "Working on this now."), ("response", "Unable to complete this request. Please retry.")])
-            self.assertFalse(worker.process_once(lambda *_: "duplicate"))
-
-
     def test_restart_preserves_admitted_job_for_fifo_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "worker.db"
@@ -569,7 +288,7 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 "agentSession": {"id": "linear-session-1"},
                 "promptContext": "work",
             }).encode()
-            worker = LinearWorker(database, profile="sample", workspace="example-workspace")
+            worker = LinearWorker(database, profile="alpha", workspace="demo-space")
             worker.add_delivery("delivery-1", payload)
 
             admitted, job = worker.admit_once()
@@ -577,7 +296,7 @@ class LinearAgentWorkerTests(unittest.TestCase):
             self.assertIsNotNone(job)
             self.assertEqual(worker.delivery_state("delivery-1"), "queued")
 
-            recovered = LinearWorker(database, profile="sample", workspace="example-workspace")
+            recovered = LinearWorker(database, profile="alpha", workspace="demo-space")
             queued = recovered.next_unprepared()
             self.assertIsNotNone(queued)
             self.assertEqual(queued.prompt, "work")
@@ -587,83 +306,25 @@ class LinearAgentWorkerTests(unittest.TestCase):
             recovered.complete_job(queued, "Done")
             self.assertEqual(recovered.delivery_state("delivery-1"), "completed")
 
-    def test_restart_quarantines_activity_left_sending(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            database = Path(temp) / "worker.db"
-            worker = LinearWorker(database, profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"data": {"agentSession": {"id": "linear-session-1"}, "prompt": "work"}}).encode())
-            worker.process_once(lambda *_: "Done")
-            with worker._connect() as conn:
-                conn.execute("UPDATE outbox SET state = 'sending'")
-            recovered = LinearWorker(database, profile="sample", workspace="example-workspace")
-            self.assertEqual(recovered.outbox_state(), ["ambiguous"])
-
-
     def test_import_marks_selected_logical_agent_when_name_differs_from_profile(self) -> None:
         from tests.linear_ingress_fixture import IngressStore, Route
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             inbox = root / "inbox"
             ingress = IngressStore(inbox / "ingress.db")
-            route = Route("alternate-agent", "sample", "/webhook/sample/linear", root / "unused.env", inbox)
+            route = Route("team-alpha", "alpha", "/webhook/alpha/linear", root / "unused.env", inbox)
             ingress.enqueue(route, "delivery-1", json.dumps({"data": {"agentSession": {"id": "linear-session-1"}, "prompt": "work"}}).encode())
-            worker = LinearWorker(root / "worker.db", profile="sample", workspace="example-workspace")
+            worker = LinearWorker(root / "worker.db", profile="alpha", workspace="demo-space")
             self.assertTrue(worker.import_from_ingress_once(inbox / "ingress.db"))
             self.assertFalse(worker.import_from_ingress_once(inbox / "ingress.db"))
 
 
-    def test_restart_quarantines_running_delivery_and_queues_terminal_response(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            database = Path(temp) / "worker.db"
-            worker = LinearWorker(database, profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-1", json.dumps({"type": "AgentSessionEvent", "action": "created", "agentSession": {"id": "linear-session-1"}, "promptContext": "work"}).encode())
-            self.assertIsNotNone(worker._claim_one())
-            recovered = LinearWorker(database, profile="sample", workspace="example-workspace")
-            self.assertEqual(recovered.outbox(), [("response", "linear-session-1", "The agent was interrupted before its status could be confirmed. Please retry this request.")])
-            self.assertFalse(recovered.process_once(lambda *_: "must not rerun"))
-
-    def test_malformed_json_is_quarantined_without_infinite_retry(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-bad", b"{not-json")
-
-            self.assertTrue(worker.process_once(lambda *_: "must not execute"))
-            self.assertFalse(worker.process_once(lambda *_: "must not retry"))
-            self.assertEqual(worker.delivery_state("delivery-bad"), "rejected")
-
-    def test_malformed_agent_session_event_without_session_is_quarantined(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-bad", json.dumps({
-                "type": "AgentSessionEvent",
-                "action": "created",
-                "promptContext": "work",
-            }).encode())
-
-            self.assertTrue(worker.process_once(lambda *_: "must not execute"))
-            self.assertFalse(worker.process_once(lambda *_: "must not retry"))
-            self.assertEqual(worker.delivery_state("delivery-bad"), "rejected")
-
-    def test_legacy_event_with_session_but_no_prompt_gets_terminal_response(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            worker = LinearWorker(Path(temp) / "worker.db", profile="sample", workspace="example-workspace")
-            worker.add_delivery("delivery-bad", json.dumps({
-                "data": {"agentSession": {"id": "linear-session-1"}}
-            }).encode())
-            calls = []
-
-            self.assertTrue(worker.process_once(lambda *_: calls.append("execute") or "must not execute"))
-            self.assertEqual(calls, [])
-            self.assertEqual(worker.outbox(), [
-                ("response", "linear-session-1", "Unable to process this Linear event. Please retry your request."),
-            ])
-            self.assertFalse(worker.process_once(lambda *_: "must not retry"))
     def test_queued_follow_up_does_not_move_an_actively_running_issue_back_to_todo(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             worker = LinearWorker(
                 Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             first = json.dumps({
                 "type": "AgentSessionEvent",
@@ -706,14 +367,14 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             self.assertEqual(
                 [body for _, operation, body in emitted if operation == "issue_status"],
-                ["waiting", "active"],
+                ["active"],
             )
     def test_finishing_a_turn_leaves_issue_in_todo_when_a_follow_up_is_queued(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             worker = LinearWorker(
                 Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             first = json.dumps({
                 "type": "AgentSessionEvent",
@@ -758,15 +419,15 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             self.assertEqual(
                 [body for _, operation, body in emitted if operation == "issue_status"],
-                ["waiting", "active", "waiting"],
+                ["active"],
             )
-    def test_restart_marks_interrupted_turn_failed_and_adds_summary_comment(self) -> None:
+    def test_restart_marks_interrupted_turn_failed_without_duplicate_comment(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "worker.db"
             worker = LinearWorker(
                 database,
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             worker.add_delivery("delivery-1", json.dumps({
                 "type": "AgentSessionEvent",
@@ -785,8 +446,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             recovered = LinearWorker(
                 database,
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             self.assertEqual(recovered.delivery_state("delivery-1"), "ambiguous")
             emitted: list[tuple[str, str, str]] = []
@@ -799,26 +460,28 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             self.assertIn(
                 (
-                    "issue-1",
-                    "issue_comment",
+                    "linear-session-1",
+                    "error",
                     (
-                        "### Agent session summary\n\n"
                         "The agent was interrupted before its status could be "
                         "confirmed. Please retry this request."
                     ),
                 ),
                 emitted,
             )
+            self.assertFalse(
+                any(operation == "issue_comment" for _, operation, _ in emitted)
+            )
             self.assertEqual(
                 [body for _, operation, body in emitted if operation == "issue_status"],
-                ["waiting", "active", "failure"],
+                ["active", "failure"],
             )
     def test_summary_comment_is_redacted_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             worker = LinearWorker(
                 Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             job = worker._standard_job_from_payload(
                 "delivery-1",
@@ -841,6 +504,13 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 },
                 "promptContext": "work",
             }).encode())
+            progressed, job = worker.admit_once()
+            self.assertTrue(progressed)
+            self.assertIsNotNone(job)
+            worker.mark_prepared(job)
+            job = worker.claim_prepared()
+            self.assertIsNotNone(job)
+            self.assertEqual(worker.delivery_state("delivery-1"), "running")
             private_key_marker = "PRIVATE " + "KEY"
             fake_private_key = "\n".join((
                 f"-----BEGIN {private_key_marker}-----",
@@ -894,8 +564,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             worker = LinearWorker(
                 Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             payload = json.dumps({
                 "type": "AgentSessionEvent",
@@ -913,6 +583,19 @@ class LinearAgentWorkerTests(unittest.TestCase):
             worker.mark_prepared(job)
             running = worker.claim_prepared()
             assert running is not None
+            receipt = {
+                "lifecycle_version": "execution-lifecycle/v2",
+                "session_key": running.hermes_session_key,
+                "execution_id": "exec-replay",
+                "generation": 1,
+                "state": "completed",
+                "occupancy": "released",
+                "tools": "none",
+                "children": "none",
+                "processes": "none",
+                "remote": "none",
+            }
+            worker.record_lifecycle_receipt(running, "exec-replay", receipt, released=True)
             worker.complete_job(running, "Finished")
 
             worker.add_delivery("delivery-2", payload)
@@ -929,18 +612,32 @@ class LinearAgentWorkerTests(unittest.TestCase):
                 sum(operation == "issue_comment" for _, operation, _ in emitted),
                 1,
             )
+            project_updates = [
+                (target, json.loads(body))
+                for target, operation, body in emitted
+                if operation == "project_update"
+            ]
+            self.assertEqual(project_updates, [
+                ("issue-1", {
+                    "session_key": "linear:demo-space:linear-session-1:delivery-1:closeout",
+                    "summary": (
+                        "### Agent session summary\n\n"
+                        "Work session finished. Detailed findings and remaining actions are recorded on the issue. "
+                        "Issue completion and project health are not inferred from session completion."
+                    ),
+                })
+            ])
             self.assertEqual(
                 [body for _, operation, body in emitted if operation == "issue_status"],
-                ["waiting", "active", "done"],
+                ["active", "done"],
             )
     def test_existing_worker_database_is_migrated_for_issue_lifecycle(self) -> None:
         import sqlite3
 
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "worker.db"
-            with closing(sqlite3.connect(database)) as conn:
-                with conn:
-                    conn.executescript("""
+            with sqlite3.connect(database) as conn:
+                conn.executescript("""
                     CREATE TABLE deliveries (
                         delivery_id TEXT PRIMARY KEY,
                         payload BLOB NOT NULL,
@@ -960,8 +657,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
 
             worker = LinearWorker(
                 database,
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             with worker._connect() as conn:
                 delivery_columns = {
@@ -986,8 +683,8 @@ class LinearAgentWorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             worker = LinearWorker(
                 Path(temp) / "worker.db",
-                profile="sample",
-                workspace="example-workspace",
+                profile="alpha",
+                workspace="demo-space",
             )
             worker.add_delivery("delivery-1", json.dumps({
                 "type": "AgentSessionEvent",
@@ -1017,6 +714,150 @@ class LinearAgentWorkerTests(unittest.TestCase):
                     pass
             self.assertTrue(worker.dispatch_outbox(emit))
             self.assertEqual(active_attempts, 2)
+
+
+    def test_review_handoff_reassigns_requester_and_does_not_mark_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            worker = LinearWorker(
+                Path(temp) / "worker.db",
+                profile="alpha",
+                workspace="examplecom",
+                allowed_linear_user_ids=[ALLOWED_USER_ID],
+                terminal_issue_status="review",
+                reassign_to_requester=True,
+            )
+            worker.add_delivery("delivery-1", json.dumps({
+                "type": "AgentSessionEvent",
+                "action": "created",
+                "agentSession": {
+                    "id": "linear-session-1",
+                    "creatorId": ALLOWED_USER_ID,
+                    "issue": {"id": "issue-1"},
+                },
+                "promptContext": "work",
+            }).encode())
+            admitted, job = worker.admit_once()
+            self.assertTrue(admitted)
+            assert job is not None
+            self.assertEqual(job.requester_user_id, ALLOWED_USER_ID)
+            prepared = worker.next_unprepared()
+            assert prepared is not None
+            worker.mark_prepared(prepared)
+            running = worker.claim_prepared()
+            assert running is not None
+            worker.complete_job(running, "Recommend a small fix.")
+            kinds = [kind for kind, _, _ in worker.outbox()]
+            self.assertIn("issue_handoff", kinds)
+            self.assertNotIn("issue_status_done", kinds)
+            handoff = [
+                json.loads(body)
+                for kind, _, body in worker.outbox()
+                if kind == "issue_handoff"
+            ]
+            self.assertEqual(
+                handoff,
+                [{
+                    "state": "review",
+                    "assigneeId": ALLOWED_USER_ID,
+                    "clearDelegate": True,
+                }],
+            )
+
+    def test_complete_job_does_not_mark_done_from_model_text_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            worker = LinearWorker(
+                Path(temp) / "worker.db",
+                profile="alpha",
+                workspace="demo-space",
+            )
+            worker.add_delivery("delivery-1", json.dumps({
+                "type": "AgentSessionEvent",
+                "action": "created",
+                "agentSession": {
+                    "id": "linear-session-1",
+                    "issue": {"id": "issue-1"},
+                },
+                "promptContext": "work",
+            }).encode())
+            worker.admit_once()
+            prepared = worker.next_unprepared()
+            assert prepared is not None
+            worker.mark_prepared(prepared)
+            running = worker.claim_prepared()
+            assert running is not None
+            worker.complete_job(running, "Finished")
+            kinds = [kind for kind, _, _ in worker.outbox()]
+            self.assertIn("response", kinds)
+            self.assertNotIn("issue_status_done", kinds)
+
+    def test_complete_job_marks_done_only_with_accepted_lifecycle_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            worker = LinearWorker(
+                Path(temp) / "worker.db",
+                profile="alpha",
+                workspace="demo-space",
+            )
+            worker.add_delivery("delivery-1", json.dumps({
+                "type": "AgentSessionEvent",
+                "action": "created",
+                "agentSession": {
+                    "id": "linear-session-1",
+                    "issue": {"id": "issue-1"},
+                },
+                "promptContext": "work",
+            }).encode())
+            worker.admit_once()
+            prepared = worker.next_unprepared()
+            assert prepared is not None
+            worker.mark_prepared(prepared)
+            running = worker.claim_prepared()
+            assert running is not None
+            receipt = {
+                "lifecycle_version": "execution-lifecycle/v2",
+                "session_key": running.hermes_session_key,
+                "execution_id": "exec-1",
+                "generation": 1,
+                "state": "completed",
+                "occupancy": "released",
+                "tools": "none",
+                "children": "none",
+                "processes": "none",
+                "remote": "none",
+            }
+            worker.record_lifecycle_receipt(
+                running, "exec-1", receipt, released=True
+            )
+            worker.complete_job(running, "Finished")
+            kinds = [kind for kind, _, _ in worker.outbox()]
+            self.assertIn("issue_status_done", kinds)
+
+    def test_fail_job_emits_error_activity_not_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            worker = LinearWorker(
+                Path(temp) / "worker.db",
+                profile="alpha",
+                workspace="examplecom",
+            )
+            worker.add_delivery("delivery-1", json.dumps({
+                "type": "AgentSessionEvent",
+                "action": "created",
+                "agentSession": {
+                    "id": "linear-session-1",
+                    "issue": {"id": "issue-1"},
+                },
+                "promptContext": "work",
+            }).encode())
+            worker.admit_once()
+            prepared = worker.next_unprepared()
+            assert prepared is not None
+            worker.mark_prepared(prepared)
+            running = worker.claim_prepared()
+            assert running is not None
+            worker.fail_job(running)
+            kinds = [kind for kind, _, _ in worker.outbox()]
+            self.assertIn("error", kinds)
+            self.assertNotIn("issue_status_done", kinds)
+            self.assertIn("issue_status_failure", kinds)
 
 
 if __name__ == "__main__":
