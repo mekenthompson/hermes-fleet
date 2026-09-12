@@ -81,14 +81,14 @@ One successful surface does not prove the other. Persistence includes **working 
 
 ### Check
 
-- Did we prove every surface this job claims (for example Slack and Telegram, cold and warm state)?
+- Did we prove every surface this job claims (Telegram, Slack, and Desktop, cold and warm state)?
 - After a restart or volume reuse, do the tools still run on the intended executable and interpreter?
 - Did we look at existing private proof before adding a public harness?
 
 ### Examples
 
 - Good: a tool that works via its pinned executable and fails via the wrong Python is a failed persistence proof.
-- Bad: "Telegram worked, so Slack is done."
+- Bad: "Telegram worked, so Slack and Desktop are done."
 - Bad: a new public acceptance harness that duplicates private rollout checks we never read.
 
 ## Applying the principles

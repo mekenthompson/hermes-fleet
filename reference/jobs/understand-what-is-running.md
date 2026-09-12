@@ -1,19 +1,22 @@
 ---
 title: Understand what is running
 job: understand-what-is-running
-serves: change-recoverable
+serves: on-a-leash
 stakes: full
 invariants:
   - built-published-deployed-are-different
   - one-agent-change-is-local
   - public-image-has-no-deployment-identity
   - no-shared-credentials
+  - no-off-plan-model-call
 last_reviewed: 2026-09-12
 ---
 
 # Job Spec: understand what is running and whether the intended change actually took effect
 
 A durable Job Spec. How we surface live state lives in an RFC that `serves:` this job. That artefact churns. This job does not.
+
+`serves:` retargeted from `change-recoverable` to `on-a-leash` by [../rfcs/successor-vision.md](../rfcs/successor-vision.md).
 
 ## The job
 
@@ -35,7 +38,7 @@ This job assumes: operators cannot trust the North Star without an independent l
 
 ## Evidence & confidence
 
-- Operator interview 2026-09-12: first job chosen because the North Star is unverifiable without it.
+- Operator interview 2026-09-12: first job chosen because live intended-change cannot be scored without it. Successor interview kept the job and moved it under on-a-leash.
 - Public docs already separate publication from rollout (`docs/image-release.md`). That supports the claim distinction. It does not independently prove operators conflate the two.
 - Related overlay issues exist (HF-107, HF-163). Their contents were not reviewer-readable from the public tree, so they are not counted as verified evidence.
 
@@ -47,7 +50,7 @@ Mechanism: after an intended change, a fresh-process reader can state what the t
 
 Leading indicator: share of intended changes where that read is possible without asking the author.
 
-Where the number lives: rolls into change-recoverable's intended-change hold rate (product spec), which drives the North Star.
+Where the number lives: rolls into on-a-leash's intended-change hold rate (product spec), the leash signal under TUTR.
 
 ## Good / bad
 
