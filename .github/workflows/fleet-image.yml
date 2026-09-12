@@ -260,6 +260,22 @@ jobs:
           assert perplexity.name == "perplexity"
           assert perplexity.supports_search() and not perplexity.supports_extract()
           assert not perplexity.is_available()
+          kokoro_plugin = pathlib.Path("/opt/hermes/plugins/kokoro-voice")
+          assert (kokoro_plugin / "plugin.yaml").is_file()
+          assert (kokoro_plugin / "__init__.py").is_file()
+          kokoro_spec = importlib.util.spec_from_file_location(
+              "hermes_plugins.kokoro_voice_release",
+              kokoro_plugin / "__init__.py",
+              submodule_search_locations=[str(kokoro_plugin)],
+          )
+          assert kokoro_spec is not None and kokoro_spec.loader is not None
+          kokoro_module = importlib.util.module_from_spec(kokoro_spec)
+          sys.modules[kokoro_spec.name] = kokoro_module
+          kokoro_spec.loader.exec_module(kokoro_module)
+          assert callable(kokoro_module.register)
+          kokoro = kokoro_module.KokoroProvider()
+          assert kokoro.name == "kokoro"
+          assert not kokoro.is_available()
           from providers import get_provider_profile
           from hermes_cli.auth import resolve_external_process_provider_credentials
           profile = get_provider_profile("claude-acp")
@@ -543,6 +559,22 @@ jobs:
           assert perplexity.name == "perplexity"
           assert perplexity.supports_search() and not perplexity.supports_extract()
           assert not perplexity.is_available()
+          kokoro_plugin = pathlib.Path("/opt/hermes/plugins/kokoro-voice")
+          assert (kokoro_plugin / "plugin.yaml").is_file()
+          assert (kokoro_plugin / "__init__.py").is_file()
+          kokoro_spec = importlib.util.spec_from_file_location(
+              "hermes_plugins.kokoro_voice_release",
+              kokoro_plugin / "__init__.py",
+              submodule_search_locations=[str(kokoro_plugin)],
+          )
+          assert kokoro_spec is not None and kokoro_spec.loader is not None
+          kokoro_module = importlib.util.module_from_spec(kokoro_spec)
+          sys.modules[kokoro_spec.name] = kokoro_module
+          kokoro_spec.loader.exec_module(kokoro_module)
+          assert callable(kokoro_module.register)
+          kokoro = kokoro_module.KokoroProvider()
+          assert kokoro.name == "kokoro"
+          assert not kokoro.is_available()
           from providers import get_provider_profile
           from hermes_cli.auth import resolve_external_process_provider_credentials
           profile = get_provider_profile("claude-acp")
