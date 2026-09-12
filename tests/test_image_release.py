@@ -29,9 +29,9 @@ ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
     "sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1"
 )
-CLAUDE_CODE_VERSION = "2.1.261"
-CLAUDE_CODE_INTEGRITY = "sha512-j6+AkfCl6/UJBcx66nlZUmWc4XGK3TscvW19Tiat+oDwkz3WqQfKzjvHO5FhR+shXTtktqs6vqSBrJmeSWpU3Q=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-t7yPrjZH7/xOPR0HYg8NDBr9dGqIi2y3dCDLKmx2zHedSHjAGxoX7HnHeXr1tdk3iw2a6sM/LsV9O7/+Ar86FA=="
+CLAUDE_CODE_VERSION = "2.1.263"
+CLAUDE_CODE_INTEGRITY = "sha512-kvvBK6/69iTRYnq0TKVyxVZs1CxYCJGojshQSP+2qaDb66A2xtI4zbCuqkZUWLkFGmHSRqhFf/ATpzH2UNKcwg=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-0IrvpLd/0FP0acQw59T4Cvx/r4nwAXKBrW0WyhIXymzYWurPCLztB+Icu9MkeewAUI+p3PTXsSfmilv/n6XlAQ=="
 CLAUDE_AGENT_ACP_VERSION = "0.75.1"
 CLAUDE_AGENT_ACP_INTEGRITY = "sha512-Un6I4BRkhpCFS3I7kr5C/lkAm8Nc3VuGZU2YQ3xIpJAIxV94iWO0Q2CH2QABxMERpONRu4Le6XC9V+5PImQZ2A=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
@@ -258,7 +258,15 @@ class FleetImageReleaseTests(unittest.TestCase):
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         ):
             self.assertIn(variable, launcher)
-        self.assertIn('exec /usr/local/bin/claude-agent-acp "$@"', launcher)
+        self.assertLess(
+            launcher.index("export CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude"),
+            launcher.index('exec /usr/local/bin/claude-agent-acp "$@"'),
+        )
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude",
+            dockerfile,
+        )
         self.assertIn(CLAUDE_ACP_PLUGIN_REVISION, plugin)
         self.assertIn("kind: model-provider", metadata)
 
