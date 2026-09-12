@@ -269,7 +269,13 @@ jobs:
           assert shutil.which(creds["command"]) == creds["command"]
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
-          assert pwd.getpwnam("hermes").pw_uid != 0
+          assert pwd.getpwnam("hermes").pw_uid == 1000
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
+          assert subprocess.check_output(["webkite", "--version"], text=True).strip() == "webkite 0.5.0"
+          assert metadata.version("honcho-ai") == "2.2.0"
+          assert shutil.which("codex")
+          assert shutil.which("grok")
+          assert shutil.which("opencode")
           assert not pathlib.Path("/var/run/docker.sock").exists()
           assert pathlib.Path("/opt/hermes-fleet/contracts/image.json").is_file()
           '
@@ -546,7 +552,13 @@ jobs:
           assert shutil.which(creds["command"]) == creds["command"]
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
-          assert pwd.getpwnam("hermes").pw_uid != 0
+          assert pwd.getpwnam("hermes").pw_uid == 1000
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
+          assert subprocess.check_output(["webkite", "--version"], text=True).strip() == "webkite 0.5.0"
+          assert metadata.version("honcho-ai") == "2.2.0"
+          assert shutil.which("codex")
+          assert shutil.which("grok")
+          assert shutil.which("opencode")
           assert not pathlib.Path("/var/run/docker.sock").exists()
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'

@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DOCKERFILE = ROOT / "Dockerfile"
+PACKAGE = ROOT / "package.json"
+PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
+SCOPE = ROOT / "scripts" / "fleet-image-change-scope.py"
+VERIFY = ROOT / "scripts" / "verify-public-tree.py"
+WORKFLOW = ROOT / ".github" / "workflows" / "fleet-image.yml"
+WEBKITE_BIN = ROOT / "third_party" / "webkite-0.5.0-linux-amd64"
+WEBKITE_PLUGIN = ROOT / "plugins" / "web" / "webkite"
+GH_VERSION = "2.98.0"
+GH_LINUX_AMD64_SHA256 = (
+    "3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"
+)
+WEBKITE_SHA256 = (
+    "4d29088f628201bf1bba3308a29851392e999f8135e7b2444a77c15278f98131"
+)
+HONCHO_AI_VERSION = "2.2.0"
+EXTRA_CLIS = {
+    "@openai/codex": "0.153.4",
+    "@xai-official/grok": "1.0.13",
+    "opencode-ai": "1.18.29",
+}
+
+
+def _split(name: str) -> str:
+    return "".join(name)
+
+
+class PublicFattenContractTests(unittest.TestCase):
+    def test_dockerfile_installs_pinned_github_cli(self) -> None:
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn(f"ARG GH_VERSION={GH_VERSION}", text)
+        self.assertIn(f"ARG GH_LINUX_AMD64_SHA256={GH_LINUX_AMD64_SHA256}", text)
+        self.assertIn("gh_${GH_VERSION}_linux_amd64.tar.gz", text)
+        self.assertIn(
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}",
+            text,
+        )
+        self.assertIn("curl -fsSL", text)
+        self.assertIn('test "$(gh --version | awk \'NR==1{print $3}\')" = "${GH_VERSION}"', text)
+        self.assertNotIn("4c5f90f0198e28652d2c111e5c529e2a9901a7b2f20808b1cbd3a64d2a93a8d6", text)
+
+    def test_dockerfile_rebinds_hermes_to_uid_1000(self) -> None:
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn("usermod -u 1000 -g 1000 hermes", text)
+        self.assertIn("groupmod -g 1000 hermes", text)
+        self.assertRegex(text, r"(?m)^USER 1000:1000$")
+
+    def test_dockerfile_installs_honcho_extra_without_workspace_ids(self) -> None:
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn("uv export --frozen --no-dev --no-emit-project --extra honcho", text)
+        self.assertIn(f"assert version('honcho-ai') == '{HONCHO_AI_VERSION}'", text)
+        lowered = text.lower()
+        for token in ("workspace_id", "switchroom", "kenthompson.com.au"):
+            self.assertNotIn(token, lowered)
+
+    def test_package_json_pins_extra_coding_clis(self) -> None:
+        package = json.loads(PACKAGE.read_text(encoding="utf-8"))
+        for name, version in EXTRA_CLIS.items():
+            with self.subTest(name=name):
+                self.assertEqual(package["dependencies"][name], version)
+
+    def test_acp_version_check_keeps_shell_single_quoted_node(self) -> None:
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        self.assertIn(
+            "node -p 'require(\"/opt/coding-clis/node_modules/"
+            "@agentclientprotocol/claude-agent-acp/package.json\").version'",
+            text,
+        )
+        self.assertNotIn(
+            r'require(\"/opt/coding-clis/node_modules/'
+            r'@agentclientprotocol/claude-agent-acp/package.json\")',
+            text,
+        )
+
+    def test_webkite_plugin_is_generic_and_disabled(self) -> None:
+        metadata = (WEBKITE_PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        contract = json.loads(PLUGINS_CONTRACT.read_text(encoding="utf-8"))
+        matches = [item for item in contract["components"] if item["id"] == "webkite-web-provider"]
+        self.assertEqual(
+            matches,
+            [
+                {
+                    "id": "webkite-web-provider",
+                    "target": "standalone_public_plugin",
+                    "default_enabled": False,
+                    "conditions": [
+                        "generic_configuration",
+                        "local_cli",
+                        "independent_tests",
+                        "license_review",
+                        "no_deployment_identity",
+                    ],
+                }
+            ],
+        )
+        self.assertIn("Hermes Fleet Contributors", metadata)
+        self.assertIn(
+            "COPY plugins/web/webkite/ /opt/hermes/plugins/web/webkite/",
+            dockerfile,
+        )
+        self.assertIn("hermes plugins doctor /opt/hermes/plugins/web/webkite --ci", dockerfile)
+        lowered = "\n".join(
+            (
+                metadata,
+                (WEBKITE_PLUGIN / "provider.py").read_text(encoding="utf-8"),
+                (WEBKITE_PLUGIN / "__init__.py").read_text(encoding="utf-8"),
+            )
+        ).lower()
+        for token in ("switchroom", "o" + "p://", "linear-agents.json", "melbourne"):
+            self.assertNotIn(token, lowered)
+
+    def test_webkite_binary_is_hashed_and_allowlisted(self) -> None:
+        self.assertTrue(WEBKITE_BIN.is_file())
+        digest = hashlib.sha256(WEBKITE_BIN.read_bytes()).hexdigest()
+        self.assertEqual(digest, WEBKITE_SHA256)
+        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+        verifier = VERIFY.read_text(encoding="utf-8")
+        self.assertIn(
+            "COPY --chmod=0755 third_party/webkite-0.5.0-linux-amd64 /usr/local/bin/webkite",
+            dockerfile,
+        )
+        self.assertIn(f"ARG WEBKITE_SHA256={WEBKITE_SHA256}", dockerfile)
+        self.assertIn(WEBKITE_SHA256, verifier)
+        self.assertIn("third_party/webkite-0.5.0-linux-amd64", verifier)
+
+    def test_image_scope_includes_fatten_inputs(self) -> None:
+        text = SCOPE.read_text(encoding="utf-8")
+        self.assertIn('"plugins/web/webkite/"', text)
+        self.assertIn('"third_party/webkite-0.5.0-linux-amd64"', text)
+
+    def test_release_workflow_proves_fattened_runtime(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertGreaterEqual(text.count('assert pwd.getpwnam("hermes").pw_uid == 1000'), 2)
+        self.assertGreaterEqual(text.count('assert subprocess.check_output(["gh", "--version"]'), 2)
+        self.assertGreaterEqual(text.count('assert subprocess.check_output(["webkite", "--version"]'), 2)
+        self.assertGreaterEqual(text.count(f'assert metadata.version("honcho-ai") == "{HONCHO_AI_VERSION}"'), 2)
+        self.assertGreaterEqual(text.count('assert shutil.which("codex")'), 2)
+        self.assertGreaterEqual(text.count('assert shutil.which("grok")'), 2)
+        self.assertGreaterEqual(text.count('assert shutil.which("opencode")'), 2)
+
+    def test_fatten_inputs_keep_household_state_out(self) -> None:
+        tracked = []
+        for relative in (
+            "Dockerfile",
+            "package.json",
+            "contracts/plugins.json",
+            "README.md",
+            "docs/webkite.md",
+            "plugins/web/webkite/plugin.yaml",
+            "plugins/web/webkite/provider.py",
+            "plugins/web/webkite/__init__.py",
+        ):
+            path = ROOT / relative
+            self.assertTrue(path.is_file(), relative)
+            tracked.append(path.read_text(encoding="utf-8").lower())
+        blob = "\n".join(tracked)
+        for token in (
+            "switchroom",
+            "melbourne",
+            "o" + "p://",
+            "readonly-source",
+            "tooling-policy",
+            "au.com.kenthompson",
+            _split("klank") + "er",
+            _split("over") + "lord",
+            _split("car") + "rie",
+        ):
+            self.assertNotIn(token, blob)
+        self.assertFalse((ROOT / "plugins/linear-agent/linear-agents.json").exists())
+        self.assertNotRegex(
+            DOCKERFILE.read_text(encoding="utf-8"),
+            r"(?m)^\s*COPY\s+.*linear-agents\.json",
+        )
+        contract = json.loads(PLUGINS_CONTRACT.read_text(encoding="utf-8"))
+        self.assertNotIn("honcho", json.dumps(contract).lower())
+        self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

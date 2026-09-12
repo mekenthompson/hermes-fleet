@@ -138,7 +138,9 @@ class FleetImageReleaseTests(unittest.TestCase):
             "/etc/hermes-fleet/image-provenance.json",
         ):
             self.assertIn(token, text)
-        self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD|USER)\b")
+        self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD)\b")
+        self.assertIn("USER root", text)
+        self.assertRegex(text, r"(?m)^USER 1000:1000$")
 
     def test_tooling_versions_match_build_and_workflow_inputs(self) -> None:
         package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
@@ -160,6 +162,9 @@ class FleetImageReleaseTests(unittest.TestCase):
             {
                 "@agentclientprotocol/claude-agent-acp": CLAUDE_AGENT_ACP_VERSION,
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
+                "@openai/codex": "0.153.4",
+                "@xai-official/grok": "1.0.13",
+                "opencode-ai": "1.18.29",
             },
         )
         self.assertTrue(package["private"])

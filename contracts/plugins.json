@@ -39,6 +39,18 @@
       ]
     },
     {
+      "id": "webkite-web-provider",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "generic_configuration",
+        "local_cli",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
       "id": "work-tracker",
       "target": "standalone_public_plugin",
       "default_enabled": false,
