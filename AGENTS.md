@@ -21,6 +21,7 @@ Dockerfile                 Fleet child only
 compose.example.yaml       Synthetic example, not a production baseline
 contracts/                 Public product boundaries
 docs/                      Human docs for public behavior
+examples/overlay-repo/     Placeholder overlay repository
 plugins/                   Optional, default-disabled plugins
 release/                   Pinned Agent parent handoff
 scripts/                   Build, compose, and verification wrappers
@@ -59,4 +60,4 @@ If you add a tool, pin it (version + sha256 or lockfile) and prove it in `fleet-
 
 ## Docs
 
-Update `README.md` when the public product shape changes. Keep this file honest about the public/private split. `SECURITY.md` is the vulnerability path.
+Update `README.md` when the public product shape changes. Keep this file honest about the public/private split. Overlay layout and Hermes config layers: `docs/overlay-repository.md` and `examples/overlay-repo/`. `SECURITY.md` is the vulnerability path.

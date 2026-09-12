@@ -1,0 +1,9 @@
+# Fleet-wide Hermes defaults. Applied to every agent.
+# Do not set `profile:` here. Use agents/<name>.yaml for per-agent values.
+# `{profile}` in a string is replaced with the agent name at render time.
+values:
+  memory.provider: honcho
+  prompt_caching.cache_ttl: 1h
+  terminal.cwd: /opt/data/workspace
+  web.search_backend: perplexity
+  web.use_gateway: false

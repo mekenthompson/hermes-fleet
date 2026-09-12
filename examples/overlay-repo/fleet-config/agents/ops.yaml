@@ -1,0 +1,6 @@
+profile: ops
+role: operator
+apply_mode: merge
+values:
+  model.provider: example-provider
+  model.default: example-model
