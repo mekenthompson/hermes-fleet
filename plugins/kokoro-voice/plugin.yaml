@@ -1,0 +1,12 @@
+name: kokoro-voice
+version: 1.0.0
+description: Local Kokoro TTS and faster-whisper sidecar providers.
+author: Hermes Fleet Contributors
+kind: backend
+requires_env:
+  - name: HERMES_KOKORO_SIDECAR_URL
+    description: Internal URL of the Hermes voice sidecar.
+    password: false
+  - name: HERMES_KOKORO_SIDECAR_TOKEN
+    description: Shared voice sidecar authentication token.
+    password: true

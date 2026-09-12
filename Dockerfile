@@ -53,7 +53,10 @@ RUN python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py \
     && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci
 COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/
 RUN test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json \
+    && test ! -e /opt/hermes/plugins/linear-agent/linear-publishers.json \
     && python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py
+COPY plugins/kokoro-voice/ /opt/hermes/plugins/kokoro-voice/
+RUN python3 -m py_compile /opt/hermes/plugins/kokoro-voice/*.py
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
 COPY contracts/ /opt/hermes-fleet/contracts/
