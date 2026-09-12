@@ -60,8 +60,13 @@ class PublicProductTests(unittest.TestCase):
             "plugins/linear-agent/linear_runtime.py",
             "plugins/linear-agent/plugin.yaml",
             "docs/perplexity.md",
+            "docs/webkite.md",
             "docs/linear-agent.md",
             "examples/linear-agent-policy.json",
+            "plugins/web/webkite/__init__.py",
+            "plugins/web/webkite/plugin.yaml",
+            "plugins/web/webkite/provider.py",
+            "third_party/webkite-0.5.0-linux-amd64",
         ):
             with self.subTest(relative=relative):
                 self.assertTrue((ROOT / relative).is_file())
@@ -133,9 +138,11 @@ class PublicProductTests(unittest.TestCase):
         self.assertIn("DISABLE_AUTOUPDATER=1", text)
         self.assertIn("scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py", text)
         self.assertIn("scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref", text)
-        self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD|USER)\b")
+        self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD)\b")
+        self.assertIn("USER root", text)
+        self.assertRegex(text, r"(?m)^USER 1000:1000$")
         self.assertNotIn("apt-get", text)
-        self.assertNotIn("curl ", text)
+        self.assertIn("curl -fsSL", text)
         self.assertNotIn("wget ", text)
         self.assertNotIn("core_runtime_paths", text)
 

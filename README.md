@@ -2,7 +2,7 @@
 
 An opinionated, public Docker isolation pattern for running multiple [Hermes Agent](https://github.com/NousResearch/hermes-agent) profiles as separate containers.
 
-This repository publishes a minimal, provenance-bound Fleet child image through a protected manual release workflow. Source publication and image publication do not imply production readiness or authorize deployment.
+This repository publishes an opinionated, provenance-bound Fleet child image through a protected manual release workflow. Source publication and image publication do not imply production readiness or authorize deployment.
 
 ## Design
 
@@ -12,6 +12,8 @@ This repository publishes a minimal, provenance-bound Fleet child image through 
 - Keep Docker socket, host networking, host bridges, privileged mode, credentials, identities, sessions, memories, and deployment topology out of the public image.
 - Keep optional integrations as standalone plugins, disabled by default.
 - Bundle a generic Perplexity Search API provider while requiring its API key from the deployment secret boundary.
+- Bundle a generic Webkite CLI provider, GitHub CLI, extra coding CLIs, and the Honcho Python extra without deployment identities or workspace IDs.
+- Rebind the runtime user to UID/GID 1000 so profile containers can start with no-new-privileges.
 - Bundle generic Linear Agent executable code while requiring deployment policy as a separate read-only data mount.
 
 ## Supported local commands

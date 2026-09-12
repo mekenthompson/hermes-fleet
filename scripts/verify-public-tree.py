@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_NAMES = {"auth.json", "credentials.json", "sessions", "memories", "logs"}
+ALLOWED_BINARIES = {
+    "third_party/webkite-0.5.0-linux-amd64": (
+        "4d29088f628201bf1bba3308a29851392e999f8135e7b2444a77c15278f98131"
+    ),
+}
 FORBIDDEN_PATTERNS = {
     "broker reference": re.compile("o" + "p://", re.IGNORECASE),
     "private key": re.compile("BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY"),
@@ -58,7 +64,13 @@ def main() -> int:
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            errors.append(f"binary file requires dedicated scanning: {relative}")
+            expected = ALLOWED_BINARIES.get(relative.as_posix())
+            if expected is None:
+                errors.append(f"binary file requires dedicated scanning: {relative}")
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest != expected:
+                errors.append(f"binary hash mismatch: {relative}")
             continue
         for label, pattern in FORBIDDEN_PATTERNS.items():
             if pattern.search(text):
