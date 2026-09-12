@@ -4,6 +4,29 @@ Instructions for humans and coding agents working in `mekenthompson/hermes-fleet
 
 This is the **public** Hermes Fleet distribution. It owns generic implementation, the opinionated Fleet child image, independent sidecar source, and public GHCR publication. Deployment overlays, identities, and private binaries live elsewhere.
 
+Product decisions live in [`reference/`](reference/). Read that before changing behaviour that operators will feel.
+
+## Product contract
+
+A change ships only when **all** hold:
+
+1. It advances a named vision outcome in `reference/vision.md` / `reference/product-spec.md`.
+2. It satisfies its Job Spec, proven by that job's outcome UAT.
+3. It passes every principle check in `reference/principles.md`.
+4. It crosses no invariant in `reference/invariants.md`.
+
+Else: out of scope, however clever.
+
+Humans own the vision, principles, invariants, and ratifying the job statement. Agents consume those anchors; they never author them.
+
+Review is a **separate fresh-process reviewer**, never the author. Unit-green, outcome UAT, and production-readiness are three gates. None implies the others. **Built, published, and deployed are different claims.**
+
+Do not add ledgers, dashboards, confidence scores, or standalone formulation documents. Record assumptions and findings inside the spec, RFC, or post-launch review.
+
+Do not change policy merely to make documentation agree with code. Reconcile the explanation with the intended policy.
+
+Ceremony matches user-visible change. Not every patch is a launch. Lighter evidence does not mean optional invariants.
+
 ## Hard rules
 
 - Pin images by immutable digest. Never teach people to run mutable tags.
@@ -27,6 +50,7 @@ release/                   Pinned Agent parent handoff
 scripts/                   Build, compose, and verification wrappers
 sidecars/                  Independent sidecar source and image workflows
 tests/                     Public product and sidecar tests
+reference/                 ProductOS: vision, principles, invariants, product spec, jobs
 ```
 
 There is no `sidecars/` copy in the private overlay, and no private compose in this tree.
@@ -60,4 +84,4 @@ If you add a tool, pin it (version + sha256 or lockfile) and prove it in `fleet-
 
 ## Docs
 
-Update `README.md` when the public product shape changes. Keep this file honest about the public/private split. Overlay layout and Hermes config layers: `docs/overlay-repository.md` and `examples/overlay-repo/`. `SECURITY.md` is the vulnerability path.
+Update `README.md` when the public product shape changes. Keep this file honest about the public/private split. Overlay layout and Hermes config layers: `docs/overlay-repository.md` and `examples/overlay-repo/`. Product scope and jobs live in `reference/`. `SECURITY.md` is the vulnerability path.

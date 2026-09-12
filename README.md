@@ -81,13 +81,14 @@ python3 scripts/verify-public-tree.py
 
 Pull requests build a non-publishing `linux/amd64` candidate, verify runtime/provenance, and run the critical-vulnerability gate. Pushes to `main` that touch image inputs publish the exact scanned candidate. See [`docs/image-release.md`](docs/image-release.md).
 
-Coding agents should start at [`AGENTS.md`](AGENTS.md).
+Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`reference/`](reference/).
 
 ## Docs
 
 | Doc | What it covers |
 | --- | --- |
 | [`AGENTS.md`](AGENTS.md) | How to work in this repo |
+| [`reference/`](reference/) | Vision, principles, invariants, product spec, jobs |
 | [`docs/overlay-repository.md`](docs/overlay-repository.md) | Overlay repo layout, config layers, sample files |
 | [`docs/image-release.md`](docs/image-release.md) | Image bake, scan, and publication |
 | [`docs/linear-agent.md`](docs/linear-agent.md) | Linear worker plugin (policy stays external) |
