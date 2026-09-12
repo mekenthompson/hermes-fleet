@@ -70,9 +70,14 @@
     },
     {
       "id": "voice-provider",
-      "target": "undecided",
+      "target": "standalone_public_plugin",
       "default_enabled": false,
-      "decision_gate": "prove_generic_value_and_independent_lifecycle"
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
     }
   ],
   "excluded_capability_classes": [

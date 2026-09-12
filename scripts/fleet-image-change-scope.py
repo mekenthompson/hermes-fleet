@@ -56,6 +56,7 @@ IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
     "plugins/linear-agent/",
     "plugins/model-providers/claude-acp/",
     "plugins/web/perplexity/",
+    "plugins/kokoro-voice/",
 )
 
 

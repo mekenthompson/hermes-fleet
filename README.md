@@ -93,6 +93,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 | [`docs/image-release.md`](docs/image-release.md) | Image bake, scan, and publication |
 | [`docs/linear-agent.md`](docs/linear-agent.md) | Linear worker plugin (policy stays external) |
 | [`docs/perplexity.md`](docs/perplexity.md) | Optional search provider |
+| [`plugins/kokoro-voice/`](plugins/kokoro-voice/) | Optional local Kokoro sidecar TTS (disabled by default) |
 | [`SECURITY.md`](SECURITY.md) | Vulnerability reporting and public boundary |
 | [`contracts/`](contracts/) | Machine-readable architecture boundaries |
 

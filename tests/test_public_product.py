@@ -59,6 +59,8 @@ class PublicProductTests(unittest.TestCase):
             "plugins/linear-agent/linear_oauth.py",
             "plugins/linear-agent/linear_runtime.py",
             "plugins/linear-agent/plugin.yaml",
+            "plugins/kokoro-voice/__init__.py",
+            "plugins/kokoro-voice/plugin.yaml",
             "docs/perplexity.md",
             "docs/overlay-repository.md",
             "docs/linear-agent.md",

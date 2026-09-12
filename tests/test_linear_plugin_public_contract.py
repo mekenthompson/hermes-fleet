@@ -45,6 +45,7 @@ class LinearPluginPublicContractTests(unittest.TestCase):
 
     def test_house_policy_and_operations_are_not_embedded(self) -> None:
         self.assertFalse((PLUGIN / "linear-agents.json").exists())
+        self.assertFalse((PLUGIN / "linear-publishers.json").exists())
         self.assertFalse((PLUGIN / "linear_provision.py").exists())
         self.assertFalse((PLUGIN / "linear_live_canary.py").exists())
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
