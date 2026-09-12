@@ -1,0 +1,11 @@
+schema_version: 1
+# Allowlisted desired-state keys for fleet-config/*.yaml.
+# This is not /etc/hermes/config.yaml (the managed policy layer).
+managed_leaves:
+  memory.provider: str
+  model.default: str
+  model.provider: str
+  prompt_caching.cache_ttl: str
+  terminal.cwd: str
+  web.search_backend: str
+  web.use_gateway: bool

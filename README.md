@@ -66,7 +66,11 @@ export HERMES_FLEET_IMAGE=ghcr.io/example/hermes-fleet@sha256:0123456789abcdef01
 python3 scripts/compose.py config
 ```
 
-The example profiles in `compose.example.yaml` are synthetic. Replace them in a deployment repository.
+The example profiles in `compose.example.yaml` are synthetic. For a real
+deployment, copy [`examples/overlay-repo/`](examples/overlay-repo) into a
+separate overlay repository. That is where fleet-wide Hermes defaults,
+per-agent overrides, compose, and unpublished binaries live. See
+[`docs/overlay-repository.md`](docs/overlay-repository.md).
 
 ## Development
 
@@ -84,6 +88,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md).
 | Doc | What it covers |
 | --- | --- |
 | [`AGENTS.md`](AGENTS.md) | How to work in this repo |
+| [`docs/overlay-repository.md`](docs/overlay-repository.md) | Overlay repo layout, config layers, sample files |
 | [`docs/image-release.md`](docs/image-release.md) | Image bake, scan, and publication |
 | [`docs/linear-agent.md`](docs/linear-agent.md) | Linear worker plugin (policy stays external) |
 | [`docs/perplexity.md`](docs/perplexity.md) | Optional search provider |

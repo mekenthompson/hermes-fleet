@@ -1,0 +1,6 @@
+profile: worker
+role: worker
+apply_mode: merge
+values:
+  model.provider: example-provider
+  model.default: example-model

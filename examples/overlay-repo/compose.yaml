@@ -1,0 +1,40 @@
+name: hermes-fleet-overlay-example
+
+x-hermes-agent: &hermes-agent
+  image: ${HERMES_FLEET_IMAGE:?set a digest-pinned Fleet image, for example ghcr.io/example/hermes-fleet@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  restart: unless-stopped
+  environment:
+    HERMES_UID: ${HERMES_UID:-1000}
+    HERMES_GID: ${HERMES_GID:-1000}
+    TZ: UTC
+  command: ["gateway", "run"]
+
+services:
+  ops:
+    <<: *hermes-agent
+    volumes:
+      - ops-state:/opt/data
+      - ops-workspace:/opt/data/workspace
+      - ./managed/ops.yaml:/etc/hermes/config.yaml:ro
+    networks:
+      - ops-network
+
+  worker:
+    <<: *hermes-agent
+    volumes:
+      - worker-state:/opt/data
+      - worker-workspace:/opt/data/workspace
+    networks:
+      - worker-network
+
+volumes:
+  ops-state:
+  ops-workspace:
+  worker-state:
+  worker-workspace:
+
+networks:
+  ops-network:
+    driver: bridge
+  worker-network:
+    driver: bridge

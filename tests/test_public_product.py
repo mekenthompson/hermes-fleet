@@ -60,6 +60,7 @@ class PublicProductTests(unittest.TestCase):
             "plugins/linear-agent/linear_runtime.py",
             "plugins/linear-agent/plugin.yaml",
             "docs/perplexity.md",
+            "docs/overlay-repository.md",
             "docs/linear-agent.md",
             "examples/linear-agent-policy.json",
             "AGENTS.md",
