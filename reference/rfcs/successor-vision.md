@@ -1,7 +1,7 @@
 ---
 title: Successor vision
 date: 2026-09-12
-commit: 4bf14494ee3d64b8c6d58a8cca4e2b3ad839ca31
+commit: b7a183e6b7bd1f8ee559fd40ad386e267b27db22
 ---
 
 # Decision: successor vision
