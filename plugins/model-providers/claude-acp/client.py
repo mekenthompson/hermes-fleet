@@ -36,6 +36,10 @@ _CONTEXT_HINT_SUFFIX_RE = re.compile(r"-(\d+m)$", re.I)
 _ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
 _BRIDGE_PREFIX = "mcp__hermes_bridge__"
 _CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
+_DISCOVERY_TOOLS = ("ToolSearch",)
+_CONNECTOR_PREFIX = "mcp__claude_ai_"
+_CONNECTOR_WILDCARD = "mcp__claude_ai_*"
+_SETTINGS_MAX_BYTES = 1_048_576
 
 
 class BridgeCaptureError(RuntimeError):
@@ -174,6 +178,58 @@ def select_offered_model(offered: set[str], requested: str) -> str | None:
         if canonicalize_model_id(value) == canonical:
             return value
     return None
+
+
+def connector_allow_tools(config_dir: str | None = None) -> list[str]:
+    """Return profile allow rules for claude.ai connectors. Never reads secrets."""
+    root = config_dir if config_dir is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    if not isinstance(root, str) or not root.strip():
+        return []
+    path = Path(root) / "settings.json"
+    try:
+        if not path.is_file() or path.stat().st_size > _SETTINGS_MAX_BYTES:
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return []
+    permissions = payload.get("permissions") if isinstance(payload, dict) else None
+    allow = permissions.get("allow") if isinstance(permissions, dict) else None
+    if not isinstance(allow, list):
+        return []
+    seen: set[str] = set()
+    rules: list[str] = []
+    for item in allow:
+        if not isinstance(item, str) or not item.startswith(_CONNECTOR_PREFIX):
+            continue
+        if item == _CONNECTOR_WILDCARD or item in seen:
+            continue
+        seen.add(item)
+        rules.append(item)
+    return rules
+
+
+def claude_code_session_options(
+    advertised_names: set[str],
+    config_dir: str | None = None,
+) -> dict[str, Any]:
+    """Build Claude Code options: no native Bash/Write, connectors keep profile allow."""
+    allowed: list[str] = []
+    seen: set[str] = set()
+    for name in (
+        *[f"{_BRIDGE_PREFIX}{item}" for item in sorted(advertised_names)],
+        *_DISCOVERY_TOOLS,
+        *connector_allow_tools(config_dir),
+    ):
+        if name in seen:
+            continue
+        seen.add(name)
+        allowed.append(name)
+    return {
+        "tools": list(_DISCOVERY_TOOLS),
+        "allowedTools": allowed,
+        "settingSources": ["user"],
+        "settings": {"disableAllHooks": True},
+    }
 
 
 def permission_response(params: dict[str, Any]) -> dict[str, Any]:
@@ -997,6 +1053,8 @@ class ClaudeACPClient:
                         ],
                     }
                 }
+            options = claude_code_session_options(advertised_names)
+            options["mcpServers"] = bridge_config
             session = request("session/new", {
                 "cwd": self._cwd,
                 "mcpServers": [],
@@ -1004,13 +1062,7 @@ class ClaudeACPClient:
                     "disableBuiltInTools": True,
                     "systemPrompt": {"type": "preset", "preset": "claude_code", "append": system},
                     "claudeCode": {
-                        "options": {
-                            "tools": [],
-                            "allowedTools": [f"{_BRIDGE_PREFIX}{name}" for name in sorted(advertised_names)],
-                            "settingSources": ["user"],
-                            "settings": {"disableAllHooks": True},
-                            "mcpServers": bridge_config,
-                        },
+                        "options": options,
                     },
                 },
             })
