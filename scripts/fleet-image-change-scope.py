@@ -47,7 +47,6 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "scripts/verify-exact-main-ci.py",
         "scripts/verify-inherited-runtime-config.py",
         "scripts/verify-trivy-vex.py",
-        "third_party/webkite-0.5.0-linux-amd64",
     }
 )
 
@@ -57,7 +56,6 @@ IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
     "plugins/linear-agent/",
     "plugins/model-providers/claude-acp/",
     "plugins/web/perplexity/",
-    "plugins/web/webkite/",
 )
 
 

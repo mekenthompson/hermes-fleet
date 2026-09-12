@@ -271,7 +271,6 @@ jobs:
           assert client is not None
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
-          assert subprocess.check_output(["webkite", "--version"], text=True).strip() == "webkite 0.5.0"
           assert metadata.version("honcho-ai") == "2.2.0"
           assert shutil.which("codex")
           assert shutil.which("grok")
@@ -554,7 +553,6 @@ jobs:
           assert client is not None
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
-          assert subprocess.check_output(["webkite", "--version"], text=True).strip() == "webkite 0.5.0"
           assert metadata.version("honcho-ai") == "2.2.0"
           assert shutil.which("codex")
           assert shutil.which("grok")

@@ -2,7 +2,7 @@
 
 Do not report suspected credentials or private deployment data in a public issue.
 
-Use GitHub private vulnerability reporting when enabled for the repository. Until a public repository exists, report security issues through the maintainer's established private channel.
+Use GitHub private vulnerability reporting when enabled for the repository. Report security issues through GitHub advisory reporting, not a public issue.
 
 ## Public product boundary
 

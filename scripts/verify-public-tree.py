@@ -8,11 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_NAMES = {"auth.json", "credentials.json", "sessions", "memories", "logs"}
-ALLOWED_BINARIES = {
-    "third_party/webkite-0.5.0-linux-amd64": (
-        "4d29088f628201bf1bba3308a29851392e999f8135e7b2444a77c15278f98131"
-    ),
-}
+ALLOWED_BINARIES: dict[str, str] = {}
 FORBIDDEN_PATTERNS = {
     "broker reference": re.compile("o" + "p://", re.IGNORECASE),
     "private key": re.compile("BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY"),

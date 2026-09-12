@@ -7,8 +7,6 @@ USER root
 
 ARG GH_VERSION=2.98.0
 ARG GH_LINUX_AMD64_SHA256=3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
-ARG WEBKITE_VERSION=0.5.0
-ARG WEBKITE_SHA256=4d29088f628201bf1bba3308a29851392e999f8135e7b2444a77c15278f98131
 ARG CLAUDE_CODE_VERSION=2.1.261
 ARG CLAUDE_AGENT_ACP_VERSION=0.75.1
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
@@ -17,9 +15,6 @@ ENV DISABLE_AUTOUPDATER=1
 
 COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op
 RUN test "$(/usr/local/bin/op --version)" = "2.39.0"
-COPY --chmod=0755 third_party/webkite-0.5.0-linux-amd64 /usr/local/bin/webkite
-RUN printf '%s  %s\n' "${WEBKITE_SHA256}" /usr/local/bin/webkite | sha256sum -c - \
-    && webkite --version | grep -qx "webkite ${WEBKITE_VERSION}"
 RUN set -eux; \
     archive="gh_${GH_VERSION}_linux_amd64.tar.gz"; \
     curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o "/tmp/${archive}"; \
@@ -53,11 +48,8 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
 COPY plugins/model-providers/claude-acp/ /opt/hermes/plugins/model-providers/claude-acp/
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/
-COPY plugins/web/webkite/ /opt/hermes/plugins/web/webkite/
 RUN python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py \
-    && python3 -m py_compile /opt/hermes/plugins/web/webkite/*.py \
-    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci \
-    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/webkite --ci
+    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci
 COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/
 RUN test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json \
     && python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py
