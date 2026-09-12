@@ -18,7 +18,10 @@ HOUSEHOLD = re.compile(
     + re.escape("klank" + "er")
     + r"|"
     + re.escape("over" + "lord")
-    + r"|gymbro|lawgpt",
+    + r"|"
+    + re.escape("gym" + "bro")
+    + r"|"
+    + re.escape("law" + "gpt"),
     re.I,
 )
 class PublicGenericPluginTests(unittest.TestCase):
