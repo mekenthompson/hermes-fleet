@@ -7,7 +7,7 @@ USER root
 
 ARG GH_VERSION=2.98.0
 ARG GH_LINUX_AMD64_SHA256=3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
-ARG CLAUDE_CODE_VERSION=2.1.261
+ARG CLAUDE_CODE_VERSION=2.1.263
 ARG CLAUDE_AGENT_ACP_VERSION=0.75.1
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
 ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
@@ -45,6 +45,7 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
     && test -x /usr/local/bin/codex \
     && test -x /usr/local/bin/grok \
     && test -x /usr/local/bin/opencode
+ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
 COPY plugins/model-providers/claude-acp/ /opt/hermes/plugins/model-providers/claude-acp/
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/

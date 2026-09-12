@@ -21,4 +21,5 @@ unset \
   ANTHROPIC_DEFAULT_SONNET_MODEL \
   ANTHROPIC_DEFAULT_HAIKU_MODEL \
   CLAUDE_CODE_SUBAGENT_MODEL
+export CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
 exec /usr/local/bin/claude-agent-acp "$@"
