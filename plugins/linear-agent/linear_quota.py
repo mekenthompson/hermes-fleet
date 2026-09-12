@@ -1,6 +1,6 @@
 """Shared Linear API quota cooldown and read-only GraphQL cache.
 
-Linear bills every fleet token against Ken's user/workspace cap. After a
+Linear bills every fleet token against the configured user/workspace cap. After a
 rate-limit, every GraphQL caller must stop immediately and honor a cooldown
 instead of retrying. Read queries may be reused for a short TTL; mutations
 are never cached.
@@ -249,7 +249,7 @@ class LinearReadCache:
     """Short-lived cache for read-only GraphQL. Mutations never enter.
 
     Process memory plus an optional flocked file so every agent reuses the
-    same viewer/issue reads against Ken's one workspace cap.
+    same viewer/issue reads against one configured workspace cap.
     """
 
     def __init__(

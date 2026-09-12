@@ -1,5 +1,5 @@
 name: linear-agent
 kind: standalone
-version: 0.1.0
-description: Profile-local Linear Agent Session worker
+version: 0.5.0
+description: Profile-local Linear ownership with durable Stop containment
 author: Hermes Fleet Contributors

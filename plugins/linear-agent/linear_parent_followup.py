@@ -9,6 +9,7 @@ import json
 import re
 import sqlite3
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,39 +22,102 @@ except ImportError:  # direct module invocation in the plugin directory
 _SUMMARY = re.compile(r"^[A-Za-z0-9._:-]+ (completed|started|blocked|stale|missing-evidence)$")
 
 
-def parent_id_from_session_event(raw: object) -> str:
-    """Return parent issue id from a Linear session event. Missing/malformed is empty."""
+def _event_dict(raw: object) -> dict[str, object]:
     event: object
     if isinstance(raw, (bytes, bytearray)):
         try:
             event = json.loads(bytes(raw))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return ""
+            return {}
     elif isinstance(raw, str):
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
-            return ""
+            return {}
     else:
         event = raw
-    if not isinstance(event, dict):
-        return ""
+    return event if isinstance(event, dict) else {}
+
+
+def _session_dict(event: dict[str, object]) -> dict[str, object]:
     session = event.get("agentSession")
     if not isinstance(session, dict):
         data = event.get("data")
         session = data.get("agentSession") if isinstance(data, dict) else None
-    issue = session.get("issue") if isinstance(session, dict) else None
-    parent = issue.get("parent") if isinstance(issue, dict) else None
-    parent_id = parent.get("id") if isinstance(parent, dict) else None
-    if isinstance(parent_id, str) and parent_id and parent_id.strip() == parent_id:
-        return parent_id
+    return session if isinstance(session, dict) else {}
+
+
+def _exact_id(value: object) -> str:
+    if isinstance(value, str) and value and value.strip() == value:
+        return value
     return ""
+
+
+def parent_id_from_session_event(raw: object) -> str:
+    """Return parent issue id from a Linear session event. Missing/malformed is empty."""
+    issue = _session_dict(_event_dict(raw)).get("issue")
+    parent = issue.get("parent") if isinstance(issue, dict) else None
+    return _exact_id(parent.get("id") if isinstance(parent, dict) else None)
+
+
+def child_id_from_session_event(raw: object) -> str:
+    """Return child issue id from a Linear session event. Missing/malformed is empty."""
+    session = _session_dict(_event_dict(raw))
+    issue = session.get("issue")
+    nested = _exact_id(issue.get("id") if isinstance(issue, dict) else None)
+    if nested:
+        return nested
+    return _exact_id(session.get("issueId"))
+
+
+def lookup_parent_issue_id(graphql: Callable[..., object], child_id: str) -> str:
+    """Read-only parent lookup. Errors and malformed ids are empty."""
+    if not _exact_id(child_id):
+        return ""
+    try:
+        result = graphql(
+            "query($id: String!) { issue(id: $id) { parent { id } } }",
+            {"id": child_id},
+        )
+    except Exception:
+        return ""
+    data = result.get("data") if isinstance(result, dict) else None
+    issue = data.get("issue") if isinstance(data, dict) else None
+    parent = issue.get("parent") if isinstance(issue, dict) else None
+    return _exact_id(parent.get("id") if isinstance(parent, dict) else None)
+
+
+def resolve_parent_issue_id(
+    raw: object,
+    lookup: Callable[[str], str] | None = None,
+) -> str:
+    """Use nested parent when present. Otherwise fail-closed lookup by child id."""
+    nested = parent_id_from_session_event(raw)
+    if nested:
+        return nested
+    child_id = child_id_from_session_event(raw)
+    if not child_id or lookup is None:
+        return ""
+    try:
+        found = lookup(child_id)
+    except Exception:
+        return ""
+    return _exact_id(found)
 
 
 @dataclass(frozen=True)
 class EnqueueResult:
     action: str
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    action: str
+    reason: str = ""
+    followup_key: str = ""
+    hermes_session_id: str = ""
+    trusted_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -160,6 +224,84 @@ class ParentFollowupQueue:
                 conn.execute("ROLLBACK")
                 raise
         return EnqueueResult(action="queued", reason="child_transition")
+
+    def deliver_queued(self, deliver: Callable[[str, str], bool]) -> DrainResult:
+        """Deliver the oldest queued followup to the owning Hermes session.
+
+        Does not mutate Linear. Failed delivery leaves the row queued.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT followup_key, parent_hermes_session_key, trusted_summary
+                    FROM linear_parent_followups
+                    WHERE state = 'queued'
+                    ORDER BY created_at ASC, followup_key ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        if row is None:
+            return DrainResult(action="empty")
+        followup_key = str(row["followup_key"])
+        hermes_session_id = str(row["parent_hermes_session_key"])
+        trusted_summary = str(row["trusted_summary"])
+        if not hermes_session_id or not self._trusted(trusted_summary):
+            return DrainResult(
+                action="retry",
+                reason="untrusted_delivery",
+                followup_key=followup_key,
+                hermes_session_id=hermes_session_id,
+                trusted_summary=trusted_summary,
+            )
+        try:
+            ok = bool(deliver(hermes_session_id, trusted_summary))
+        except Exception:
+            ok = False
+        if not ok:
+            return DrainResult(
+                action="retry",
+                reason="deliver_failed",
+                followup_key=followup_key,
+                hermes_session_id=hermes_session_id,
+                trusted_summary=trusted_summary,
+            )
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                updated = conn.execute(
+                    """
+                    UPDATE linear_parent_followups
+                    SET state = 'dispatched', updated_at = ?
+                    WHERE followup_key = ? AND state = 'queued'
+                    """,
+                    (now, followup_key),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        if updated.rowcount != 1:
+            return DrainResult(
+                action="retry",
+                reason="lost_claim",
+                followup_key=followup_key,
+                hermes_session_id=hermes_session_id,
+                trusted_summary=trusted_summary,
+            )
+        return DrainResult(
+            action="dispatched",
+            reason="child_transition",
+            followup_key=followup_key,
+            hermes_session_id=hermes_session_id,
+            trusted_summary=trusted_summary,
+        )
 
     def get(self, followup_key: str) -> FollowupRecord:
         with self._connect() as conn:
