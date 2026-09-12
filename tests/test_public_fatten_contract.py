@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import unittest
@@ -14,14 +13,9 @@ PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
 SCOPE = ROOT / "scripts" / "fleet-image-change-scope.py"
 VERIFY = ROOT / "scripts" / "verify-public-tree.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "fleet-image.yml"
-WEBKITE_BIN = ROOT / "third_party" / "webkite-0.5.0-linux-amd64"
-WEBKITE_PLUGIN = ROOT / "plugins" / "web" / "webkite"
 GH_VERSION = "2.98.0"
 GH_LINUX_AMD64_SHA256 = (
     "3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"
-)
-WEBKITE_SHA256 = (
-    "4d29088f628201bf1bba3308a29851392e999f8135e7b2444a77c15278f98131"
 )
 HONCHO_AI_VERSION = "2.2.0"
 EXTRA_CLIS = {
@@ -82,72 +76,20 @@ class PublicFattenContractTests(unittest.TestCase):
             text,
         )
 
-    def test_webkite_plugin_is_generic_and_disabled(self) -> None:
-        metadata = (WEBKITE_PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
-        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        contract = json.loads(PLUGINS_CONTRACT.read_text(encoding="utf-8"))
-        matches = [item for item in contract["components"] if item["id"] == "webkite-web-provider"]
-        self.assertEqual(
-            matches,
-            [
-                {
-                    "id": "webkite-web-provider",
-                    "target": "standalone_public_plugin",
-                    "default_enabled": False,
-                    "conditions": [
-                        "generic_configuration",
-                        "local_cli",
-                        "independent_tests",
-                        "license_review",
-                        "no_deployment_identity",
-                    ],
-                }
-            ],
-        )
-        self.assertIn("Hermes Fleet Contributors", metadata)
-        self.assertIn(
-            "COPY plugins/web/webkite/ /opt/hermes/plugins/web/webkite/",
-            dockerfile,
-        )
-        self.assertIn("hermes plugins doctor /opt/hermes/plugins/web/webkite --ci", dockerfile)
-        lowered = "\n".join(
-            (
-                metadata,
-                (WEBKITE_PLUGIN / "provider.py").read_text(encoding="utf-8"),
-                (WEBKITE_PLUGIN / "__init__.py").read_text(encoding="utf-8"),
-            )
-        ).lower()
-        for token in ("switchroom", "o" + "p://", "linear-agents.json", "melbourne"):
-            self.assertNotIn(token, lowered)
-
-    def test_webkite_binary_is_hashed_and_allowlisted(self) -> None:
-        self.assertTrue(WEBKITE_BIN.is_file())
-        digest = hashlib.sha256(WEBKITE_BIN.read_bytes()).hexdigest()
-        self.assertEqual(digest, WEBKITE_SHA256)
-        dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        verifier = VERIFY.read_text(encoding="utf-8")
-        self.assertIn(
-            "COPY --chmod=0755 third_party/webkite-0.5.0-linux-amd64 /usr/local/bin/webkite",
-            dockerfile,
-        )
-        self.assertIn(f"ARG WEBKITE_SHA256={WEBKITE_SHA256}", dockerfile)
-        self.assertIn(WEBKITE_SHA256, verifier)
-        self.assertIn("third_party/webkite-0.5.0-linux-amd64", verifier)
-
     def test_image_scope_includes_fatten_inputs(self) -> None:
         text = SCOPE.read_text(encoding="utf-8")
-        self.assertIn('"plugins/web/webkite/"', text)
-        self.assertIn('"third_party/webkite-0.5.0-linux-amd64"', text)
+        self.assertIn('"plugins/web/perplexity/"', text)
+        self.assertNotIn("webkite", text.lower())
 
     def test_release_workflow_proves_fattened_runtime(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertGreaterEqual(text.count('assert pwd.getpwnam("hermes").pw_uid == 1000'), 2)
         self.assertGreaterEqual(text.count('assert subprocess.check_output(["gh", "--version"]'), 2)
-        self.assertGreaterEqual(text.count('assert subprocess.check_output(["webkite", "--version"]'), 2)
         self.assertGreaterEqual(text.count(f'assert metadata.version("honcho-ai") == "{HONCHO_AI_VERSION}"'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("codex")'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("grok")'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("opencode")'), 2)
+        self.assertNotIn("webkite", text.lower())
 
     def test_fatten_inputs_keep_household_state_out(self) -> None:
         tracked = []
@@ -156,10 +98,7 @@ class PublicFattenContractTests(unittest.TestCase):
             "package.json",
             "contracts/plugins.json",
             "README.md",
-            "docs/webkite.md",
-            "plugins/web/webkite/plugin.yaml",
-            "plugins/web/webkite/provider.py",
-            "plugins/web/webkite/__init__.py",
+            "AGENTS.md",
         ):
             path = ROOT / relative
             self.assertTrue(path.is_file(), relative)

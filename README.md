@@ -1,76 +1,95 @@
 # Hermes Fleet
 
-An opinionated, public Docker isolation pattern for running multiple [Hermes Agent](https://github.com/NousResearch/hermes-agent) profiles as separate containers.
+Opinionated Docker isolation for running multiple [Hermes Agent](https://github.com/NousResearch/hermes-agent) profiles as separate containers.
 
-This repository publishes an opinionated, provenance-bound Fleet child image through a protected manual release workflow. Source publication and image publication do not imply production readiness or authorize deployment.
+Hermes Fleet is the public distribution: a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout.
 
-## Design
+## Why
 
-- Build a complete Agent image from an exact pushed public fork commit.
-- Build the Fleet image as a digest-pinned child of that Agent image.
-- Run one container, writable state volume, workspace volume, and Docker network per profile.
-- Keep Docker socket, host networking, host bridges, privileged mode, credentials, identities, sessions, memories, and deployment topology out of the public image.
-- Keep optional integrations as standalone plugins, disabled by default.
-- Bundle a generic Perplexity Search API provider while requiring its API key from the deployment secret boundary.
-- Bundle a generic Webkite CLI provider, GitHub CLI, extra coding CLIs, and the Honcho Python extra without deployment identities or workspace IDs.
-- Rebind the runtime user to UID/GID 1000 so profile containers can start with no-new-privileges.
-- Bundle generic Linear Agent executable code while requiring deployment policy as a separate read-only data mount.
+Hermes Agent is one process. Fleet is many profiles, each with its own container, writable state, workspace, and Docker network. The public product proves that pattern without shipping anyone's credentials, deployment identities, private binaries, or live topology.
 
-## Supported local commands
+## What's in the image
 
-The supported build wrapper validates the Agent base reference before Docker sees it:
+The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pinned child of an exact Hermes Agent image. It currently bundles:
+
+- UID/GID 1000 for the `hermes` account so profile containers can start with no-new-privileges
+- GitHub CLI 2.98.0 from the official release tarball
+- 1Password CLI 2.39.0 from its digest-pinned official image (no vault config)
+- The Agent `honcho` extra, with no workspace identifiers
+- Codex, Grok, and OpenCode from the committed lockfile
+- Optional plugins, **disabled by default**: Perplexity search, Linear Agent (policy mounted at deploy time), Claude ACP
+
+Consume it only as:
+
+```text
+ghcr.io/mekenthompson/hermes-fleet-public@sha256:<digest>
+```
+
+Mutable tags are not a supported interface.
+
+## What's not in this repository
+
+Keep these in a private overlay repository, not here:
+
+- Credentials, OAuth state, vault references, and secret-source URIs
+- Profile identities, live compose, and host topology
+- Private binaries and unpublished local CLIs
+- Deployment policy such as Linear agent maps
+
+`scripts/verify-public-tree.py` fail-closes on the obvious cases. It is a shape check, not a secret scanner.
+
+## Architecture
+
+```text
+Hermes Agent image  (exact digest)
+        │
+        ▼
+Hermes Fleet child  (this repo)
+        │
+        ├── profile A container + state volume + workspace + network
+        ├── profile B container + state volume + workspace + network
+        └── independent sidecar images (browser broker, proxies, Camofox, Kokoro)
+```
+
+Sidecar source lives under `sidecars/`. Each sidecar publishes its own GHCR image through a dedicated workflow. The Fleet child does not bake those sidecars in.
+
+## Quick start
+
+Build and compose only through the wrappers. Direct `docker build` / `docker compose` skip the immutable-reference guard.
 
 ```bash
 python3 scripts/build-fleet-image.py \
   --agent-image ghcr.io/example/hermes-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --tag hermes-fleet:local
-```
 
-The supported Compose wrapper validates `HERMES_FLEET_IMAGE` before invoking Docker Compose:
-
-```bash
 export HERMES_FLEET_IMAGE=ghcr.io/example/hermes-fleet@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 python3 scripts/compose.py config
 ```
 
-Direct `docker build` and `docker compose` calls bypass the immutable-reference guard and are not supported.
+The example profiles in `compose.example.yaml` are synthetic. Replace them in a deployment repository.
 
-## Published image releases
-
-The protected Fleet image workflow builds from the exact Agent handoff in `release/agent-image-manifest.json`. Pull requests run a non-publishing build, runtime/provenance verification, full and bounded SPDX generation, and Trivy critical-vulnerability gate. A manual `publish=true` dispatch from `main` promotes that exact scanned candidate without rebuilding.
-
-Release source repository:
-
-```text
-https://github.com/mekenthompson/hermes-fleet
-```
-
-Release image repository:
-
-```text
-ghcr.io/mekenthompson/hermes-fleet-public
-```
-
-The GitHub repository uses the canonical product name. The existing GHCR package retains `hermes-fleet-public` so previously published immutable references remain valid.
-
-Consume release outputs only by immutable digest. The authenticated House handoff artifact records the Fleet source/digest and its exact Agent parent. Image publication does not deploy profiles or authorize production rollout. See [`docs/image-release.md`](docs/image-release.md).
-
-## Local validation
+## Development
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/verify-public-tree.py
-python3 scripts/verify-agent-image-ref.py   ghcr.io/example/hermes-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-## Example deployment
+Pull requests build a non-publishing `linux/amd64` candidate, verify runtime/provenance, and run the critical-vulnerability gate. Pushes to `main` that touch image inputs publish the exact scanned candidate. See [`docs/image-release.md`](docs/image-release.md).
 
-Set `HERMES_FLEET_IMAGE` to an immutable digest reference, then use `python3 scripts/compose.py`. The example profiles are synthetic. Replace them in a deployment repository, not in this public product tree.
+Coding agents should start at [`AGENTS.md`](AGENTS.md).
 
-The Phase 2 Compose file demonstrates volume and network separation only. Runtime hardening, egress controls, cold/warm state compatibility, UID/GID behavior, shutdown, persistence, and rollback remain Phase 3 acceptance gates. The example is not a production baseline until those daemon-backed tests pass.
+## Docs
 
-The managed files under `examples/` demonstrate a small administrator overlay. They are not a security boundary and contain no secrets. Mutable Hermes configuration remains in each profile's `/opt/data/config.yaml`.
+| Doc | What it covers |
+| --- | --- |
+| [`AGENTS.md`](AGENTS.md) | How to work in this repo |
+| [`docs/image-release.md`](docs/image-release.md) | Image bake, scan, and publication |
+| [`docs/linear-agent.md`](docs/linear-agent.md) | Linear worker plugin (policy stays external) |
+| [`docs/perplexity.md`](docs/perplexity.md) | Optional search provider |
+| [`SECURITY.md`](SECURITY.md) | Vulnerability reporting and public boundary |
+| [`contracts/`](contracts/) | Machine-readable architecture boundaries |
 
-See `contracts/` for the machine-readable architecture boundaries.
+## License
 
-The optional Linear Agent worker is documented in [`docs/linear-agent.md`](docs/linear-agent.md). Its executable code is part of the attested image; deployment policy remains external.
+[MIT](LICENSE)

@@ -60,13 +60,9 @@ class PublicProductTests(unittest.TestCase):
             "plugins/linear-agent/linear_runtime.py",
             "plugins/linear-agent/plugin.yaml",
             "docs/perplexity.md",
-            "docs/webkite.md",
             "docs/linear-agent.md",
             "examples/linear-agent-policy.json",
-            "plugins/web/webkite/__init__.py",
-            "plugins/web/webkite/plugin.yaml",
-            "plugins/web/webkite/provider.py",
-            "third_party/webkite-0.5.0-linux-amd64",
+            "AGENTS.md",
         ):
             with self.subTest(relative=relative):
                 self.assertTrue((ROOT / relative).is_file())
