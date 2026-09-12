@@ -8,7 +8,8 @@ ProductOS shapes copied into this repository. ProductOS is not a dependency to i
 | [principles.md](principles.md) | Built-well standards. A "no" is a redesign, not a follow-up |
 | [invariants.md](invariants.md) | Lines we will not cross by construction |
 | [product-spec.md](product-spec.md) | Outcomes, how it functions, job index |
-| [jobs/](jobs/) | One Job Spec per operator job |
+| [jobs/](jobs/) | One Job Spec per job |
+| [rfcs/](rfcs/) | Decision records and ship-coupled RFCs |
 
 The operating contract is in [`AGENTS.md`](../AGENTS.md). A change ships only when it advances a named outcome, satisfies its Job Spec, passes every principle check, and crosses no invariant.
 

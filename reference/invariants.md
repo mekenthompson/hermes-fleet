@@ -19,7 +19,7 @@ Credentials, vaults, sessions, and memories are never shared across agents.
 
 By-construction test: can one profile container read another's secret material, auth state, session store, or memory store? If yes, it is out.
 
-Why this is an invariant: shared credentials make isolation theatre. The North Star is false the moment agent B can act as agent A.
+Why this is an invariant: shared credentials make isolation theatre. TUTR is false the moment agent B can act as agent A.
 
 ## one-agent-change-is-local
 
@@ -35,7 +35,15 @@ Built, published, and deployed are different claims. Reporting one as another is
 
 By-construction test: does this path call a source tree, a registry digest, and a running profile the same kind of "done"? If yes, it is out.
 
-Why this is an invariant: the North Star is about live agents after an intended change. A green bake or a pushed digest is not that.
+Why this is an invariant: a Trusted turn is about live agents, granted tools, and the granted plan. A green bake or a pushed digest is not that.
+
+## no-off-plan-model-call
+
+A turn must not bill a model path the principal did not grant. Claude stays on the granted plan login unless they opt a specific account into overage.
+
+By-construction test: can this path silently use an API key or another account's quota to "make it work"? If yes, it is out.
+
+Why this is an invariant: subscription-honest is an outcome. Off-plan billing is not a workaround.
 
 ## public-image-has-no-deployment-identity
 

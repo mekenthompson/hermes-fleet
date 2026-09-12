@@ -7,120 +7,136 @@ last_reviewed: 2026-09-12
 
 The product-level layer between the anchors ([vision](vision.md) / [principles](principles.md) / [invariants](invariants.md)) and the Job Specs. Job Specs `serves:` one of the outcome slugs named here.
 
+Decision: [rfcs/successor-vision.md](rfcs/successor-vision.md).
+
 ## The product, in one line
 
-Hermes Fleet is the opinionated way to run Hermes isolated: one agent per container and gateway, no shared credentials, so an operator can change or recover one agent without losing a working, capable setup.
+Opinionated isolated Hermes. One agent per container and gateway. No shared credentials. A standing team of specialists you text is an outcome, not the tagline.
 
 ## North Star
 
-**Metric:** intended-change hold rate
+**Metric:** trusted unsupervised turns (TUTR)
 
-**Definition:** of intended fleet changes in a window, the share where (a) the target agent is observed to have the intended state and (b) every other in-scope agent is observed still independently working. Independently working includes tools that still do their job, not merely a process that is still up.
+**Definition:** of all turns the principal did not sit through, the share that were Trusted. A turn is Trusted when it was Unsupervised, completed without a human rescue, stayed inside the granted tools, and made no off-plan model call. Telegram, Slack, and Desktop use the same definition.
 
-**Now → Target:** unmeasured → to validate once the dogfood deployment runs the public Fleet image. No numeric target was ratified.
+**Now → Target:** unmeasured → to validate once dogfood runs the public Fleet image and principals text the team on those three surfaces. No numeric target was ratified.
 
-**Why this one:** it is the vision made countable. Isolation, capability, recovery, and surviving setup all fail this number if they fail.
+**Why this one:** it is principal-turn quality. Isolation, leash, presence, and subscription honesty all fail this number if they fail.
+
+**Leash signal (not the headline):** intended-change hold rate. Of intended fleet changes, the share where the target has the intended state and every other in-scope agent is still independently working, including tools that still do their job.
 
 ## Outcomes
 
 Every job ladders up to exactly one of these. A change that advances none of them is out of scope.
 
-### isolation-holds – Isolation holds
+### standing-team – Standing team
 
-One agent cannot see another's files, network, credentials, or vault. The operator can change A and leave B alone.
+Named specialists you text, each with its own identity, memory, tools, and credentials. Not one generalist with profile names.
 
-Signal: cross-agent bleed or unsolicited neighbour restart on an intended one-agent change. Shape: count of such events per intended one-agent change. Now: unmeasured. Target: zero, to validate. Guardrail: do not "fix" bleed by collapsing agents onto a shared runtime.
+Signal: share of in-scope specialists that a principal can address as themselves, with unshared memory and credentials. Shape: count of independently addressable specialists that still remember and authenticate as themselves. Now: unmeasured. Target: to validate. Guardrail: do not fake a team by routing everyone through one runtime.
 
-### capable-hermes – Isolated Hermes stays capable
+### on-a-leash – On a leash
 
-The isolated agent is still Hermes. Browser handoff, local voice, Linear, and search still work. Optional capabilities stay off until turned on. Adding a surface does not replace an existing one.
+Isolation plus recoverable change plus no self-escalation. One agent cannot see another's files, network, credentials, or vault. A change to A leaves B alone. Failed upgrades recover without touching the others. Built, published, and deployed stay distinct claims.
 
-Signal: enabled-capability hold rate. Shape: after an isolation or intended-runtime change, share of enabled capabilities on the target that still complete their job. Now: unmeasured. Target: to validate. Guardrail: do not strip integrations to make isolation easier.
+Signal: intended-change hold rate (the leash signal above). Now: unmeasured. Target: to validate. Guardrail: do not "fix" bleed by collapsing agents onto a shared runtime, and do not treat a published artefact as a deployed agent.
 
-### change-recoverable – Change is recoverable
+### there-when-you-reach – There when you reach for it
 
-The operator can upgrade or roll back one agent, know whether the intended change took effect, and recover a failed upgrade without touching the others. Built, published, and deployed stay distinct claims.
+The isolated agent is still Hermes, still reachable, still itself after a move or restart. Telegram, Slack, and Desktop have the same bar. Adding a surface does not replace an existing one. Persistence includes working tools, not just surviving files.
 
-Signal: intended-change hold rate on one-agent upgrades and rollbacks. This outcome owns the North Star's observability. Now: unmeasured. Target: to validate. Guardrail: do not treat a published artefact as a deployed agent.
+Signal: first-class surface hold rate. Shape: after an isolation, restart, or intended-runtime change, share of claimed surfaces on which the specialist still completes the job, and share of pre-move tools that still run. Now: unmeasured. Target: to validate. Guardrail: do not treat one surface as proof of another.
 
-### working-setup-survives – Working setup survives
+### subscription-honest – Subscription-honest
 
-An existing agent can come under Fleet management without losing identity, tools, or sessions. Persistence includes working tools and dependency ownership, not just stored files that still exist.
+Claude stays on the granted plan login (ACP/OAuth), not a silent API meter. Other billed subscriptions follow the same rule: the principal's granted plan is the ceiling unless they opt a specific account into overage.
 
-Signal: setup-survival rate. Shape: share of existing agents brought under management that still authenticate and run their pre-move tools. Now: unmeasured. Target: to validate. Guardrail: do not recreate a profile or borrow another agent's credentials to clear a blocker.
+Signal: off-plan model-call rate. Shape: share of turns that billed a path the principal did not grant. Now: unmeasured. Target: zero, to validate. Guardrail: do not "make it work" by dropping to an API key.
 
 ## The customer model
 
-Last revised: 2026-09-12 – first ProductOS pass from operator interview. Confidence: **2** (directional). Dogfood operator evidence is strong; public-adopter evidence is [GUESS].
+Last revised: 2026-09-12 – successor interview. Confidence: **2** (directional). Dogfood principal+operator evidence is strong; public-adopter evidence is [GUESS].
 
-**Who hires the job.** When an operator already runs (or is about to run) more than one Hermes agent on one host, they want each agent isolated and still capable, so a change or failure stays local. They choose the runtime. They are judged on agents staying up and not leaking.
+**Who hires the job.** Two people, often the same human on different days.
+
+- Principal: already paying for a model plan, wants a standing team they can text, that remembers them, that asks before consequences.
+- Operator: stands the team up, isolates them, upgrades them, and needs a change to stay local.
 
 **Forces**
 
-- Push: shared process, shared credentials, and a bounce that takes everyone down. Evidence: operator interview 2026-09-12.
-- Pull: one bounded agent, recover one without touching the rest. Evidence: same interview; isolation is the public product default.
-- Anxiety: isolation that breaks browser, voice, tracker, or login; an upgrade they cannot see or undo. Evidence: interview non-goals and first job.
-- Habit: keep the private snowflake because it already works. [GUESS] for public adopters.
+- Push: one shared runtime; a bounce that takes everyone down; a specialist that forgets you; an off-plan bill. Evidence: successor interview; Switchroom product the dogfood already ran.
+- Pull: isolated specialists you text; recover one without touching the rest; stay on the granted plan. Evidence: same interview.
+- Anxiety: isolation that breaks chat, voice, or login; an upgrade they cannot see; a surface that works in Telegram and dies on Slack or Desktop. Evidence: interview surfaces and non-goals.
+- Habit: keep the private snowflake, or keep the old Claude-native specialist runtime, because it already works. [GUESS] for public adopters.
 
-**The workaround.** Hand-assembled runtime, shared networks, copied env files, and "I know what's running because I just deployed it." Switching cost is the working private overlay.
+**The workaround.** Hand-assembled runtime, copied env files, "I know what's running because I just deployed it," and a single chat app treated as the product.
 
-**Behaviour.** The operator will read live state when they distrust docs. They have zero tolerance for a status that says deployed when the profile is still on the previous intended state.
+**Behaviour.** The principal texts and expects the same specialist back. The operator reads live state when they distrust docs. Zero tolerance for "deployed" when the profile is still on the previous intended state, and for a turn that billed the wrong plan.
 
-**Language and the buying committee.** Dogfood words in use: "what's running", "intended change", "don't disturb the others." The dogfood operator champions, evaluates, and signs. Public-adopter language, champion, evaluator, signer, and veto are unknown. [GUESS]
+**Language and the buying committee.** Dogfood words: "what's running", "don't disturb the others", "on a leash", "the plan we already pay for." The dogfood human is both champion and signer. Public-adopter committee unknown. [GUESS]
 
-**Their economics.** Fleet is not a paid product. Public-adopter budget, margin, and buying motion are unknown. The dogfood operator is judged on agents staying up and not leaking. A bad month looks like a change that takes more than one agent down, or a "success" that was only published.
+**Their economics.** Fleet is not a paid product. The principal already pays the model plan. A bad month is a change that takes more than one agent down, a "success" that was only published, or an off-plan bill.
 
 **What must be true to win**
 
-- Operators will run one isolated agent rather than one Hermes with many profiles. If they will not, isolation-holds is the wrong outcome.
-- The public product can carry generic capability without household identity. If every useful integration is deployment-specific, capable-hermes never ships publicly.
-- Live state can be read independently of the author. If not, the North Star cannot be scored.
+- Principals will text specialists rather than one generalist. If they will not, standing-team is the wrong outcome.
+- Operators will run one isolated agent rather than one Hermes with many profiles. If they will not, on-a-leash is the wrong outcome.
+- The public product can carry generic capability without household identity.
+- Live state can be read independently of the author.
+- Telegram, Slack, and Desktop can meet one bar. If Desktop cannot, it is not first-class.
 
 **Known unknowns**
 
-- Public-adopter demand and buying committee. Close: later adopter conversations, not this interview.
-- Whether stock runtime tools already satisfy "understand what is running" well enough that Fleet should not add a surface. Close: the first Job Spec's bet; abandon if true.
-- What private drift proof already covers. HF-107 and HF-163 exist; their contents were not reviewer-readable from the public tree. Close: private overlay inventory before any new harness.
+- Public-adopter demand and buying committee.
+- Whether stock runtime tools already satisfy "understand what is running."
+- What private drift proof already covers (HF-107, HF-163 not reviewer-readable from the public tree).
+- How TUTR will be scored on Desktop versus Telegram and Slack. Close: first UAT for there-when-you-reach, not a number invented here.
 
 ## How it functions, at a high level
 
-Each agent stays independently bounded. A change is supposed to land on one of them and leave the others alone. The operator can observe whether that happened and recover when it did not. Built, published, and deployed stay different claims. Deployment identity stays outside the public product. Runtime and packaging live in `docs/` and `contracts/`.
+Each specialist stays independently bounded. The principal reaches them on Telegram, Slack, or Desktop. A change is supposed to land on one of them and leave the others alone. Claude stays on the granted plan. Deployment identity stays outside the public product. Runtime and packaging live in `docs/` and `contracts/`.
 
 ## The job index
 
-### change-recoverable
+### on-a-leash
 
-- [understand-what-is-running.md](jobs/understand-what-is-running.md) – share of intended changes where a fresh-process reader can state the target's live state and whether it matches intent. Job metric: unmeasured. Rolls into change-recoverable's Signal. **Specified.**
-
-Queued, not yet specified:
-
-- upgrade-and-recover – failed one-agent upgrades restored without disturbing neighbours.
-
-### isolation-holds
+- [understand-what-is-running.md](jobs/understand-what-is-running.md) – share of intended changes where a fresh-process reader can state the target's live state and whether it matches intent. Job metric: unmeasured. Rolls into on-a-leash's Signal. **Specified.** Retargeted from `change-recoverable` by [rfcs/successor-vision.md](rfcs/successor-vision.md).
 
 Queued, not yet specified:
 
-- change-one-agent-without-disturbing-another – intended change to A leaves B's process, image, and tools untouched.
+- change-one-agent-without-disturbing-another
+- upgrade-and-recover
 
-### working-setup-survives
+### standing-team
 
 Queued, not yet specified:
 
-- bring-existing-agent-under-management – an already-working agent keeps identity, tools, and sessions after coming under Fleet.
+- run-a-fleet-of-specialists
+- feel-like-a-colleague
 
-### capable-hermes
+### there-when-you-reach
 
-No Job Spec yet. Browser handoff, local voice, Linear, and search are capabilities this outcome must keep working. They become jobs when we specify their operator progress, not before.
+Queued, not yet specified:
+
+- talk-to-agents-from-anywhere (Telegram, Slack, Desktop)
+- bring-existing-agent-under-management
+
+### subscription-honest
+
+Queued, not yet specified:
+
+- keep-subscription-honest
 
 ## Evidence & confidence
 
-Evidence: 2026-09-12 operator interview (vision, four outcomes, North Star, invariants, principles, non-goals, first job); public contracts and README isolation model; known publication vs deployment split in `docs/image-release.md`.
+Evidence: 2026-09-12 successor interview (one-liner, four outcomes, TUTR, surfaces, audience); Switchroom vision/JTBD as the prior vehicle, not copied wholesale; public contracts and README isolation model.
 
-Confidence: 2. The dogfood operator ratified the sentence. Public adopter demand is unmeasured.
+Confidence: 2. The dogfood principal+operator ratified the sentence. Public adopter demand is unmeasured. TUTR is uninstrumented.
 
 ## Related
 
 - [vision.md](vision.md)
 - [principles.md](principles.md)
 - [invariants.md](invariants.md)
-- Linear: [HF-186](https://linear.app/switchroom-ai/issue/HF-186/adopt-productos-in-public-hermes-fleet)
+- [rfcs/successor-vision.md](rfcs/successor-vision.md)
+- Linear: [HF-282](https://linear.app/switchroom-ai/issue/HF-282/retarget-public-fleet-vision-as-switchroom-successor)
