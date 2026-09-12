@@ -15,6 +15,10 @@ _REQUIRED_RECEIPT_KEYS = frozenset({
     "occupancy", *_LIFETIMES,
 })
 _STOP_STATUSES = frozenset({"accepted", "not_delivered", "not_running", "stale"})
+# Linear AgentActivitySignal enum. Internal authority-loss causes are not signals.
+LINEAR_ACTIVITY_SIGNALS = frozenset({"auth", "continue", "select", "stop"})
+STOP_ACTIVITY_SIGNALS = frozenset({"stop"})
+FOLLOW_UP_ACTIVITY_SIGNALS = frozenset({"auth", "continue", "select"})
 _CONTROL_CAUSES = frozenset({"stop", "reassigned", "permission_lost"})
 
 

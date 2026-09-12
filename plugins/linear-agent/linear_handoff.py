@@ -1,4 +1,4 @@
-"""Shared workspace/issue authority for Linear handoffs (KEN-444).
+"""Shared workspace/issue authority for Linear handoffs.
 
 Profile-local SQLite is not a fleet lock. This store is keyed only by
 workspace and issue_id. Isolated store files do not fence each other.

@@ -1,4 +1,4 @@
-"""Durable, fail-closed per-issue execution budgets."""
+"""Durable, fail-closed execution budgets for autonomous retries."""
 from __future__ import annotations
 
 import math
@@ -11,7 +11,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class IssueBudget:
-    """One issue may consume at most these local execution resources."""
+    """One autonomous generation may consume at most these local execution resources."""
 
     max_attempts: int = 3
     max_seconds: float = 3_600.0
@@ -53,6 +53,16 @@ class IssueBudgetLedger:
                     spent REAL NOT NULL
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS linear_generation_budgets (
+                    issue_id TEXT NOT NULL,
+                    generation_id TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    first_attempt_at REAL NOT NULL,
+                    spent REAL NOT NULL,
+                    PRIMARY KEY (issue_id, generation_id)
+                )"""
+            )
         finally:
             conn.close()
 
@@ -61,9 +71,17 @@ class IssueBudgetLedger:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
-    def admit(self, issue_id: str | None, *, now: float | None = None) -> BudgetAdmission:
-        """Atomically reserve one attempt; unknown issue identity is refused."""
+    def admit(
+        self,
+        issue_id: str | None,
+        generation_id: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> BudgetAdmission:
+        """Atomically reserve one attempt; unknown identity is refused."""
         if not isinstance(issue_id, str) or not issue_id:
+            return BudgetAdmission(False, "issue_budget_identity_unavailable")
+        if generation_id is not None and (not isinstance(generation_id, str) or not generation_id):
             return BudgetAdmission(False, "issue_budget_identity_unavailable")
         now = time.time() if now is None else now
         if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
@@ -72,10 +90,17 @@ class IssueBudgetLedger:
         try:
             conn.execute("BEGIN IMMEDIATE")
             with closing(conn.cursor()) as cursor:
-                row = cursor.execute(
-                    "SELECT attempts, first_attempt_at, spent FROM linear_issue_budgets WHERE issue_id = ?",
-                    (issue_id,),
-                ).fetchone()
+                if generation_id is None:
+                    row = cursor.execute(
+                        "SELECT attempts, first_attempt_at, spent FROM linear_issue_budgets WHERE issue_id = ?",
+                        (issue_id,),
+                    ).fetchone()
+                else:
+                    row = cursor.execute(
+                        "SELECT attempts, first_attempt_at, spent FROM linear_generation_budgets "
+                        "WHERE issue_id = ? AND generation_id = ?",
+                        (issue_id, generation_id),
+                    ).fetchone()
                 attempts, first_attempt_at, spent = row if row else (0, now, 0.0)
                 if now < first_attempt_at:
                     conn.execute("ROLLBACK")
@@ -89,12 +114,28 @@ class IssueBudgetLedger:
                 if spent + self.budget.cost_per_attempt > self.budget.max_cost:
                     conn.execute("ROLLBACK")
                     return BudgetAdmission(False, "issue_monetary_budget_exhausted")
-                cursor.execute(
-                    """INSERT INTO linear_issue_budgets(issue_id, attempts, first_attempt_at, spent)
-                       VALUES (?, ?, ?, ?)
-                       ON CONFLICT(issue_id) DO UPDATE SET attempts=excluded.attempts, spent=excluded.spent""",
-                    (issue_id, attempts + 1, first_attempt_at, spent + self.budget.cost_per_attempt),
-                )
+                if generation_id is None:
+                    cursor.execute(
+                        """INSERT INTO linear_issue_budgets(issue_id, attempts, first_attempt_at, spent)
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT(issue_id) DO UPDATE SET attempts=excluded.attempts, spent=excluded.spent""",
+                        (issue_id, attempts + 1, first_attempt_at, spent + self.budget.cost_per_attempt),
+                    )
+                else:
+                    cursor.execute(
+                        """INSERT INTO linear_generation_budgets(
+                               issue_id, generation_id, attempts, first_attempt_at, spent)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(issue_id, generation_id) DO UPDATE SET
+                               attempts=excluded.attempts, spent=excluded.spent""",
+                        (
+                            issue_id,
+                            generation_id,
+                            attempts + 1,
+                            first_attempt_at,
+                            spent + self.budget.cost_per_attempt,
+                        ),
+                    )
             conn.execute("COMMIT")
             return BudgetAdmission(True)
         except sqlite3.Error:
@@ -106,12 +147,22 @@ class IssueBudgetLedger:
         finally:
             conn.close()
 
-    def snapshot(self, issue_id: str) -> tuple[int, float, float] | None:
+    def snapshot(
+        self, issue_id: str, generation_id: str | None = None
+    ) -> tuple[int, float, float] | None:
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT attempts, first_attempt_at, spent FROM linear_issue_budgets WHERE issue_id = ?", (issue_id,)
-            ).fetchone()
+            if generation_id is None:
+                row = conn.execute(
+                    "SELECT attempts, first_attempt_at, spent FROM linear_issue_budgets WHERE issue_id = ?",
+                    (issue_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT attempts, first_attempt_at, spent FROM linear_generation_budgets "
+                    "WHERE issue_id = ? AND generation_id = ?",
+                    (issue_id, generation_id),
+                ).fetchone()
         finally:
             conn.close()
         return tuple(row) if row else None
