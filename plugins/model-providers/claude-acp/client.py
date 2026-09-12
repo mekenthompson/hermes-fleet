@@ -7,6 +7,7 @@ server directly and consumes its private capture stream before Hermes receives a
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import contextvars
 import os
@@ -36,7 +37,73 @@ _CONTEXT_HINT_SUFFIX_RE = re.compile(r"-(\d+m)$", re.I)
 _ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
 _BRIDGE_PREFIX = "mcp__hermes_bridge__"
 _CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
+_CLAUDE_CODE_PACKAGE = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/package.json")
+_CLAUDE_SDK_TOOLS = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts")
+_REVIEWED_CLAUDE_CODE_VERSION = "2.1.263"
+_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "26d020351e8112f4006790f3cfce43b4c9df0c1bb1d0e542364d64151b81d5ba"
+_REVIEWED_SDK_TOOLS_SHA256 = "a8bb537bb1624e9e68d5aa7c620260027278a9f83ce81943906a9485b06d7c9d"
 _DISCOVERY_TOOLS = ("ToolSearch",)
+# Claude.ai cloud connectors only hydrate when the full Claude Code preset is
+# selected. Deny every native tool in the reviewed, pinned Claude Code release;
+# ToolSearch remains available solely to lazily discover profile-authorized
+# connectors. The runtime version guard below fails closed before a future
+# Claude Code release can add an unreviewed native tool.
+_NATIVE_TOOL_DENY = (
+    "Agent",
+    "Artifact",
+    "AskUserQuestion",
+    "Bash",
+    "ClaudeDesign",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "FileEdit",
+    "FileRead",
+    "FileWrite",
+    "Glob",
+    "Grep",
+    "ListAgents",
+    "ListMcpResources",
+    "Mcp",
+    "Monitor",
+    "NotebookEdit",
+    "Projects",
+    "ProposeGoal",
+    "ProposeSkills",
+    "PushNotification",
+    "Read",
+    "ReadMcpResource",
+    "ReadMcpResourceDir",
+    "ReadNotifications",
+    "RefreshMcpTools",
+    "RemoteTrigger",
+    "REPL",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendFeedback",
+    "SendMessage",
+    "ShareOnboardingGuide",
+    "ShowOnboardingRolePicker",
+    "Skill",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write",
+)
 _CONNECTOR_PREFIX = "mcp__claude_ai_"
 _CONNECTOR_WILDCARD = "mcp__claude_ai_*"
 _SETTINGS_MAX_BYTES = 1_048_576
@@ -44,6 +111,66 @@ _SETTINGS_MAX_BYTES = 1_048_576
 
 class BridgeCaptureError(RuntimeError):
     """Raised when the trusted MCP bridge capture channel fails."""
+
+
+def assert_reviewed_claude_code_version(
+    package_path: str | os.PathLike[str] = _CLAUDE_CODE_PACKAGE,
+    executable: str | os.PathLike[str] = _CLAUDE_CODE_EXECUTABLE,
+    sdk_tools_path: str | os.PathLike[str] = _CLAUDE_SDK_TOOLS,
+    *,
+    executable_sha256: str = _REVIEWED_CLAUDE_EXECUTABLE_SHA256,
+    sdk_tools_sha256: str = _REVIEWED_SDK_TOOLS_SHA256,
+) -> str:
+    """Fail closed when Claude Code's package or launched executable has drifted."""
+    path = Path(package_path)
+    try:
+        if path.stat().st_size > 64 * 1024:
+            raise ValueError("package metadata is too large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("cannot verify the reviewed Claude Code version") from exc
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if version != _REVIEWED_CLAUDE_CODE_VERSION:
+        raise RuntimeError(
+            f"Claude Code {version!r} is not the reviewed release "
+            f"{_REVIEWED_CLAUDE_CODE_VERSION!r}; review the native tool deny set before upgrading"
+        )
+    artifacts = (
+        (Path(executable), executable_sha256, 512 * 1024 * 1024),
+        (Path(sdk_tools_path), sdk_tools_sha256, 4 * 1024 * 1024),
+    )
+    for artifact, expected_digest, max_bytes in artifacts:
+        try:
+            if artifact.stat().st_size > max_bytes:
+                raise ValueError("reviewed artifact is too large")
+            digest = hashlib.sha256()
+            with artifact.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("cannot verify a reviewed Claude Code artifact") from exc
+        if digest.hexdigest() != expected_digest:
+            raise RuntimeError(f"Claude Code artifact hash mismatch: {artifact}")
+    expected_banner = f"{_REVIEWED_CLAUDE_CODE_VERSION} (Claude Code)"
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env=build_subprocess_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("cannot verify the launched Claude Code executable") from exc
+    if result.returncode or result.stdout.strip() != expected_banner:
+        raise RuntimeError(
+            f"launched Claude Code executable is not the reviewed release {expected_banner!r}"
+        )
+    return version
 
 
 _BRIDGE_POLICY = (
@@ -180,32 +307,43 @@ def select_offered_model(offered: set[str], requested: str) -> str | None:
     return None
 
 
-def connector_allow_tools(config_dir: str | None = None) -> list[str]:
-    """Return profile allow rules for claude.ai connectors. Never reads secrets."""
+def connector_tool_policy(config_dir: str | None = None) -> tuple[list[str], list[str]]:
+    """Return profile allow/deny rules for claude.ai connectors. Never reads secrets."""
     root = config_dir if config_dir is not None else os.environ.get("CLAUDE_CONFIG_DIR")
     if not isinstance(root, str) or not root.strip():
-        return []
+        return [], []
     path = Path(root) / "settings.json"
     try:
         if not path.is_file() or path.stat().st_size > _SETTINGS_MAX_BYTES:
-            return []
+            return [], []
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeError):
-        return []
+        return [], []
     permissions = payload.get("permissions") if isinstance(payload, dict) else None
-    allow = permissions.get("allow") if isinstance(permissions, dict) else None
-    if not isinstance(allow, list):
-        return []
-    seen: set[str] = set()
-    rules: list[str] = []
-    for item in allow:
-        if not isinstance(item, str) or not item.startswith(_CONNECTOR_PREFIX):
-            continue
-        if item == _CONNECTOR_WILDCARD or item in seen:
-            continue
-        seen.add(item)
-        rules.append(item)
-    return rules
+    if not isinstance(permissions, dict):
+        return [], []
+
+    def rules_for(key: str, *, keep_wildcard: bool) -> list[str]:
+        values = permissions.get(key)
+        if not isinstance(values, list):
+            return []
+        seen: set[str] = set()
+        rules: list[str] = []
+        for item in values:
+            if not isinstance(item, str) or not item.startswith(_CONNECTOR_PREFIX):
+                continue
+            if (item == _CONNECTOR_WILDCARD and not keep_wildcard) or item in seen:
+                continue
+            seen.add(item)
+            rules.append(item)
+        return rules
+
+    return rules_for("allow", keep_wildcard=False), rules_for("deny", keep_wildcard=True)
+
+
+def connector_allow_tools(config_dir: str | None = None) -> list[str]:
+    """Return specific profile allow rules for claude.ai connectors."""
+    return connector_tool_policy(config_dir)[0]
 
 
 def claude_code_session_options(
@@ -215,18 +353,20 @@ def claude_code_session_options(
     """Build Claude Code options: no native Bash/Write, connectors keep profile allow."""
     allowed: list[str] = []
     seen: set[str] = set()
+    connector_allow, connector_deny = connector_tool_policy(config_dir)
     for name in (
         *[f"{_BRIDGE_PREFIX}{item}" for item in sorted(advertised_names)],
         *_DISCOVERY_TOOLS,
-        *connector_allow_tools(config_dir),
+        *connector_allow,
     ):
         if name in seen:
             continue
         seen.add(name)
         allowed.append(name)
     return {
-        "tools": list(_DISCOVERY_TOOLS),
+        "tools": {"type": "preset", "preset": "claude_code"},
         "allowedTools": allowed,
+        "disallowedTools": [*_NATIVE_TOOL_DENY, *connector_deny],
         "settingSources": ["user"],
         "settings": {"disableAllHooks": True},
     }
@@ -726,6 +866,7 @@ class ClaudeACPClient:
         publish=None,
     ) -> tuple[str, str, list[SimpleNamespace], dict[str, Any]]:
         del requirement, timeout  # The completion owns the shared absolute deadline.
+        assert_reviewed_claude_code_version()
         schema_path = ""
         bridge_dir = ""
         bridge_socket = ""
@@ -1059,7 +1200,6 @@ class ClaudeACPClient:
                 "cwd": self._cwd,
                 "mcpServers": [],
                 "_meta": {
-                    "disableBuiltInTools": True,
                     "systemPrompt": {"type": "preset", "preset": "claude_code", "append": system},
                     "claudeCode": {
                         "options": options,
