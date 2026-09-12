@@ -229,6 +229,8 @@ jobs:
           assert pathlib.Path("/usr/local/bin/claude-agent-acp").is_file()
           assert os.environ["CLAUDE_CODE_EXECUTABLE"] == "/opt/coding-clis/node_modules/.bin/claude"
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
           linear_plugin = pathlib.Path("/opt/hermes/plugins/linear-agent")
           assert (linear_plugin / "__init__.py").is_file()
           assert (linear_plugin / "linear_runtime.py").is_file()
@@ -286,6 +288,10 @@ jobs:
           assert shutil.which(creds["command"]) == creds["command"]
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
+          assert type(client).__name__ == "ClaudeACPClient"
+          assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
           assert metadata.version("honcho-ai") == "2.2.0"
@@ -528,6 +534,8 @@ jobs:
           assert pathlib.Path("/usr/local/bin/claude-agent-acp").is_file()
           assert os.environ["CLAUDE_CODE_EXECUTABLE"] == "/opt/coding-clis/node_modules/.bin/claude"
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
           linear_plugin = pathlib.Path("/opt/hermes/plugins/linear-agent")
           assert (linear_plugin / "__init__.py").is_file()
           assert (linear_plugin / "linear_runtime.py").is_file()
@@ -585,6 +593,10 @@ jobs:
           assert shutil.which(creds["command"]) == creds["command"]
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
+          assert type(client).__name__ == "ClaudeACPClient"
+          assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
+          assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
           assert metadata.version("honcho-ai") == "2.2.0"

@@ -11,17 +11,19 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
+from .client import ClaudeACPClient
+
 
 class ClaudeACPProfile(ProviderProfile):
     """Claude Code external-process provider."""
 
     def create_client(self, **client_kwargs: Any) -> Any:
-        """Build the generic ACP stdio shim with this provider's launcher."""
-        from agent.copilot_acp_client import CopilotACPClient
-
-        client_kwargs["command"] = self.process_command
-        client_kwargs["args"] = list(self.process_args)
-        return CopilotACPClient(**client_kwargs)
+        """Use the profile-local ACP transport and the subscription launcher."""
+        command = self.process_command or "/usr/local/bin/hermes-claude-acp-subscription"
+        client_kwargs.setdefault("acp_command", command)
+        client_kwargs.setdefault("command", command)
+        client_kwargs["args"] = list(self.process_args or ())
+        return ClaudeACPClient(**client_kwargs)
 
     def fetch_models(
         self,

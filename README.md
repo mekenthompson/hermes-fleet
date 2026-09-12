@@ -17,7 +17,8 @@ The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pi
 - 1Password CLI 2.39.0 from its digest-pinned official image (no vault config)
 - The Agent `honcho` extra, with no workspace identifiers
 - Codex, Grok, OpenCode, and Claude Code from the committed lockfile
-- Optional plugins, **disabled by default**: Perplexity search, Linear Agent (policy mounted at deploy time), Claude ACP, Kokoro voice
+- Optional plugins, **disabled by default**: Perplexity search, Linear Agent (policy mounted at deploy time), Claude ACP with the profile-local client, Kokoro voice, browser handoff (origin from env), and read-only source snapshots
+- Optional `tooling-policy-hook` binary for overlay install policy. Disabled until the overlay wires it.
 
 Consume it only as:
 
@@ -94,6 +95,9 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 | [`docs/linear-agent.md`](docs/linear-agent.md) | Linear worker plugin (policy stays external) |
 | [`docs/perplexity.md`](docs/perplexity.md) | Optional search provider |
 | [`plugins/kokoro-voice/`](plugins/kokoro-voice/) | Optional local Kokoro sidecar TTS (disabled by default) |
+| [`plugins/browser-handoff/`](plugins/browser-handoff/) | Optional browser handoff. Origin from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` |
+| [`plugins/readonly-source/`](plugins/readonly-source/) | Optional allowlisted read-only snapshot tools |
+| [`scripts/tooling-policy-hook`](scripts/tooling-policy-hook) | Optional overlay install-policy hook |
 | [`SECURITY.md`](SECURITY.md) | Vulnerability reporting and public boundary |
 | [`contracts/`](contracts/) | Machine-readable architecture boundaries |
 

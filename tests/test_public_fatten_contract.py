@@ -108,8 +108,6 @@ class PublicFattenContractTests(unittest.TestCase):
             "switchroom",
             "melbourne",
             "o" + "p://",
-            "readonly-source",
-            "tooling-policy",
             "au.com.kenthompson",
             _split("klank") + "er",
             _split("over") + "lord",

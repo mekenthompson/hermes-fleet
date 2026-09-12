@@ -1,0 +1,9 @@
+name: readonly-source
+kind: standalone
+version: 0.1.0
+description: Allowlisted read-only source snapshot tools
+author: Hermes Fleet Contributors
+provides_tools:
+  - source_list
+  - source_read
+  - source_search
