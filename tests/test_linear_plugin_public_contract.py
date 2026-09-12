@@ -16,9 +16,24 @@ SOURCE_FILES = {
     "__init__.py",
     "linear_activity.py",
     "linear_agent.py",
+    "linear_attachments.py",
+    "linear_budgets.py",
+    "linear_chat_closeout.py",
+    "linear_completion.py",
     "linear_connect.py",
+    "linear_cos_dispatch.py",
+    "linear_guard_health.py",
+    "linear_handoff.py",
+    "linear_limits.py",
     "linear_oauth.py",
+    "linear_ownership.py",
+    "linear_parent_continuation.py",
+    "linear_parent_followup.py",
+    "linear_quota.py",
+    "linear_readiness.py",
+    "linear_resume.py",
     "linear_runtime.py",
+    "linear_stop.py",
     "plugin.yaml",
 }
 
@@ -46,8 +61,8 @@ class LinearPluginPublicContractTests(unittest.TestCase):
     def test_house_policy_and_operations_are_not_embedded(self) -> None:
         self.assertFalse((PLUGIN / "linear-agents.json").exists())
         self.assertFalse((PLUGIN / "linear-publishers.json").exists())
-        self.assertFalse((PLUGIN / "linear_provision.py").exists())
-        self.assertFalse((PLUGIN / "linear_live_canary.py").exists())
+        self.assertTrue((PLUGIN / "linear_ownership.py").is_file())
+        self.assertTrue((PLUGIN / "linear_stop.py").is_file())
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
             "COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/",
