@@ -19,30 +19,61 @@ class ImmutablePolicyError(RuntimeError):
     """An external policy map is unavailable or not safe to trust."""
 
 
-def read_immutable_json(path: Path, *, description: str) -> object:
-    """Read one small, regular, non-writable policy map without following links.
+def _require_trusted_root_owned(metadata: os.stat_result, *, description: str, directory: bool = False) -> None:
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ImmutablePolicyError(f"{description} is unavailable")
 
-    Policy maps are mounted by the deployment overlay. They may be owned by root
-    and readable by the runtime, but no actor may retain a writable mode bit.
-    """
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+
+def _open_trusted_policy(path: Path, *, description: str) -> int:
+    """Open a root-owned regular file through root-owned, non-writable directories."""
+    if os.geteuid() == 0:
+        raise ImmutablePolicyError(f"{description} reader must not run as root")
+    if not path.is_absolute():
+        raise ImmutablePolicyError(f"{description} path must be absolute")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory: int | None = None
+    descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags)
+        directory = os.open("/", directory_flags)
+        _require_trusted_root_owned(os.fstat(directory), description=description, directory=True)
+        for component in path.parts[1:-1]:
+            child = os.open(component, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+            metadata = os.fstat(directory)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ImmutablePolicyError(f"{description} ancestor is not a directory")
+            _require_trusted_root_owned(metadata, description=description, directory=True)
+        descriptor = os.open(path.name, file_flags, dir_fd=directory)
+    except ImmutablePolicyError:
+        raise
     except OSError as exc:
         raise ImmutablePolicyError(f"{description} is unavailable") from exc
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+    assert descriptor is not None
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ImmutablePolicyError(f"{description} must be a regular file")
+    _require_trusted_root_owned(metadata, description=description)
+    return descriptor
+
+
+def read_immutable_json(path: Path, *, description: str) -> object:
+    """Read a bounded policy map from the deployment's immutable trust boundary.
+
+    A runtime-owned read-only file is not a policy boundary: that runtime can
+    chmod, rewrite, and chmod it back. The file and every path ancestor must
+    instead be root-owned and non-writable by group or other users.
+    """
+    descriptor = _open_trusted_policy(path, description=description)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ImmutablePolicyError(f"{description} must be a regular file")
-        if metadata.st_uid not in {0, os.geteuid()}:
-            raise ImmutablePolicyError(f"{description} owner is invalid")
-        if stat.S_IMODE(metadata.st_mode) & 0o222:
-            raise ImmutablePolicyError(f"{description} policy is writable by the runtime")
         if metadata.st_size > POLICY_LIMIT:
             raise ImmutablePolicyError(f"{description} is too large")
         chunks: list[bytes] = []

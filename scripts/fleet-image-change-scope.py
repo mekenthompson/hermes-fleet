@@ -41,6 +41,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "scripts/extract-pushed-image-digest.py",
         "scripts/fleet-image-change-scope.py",
         "scripts/image_ref.py",
+        "scripts/verify-linear-policy-trust.py",
         "scripts/read-agent-image-manifest.py",
         "scripts/scan-fleet-image.py",
         "scripts/validate-spdx-schema.py",
