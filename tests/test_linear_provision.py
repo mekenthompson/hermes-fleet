@@ -19,6 +19,13 @@ import linear_provision
 
 class LinearProvisionTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.policy_reader = patch.object(
+            linear_provision,
+            "read_agent_policy",
+            side_effect=lambda path: json.loads(path.read_text(encoding="utf-8")),
+        )
+        self.policy_reader.start()
+        self.addCleanup(self.policy_reader.stop)
         self.publisher_binding = patch.object(
             linear_provision,
             "_publisher_binding",

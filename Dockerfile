@@ -66,7 +66,7 @@ RUN python3 -m py_compile /opt/hermes/plugins/readonly-source/*.py \
     && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/readonly-source --ci
 COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
-COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref.py
+COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
 COPY --chmod=0755 scripts/verify-linear-policy-trust.py /opt/hermes-fleet/bin/verify-linear-policy-trust.py
 COPY contracts/ /opt/hermes-fleet/contracts/
 ARG AGENT_IMAGE

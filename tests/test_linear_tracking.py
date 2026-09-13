@@ -430,6 +430,10 @@ class LinearTrackingCliTests(unittest.TestCase):
                     },
                 ),
                 mock.patch("linear_policy.AGENT_POLICY_PATH", home / "linear-agents.json"),
+                mock.patch(
+                    "linear_policy.read_agent_policy",
+                    return_value=json.loads((home / "linear-agents.json").read_text(encoding="utf-8")),
+                ),
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "chat-1"}, clear=False),
             ):
                 _configured_tracker()
@@ -457,6 +461,10 @@ class LinearTrackingCliTests(unittest.TestCase):
                     },
                 ),
                 mock.patch("linear_policy.AGENT_POLICY_PATH", home / "linear-agents.json"),
+                mock.patch(
+                    "linear_policy.read_agent_policy",
+                    return_value=json.loads((home / "linear-agents.json").read_text(encoding="utf-8")),
+                ),
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "chat-1"}, clear=False),
             ):
                 with self.assertRaisesRegex(TrackingError, "binding refused"):
