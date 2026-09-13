@@ -177,6 +177,7 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             }), encoding="utf-8")
             policy.chmod(0o444)
             setattr(module, "_POLICY_PATH", policy)
+            setattr(module, "read_agent_policy", lambda _path: json.loads(policy.read_text(encoding="utf-8")))
             captured.clear()
             module.register(Context({**base_settings, "dry_run": True}))
             service = cast(
@@ -213,7 +214,7 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             policy.write_text('{"agents": []}\n', encoding="utf-8")
             policy.chmod(0o644)
             setattr(module, "_POLICY_PATH", policy)
-            with self.assertRaisesRegex(RuntimeError, "writable"):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
                 module._require_policy(
                     profile="sample",
                     workspace="example-workspace",
@@ -241,7 +242,7 @@ class LinearPluginPublicContractTests(unittest.TestCase):
                     allowed_linear_user_ids=None,
                 )
 
-    def test_synthetic_external_policy_is_accepted(self) -> None:
+    def test_runtime_owned_synthetic_external_policy_is_rejected(self) -> None:
         module = load_plugin()
         user_id = "11111111-1111-4111-8111-111111111111"
         with tempfile.TemporaryDirectory() as temp:
@@ -262,13 +263,14 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             }]}), encoding="utf-8")
             policy.chmod(0o444)
             module._POLICY_PATH = policy
-            module._require_policy(
-                profile="sample",
-                workspace="example-workspace",
-                vault_id="vault-sample",
-                item_id="item-linear",
-                allowed_linear_user_ids=[user_id],
-            )
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                module._require_policy(
+                    profile="sample",
+                    workspace="example-workspace",
+                    vault_id="vault-sample",
+                    item_id="item-linear",
+                    allowed_linear_user_ids=[user_id],
+                )
 
 
 if __name__ == "__main__":

@@ -40,7 +40,8 @@ class PublicGenericPluginTests(unittest.TestCase):
     def test_public_policy_reader_stays_fail_closed(self) -> None:
         text = (LINEAR / "linear_policy.py").read_text(encoding="utf-8")
         self.assertIn("O_NOFOLLOW", text)
-        self.assertIn("policy is writable by the runtime", text)
+        self.assertIn("metadata.st_uid != 0", text)
+        self.assertIn("os.geteuid() == 0", text)
         self.assertIn("read_immutable_json", text)
 
     def test_claude_acp_ships_the_profile_local_client(self) -> None:
