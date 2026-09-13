@@ -301,7 +301,7 @@ jobs:
           assert not pathlib.Path("/var/run/docker.sock").exists()
           assert pathlib.Path("/opt/hermes-fleet/contracts/image.json").is_file()
           '
-          docker run --rm --user root --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
+          timeout 15s docker run --rm --network none --user root --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
@@ -606,7 +606,7 @@ jobs:
           assert shutil.which("opencode")
           assert not pathlib.Path("/var/run/docker.sock").exists()
           '
-          docker run --rm --user root --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
+          timeout 15s docker run --rm --network none --user root --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
