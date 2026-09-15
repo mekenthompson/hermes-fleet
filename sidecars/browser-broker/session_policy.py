@@ -236,7 +236,9 @@ class HandoffBroker:
                     raise BrokerError(403, 'browser workspace denied')
                 if invocation.chat_type in {'dm', 'private'}:
                     return principal
-                if any(grant.matches(invocation) for grant in principal.group_routes):
+                # Matched person+team already proved identity. A Slack group
+                # only also needs a thread so channel-root chatter cannot mint.
+                if invocation.chat_type == 'group' and invocation.thread_id:
                     return principal
                 raise BrokerError(403, 'route denied')
         raise BrokerError(403, 'unknown principal')
