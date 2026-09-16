@@ -53,10 +53,10 @@ SYNTHETIC_DESKTOP_ROUTES = frozenset({
     ("server-internal", "server-internal"),
 })
 UUID_RE = re.compile(
-    r"^/([a-z][a-z0-9-]{0,63})/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(/(end|observe|takeover|extend))?$"
+    r"^/([a-z][a-z0-9-]{0,63})/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(/(end|observe|takeover|extend|mode))?$"
 )
 WORKSPACE_UUID_RE = re.compile(
-    r"^/([a-z][a-z0-9-]{0,63})/([a-z][a-z0-9-]{0,63})/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(/(end|observe|takeover|extend))?$"
+    r"^/([a-z][a-z0-9-]{0,63})/([a-z][a-z0-9-]{0,63})/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(/(end|observe|takeover|extend|mode))?$"
 )
 SCOPED_RE = re.compile(
     r"^/([a-z][a-z0-9-]{0,63})/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:/(.*))?$"
@@ -810,6 +810,37 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _uuid_mode_status(self, route_agent: str, session_id: str, workspace: str = "default") -> None:
+        """Read-only mode for the live viewer so chat-reply Observe can force the UI."""
+        try:
+            email = (self._email() or "").strip().lower()
+        except Exception:
+            self._deny(401, b"unauthorized\n")
+            return
+        broker: HandoffBroker = self.server.broker  # type: ignore[attr-defined]
+        try:
+            self._session_agent(route_agent, session_id, workspace)
+            page_out = broker.public_page(session_id, method="GET", access_email=email)
+        except BrokerError as exc:
+            self._deny(exc.status, f"{exc}\n".encode())
+            return
+        if page_out.status != 200:
+            self._deny(page_out.status, b"denied\n")
+            return
+        try:
+            rec = broker.debug(session_id)
+        except BrokerError as exc:
+            self._deny(exc.status, f"{exc}\n".encode())
+            return
+        mode = rec.get("mode") if rec.get("mode") in {"observe", "takeover"} else "takeover"
+        body = f"{mode}\n".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _uuid_extend(self, route_agent: str, session_id: str, workspace: str = "default") -> None:
         if (self.headers.get("Origin") or "") != canonical_public_url():
             self._deny(403, b"csrf\n")
@@ -882,8 +913,15 @@ class Handler(BaseHTTPRequestHandler):
             self._html(status_page("ended"))
             return
         workspace = WORKSPACE_UUID_RE.match(path)
+        if workspace and workspace.group(4) == "/mode":
+            self._uuid_mode_status(workspace.group(1), workspace.group(3), workspace.group(2))
+            return
         if workspace and not workspace.group(4):
             self._uuid_get(workspace.group(1), workspace.group(3), workspace.group(2))
+            return
+        uuid_match = UUID_RE.match(path)
+        if uuid_match and uuid_match.group(4) == "mode":
+            self._uuid_mode_status(uuid_match.group(1), uuid_match.group(2))
             return
         scoped_workspace = WORKSPACE_SCOPED_RE.match(path)
         if scoped_workspace and scoped_workspace.group(4):
@@ -909,6 +947,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._uuid_mode(agent, session_id, action == "/takeover", resource); return
             if action == "/extend":
                 self._uuid_extend(agent, session_id, resource); return
+            if action == "/mode":
+                self._deny(405, b"method not allowed\n"); return
         scoped_workspace = WORKSPACE_SCOPED_RE.match(path)
         if scoped_workspace and scoped_workspace.group(4):
             self._scoped_proxy(scoped_workspace.group(1), scoped_workspace.group(3), scoped_workspace.group(4) or "", scoped_workspace.group(2))
@@ -922,6 +962,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if match and match.group(4) == "extend":
             self._uuid_extend(match.group(1), match.group(2))
+            return
+        if match and match.group(4) == "mode":
+            self._deny(405, b"method not allowed\n")
             return
         scoped = SCOPED_RE.match(path)
         if scoped and scoped.group(2):
@@ -1018,7 +1061,7 @@ class AdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
-        if path not in {"/v1/handoffs", "/v1/handoffs/status", "/v1/handoffs/end"}:
+        if path not in {"/v1/handoffs", "/v1/handoffs/status", "/v1/handoffs/end", "/v1/handoffs/observe"}:
             self._deny(404, "not found")
             return
         inv = self._invocation()
@@ -1045,6 +1088,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 # A recovery_required session is still live here and reports
                 # itself; a missing handle is 404 'no active handoff'.
                 payload = broker.status(inv)
+            elif path == "/v1/handoffs/observe":
+                payload = broker.observe_current(inv, expected_session_id=getattr(self, 'requested_session_id', None))
             else:
                 # end_current authenticates before the broker performs its
                 # lifecycle-owned checkpoint and unlock.
