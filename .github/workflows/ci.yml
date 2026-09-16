@@ -22,7 +22,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
       - name: Unit tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+        run: |
+          python3 -m venv --system-site-packages "$RUNNER_TEMP/source-tests"
+          "$RUNNER_TEMP/source-tests/bin/python" -m pip install --require-hashes -r release/spdx-validation-requirements.txt
+          . "$RUNNER_TEMP/source-tests/bin/activate"
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Compose syntax
         env:
           HERMES_FLEET_IMAGE: ghcr.io/example/hermes-fleet@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

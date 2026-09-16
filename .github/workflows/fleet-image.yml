@@ -25,8 +25,8 @@ env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-public
   TEST_IMAGE: ghcr.io/mekenthompson/hermes-fleet-public:sha-${{ github.sha }}
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1
-  CLAUDE_CODE_VERSION: "2.1.263"
-  CLAUDE_AGENT_ACP_VERSION: "0.75.1"
+  CLAUDE_CODE_VERSION: "2.1.273"
+  CLAUDE_AGENT_ACP_VERSION: "0.78.0"
   CLAUDE_ACP_PLUGIN_SOURCE: https://github.com/mvdbastos/hermes-acp-agents
   CLAUDE_ACP_PLUGIN_REVISION: 0526610a3945cc376ac517b63ca358a5b838a2fc
   # Scanner pins match the versions the previously used anchore/sbom-action v0.24.2 and
@@ -289,6 +289,11 @@ jobs:
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
           assert type(client).__name__ == "ClaudeACPClient"
+          acp_spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
+          acp_review = importlib.util.module_from_spec(acp_spec)
+          acp_spec.loader.exec_module(acp_review)
+          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
+          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
@@ -595,6 +600,11 @@ jobs:
           client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
           assert client is not None
           assert type(client).__name__ == "ClaudeACPClient"
+          acp_spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
+          acp_review = importlib.util.module_from_spec(acp_spec)
+          acp_spec.loader.exec_module(acp_review)
+          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
+          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
