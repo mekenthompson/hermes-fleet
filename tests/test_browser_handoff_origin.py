@@ -64,6 +64,50 @@ class BrowserHandoffOriginTests(unittest.TestCase):
                 )
             )
 
+    def test_start_without_public_host_does_not_mint(self) -> None:
+        import json
+
+        broker = mock.Mock()
+        broker.start.return_value = {
+            "ok": True,
+            "url": f"https://handoff.example/{self.invocation.profile}/{self.session}",
+            "session_id": self.session,
+        }
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERMES_BROWSER_HANDOFF_PUBLIC_HOST", None)
+            payload = json.loads(
+                self.module.start_handoff({}, invocation_context=self.invocation, broker=broker)
+            )
+        self.assertEqual(payload["error"], "missing_public_host")
+        broker.start.assert_not_called()
+
+    def test_start_rejects_bad_url_as_broker_invalid_url(self) -> None:
+        import json
+
+        broker = mock.Mock()
+        broker.start.return_value = {
+            "ok": True,
+            "url": f"https://other.example/{self.invocation.profile}/{self.session}",
+            "session_id": self.session,
+        }
+        env = {"HERMES_BROWSER_HANDOFF_PUBLIC_HOST": "handoff.example"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            payload = json.loads(
+                self.module.start_handoff({}, invocation_context=self.invocation, broker=broker)
+            )
+        self.assertEqual(payload["error"], "broker_invalid_url")
+        broker.start.assert_called_once()
+
+    def test_status_none_clears_hold_after_broker_reset(self) -> None:
+        env = {"HERMES_BROWSER_HANDOFF_PUBLIC_HOST": "handoff.example"}
+        transport = self.module.BrokerHttpTransport("http://127.0.0.1:9", "token")
+        owner = {"platform": "telegram", "user_id": "1", "chat_id": "1", "chat_type": "dm"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            transport._hold(owner, {"session_id": self.session, "ok": True})
+            self.assertIsNotNone(transport.held_handoff())
+            transport._settle(owner, dict(self.module.NO_ACTIVE_HANDOFF))
+            self.assertIsNone(transport.held_handoff())
+
 
 if __name__ == "__main__":
     unittest.main()
