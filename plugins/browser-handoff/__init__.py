@@ -180,7 +180,9 @@ class BrokerHttpTransport:
             result = json.loads(body.decode())
         except (UnicodeDecodeError, json.JSONDecodeError):
             return {"ok": False, "error": "broker_invalid_response"}
-        if not isinstance(result, dict) or (require_url and not isinstance(result.get("url"), str)):
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "broker_invalid_json"}
+        if require_url and not isinstance(result.get("url"), str):
             return {"ok": False, "error": "broker_invalid_response"}
         return result
 
