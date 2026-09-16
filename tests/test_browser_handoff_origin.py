@@ -108,6 +108,45 @@ class BrowserHandoffOriginTests(unittest.TestCase):
             transport._settle(owner, dict(self.module.NO_ACTIVE_HANDOFF))
             self.assertIsNone(transport.held_handoff())
 
+    def test_start_non_dict_json_is_broker_invalid_json(self) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                if length:
+                    self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"[]")
+
+            def log_message(self, format, *args):
+                del format, args
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host = server.server_address[0]
+            port = server.server_address[1]
+            transport = self.module.BrokerHttpTransport(f"http://{host}:{port}", "token")
+            env = {"HERMES_BROWSER_HANDOFF_PUBLIC_HOST": "handoff.example"}
+            with mock.patch.dict(os.environ, env, clear=False):
+                payload = json.loads(
+                    self.module.start_handoff(
+                        {},
+                        invocation_context=self.invocation,
+                        broker=transport,
+                    )
+                )
+            self.assertEqual(payload["error"], "broker_invalid_json")
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
