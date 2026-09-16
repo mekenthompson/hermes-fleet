@@ -317,6 +317,24 @@ VIEWER_JS = r"""
   if (modeBtn) modeBtn.addEventListener("click", function () {
     setMode(state.mode === "takeover" ? "observe" : "takeover");
   });
+  function applyServerMode(mode) {
+    if (state.ended || (mode !== "observe" && mode !== "takeover") || mode === state.mode) return;
+    state.mode = mode;
+    state.started = true;
+    if (modeBtn) modeBtn.textContent = mode === "takeover" ? "Switch to observe" : "Take control";
+    try { var r = rfb(); if (r) r.viewOnly = state.mode !== "takeover"; } catch (e) {}
+    if (mode === "observe") setStatus("Watching", "ok");
+  }
+  function pollMode() {
+    if (state.ended || !scope) return;
+    fetch(scope + "/mode", {credentials: "same-origin"}).then(function (res) {
+      return res.ok ? res.text() : "";
+    }).then(function (text) {
+      applyServerMode((text || "").trim());
+    }).catch(function () {});
+  }
+  setInterval(pollMode, 1500);
+  pollMode();
   var introKey = "sr-intro-v1";
   var seen = false;
   try { seen = window.localStorage.getItem(introKey) === "1"; } catch (e) {}
@@ -530,7 +548,7 @@ def viewer_page(
         "<p>The agent is paused while you're here. Sign in or finish the step it got stuck on.</p>"
         "<p>Paste works: copy from your password manager and press "
         "<b>Ctrl+V</b> (or <b>Cmd+V</b> on a Mac). Choose a code or SMS if a site offers passkeys; those can't reach this browser.</p>"
-        f"<p>Press <b>{END_BUTTON}</b> when you're done, then reply in the original Slack thread so the agent can carry on.</p>"
+        "<p>Reply in the original Slack thread when you're done so the agent can carry on. This tab stays open in observe so you can watch.</p>"
         "<div class=\"row\"><button type=\"button\" id=\"intro-take\" class=\"primary\">Take control</button>"
         "<button type=\"button\" id=\"intro-watch\">Just watch</button></div>"
         "</div></div>"
@@ -564,7 +582,7 @@ def slack_message(url: str, expires_at: float | None = None, *, agent: str | Non
         "1. Choose the Google account this link was sent to",
         "2. Sign in on the page you see. Paste works: copy from your password manager and press Ctrl+V (Cmd+V on a Mac)",
         "3. If the site offers a passkey or push approval, pick a code or SMS instead",
-        f"4. Press *{END_BUTTON}* when you're done, then reply here so {who} can carry on",
+        f"4. Reply here when you're done so {who} can carry on. This tab stays open so you can watch. Press Take control to interrupt, or *{END_BUTTON}* to close",
     ]
     if when:
         lines.append(f"The link expires at {when}. Reply here if you need a new one.")

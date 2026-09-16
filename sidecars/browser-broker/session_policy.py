@@ -389,6 +389,26 @@ class HandoffBroker:
         self._terminate(sess, 'ended', explicit_end=True)
         return sess.session_id
 
+    def observe_current(self, invocation, expected_session_id=None):
+        """Checkpoint and force Observe without ending the session.
+
+        Chat reply is permission for the agent to continue. The human viewer
+        stays connected, read-only. End takeover remains the terminal path.
+        """
+        if expected_session_id is None:
+            sess = self._current(invocation)
+        else:
+            principal = self._authorized_principal(invocation)
+            with self._lifecycle_lock:
+                sess = self._sessions.get(expected_session_id)
+                if sess is None:
+                    raise BrokerError(404, 'unknown handoff')
+                if sess.principal_id != principal.principal_id or sess.owner != self._owner(invocation):
+                    raise BrokerError(403, 'wrong handoff owner')
+        self.release_to_observe(sess.session_id, access_email=sess.access_email)
+        with self._lifecycle_lock:
+            return self._session_status(sess)
+
     def status_for_agent(self, agent):
         self._require_configured_agent(agent)
         with self._lifecycle_lock:

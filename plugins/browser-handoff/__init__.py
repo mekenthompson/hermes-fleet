@@ -41,7 +41,7 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 
 # States in which the broker no longer reserves the browser for a human.
 RELEASED_STATES = frozenset({"none", "ended", "expired"})
-# States in which a human reply should checkpoint and release via agent-side end.
+# States in which a human reply should checkpoint and force Observe.
 HELD_STATES = frozenset({"pending", "active", "ending", "recovery_required"})
 # After blocking browser tools for this long, refresh the hold once via status
 # using the remembered owner (core passes no invocation to pre_tool_call).
@@ -91,6 +91,18 @@ class BrokerHttpTransport:
             if not sid:
                 return result
         result = self._post('/end', {'invocation': _invocation_payload(invocation), 'session_id': sid})
+        self._settle(invocation, result)
+        return result
+
+    def observe(self, invocation: Any) -> dict[str, Any]:
+        """Checkpoint and force Observe. Does not end the session."""
+        owner = self._owner_key(invocation)
+        with self._handles_lock:
+            sid = self._handles.get(owner)
+        payload: dict[str, Any] = {"invocation": _invocation_payload(invocation)}
+        if isinstance(sid, str) and sid:
+            payload["session_id"] = sid
+        result = self._post("/observe", payload)
         self._settle(invocation, result)
         return result
 
@@ -144,7 +156,8 @@ class BrokerHttpTransport:
         """Release the hold only on explicit evidence; errors keep it."""
         if not isinstance(result, dict) or result.get("ok") is False:
             return
-        if result.get("state") in RELEASED_STATES:
+        observing = result.get("mode") == "observe" or result.get("automation_blocked") is False
+        if result.get("state") in RELEASED_STATES or observing:
             with self._handles_lock:
                 self._held.pop(self._owner_key(invocation), None)
 
@@ -262,7 +275,7 @@ def handoff_message(url: str, expires_at: Any = None, *, agent: str | None = Non
         "1. Choose the Google account this link was sent to",
         "2. Sign in on the page you see. Paste works: copy from your password manager and press Ctrl+V (Cmd+V on a Mac)",
         "3. If the site offers a passkey or push approval, pick a code or SMS instead",
-        f"4. Reply here when you're done so {who} can carry on. You can also press *{END_BUTTON}* in the viewer",
+        f"4. Reply here when you're done so {who} can carry on. This tab stays open so you can watch. Press Take control to interrupt, or *{END_BUTTON}* to close",
     ]
     if when:
         lines.append(f"The link expires at {when}. Reply here if you need a new one.")
@@ -274,9 +287,9 @@ NEXT_STEP = (
     "Call the clarify tool with questions=[{\"question\": user_message}] (no choices) so this turn blocks until the human replies; "
     "if clarify is unavailable on this platform, send user_message and end the turn instead. "
     "When the reply arrives, call browser_handoff_status once. A chat reply is the unlock signal on every platform. "
-    "browser_handoff_status checkpoints and releases if the handoff is still held. "
-    "If state is \"none\" or \"ended\", continue with browser tools. "
-    "If the handoff is still held after that check, call browser_handoff_end, then status once more. "
+    "browser_handoff_status checkpoints and forces the human into observe so they can watch while you continue. "
+    "If mode is \"observe\", automation_blocked is false, or state is \"none\" or \"ended\", continue with browser tools. "
+    "Do not call browser_handoff_end unless they asked to close the session. "
     "Do not ask the human to press End takeover. "
     "Other errors do not confirm release. Never ask for passwords or codes in chat."
 )
@@ -366,11 +379,12 @@ def start_handoff(args: dict[str, Any] | None = None, *, invocation_context: Any
     return _result(_with_user_message(result, invocation_context))
 
 
-def _status_then_release(broker: Any, invocation_context: Any) -> dict[str, Any]:
-    """Inspect, then checkpoint-and-end if a human reply found the session still held.
+def _status_then_observe(broker: Any, invocation_context: Any) -> dict[str, Any]:
+    """Inspect, then checkpoint-and-observe if a human reply found takeover still held.
 
     BrokerHttpTransport.status stays inspect-only: the hold-refresh path uses it
-    without unlocking while the human is still in the viewer.
+    without unlocking while the human is still in the viewer. Chat reply must
+    not fall back to end; an unavailable observe path keeps the hold.
     """
     result = broker.status(invocation_context)
     if not isinstance(result, dict):
@@ -379,11 +393,18 @@ def _status_then_release(broker: Any, invocation_context: Any) -> dict[str, Any]
         return result
     if result.get("state") in RELEASED_STATES:
         return result
-    if result.get("state") in HELD_STATES and hasattr(broker, "end"):
-        ended = broker.end(invocation_context)
-        if not isinstance(ended, dict):
+    if result.get("mode") == "observe" or result.get("automation_blocked") is False:
+        return result
+    if result.get("state") in HELD_STATES:
+        if not hasattr(broker, "observe"):
+            held = dict(result)
+            held["ok"] = False
+            held["error"] = "observe_unavailable"
+            return held
+        observed = broker.observe(invocation_context)
+        if not isinstance(observed, dict):
             return {"ok": False, "error": "broker_invalid_response"}
-        return ended
+        return observed
     return result
 
 
@@ -394,7 +415,7 @@ def status_handoff(args: dict[str, Any] | None = None, *, invocation_context: An
         return _result({"ok": False, "error": reason})
     if broker is None or not hasattr(broker, "status"):
         return _result({"ok": False, "error": "status_unavailable"})
-    return _result(_status_then_release(broker, invocation_context))
+    return _result(_status_then_observe(broker, invocation_context))
 
 
 def end_handoff(args: dict[str, Any] | None = None, *, invocation_context: Any = None, broker: Any | None = None, desktop_authorized_subjects: tuple[tuple[str, str, str], ...] = (), **_: Any) -> str:
@@ -425,7 +446,7 @@ def guard_browser_tools(tool_name: str = "", args: Any = None, *, broker: Any | 
         "action": "block",
         "message": (
             f"A human currently has this browser (handoff {held['session_id']}). "
-            "Call browser_handoff_status after the user replies; do not use browser tools until it reports state none."
+            "Call browser_handoff_status after the user replies; do not use browser tools until it reports mode observe or state none."
         ),
     }
 
@@ -508,7 +529,8 @@ def register(ctx: Any) -> None:
             "Pass the returned user_message verbatim as the question of a clarify call (questions=[{\"question\": user_message}]) "
             "so the turn blocks until the human replies; if clarify is unavailable, send user_message and end the turn. "
             "When they reply, call browser_handoff_status once before any browser action; "
-            "a chat reply unlocks the browser. browser_* tools are blocked while the handoff is outstanding. "
+            "a chat reply unlocks the browser and puts the human into observe so they can watch. "
+            "browser_* tools are blocked while takeover is outstanding. "
             "Never ask the user for a password or code in chat.",
             {"reason": {"type": "string", "description": "Short note for logs about why the handoff is needed. Not shown to the human."}},
             start_handoff,
@@ -517,18 +539,18 @@ def register(ctx: Any) -> None:
             "browser_handoff_status",
             "Check once, after the human answers the clarify prompt or replies in this thread. "
             "A chat reply is the unlock signal on every platform; do not ask them to press End takeover. "
-            "If the handoff is still held, this tool checkpoints and releases it. "
-            "state \"none\" or \"ended\" (ok: true) means the browser is free and you can continue. "
-            "If it is still pending, active, ending, or recovery_required after that, do not use browser_* tools; call browser_handoff_end. "
+            "If takeover is still held, this tool checkpoints and forces observe so the human can watch while you continue. "
+            "mode \"observe\" or automation_blocked false, or state \"none\" or \"ended\" (ok: true), means you can continue. "
+            "Do not call browser_handoff_end unless they asked to close the session. "
             "Other errors do not confirm release.",
             {},
             status_handoff,
         ),
         (
             "browser_handoff_end",
-            "End the current browser handoff from the agent side (checkpoint then release). "
-            "Use after a human reply if status did not already release, or if they ask you to end it. "
-            "The viewer End takeover button is optional.",
+            "End the current browser handoff from the agent side (checkpoint then close the session). "
+            "Use only if they asked you to close it. A chat reply should use browser_handoff_status, which forces observe instead. "
+            "The viewer End takeover button still closes the session.",
             {},
             end_handoff,
         ),
