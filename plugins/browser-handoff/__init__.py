@@ -354,11 +354,13 @@ def start_handoff(args: dict[str, Any] | None = None, *, invocation_context: Any
         return _result({"ok": False, "error": reason})
     if broker is None:
         return _result({"ok": False, "error": "missing_broker"})
+    if _public_handoff_host() is None:
+        return _result({"ok": False, "error": "missing_public_host"})
     result = broker.start(invocation_context)
     if not isinstance(result, dict):
-        return _result({"ok": False, "error": "broker_invalid_response"})
+        return _result({"ok": False, "error": "broker_invalid_json"})
     if result.get("ok") is not False and not _valid_handoff_url(result.get("url"), invocation_context):
-        return _result({"ok": False, "error": "broker_invalid_response"})
+        return _result({"ok": False, "error": "broker_invalid_url"})
     return _result(_with_user_message(result, invocation_context))
 
 
