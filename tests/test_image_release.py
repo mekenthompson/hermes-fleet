@@ -29,16 +29,21 @@ ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
     "sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1"
 )
-CLAUDE_CODE_VERSION = "2.1.263"
-CLAUDE_CODE_INTEGRITY = "sha512-kvvBK6/69iTRYnq0TKVyxVZs1CxYCJGojshQSP+2qaDb66A2xtI4zbCuqkZUWLkFGmHSRqhFf/ATpzH2UNKcwg=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-0IrvpLd/0FP0acQw59T4Cvx/r4nwAXKBrW0WyhIXymzYWurPCLztB+Icu9MkeewAUI+p3PTXsSfmilv/n6XlAQ=="
-CLAUDE_AGENT_ACP_VERSION = "0.75.1"
-CLAUDE_AGENT_ACP_INTEGRITY = "sha512-Un6I4BRkhpCFS3I7kr5C/lkAm8Nc3VuGZU2YQ3xIpJAIxV94iWO0Q2CH2QABxMERpONRu4Le6XC9V+5PImQZ2A=="
+CLAUDE_CODE_VERSION = "2.1.273"
+CLAUDE_CODE_INTEGRITY = "sha512-ym42/WNRf6H43FQdIPigvzzTW0DeQ1CPqrTdYnAlkWVGj8x8NaysCE0TU148mb3lpny5yo1/94+7dQK5USmBEQ=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-IunGXNpsmV1IHjW6ttZIqhZDVOzp8UZgJBGBV0VyQ3JCcDWY4b3AokOL0YJOptl8GhBVrgks6DckEYLR/QNZJg=="
+CLAUDE_AGENT_ACP_VERSION = "0.78.0"
+CLAUDE_AGENT_ACP_INTEGRITY = "sha512-ivWFMmadPFRbc0vn+80B04qomeLdvVieWFu2WK0JFXvHt12Uqdn3Ujjm7rERvM8w4hjxUb1u5vRotu1C/cquCA=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
 CLAUDE_ACP_PLUGIN_REVISION = "0526610a3945cc376ac517b63ca358a5b838a2fc"
 
 
 class FleetImageReleaseTests(unittest.TestCase):
+    def test_both_image_gates_verify_reviewed_claude_artifacts(self) -> None:
+        workflow = WORKFLOW.read_text()
+        self.assertEqual(workflow.count('assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]'), 2)
+        self.assertEqual(workflow.count('assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False'), 2)
+
     def test_release_files_exist(self) -> None:
         for path in (
             WORKFLOW,

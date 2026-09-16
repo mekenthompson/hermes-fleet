@@ -36,7 +36,8 @@ class ConnectorHydrationTests(unittest.TestCase):
         declared = set(re.findall(r"\b([A-Za-z]+)Input\b", union.group(1)))
         self.assertGreater(len(declared), 40)
         aliases = {"Edit", "Read", "Write", "Task", "Skill", "ToolSearch",
-                   "DesignSync", "ListAgents", "SendMessage", "ShareOnboardingGuide"}
+                   "DesignSync", "ListAgents", "SendMessage", "ShareOnboardingGuide",
+                   "AppifactRepl", "FetchInboxMessage", "SubagentHandback"}
         with tempfile.TemporaryDirectory() as tmp:
             options = client.claude_code_session_options(set(), tmp)
         self.assertEqual(
@@ -56,16 +57,19 @@ class ConnectorHydrationTests(unittest.TestCase):
 
     def test_installed_sdk_union_matches_reviewed_fixture_when_present(self) -> None:
         client = load_client()
-        if not client._CLAUDE_SDK_TOOLS.exists():
+        sdk_tools = Path(os.environ.get("CLAUDE_REVIEW_NODE_MODULES", str(ROOT / "node_modules"))) / "@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts"
+        if not sdk_tools.exists():
+            sdk_tools = client._CLAUDE_SDK_TOOLS
+        if not sdk_tools.exists():
             self.skipTest("installed SDK checked in the image environment")
-        source = client._CLAUDE_SDK_TOOLS.read_text()
+        source = sdk_tools.read_text()
         fixture = (ROOT / "tests/fixtures/claude-tool-inputs.txt").read_text()
         pattern = r"export type ToolInputSchemas\s*=([^;]+);"
         source_union = re.search(pattern, source)
         fixture_union = re.search(pattern, fixture)
         assert source_union is not None and fixture_union is not None
         self.assertEqual(source_union.group(0), fixture_union.group(0))
-        self.assertEqual(hashlib.sha256(client._CLAUDE_SDK_TOOLS.read_bytes()).hexdigest(), client._REVIEWED_SDK_TOOLS_SHA256)
+        self.assertEqual(hashlib.sha256(sdk_tools.read_bytes()).hexdigest(), client._REVIEWED_SDK_TOOLS_SHA256)
 
     def test_reviewed_claude_code_version_guard_fails_closed(self) -> None:
         client = load_client()
@@ -73,7 +77,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             package = Path(tmp, "package.json")
             executable = Path(tmp, "claude")
             sdk_tools = Path(tmp, "sdk-tools.d.ts")
-            executable.write_text("#!/bin/sh\nprintf '2.1.263 (Claude Code)\\n'\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.273 (Claude Code)\\n'\n", encoding="utf-8")
             sdk_tools.write_text("export type ToolInputSchemas = BashInput;\n", encoding="utf-8")
             os.chmod(executable, 0o700)
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
@@ -86,20 +90,20 @@ class ConnectorHydrationTests(unittest.TestCase):
                     executable_sha256=executable_sha256,
                     sdk_tools_sha256=sdk_tools_sha256,
                 )
-            package.write_text(json.dumps({"version": "2.1.263"}), encoding="utf-8")
-            self.assertEqual(verify(), "2.1.263")
+            package.write_text(json.dumps({"version": "2.1.273"}), encoding="utf-8")
+            self.assertEqual(verify(), "2.1.273")
 
-            package.write_text(json.dumps({"version": "2.1.264"}), encoding="utf-8")
+            package.write_text(json.dumps({"version": "2.1.274"}), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "review the native tool deny set"):
                 verify()
 
-            package.write_text(json.dumps({"version": "2.1.263"}), encoding="utf-8")
-            executable.write_text("#!/bin/sh\nprintf '2.1.264 (Claude Code)\\n'\n", encoding="utf-8")
+            package.write_text(json.dumps({"version": "2.1.273"}), encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.274 (Claude Code)\\n'\n", encoding="utf-8")
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
             with self.assertRaisesRegex(RuntimeError, "launched Claude Code executable"):
                 verify()
 
-            executable.write_text("#!/bin/sh\nprintf '2.1.263 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.273 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "artifact hash mismatch"):
                 verify()
 
@@ -148,9 +152,11 @@ class ConnectorHydrationTests(unittest.TestCase):
             }), encoding="utf-8")
             options = client.claude_code_session_options({"probe_tool"}, tmp)
         self.assertEqual(options["tools"], {"type": "preset", "preset": "claude_code"})
+        self.assertIs(options["allowDangerouslySkipPermissions"], False)
         denied = options["disallowedTools"]
         expected_native = {
-            "Agent", "Artifact", "AskUserQuestion", "Bash", "ClaudeDesign",
+            "Agent", "AppifactRepl", "Artifact", "AskUserQuestion", "Bash", "ClaudeDesign",
+            "FetchInboxMessage", "SubagentHandback",
             "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit",
             "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree",
             "FileEdit", "FileRead", "FileWrite",

@@ -39,9 +39,9 @@ _BRIDGE_PREFIX = "mcp__hermes_bridge__"
 _CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
 _CLAUDE_CODE_PACKAGE = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/package.json")
 _CLAUDE_SDK_TOOLS = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts")
-_REVIEWED_CLAUDE_CODE_VERSION = "2.1.263"
-_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "26d020351e8112f4006790f3cfce43b4c9df0c1bb1d0e542364d64151b81d5ba"
-_REVIEWED_SDK_TOOLS_SHA256 = "a8bb537bb1624e9e68d5aa7c620260027278a9f83ce81943906a9485b06d7c9d"
+_REVIEWED_CLAUDE_CODE_VERSION = "2.1.273"
+_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "6c752e2cc7c110c9df15f26d8d134d438c5ae95dbd610efc1a308bf7f9c5f6c1"
+_REVIEWED_SDK_TOOLS_SHA256 = "66d864d04c989d0436b7954734187336bb31a09b47a17a56382939dc38c83c5e"
 _DISCOVERY_TOOLS = ("ToolSearch",)
 # Claude.ai cloud connectors only hydrate when the full Claude Code preset is
 # selected. Deny every native tool in the reviewed, pinned Claude Code release;
@@ -50,6 +50,10 @@ _DISCOVERY_TOOLS = ("ToolSearch",)
 # Claude Code release can add an unreviewed native tool.
 _NATIVE_TOOL_DENY = (
     "Agent",
+    # Native tools added in 2.1.273 but not yet declared by SDK 0.3.270.
+    "AppifactRepl",
+    "FetchInboxMessage",
+    "SubagentHandback",
     "Artifact",
     "AskUserQuestion",
     "Bash",
@@ -366,6 +370,8 @@ def claude_code_session_options(
     return {
         "tools": {"type": "preset", "preset": "claude_code"},
         "allowedTools": allowed,
+        # ACP >=0.77 honors this host opt-out, including inherited bypass mode.
+        "allowDangerouslySkipPermissions": False,
         "disallowedTools": [*_NATIVE_TOOL_DENY, *connector_deny],
         "settingSources": ["user"],
         "settings": {"disableAllHooks": True},
