@@ -36,12 +36,15 @@ for line in sys.stdin:
         options = message["params"]["_meta"]["claudeCode"]["options"]
         assert options["allowDangerouslySkipPermissions"] is False
         result = {"sessionId": session_id}
-        if mode in {"wrong_model", "model_ok"}:
+        if mode in {"wrong_model", "model_ok", "missing_model"}:
             result["configOptions"] = [dict(MODEL_OPTION)]
     elif method == "session/set_config_option":
         requested = message["params"]["value"]
-        applied = "claude-a" if mode == "wrong_model" else requested
-        result = {"configOptions": [dict(MODEL_OPTION, currentValue=applied)]}
+        if mode == "missing_model":
+            result = {"configOptions": [{"id": "permissionMode", "currentValue": "default"}]}
+        else:
+            applied = "claude-a" if mode == "wrong_model" else requested
+            result = {"configOptions": [dict(MODEL_OPTION, currentValue=applied)]}
     elif method == "session/prompt":
         if mode == "malformed_result":
             # Right id, but neither "result" nor "error": not a valid JSON-RPC reply.
