@@ -124,6 +124,7 @@ def assert_reviewed_claude_code_version(
     *,
     executable_sha256: str = _REVIEWED_CLAUDE_EXECUTABLE_SHA256,
     sdk_tools_sha256: str = _REVIEWED_SDK_TOOLS_SHA256,
+    timeout: float = 5.0,
 ) -> str:
     """Fail closed when Claude Code's package or launched executable has drifted."""
     path = Path(package_path)
@@ -165,7 +166,7 @@ def assert_reviewed_claude_code_version(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=5,
+            timeout=min(5.0, max(0.01, timeout)),
             env=build_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -871,8 +872,8 @@ class ClaudeACPClient:
         timeout: float,
         publish=None,
     ) -> tuple[str, str, list[SimpleNamespace], dict[str, Any]]:
-        del requirement, timeout  # The completion owns the shared absolute deadline.
-        assert_reviewed_claude_code_version()
+        del requirement  # The completion owns the shared absolute deadline.
+        assert_reviewed_claude_code_version(timeout=max(0.01, self._deadline - time.monotonic()))
         schema_path = ""
         bridge_dir = ""
         bridge_socket = ""
@@ -1011,6 +1012,8 @@ class ClaudeACPClient:
                 while True:
                     line = proc.stdout.readline(_MAX_FRAME_CHARS + 1) if proc.stdout else ""
                     if not line:
+                        if not stopped.is_set() and not self._cancelled.is_set():
+                            enqueue(inbox, {"_hermes_error": "Claude ACP closed its output stream"})
                         return
                     if len(line) > _MAX_FRAME_CHARS:
                         enqueue(inbox, {"_hermes_error": "Claude ACP response frame is too large"})
@@ -1176,7 +1179,9 @@ class ClaudeACPClient:
                         continue
                     if "error" in message:
                         raise RuntimeError(f"Claude ACP {method} failed")
-                    result = message.get("result") or {}
+                    if "result" not in message:
+                        raise RuntimeError(f"Claude ACP {method} returned no result")
+                    result = message.get("result")
                     if not isinstance(result, dict):
                         raise TypeError(f"Claude ACP {method} returned a non-object result")
                     return result
@@ -1232,11 +1237,24 @@ class ClaudeACPClient:
                     selected = select_offered_model(offered, model)
                     if selected is None:
                         raise ValueError(f"Claude ACP model '{model}' was not offered by the adapter")
-                    request("session/set_config_option", {
+                    config_id = str(options[0].get("id") or "model")
+                    ack = request("session/set_config_option", {
                         "sessionId": session_id,
-                        "configId": str(options[0].get("id") or "model"),
+                        "configId": config_id,
                         "value": selected,
                     })
+                    for item in ack.get("configOptions") or []:
+                        if isinstance(item, dict) and item.get("id") == config_id:
+                            if item.get("currentValue") != selected:
+                                raise RuntimeError(
+                                    f"Claude ACP did not apply the requested model '{selected}'"
+                                    f" (adapter reports {item.get('currentValue')!r})"
+                                )
+                            break
+                    else:
+                        raise RuntimeError(
+                            f"Claude ACP did not acknowledge the requested model '{selected}'"
+                        )
                 else:
                     request("session/set_model", {"sessionId": session_id, "modelId": model})
 
