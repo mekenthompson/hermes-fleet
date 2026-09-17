@@ -52,7 +52,8 @@ class ConnectorHydrationTests(unittest.TestCase):
                 instance = client.ClaudeACPClient()
                 with self.assertRaisesRegex(RuntimeError, "runtime drift"):
                     instance.chat.completions.create(messages=[{"role": "user", "content": "hello"}])
-                guard.assert_called_once_with()
+                guard.assert_called_once()
+                self.assertGreater(guard.call_args.kwargs["timeout"], 0)
                 spawn.assert_not_called()
 
     def test_installed_sdk_union_matches_reviewed_fixture_when_present(self) -> None:

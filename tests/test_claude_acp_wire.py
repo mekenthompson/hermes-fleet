@@ -78,6 +78,45 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertTrue(client.is_closed)
         self.assertIsNone(client._process)
 
+    def test_model_ack_that_does_not_match_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "did not apply the requested model"):
+            self.client("wrong_model").chat.completions.create(
+                model="claude-b", messages=[{"role": "user", "content": "test"}], timeout=10)
+
+    def test_model_ack_that_matches_succeeds(self):
+        client = self.client("model_ok")
+        response = client.chat.completions.create(
+            model="claude-b", messages=[{"role": "user", "content": "test"}], timeout=10)
+        self.assertEqual(response.choices[0].message.content, "hello world")
+        self.assertTrue(client.is_closed)
+
+    def test_result_frame_without_result_or_error_fails_fast(self):
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "no result"):
+            self.client("malformed_result").chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], timeout=10)
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_closed_stdout_is_a_transport_failure_not_a_timeout(self):
+        client = self.client("close_stdout")
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            client.chat.completions.create(messages=[{"role": "user", "content": "test"}], timeout=10)
+        self.assertLess(time.monotonic() - start, 3)
+        self.assertTrue(client.is_closed)
+        self.assertIsNone(client._process)
+
+    def test_preflight_version_check_is_bounded_by_request_deadline(self):
+        client = self.client("hang")
+        with self.assertRaises(TimeoutError):
+            client.chat.completions.create(messages=[{"role": "user", "content": "test"}], timeout=0.5)
+        guard = self.module.assert_reviewed_claude_code_version
+        guard.assert_called_once()
+        budget = guard.call_args.kwargs.get("timeout")
+        self.assertIsNotNone(budget)
+        self.assertGreater(budget, 0)
+        self.assertLessEqual(budget, 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

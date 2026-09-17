@@ -3,6 +3,7 @@
 Exercises Fleet's subprocess and trusted MCP bridge with ACP 0.78 event shapes.
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -10,6 +11,8 @@ import time
 mode = sys.argv[1]
 session_id = "fixture-session"
 options = {}
+MODEL_OPTION = {"id": "model", "category": "model", "currentValue": "claude-a",
+                "options": [{"value": "claude-a"}, {"value": "claude-b"}]}
 
 
 def send(value):
@@ -33,8 +36,18 @@ for line in sys.stdin:
         options = message["params"]["_meta"]["claudeCode"]["options"]
         assert options["allowDangerouslySkipPermissions"] is False
         result = {"sessionId": session_id}
+        if mode in {"wrong_model", "model_ok"}:
+            result["configOptions"] = [dict(MODEL_OPTION)]
+    elif method == "session/set_config_option":
+        requested = message["params"]["value"]
+        applied = "claude-a" if mode == "wrong_model" else requested
+        result = {"configOptions": [dict(MODEL_OPTION, currentValue=applied)]}
     elif method == "session/prompt":
-        if mode == "hang":
+        if mode == "malformed_result":
+            # Right id, but neither "result" nor "error": not a valid JSON-RPC reply.
+            send({"jsonrpc": "2.0", "id": message["id"]})
+            continue
+        elif mode == "hang":
             update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ready"}})
             time.sleep(60)
         elif mode in {"bridge", "forged"}:
@@ -64,3 +77,8 @@ for line in sys.stdin:
     elif method == "session/cancel":
         continue
     send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+    if mode == "close_stdout" and method == "session/new":
+        # Adapter drops its output pipe but stays alive.
+        sys.stdout.close()
+        os.close(1)
+        time.sleep(60)
