@@ -90,6 +90,11 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertEqual(response.choices[0].message.content, "hello world")
         self.assertTrue(client.is_closed)
 
+    def test_model_ack_missing_model_option_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "did not acknowledge the requested model"):
+            self.client("missing_model").chat.completions.create(
+                model="claude-b", messages=[{"role": "user", "content": "test"}], timeout=10)
+
     def test_result_frame_without_result_or_error_fails_fast(self):
         start = time.monotonic()
         with self.assertRaisesRegex(RuntimeError, "no result"):
