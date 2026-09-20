@@ -106,6 +106,10 @@ Only jobs with a Job Spec are indexed.
 
 - [understand-what-is-running.md](jobs/understand-what-is-running.md) – share of intended changes where a fresh-process reader can state the target's live state and whether it matches intent. Job metric: unmeasured. Rolls into on-a-leash's Signal. **Specified.** Retargeted from `change-recoverable` by [rfcs/successor-vision.md](rfcs/successor-vision.md).
 
+### there-when-you-reach
+
+- [entrust-ongoing-work.md](jobs/entrust-ongoing-work.md) – share of interrupted approved outcomes recoverable without human reconstruction or duplicate effects. Job metric: unmeasured. Rolls into there-when-you-reach's Signal. **Specified; implementation and outcome UAT unverified.** Delivery direction: [durable-work-execution.md](rfcs/durable-work-execution.md).
+
 Further jobs are not indexed until they have Job Specs. The successor interview named work that is still unwritten; it lives in the decision record, not here.
 
 ## Evidence & confidence
