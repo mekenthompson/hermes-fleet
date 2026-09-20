@@ -14,7 +14,7 @@ An operator alignment interview on 2026-09-20 ratified the job and operating bou
 
 ### Decision
 
-Use the configured work tracker as the main human-facing record and cross-gateway handoff; use gateway-local Kanban for durable execution; use delegates for bounded, ephemeral assistance. The initial integration under consideration is Linear. It remains optional and default-disabled in the public distribution. Existing chat-only installations do not acquire an unconfigured tracker dependency.
+Linear is the primary human-facing work record and cross-gateway handoff interface for this delivery. Gateway-local Kanban owns durable execution; delegates provide bounded, ephemeral assistance. The Linear integration remains optional and default-disabled in the public distribution. Existing chat-only installations do not acquire an unconfigured tracker dependency; Linear-backed coordination is claimed only when configured.
 
 Start with one profile per gateway. Multiple specialist profiles are a future-compatible option, not a prerequisite or part of this delivery. A repository is a persistent workspace; delivery projects are finite scoped outcomes. Several projects may use one repository without sharing writer workspaces.
 
@@ -24,7 +24,7 @@ The principal approved autonomous end-to-end execution of authorized objectives 
 
 A gateway needs one accountable execution owner per deliverable and durable links among tracker item, chat origin, local task, run identity, and Git evidence. The existing integration must implement these semantics or explicitly block unsupported cases. This RFC does not authorize a new scheduler, distributed queue, dashboard, standalone ledger, or cross-container shared board.
 
-Private rollout identities, repository assignments, budgets, and tracker URLs belong in the deployment overlay or private tracker, never this public tree.
+Private rollout identities, repository assignments, budgets, and private deployment tracker URLs belong in the deployment overlay or private tracker, never this public tree.
 
 ## Operating contract
 
@@ -42,7 +42,7 @@ Private rollout identities, repository assignments, budgets, and tracker URLs be
 - Separate worker and delegate caps are not proof of a shared bound. Inspect launch paths and enforce a conservative aggregate bound or report the missing mechanism. Numeric defaults remain deployment proposals until validated.
 - Keep delegation flat initially. Delegates receive bounded context, scope, acceptance criteria, and evidence expectations. Their material results are persisted to the owning card/repository and surfaced through the owner.
 - Parallel coding writers require successful workspace isolation and approved base ancestry. Automatic worktree failure must not silently permit shared writes; uncommitted parent changes are not assumed to appear in child worktrees.
-- Integration operates on the actual reviewed commits. A fresh independent reviewer may be a separate session of the same profile; distinct credentials or personas are not necessary for independence of authorship.
+- Integration operates on the actual reviewed commits. Review must be performed by a separate fresh-process reviewer, never the author. The reviewer may use the same profile's configured identity and granted provider route; distinct credentials or personas are not required. A separate session qualifies only if it satisfies the fresh-process boundary.
 
 ### Authorization, maintenance, and completion
 
@@ -67,6 +67,8 @@ Notification recovery must replay unsent durable milestones without rerunning co
 
 ## Delivery sequence
 
+Acceptance of this RFC does not itself authorize implementation execution, disruptive testing, publication, deployment, or runtime rollout; those require separately granted execution scope.
+
 1. **Reconcile, read-only:** identify existing work owners and projects; inspect boards, launch paths, profile resolution, mounts, workspaces, integration state, approvals, and evidence. Do not migrate or take over existing tasks by inference.
 2. **Specify the minimal delta:** reuse native features; map each unmet guarantee to an existing component, test, and owner. Fix only demonstrated gaps. Keep independently buildable outcomes parallel after the shared reconciliation.
 3. **Verify components:** separate unit behavior from cross-component behavior. Test duplicate/out-of-order events, ownership fencing, isolation failure, cancellation, ambiguous effects, evidence retention, and notification catch-up.
@@ -79,7 +81,7 @@ All outcome evidence below is **to validate**. Source inspection and historical 
 
 | Requirement | Required evidence |
 | --- | --- |
-| Single owner across interfaces | Duplicate assignment and follow-up do not spawn competing execution; current instructions win |
+| Single owner across chat and configured Linear | Duplicate assignment and follow-up do not spawn competing execution; current instructions win |
 | Bounded parallel work | Independent tasks overlap, dependencies gate, and observed aggregate activity stays within the approved bound |
 | Safe workspaces | Expected commit ancestry; isolated writers; failed isolation blocks unsafe work |
 | Durable resume | Interrupted authorized work reconciles actual processes, Git and remote actions before continuation |
