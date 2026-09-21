@@ -58,7 +58,12 @@ class ConnectorHydrationTests(unittest.TestCase):
 
     def test_installed_sdk_union_matches_reviewed_fixture_when_present(self) -> None:
         client = load_client()
-        sdk_tools = Path(os.environ.get("CLAUDE_REVIEW_NODE_MODULES", str(ROOT / "node_modules"))) / "@anthropic-ai/claude-agent-sdk/sdk-tools.d.ts"
+        self.assertEqual(
+            client._CLAUDE_SDK_TOOLS,
+            Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/sdk-tools.d.ts"),
+        )
+        node_modules = Path(os.environ.get("CLAUDE_REVIEW_NODE_MODULES", str(ROOT / "node_modules")))
+        sdk_tools = node_modules / "@anthropic-ai/claude-code/sdk-tools.d.ts"
         if not sdk_tools.exists():
             sdk_tools = client._CLAUDE_SDK_TOOLS
         if not sdk_tools.exists():
@@ -78,7 +83,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             package = Path(tmp, "package.json")
             executable = Path(tmp, "claude")
             sdk_tools = Path(tmp, "sdk-tools.d.ts")
-            executable.write_text("#!/bin/sh\nprintf '2.1.273 (Claude Code)\\n'\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.278 (Claude Code)\\n'\n", encoding="utf-8")
             sdk_tools.write_text("export type ToolInputSchemas = BashInput;\n", encoding="utf-8")
             os.chmod(executable, 0o700)
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
@@ -91,20 +96,20 @@ class ConnectorHydrationTests(unittest.TestCase):
                     executable_sha256=executable_sha256,
                     sdk_tools_sha256=sdk_tools_sha256,
                 )
-            package.write_text(json.dumps({"version": "2.1.273"}), encoding="utf-8")
-            self.assertEqual(verify(), "2.1.273")
+            package.write_text(json.dumps({"version": "2.1.278"}), encoding="utf-8")
+            self.assertEqual(verify(), "2.1.278")
 
-            package.write_text(json.dumps({"version": "2.1.274"}), encoding="utf-8")
+            package.write_text(json.dumps({"version": "2.1.279"}), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "review the native tool deny set"):
                 verify()
 
-            package.write_text(json.dumps({"version": "2.1.273"}), encoding="utf-8")
-            executable.write_text("#!/bin/sh\nprintf '2.1.274 (Claude Code)\\n'\n", encoding="utf-8")
+            package.write_text(json.dumps({"version": "2.1.278"}), encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.279 (Claude Code)\\n'\n", encoding="utf-8")
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
             with self.assertRaisesRegex(RuntimeError, "launched Claude Code executable"):
                 verify()
 
-            executable.write_text("#!/bin/sh\nprintf '2.1.273 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.278 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "artifact hash mismatch"):
                 verify()
 

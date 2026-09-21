@@ -7,8 +7,10 @@ USER root
 
 ARG GH_VERSION=2.98.0
 ARG GH_LINUX_AMD64_SHA256=3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
-ARG CLAUDE_CODE_VERSION=2.1.273
+ARG CLAUDE_CODE_VERSION=2.1.278
 ARG CLAUDE_AGENT_ACP_VERSION=0.78.0
+ARG CODEX_VERSION=0.155.1
+ARG GROK_VERSION=1.0.34
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
 ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
 ENV DISABLE_AUTOUPDATER=1
@@ -41,6 +43,8 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
     && ln -s /opt/coding-clis/node_modules/.bin/opencode /usr/local/bin/opencode \
     && test "$(/usr/local/bin/claude --version)" = "${CLAUDE_CODE_VERSION} (Claude Code)" \
     && test "$(node -p 'require("/opt/coding-clis/node_modules/@agentclientprotocol/claude-agent-acp/package.json").version')" = "${CLAUDE_AGENT_ACP_VERSION}" \
+    && test "$(/usr/local/bin/codex --version)" = "codex-cli ${CODEX_VERSION}" \
+    && test "$(/usr/local/bin/grok --version | awk '{print $2}')" = "${GROK_VERSION}" \
     && test -x /usr/local/bin/claude-agent-acp \
     && test -x /usr/local/bin/codex \
     && test -x /usr/local/bin/grok \
@@ -79,12 +83,14 @@ ENV HERMES_FLEET_GIT_SHA=${FLEET_GIT_SHA} \
     HERMES_FLEET_ONEPASSWORD_CLI_IMAGE=${ONEPASSWORD_CLI_IMAGE} \
     HERMES_FLEET_CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION} \
     HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION=${CLAUDE_AGENT_ACP_VERSION} \
+    HERMES_FLEET_CODEX_VERSION=${CODEX_VERSION} \
+    HERMES_FLEET_GROK_VERSION=${GROK_VERSION} \
     HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE=${CLAUDE_ACP_PLUGIN_SOURCE} \
     HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION=${CLAUDE_ACP_PLUGIN_REVISION}
 LABEL org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet" \
       org.opencontainers.image.revision="${FLEET_GIT_SHA}" \
       org.opencontainers.image.base.name="${AGENT_IMAGE}"
-RUN python3 -c 'import json, os, pathlib; marker = pathlib.Path("/etc/hermes-fleet/image-provenance.json"); marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "fleet_child_image", "image": os.environ["HERMES_FLEET_IMAGE_IDENTITY"], "revision": os.environ["HERMES_FLEET_GIT_SHA"], "parent_agent_image": os.environ["HERMES_FLEET_AGENT_IMAGE"], "onepassword_cli_image": os.environ["HERMES_FLEET_ONEPASSWORD_CLI_IMAGE"], "claude_code_version": os.environ["HERMES_FLEET_CLAUDE_CODE_VERSION"], "claude_agent_acp_version": os.environ["HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION"], "claude_acp_plugin_source": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"], "claude_acp_plugin_revision": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+RUN python3 -c 'import json, os, pathlib; marker = pathlib.Path("/etc/hermes-fleet/image-provenance.json"); marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "fleet_child_image", "image": os.environ["HERMES_FLEET_IMAGE_IDENTITY"], "revision": os.environ["HERMES_FLEET_GIT_SHA"], "parent_agent_image": os.environ["HERMES_FLEET_AGENT_IMAGE"], "onepassword_cli_image": os.environ["HERMES_FLEET_ONEPASSWORD_CLI_IMAGE"], "claude_code_version": os.environ["HERMES_FLEET_CLAUDE_CODE_VERSION"], "claude_agent_acp_version": os.environ["HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION"], "codex_version": os.environ["HERMES_FLEET_CODEX_VERSION"], "grok_version": os.environ["HERMES_FLEET_GROK_VERSION"], "claude_acp_plugin_source": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"], "claude_acp_plugin_revision": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 RUN groupmod -g 1000 hermes \
     && usermod -u 1000 -g 1000 hermes \
     && mkdir -p /run \

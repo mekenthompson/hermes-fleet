@@ -29,9 +29,13 @@ ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
     "sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1"
 )
-CLAUDE_CODE_VERSION = "2.1.273"
-CLAUDE_CODE_INTEGRITY = "sha512-ym42/WNRf6H43FQdIPigvzzTW0DeQ1CPqrTdYnAlkWVGj8x8NaysCE0TU148mb3lpny5yo1/94+7dQK5USmBEQ=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-IunGXNpsmV1IHjW6ttZIqhZDVOzp8UZgJBGBV0VyQ3JCcDWY4b3AokOL0YJOptl8GhBVrgks6DckEYLR/QNZJg=="
+CLAUDE_CODE_VERSION = "2.1.278"
+CLAUDE_CODE_INTEGRITY = "sha512-mfNRqC0GaEXqmP97NiwJBeYBmRuqe2VzgLUreUUaEhyJxJWx2Z6ClW1tBOncGNNXdhj6EY4LPvUIWP+oq311CA=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-q3r+5aLGAet1MGMkCH2xPsuIW9A40ws4zftURxhYwDenheCKvXc7Gr1jBwvEhYG8uQwgY3YsfNwnvIsh1Bjmeg=="
+CODEX_VERSION = "0.155.1"
+CODEX_INTEGRITY = "sha512-02fAAGyBtlA1zPjEo3kTj/bOSYbPz5DvjLwRZJdV7weFFEDzNFOMjQGmZ/+5CuirYV0hE+AZTrnjzwXYU4AdAQ=="
+GROK_VERSION = "1.0.34"
+GROK_INTEGRITY = "sha512-CpJqPo0BIUpMT5DyZbLhiWP10Z4HwNde2j7yxrKFux9mEqCJTZwi6Z7Bb2dMHv1bbu4hPiDwyiZxSubSZpP6JQ=="
 CLAUDE_AGENT_ACP_VERSION = "0.78.0"
 CLAUDE_AGENT_ACP_INTEGRITY = "sha512-ivWFMmadPFRbc0vn+80B04qomeLdvVieWFu2WK0JFXvHt12Uqdn3Ujjm7rERvM8w4hjxUb1u5vRotu1C/cquCA=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
@@ -125,6 +129,8 @@ class FleetImageReleaseTests(unittest.TestCase):
             "HERMES_FLEET_AGENT_IMAGE=${AGENT_IMAGE}",
             "HERMES_FLEET_ONEPASSWORD_CLI_IMAGE=${ONEPASSWORD_CLI_IMAGE}",
             "HERMES_FLEET_CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}",
+            "HERMES_FLEET_CODEX_VERSION=${CODEX_VERSION}",
+            "HERMES_FLEET_GROK_VERSION=${GROK_VERSION}",
             "COPY package.json package-lock.json /opt/coding-clis/",
             "npm ci --omit=dev --prefix /opt/coding-clis",
             "--ignore-scripts",
@@ -157,12 +163,14 @@ class FleetImageReleaseTests(unittest.TestCase):
         for name, dependency in (
             ("CLAUDE_CODE_VERSION", "@anthropic-ai/claude-code"),
             ("CLAUDE_AGENT_ACP_VERSION", "@agentclientprotocol/claude-agent-acp"),
+            ("CODEX_VERSION", "@openai/codex"),
+            ("GROK_VERSION", "@xai-official/grok"),
         ):
             version = package["dependencies"][dependency]
             self.assertIn(f"ARG {name}={version}\n", dockerfile)
             self.assertIn(f'{name}: "{version}"', workflow)
 
-    def test_claude_code_dependency_is_exact_and_integrity_locked(self) -> None:
+    def test_coding_cli_dependencies_are_exact_and_integrity_locked(self) -> None:
         package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
         lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -170,8 +178,8 @@ class FleetImageReleaseTests(unittest.TestCase):
             {
                 "@agentclientprotocol/claude-agent-acp": CLAUDE_AGENT_ACP_VERSION,
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
-                "@openai/codex": "0.153.4",
-                "@xai-official/grok": "1.0.13",
+                "@openai/codex": CODEX_VERSION,
+                "@xai-official/grok": GROK_VERSION,
                 "opencode-ai": "1.18.29",
             },
         )
@@ -193,6 +201,18 @@ class FleetImageReleaseTests(unittest.TestCase):
             native["resolved"],
             f"https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-{CLAUDE_CODE_VERSION}.tgz",
         )
+        for dependency, version, integrity in (
+            ("@openai/codex", CODEX_VERSION, CODEX_INTEGRITY),
+            ("@xai-official/grok", GROK_VERSION, GROK_INTEGRITY),
+        ):
+            with self.subTest(dependency=dependency):
+                entry = lock["packages"][f"node_modules/{dependency}"]
+                self.assertEqual(entry["version"], version)
+                self.assertEqual(entry["integrity"], integrity)
+                self.assertEqual(
+                    entry["resolved"],
+                    f"https://registry.npmjs.org/{dependency}/-/{dependency.rsplit('/', 1)[-1]}-{version}.tgz",
+                )
 
     def test_claude_acp_adapter_and_plugin_are_exact_and_subscription_only(self) -> None:
         package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
@@ -358,9 +378,13 @@ class FleetImageReleaseTests(unittest.TestCase):
             "HERMES_FLEET_ONEPASSWORD_CLI_IMAGE",
             "HERMES_FLEET_CLAUDE_CODE_VERSION",
             "HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION",
+            "HERMES_FLEET_CODEX_VERSION",
+            "HERMES_FLEET_GROK_VERSION",
             "HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION",
             "CLAUDE_CODE_VERSION",
             "CLAUDE_AGENT_ACP_VERSION",
+            "CODEX_VERSION",
+            "GROK_VERSION",
             "ONEPASSWORD_CLI_IMAGE",
             'subprocess.check_output(["/usr/local/bin/op", "--version"]',
             'subprocess.check_output(["/usr/local/bin/claude", "--version"]',

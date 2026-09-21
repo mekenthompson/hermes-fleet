@@ -19,8 +19,8 @@ GH_LINUX_AMD64_SHA256 = (
 )
 HONCHO_AI_VERSION = "2.2.0"
 EXTRA_CLIS = {
-    "@openai/codex": "0.153.4",
-    "@xai-official/grok": "1.0.13",
+    "@openai/codex": "0.155.1",
+    "@xai-official/grok": "1.0.34",
     "opencode-ai": "1.18.29",
 }
 
@@ -88,6 +88,8 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertGreaterEqual(text.count(f'assert metadata.version("honcho-ai") == "{HONCHO_AI_VERSION}"'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("codex")'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("grok")'), 2)
+        self.assertGreaterEqual(text.count('assert subprocess.check_output(["/usr/local/bin/codex", "--version"]'), 2)
+        self.assertGreaterEqual(text.count('assert subprocess.check_output(["/usr/local/bin/grok", "--version"]'), 2)
         self.assertGreaterEqual(text.count('assert shutil.which("opencode")'), 2)
         self.assertNotIn("webkite", text.lower())
 
