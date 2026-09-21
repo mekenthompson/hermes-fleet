@@ -1,9 +1,8 @@
 // ToolInputSchemas copied verbatim from the reviewed SDK declaration.
-// Full declaration SHA256: 66d864d04c989d0436b7954734187336bb31a09b47a17a56382939dc38c83c5e
+// Full declaration SHA256: 4fdbd64f76e190800f48e93ddf4edcf6f3c87187396b586a75de808a78d8c1c4
 export type ToolInputSchemas =
   | AgentInput
   | BashInput
-  | TaskOutputInput
   | ExitPlanModeInput
   | FileEditInput
   | FileReadInput
@@ -30,7 +29,6 @@ export type ToolInputSchemas =
   | TaskGetInput
   | TaskUpdateInput
   | TaskListInput
-  | REPLInput
   | WorkflowInput
   | CronCreateInput
   | CronDeleteInput
