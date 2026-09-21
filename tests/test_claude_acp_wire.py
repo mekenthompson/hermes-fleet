@@ -44,6 +44,19 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertFalse(any(getattr(chunk.choices[0].delta, "tool_calls", None) for chunk in chunks if chunk.choices))
         self.assertTrue(client.is_closed)
 
+    def test_session_new_advertises_hermes_bridge_on_the_acp_mcp_servers_list(self):
+        client = self.client("bridge")
+        response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
+        self.assertEqual(response.choices[0].message.tool_calls[0].function.name, "probe")
+        self.assertTrue(client.is_closed)
+
+    def test_native_bash_permission_is_rejected_not_cancelled(self):
+        client = self.client("permission_bash")
+        response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
+        self.assertEqual(response.choices[0].message.content.strip(), "rejected-native-bash")
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertTrue(client.is_closed)
+
     def test_new_tool_name_and_metadata_only_update_require_real_bridge_capture(self):
         client = self.client("bridge")
         response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)

@@ -11,8 +11,14 @@ import time
 mode = sys.argv[1]
 session_id = "fixture-session"
 options = {}
+prompt_id = None
+pending_permission_id = None
 MODEL_OPTION = {"id": "model", "category": "model", "currentValue": "claude-a",
                 "options": [{"value": "claude-a"}, {"value": "claude-b"}]}
+BASH_PERMISSION_OPTIONS = [
+    {"optionId": "allow-once", "name": "Yes", "kind": "allow_once"},
+    {"optionId": "reject", "name": "No", "kind": "reject_once"},
+]
 
 
 def send(value):
@@ -28,6 +34,14 @@ def update(value):
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
+    if pending_permission_id is not None and message.get("id") == pending_permission_id:
+        outcome = (message.get("result") or {}).get("outcome") or {}
+        assert outcome.get("outcome") == "selected", message
+        assert outcome.get("optionId") == "reject", message
+        pending_permission_id = None
+        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "rejected-native-bash"}})
+        send({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": "end_turn"}})
+        continue
     result = {}
     if method == "initialize":
         assert message["params"]["clientCapabilities"] == {}
@@ -35,6 +49,14 @@ for line in sys.stdin:
     elif method == "session/new":
         options = message["params"]["_meta"]["claudeCode"]["options"]
         assert options["allowDangerouslySkipPermissions"] is False
+        if mode in {"bridge", "forged", "permission_bash"}:
+            servers = message["params"].get("mcpServers")
+            assert isinstance(servers, list) and servers, "top-level mcpServers must advertise hermes_bridge"
+            server = servers[0]
+            assert server.get("name") == "hermes_bridge"
+            assert "type" not in server
+            assert server.get("command")
+            assert server.get("args")
         result = {"sessionId": session_id}
         if mode in {"wrong_model", "model_ok", "missing_model"}:
             result["configOptions"] = [dict(MODEL_OPTION)]
@@ -46,6 +68,17 @@ for line in sys.stdin:
             applied = "claude-a" if mode == "wrong_model" else requested
             result = {"configOptions": [dict(MODEL_OPTION, currentValue=applied)]}
     elif method == "session/prompt":
+        prompt_id = message["id"]
+        if mode == "permission_bash":
+            pending_permission_id = "perm-1"
+            send({"jsonrpc": "2.0", "id": pending_permission_id, "method": "session/request_permission",
+                  "params": {
+                      "sessionId": session_id,
+                      "toolCall": {"toolCallId": "bash-1", "title": "Bash", "kind": "execute",
+                                   "rawInput": {"command": "gh pr view 1"}},
+                      "options": BASH_PERMISSION_OPTIONS,
+                  }})
+            continue
         if mode == "malformed_result":
             # Right id, but neither "result" nor "error": not a valid JSON-RPC reply.
             send({"jsonrpc": "2.0", "id": message["id"]})

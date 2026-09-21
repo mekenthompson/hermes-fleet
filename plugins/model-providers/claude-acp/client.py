@@ -1193,23 +1193,32 @@ class ClaudeACPClient:
             })
             system, prompt = split_messages(messages)
             bridge_config: dict[str, Any] = {}
+            acp_mcp_servers: list[dict[str, Any]] = []
             if bridge_tools:
+                proxy_args = [
+                    str(Path(__file__).with_name("tool_bridge_mcp.py")),
+                    "--proxy",
+                    bridge_socket,
+                ]
+                # ACP session/new consumes a top-level array. Do not set type=stdio:
+                # the adapter only hydrates unnamed-type entries as stdio servers.
+                acp_mcp_servers = [{
+                    "name": "hermes_bridge",
+                    "command": sys.executable,
+                    "args": proxy_args,
+                }]
                 bridge_config = {
                     "hermes_bridge": {
                         "type": "stdio",
                         "command": sys.executable,
-                        "args": [
-                            str(Path(__file__).with_name("tool_bridge_mcp.py")),
-                            "--proxy",
-                            bridge_socket,
-                        ],
+                        "args": proxy_args,
                     }
                 }
             options = claude_code_session_options(advertised_names)
             options["mcpServers"] = bridge_config
             session = request("session/new", {
                 "cwd": self._cwd,
-                "mcpServers": [],
+                "mcpServers": acp_mcp_servers,
                 "_meta": {
                     "systemPrompt": {"type": "preset", "preset": "claude_code", "append": system},
                     "claudeCode": {

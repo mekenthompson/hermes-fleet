@@ -190,6 +190,21 @@ class ConnectorHydrationTests(unittest.TestCase):
         self.assertNotIn(WILDCARD, allowed)
         self.assertNotIn("disableClaudeAiConnectors", options["settings"])
 
+    def test_permission_response_selects_adapter_reject_option(self) -> None:
+        client = load_client()
+        reply = client.permission_response({
+            "options": [
+                {"optionId": "allow-once", "name": "Yes", "kind": "allow_once"},
+                {"optionId": "reject", "name": "No", "kind": "reject_once"},
+            ]
+        })
+        self.assertEqual(reply, {"outcome": {"outcome": "selected", "optionId": "reject"}})
+
+    def test_permission_response_without_reject_option_cancels(self) -> None:
+        client = load_client()
+        reply = client.permission_response({"options": [{"optionId": "allow-once", "kind": "allow_once"}]})
+        self.assertEqual(reply, {"outcome": {"outcome": "cancelled"}})
+
 
 if __name__ == "__main__":
     unittest.main()
