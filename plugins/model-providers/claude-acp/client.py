@@ -298,7 +298,14 @@ def canonicalize_model_id(value: str) -> str:
 
 
 def select_offered_model(offered: set[str], requested: str) -> str | None:
-    """Return the adapter-offered spelling for requested, or None if unmatched."""
+    """Return the adapter-offered spelling for requested, or None if unmatched.
+
+    The same login can offer ``opus`` or ``opus[1m]``, and ``claude-fable-5[1m]``
+    or ``claude-fable-5-1[1m]``, on different sessions. Those pairs never appear
+    together. Prefer the exact offered spelling. If it is absent, accept the
+    other spelling of that same pair. Do not map Fable onto Opus or any other
+    model.
+    """
     requested = str(requested or "").strip()
     if not requested:
         return None
@@ -309,6 +316,22 @@ def select_offered_model(offered: set[str], requested: str) -> str | None:
     for value in offered_values:
         if canonicalize_model_id(value) == canonical:
             return value
+    family = _spelling_family(requested)
+    if family is None:
+        return None
+    matches = [value for value in offered_values if _spelling_family(value) == family]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _spelling_family(value: str) -> str | None:
+    """Return a closed family id for spellings one login has been seen to swap."""
+    key = canonicalize_model_id(value)
+    if key in {"opus", "opus[1m]"}:
+        return "opus"
+    if key in {"claude-fable-5[1m]", "claude-fable-5-1[1m]"}:
+        return "fable"
     return None
 
 
