@@ -25,7 +25,7 @@ env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-public
   TEST_IMAGE: ghcr.io/mekenthompson/hermes-fleet-public:sha-${{ github.sha }}
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1
-  CLAUDE_CODE_VERSION: "2.1.278"
+  CLAUDE_CODE_VERSION: "2.1.280"
   CLAUDE_AGENT_ACP_VERSION: "0.78.0"
   CODEX_VERSION: "0.155.1"
   GROK_VERSION: "1.0.34"
