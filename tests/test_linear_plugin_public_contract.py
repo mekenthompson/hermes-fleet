@@ -79,6 +79,27 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             dockerfile,
         )
 
+    def test_attested_readonly_worker_mount_is_allowed_and_image_copy_stays(self) -> None:
+        policy = (ROOT / "docs" / "linear-agent.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertNotIn("must not be bind-mounted", policy)
+        self.assertIn(
+            "bind-mount the generic worker tree, read-only, over `/opt/hermes/plugins/linear-agent`",
+            policy,
+        )
+        self.assertIn("same generic plugin at an attested revision", policy)
+        self.assertIn("must not be a writable checkout", policy)
+        self.assertIn("Removing that copy is a separate image change", policy)
+        self.assertIn(
+            "bind-mount that same generic worker, read-only, over the image path",
+            readme,
+        )
+        self.assertIn(
+            "COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/",
+            dockerfile,
+        )
+
     def test_plugin_is_declared_public_and_disabled_by_default(self) -> None:
         manifest = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
         self.assertIn("author: Hermes Fleet Contributors", manifest)
