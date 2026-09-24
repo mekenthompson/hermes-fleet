@@ -109,6 +109,20 @@ class LinearPluginPublicContractTests(unittest.TestCase):
         )
         self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", dockerfile)
 
+    def test_policy_trust_mounts_the_worker_and_absence_check_does_not(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "fleet-image.yml").read_text(encoding="utf-8")
+        mount = "--mount \"type=bind,src=${GITHUB_WORKSPACE}/plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent,readonly\""
+        trust_lines = [line for line in workflow.splitlines() if "verify-linear-policy-trust.py" in line]
+        self.assertEqual(len(trust_lines), 2)
+        for line in trust_lines:
+            self.assertIn(mount, line)
+            self.assertIn("docker run", line)
+        absence = "assert not pathlib.Path(\"/opt/hermes/plugins/linear-agent\").exists()"
+        self.assertEqual(workflow.count(absence), 2)
+        for block in workflow.split("docker run"):
+            if absence in block and "verify-linear-policy-trust.py" not in block:
+                self.assertNotIn("plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent", block)
+
     def test_plugin_is_declared_public_and_disabled_by_default(self) -> None:
         manifest = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8")
         self.assertIn("author: Hermes Fleet Contributors", manifest)

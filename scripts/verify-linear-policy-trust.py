@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise the installed Linear policy boundary as the image runtime UID."""
+"""Exercise the mounted Linear policy boundary as the image runtime UID.
+
+The worker is not copied into the image. The caller bind-mounts the generic
+tree read-only at /opt/hermes/plugins/linear-agent before running this script.
+"""
 from __future__ import annotations
 
 import json
