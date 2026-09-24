@@ -70,35 +70,44 @@ class LinearPluginPublicContractTests(unittest.TestCase):
         self.assertTrue((PLUGIN / "linear_ownership.py").is_file())
         self.assertTrue((PLUGIN / "linear_stop.py").is_file())
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/",
             dockerfile,
         )
-        self.assertIn(
-            "test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json",
+        runs = [
+            line
+            for line in dockerfile.splitlines()
+            if line.startswith("RUN ")
+        ]
+        self.assertIn("RUN rm -rf /opt/hermes/plugins/linear-agent", runs)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", runs)
+        self.assertNotIn(
+            "rm -rf /opt/hermes/plugins/linear-agent && test ! -e",
             dockerfile,
         )
 
-    def test_attested_readonly_worker_mount_is_allowed_and_image_copy_stays(self) -> None:
+    def test_attested_readonly_worker_mount_is_required_and_image_copy_is_gone(self) -> None:
         policy = (ROOT / "docs" / "linear-agent.md").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertNotIn("must not be bind-mounted", policy)
+        self.assertIn("The image does not ship the worker", policy)
         self.assertIn(
-            "bind-mount the generic worker tree, read-only, over `/opt/hermes/plugins/linear-agent`",
+            "must bind-mount the generic worker tree, read-only, over `/opt/hermes/plugins/linear-agent`",
             policy,
         )
         self.assertIn("same generic plugin at an attested revision", policy)
         self.assertIn("must not be a writable checkout", policy)
-        self.assertIn("Removing that copy is a separate image change", policy)
+        self.assertIn("must not hold policy, secrets, or deployment identity", policy)
         self.assertIn(
-            "bind-mount that same generic worker, read-only, over the image path",
+            "bind-mounts that same generic worker, read-only, over the image path",
             readme,
         )
-        self.assertIn(
+        self.assertNotIn(
             "COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/",
             dockerfile,
         )
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", dockerfile)
 
     def test_plugin_is_declared_public_and_disabled_by_default(self) -> None:
         manifest = (PLUGIN / "plugin.yaml").read_text(encoding="utf-8")

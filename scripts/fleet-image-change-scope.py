@@ -55,7 +55,6 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
 # Directories the Dockerfile copies wholesale.
 IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
     "contracts/",
-    "plugins/linear-agent/",
     "plugins/model-providers/claude-acp/",
     "plugins/web/perplexity/",
     "plugins/kokoro-voice/",
