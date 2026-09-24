@@ -170,10 +170,11 @@ class PublicLinearImplementationParityTests(unittest.TestCase):
         for path in sorted(PLUGIN.glob("*.py")):
             relative = path.relative_to(ROOT).as_posix()
             with self.subTest(path=relative):
-                self.assertTrue(scope.is_image_input(relative))
+                self.assertFalse(scope.is_image_input(relative))
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/", dockerfile)
-        self.assertIn("python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py", dockerfile)
+        self.assertNotIn("COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/", dockerfile)
+        self.assertNotIn("python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py", dockerfile)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", dockerfile)
 
     def test_plugin_stays_default_disabled(self) -> None:
         contract = json.loads((ROOT / "contracts" / "plugins.json").read_text(encoding="utf-8"))

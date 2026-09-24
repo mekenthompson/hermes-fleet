@@ -55,7 +55,7 @@ Optional, **disabled by default**. They exist so isolation does not mean a dumb 
 
 ### Linear Agent
 
-Multi-agent work tracking without a shared inbox. Each profile is a Linear worker with its own identity. The public image ships the worker; it does not ship routes, workspace names, or OAuth bindings. The overlay mounts root-owned policy maps. The overlay may also bind-mount that same generic worker, read-only, over the image path. The mount is attested code, not policy. Enable without policy and the process fails closed before OAuth.
+Multi-agent work tracking without a shared inbox. Each profile is a Linear worker with its own identity. The image does not ship the worker. It does not ship routes, workspace names, or OAuth bindings. The overlay bind-mounts that same generic worker, read-only, over the image path, and mounts root-owned policy maps. The mount is attested code, not policy. Enable without the mount or without policy and the process fails closed before OAuth.
 
 The principal assigns work in Linear. Specialists pick up the cards they own. They do not read each other's queues. Stop containment stays durable across a bounce. Policy and plugin settings must agree on profile, workspace, vault item binding, and rollout scope. Details: [`docs/linear-agent.md`](docs/linear-agent.md).
 

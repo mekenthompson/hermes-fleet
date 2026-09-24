@@ -1,6 +1,6 @@
 # Linear Agent plugin
 
-The Fleet image bundles a generic, disabled-by-default Linear Agent Session worker. It does not contain routes, profile names, workspace names, OAuth bindings, requester allowlists, or webhook secrets.
+The repository keeps a generic, disabled-by-default Linear Agent Session worker. The image does not ship that worker. A deployment bind-mounts it read-only. The repository does not contain routes, profile names, workspace names, OAuth bindings, requester allowlists, or webhook secrets.
 
 A deployment that enables the plugin must supply its worker and publisher policies at these default locations:
 
@@ -24,6 +24,6 @@ The policy entry and profile-local plugin settings must agree exactly on:
 
 The protected profile Connect environment must contain `OP_CONNECT_HOST`, `OP_CONNECT_TOKEN`, and `OP_CONNECT_ALLOWED_HOSTS`. The allowlist is a comma-separated set of exact HTTP(S) origins; the configured host must be one of them. This keeps deployment endpoints outside public executable code while retaining fail-closed host approval.
 
-`waiting_state_name` defaults to the generic `Waiting on Principal`; deployments whose Linear workflow uses another label must set it explicitly. The generic provisioning, reconciliation, tracking, project-update, and live-canary implementations ship in the image, but they do not contain deployment bindings and do nothing unless the operator supplies policy and invokes them.
+`waiting_state_name` defaults to the generic `Waiting on Principal`; deployments whose Linear workflow uses another label must set it explicitly. The generic provisioning, reconciliation, tracking, project-update, and live-canary implementations stay in this repository and do nothing unless the operator bind-mounts the worker, supplies policy, and invokes them.
 
-A deployment may bind-mount the generic worker tree, read-only, over `/opt/hermes/plugins/linear-agent`. The mount must be that same generic plugin at an attested revision. It must not be a writable checkout, and it must not hold policy, secrets, or deployment identity. Policy maps, configuration, secrets, and invocation stay outside the code mount. The public image still ships the worker. Removing that copy is a separate image change. See `examples/linear-agent-policy.json` for a synthetic policy shape.
+A deployment must bind-mount the generic worker tree, read-only, over `/opt/hermes/plugins/linear-agent`. The mount must be that same generic plugin at an attested revision. It must not be a writable checkout, and it must not hold policy, secrets, or deployment identity. Policy maps, configuration, secrets, and invocation stay outside the code mount. The image does not ship the worker. See `examples/linear-agent-policy.json` for a synthetic policy shape.

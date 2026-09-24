@@ -56,7 +56,7 @@ class ChangeScopeDecisionTests(unittest.TestCase):
                 self.assertEqual(matched, [])
 
     def test_image_inputs_run_the_bake_for_push_and_pull_request(self):
-        for path in ("Dockerfile", "package-lock.json", "plugins/linear-agent/linear_runtime.py", "contracts/image.json",
+        for path in ("Dockerfile", "package-lock.json", "plugins/web/perplexity/provider.py", "contracts/image.json",
                      "release/agent-image-manifest.json", "release/vex-exceptions.json", ".github/workflows/fleet-image.yml",
                      "scripts/verify-trivy-vex.py", "scripts/scan-fleet-image.py", "scripts/fleet-image-change-scope.py"):
             for event in ("push", "pull_request"):
@@ -134,7 +134,8 @@ class ChangeScopeDecisionTests(unittest.TestCase):
             self.assertTrue(prefix.endswith("/") and (ROOT / prefix).is_dir(), prefix)
         for path in ("README.md", "docs/image-release.md", "tests/test_image_release.py", ".github/workflows/ci.yml",
                      "scripts/verify-public-tree.py", "scripts/compose.py", "scripts/build-fleet-image.py",
-                     "compose.example.yaml", "examples/linear-agent-policy.json", "SECURITY.md"):
+                     "compose.example.yaml", "examples/linear-agent-policy.json", "SECURITY.md",
+                     "plugins/linear-agent/linear_runtime.py"):
             self.assertFalse(self.scope.is_image_input(path), path)
 
 

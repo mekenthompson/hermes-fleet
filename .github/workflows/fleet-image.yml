@@ -245,22 +245,9 @@ jobs:
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
-          linear_plugin = pathlib.Path("/opt/hermes/plugins/linear-agent")
-          assert (linear_plugin / "__init__.py").is_file()
-          assert (linear_plugin / "linear_runtime.py").is_file()
-          assert not (linear_plugin / "linear-agents.json").exists()
           from hermes_cli.plugins import PluginContext
           assert callable(PluginContext.register_profile_service)
-          spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.linear_agent_release",
-              linear_plugin / "__init__.py",
-              submodule_search_locations=[str(linear_plugin)],
-          )
-          assert spec is not None and spec.loader is not None
-          linear_module = importlib.util.module_from_spec(spec)
-          sys.modules[spec.name] = linear_module
-          spec.loader.exec_module(linear_module)
-          assert callable(linear_module.register)
+          assert not pathlib.Path("/opt/hermes/plugins/linear-agent").exists()
           perplexity_plugin = pathlib.Path("/opt/hermes/plugins/web/perplexity")
           assert pathlib.Path("/opt/hermes/plugins/web/perplexity/provider.py").is_file()
           perplexity_spec = importlib.util.spec_from_file_location(
@@ -568,22 +555,9 @@ jobs:
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
           assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
-          linear_plugin = pathlib.Path("/opt/hermes/plugins/linear-agent")
-          assert (linear_plugin / "__init__.py").is_file()
-          assert (linear_plugin / "linear_runtime.py").is_file()
-          assert not (linear_plugin / "linear-agents.json").exists()
           from hermes_cli.plugins import PluginContext
           assert callable(PluginContext.register_profile_service)
-          spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.linear_agent_release",
-              linear_plugin / "__init__.py",
-              submodule_search_locations=[str(linear_plugin)],
-          )
-          assert spec is not None and spec.loader is not None
-          linear_module = importlib.util.module_from_spec(spec)
-          sys.modules[spec.name] = linear_module
-          spec.loader.exec_module(linear_module)
-          assert callable(linear_module.register)
+          assert not pathlib.Path("/opt/hermes/plugins/linear-agent").exists()
           perplexity_plugin = pathlib.Path("/opt/hermes/plugins/web/perplexity")
           assert pathlib.Path("/opt/hermes/plugins/web/perplexity/provider.py").is_file()
           perplexity_spec = importlib.util.spec_from_file_location(

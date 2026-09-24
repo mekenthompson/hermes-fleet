@@ -31,11 +31,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertFalse((LINEAR / "linear-agents.json").exists())
         self.assertFalse((LINEAR / "linear-publishers.json").exists())
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertIn("test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json", dockerfile)
-        self.assertIn(
-            "test ! -e /opt/hermes/plugins/linear-agent/linear-publishers.json",
-            dockerfile,
-        )
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", dockerfile)
+        self.assertNotIn("COPY plugins/linear-agent/", dockerfile)
 
     def test_public_policy_reader_stays_fail_closed(self) -> None:
         text = (LINEAR / "linear_policy.py").read_text(encoding="utf-8")

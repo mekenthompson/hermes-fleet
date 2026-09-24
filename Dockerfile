@@ -56,10 +56,11 @@ COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-a
 COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/
 RUN python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py \
     && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci
-COPY plugins/linear-agent/ /opt/hermes/plugins/linear-agent/
-RUN test ! -e /opt/hermes/plugins/linear-agent/linear-agents.json \
-    && test ! -e /opt/hermes/plugins/linear-agent/linear-publishers.json \
-    && python3 -m py_compile /opt/hermes/plugins/linear-agent/*.py
+# The worker is mounted read-only by the deployment. Do not copy it in.
+# The next RUN checks absence on its own, so deleting this prune still fails the bake.
+# Do not assert absence in a running gateway: the mount makes the path exist.
+RUN rm -rf /opt/hermes/plugins/linear-agent
+RUN test ! -e /opt/hermes/plugins/linear-agent
 COPY plugins/kokoro-voice/ /opt/hermes/plugins/kokoro-voice/
 RUN python3 -m py_compile /opt/hermes/plugins/kokoro-voice/*.py
 COPY plugins/browser-handoff/ /opt/hermes/plugins/browser-handoff/
