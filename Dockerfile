@@ -50,25 +50,23 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
     && test -x /usr/local/bin/grok \
     && test -x /usr/local/bin/opencode
 ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
-COPY plugins/model-providers/claude-acp/ /opt/hermes/plugins/model-providers/claude-acp/
-RUN python3 -m py_compile /opt/hermes/plugins/model-providers/claude-acp/*.py
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
-COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/
-RUN python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py \
-    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci
-# The worker is mounted read-only by the deployment. Do not copy it in.
-# The next RUN checks absence on its own, so deleting this prune still fails the bake.
+
+# Fleet plugins are mounted read-only by deployment, never baked into the image.
+# Keep each absence check in a separate layer so deleting a prune fails the bake.
 # Do not assert absence in a running gateway: the mount makes the path exist.
-RUN rm -rf /opt/hermes/plugins/linear-agent
+RUN rm -rf /opt/hermes/plugins/linear-agent \
+    /opt/hermes/plugins/model-providers/claude-acp \
+    /opt/hermes/plugins/kokoro-voice \
+    /opt/hermes/plugins/browser-handoff \
+    /opt/hermes/plugins/readonly-source \
+    /opt/hermes/plugins/web/perplexity
 RUN test ! -e /opt/hermes/plugins/linear-agent
-COPY plugins/kokoro-voice/ /opt/hermes/plugins/kokoro-voice/
-RUN python3 -m py_compile /opt/hermes/plugins/kokoro-voice/*.py
-COPY plugins/browser-handoff/ /opt/hermes/plugins/browser-handoff/
-RUN python3 -m py_compile /opt/hermes/plugins/browser-handoff/*.py \
-    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/browser-handoff --ci
-COPY plugins/readonly-source/ /opt/hermes/plugins/readonly-source/
-RUN python3 -m py_compile /opt/hermes/plugins/readonly-source/*.py \
-    && HERMES_HOME=/tmp/hermes-plugin-doctor /opt/hermes/bin/hermes plugins doctor /opt/hermes/plugins/readonly-source --ci
+RUN test ! -e /opt/hermes/plugins/model-providers/claude-acp
+RUN test ! -e /opt/hermes/plugins/kokoro-voice
+RUN test ! -e /opt/hermes/plugins/browser-handoff
+RUN test ! -e /opt/hermes/plugins/readonly-source
+RUN test ! -e /opt/hermes/plugins/web/perplexity
 COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref

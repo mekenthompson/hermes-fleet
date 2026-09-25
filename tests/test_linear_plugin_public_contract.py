@@ -79,7 +79,7 @@ class LinearPluginPublicContractTests(unittest.TestCase):
             for line in dockerfile.splitlines()
             if line.startswith("RUN ")
         ]
-        self.assertIn("RUN rm -rf /opt/hermes/plugins/linear-agent", runs)
+        self.assertTrue(any(run.startswith("RUN rm -rf /opt/hermes/plugins/linear-agent") for run in runs))
         self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", runs)
         self.assertNotIn(
             "rm -rf /opt/hermes/plugins/linear-agent && test ! -e",
