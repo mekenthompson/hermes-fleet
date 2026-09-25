@@ -49,6 +49,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertTrue((ACP / "tool_bridge_mcp.py").is_file())
         self.assertIn("from .client import ClaudeACPClient", text)
         self.assertIn("/usr/local/bin/hermes-claude-acp-subscription", text)
+        self.assertNotIn("COPY plugins/model-providers/claude-acp/", DOCKERFILE.read_text(encoding="utf-8"))
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/model-providers/claude-acp", DOCKERFILE.read_text(encoding="utf-8"))
 
     def test_browser_handoff_is_env_skinned(self) -> None:
         text = (HANDOFF / "__init__.py").read_text(encoding="utf-8")
@@ -56,10 +58,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertIn("HERMES_BROWSER_HANDOFF_TZ", text)
         self.assertNotIn("Australia/", text)
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertIn(
-            "COPY plugins/browser-handoff/ /opt/hermes/plugins/browser-handoff/",
-            dockerfile,
-        )
+        self.assertNotIn("COPY plugins/browser-handoff/", dockerfile)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/browser-handoff", dockerfile)
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         matches = [item for item in contract["components"] if item["id"] == "browser-handoff"]
         self.assertEqual(len(matches), 1)
@@ -71,10 +71,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertIn("author: Hermes Fleet Contributors", manifest)
         self.assertNotIn("Ken Thompson", manifest)
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertIn(
-            "COPY plugins/readonly-source/ /opt/hermes/plugins/readonly-source/",
-            dockerfile,
-        )
+        self.assertNotIn("COPY plugins/readonly-source/", dockerfile)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/readonly-source", dockerfile)
         self.assertIn(
             "COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook",
             dockerfile,
@@ -87,7 +85,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertIn("author: Hermes Fleet Contributors", manifest)
         self.assertNotIn("Ken Thompson", manifest)
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertIn("COPY plugins/kokoro-voice/ /opt/hermes/plugins/kokoro-voice/", dockerfile)
+        self.assertNotIn("COPY plugins/kokoro-voice/", dockerfile)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/kokoro-voice", dockerfile)
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
         matches = [item for item in contract["components"] if item["id"] == "voice-provider"]
         self.assertEqual(len(matches), 1)
@@ -101,13 +100,7 @@ class PublicGenericPluginTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "fleet-image.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(
-            workflow.count('pathlib.Path("/opt/hermes/plugins/kokoro-voice")'),
-            2,
-        )
-        self.assertIn("kokoro_module.KokoroProvider()", workflow)
-        self.assertIn("assert not kokoro.is_available()", workflow)
-        self.assertIn("assert callable(kokoro_module.register)", workflow)
+        self.assertEqual(workflow.count('assert not pathlib.Path("/opt/hermes/plugins/kokoro-voice").exists()'), 2)
 
     def test_generic_plugin_trees_have_no_household_literals(self) -> None:
         roots = (LINEAR, ACP, KOKORO, HANDOFF, READONLY, ROOT / "plugins" / "web" / "perplexity")

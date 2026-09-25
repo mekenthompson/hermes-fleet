@@ -242,61 +242,15 @@ jobs:
           assert adapter["version"] == os.environ["EXPECTED_CLAUDE_AGENT_ACP_VERSION"], adapter
           assert pathlib.Path("/usr/local/bin/claude-agent-acp").is_file()
           assert os.environ["CLAUDE_CODE_EXECUTABLE"] == "/opt/coding-clis/node_modules/.bin/claude"
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
           from hermes_cli.plugins import PluginContext
           assert callable(PluginContext.register_profile_service)
           assert not pathlib.Path("/opt/hermes/plugins/linear-agent").exists()
-          perplexity_plugin = pathlib.Path("/opt/hermes/plugins/web/perplexity")
-          assert pathlib.Path("/opt/hermes/plugins/web/perplexity/provider.py").is_file()
-          perplexity_spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.web.perplexity_release",
-              perplexity_plugin / "__init__.py",
-              submodule_search_locations=[str(perplexity_plugin)],
-          )
-          assert perplexity_spec is not None and perplexity_spec.loader is not None
-          perplexity_module = importlib.util.module_from_spec(perplexity_spec)
-          sys.modules[perplexity_spec.name] = perplexity_module
-          perplexity_spec.loader.exec_module(perplexity_module)
-          perplexity = perplexity_module.PerplexityWebSearchProvider()
-          assert perplexity.name == "perplexity"
-          assert perplexity.supports_search() and not perplexity.supports_extract()
-          assert not perplexity.is_available()
-          kokoro_plugin = pathlib.Path("/opt/hermes/plugins/kokoro-voice")
-          assert (kokoro_plugin / "plugin.yaml").is_file()
-          assert (kokoro_plugin / "__init__.py").is_file()
-          kokoro_spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.kokoro_voice_release",
-              kokoro_plugin / "__init__.py",
-              submodule_search_locations=[str(kokoro_plugin)],
-          )
-          assert kokoro_spec is not None and kokoro_spec.loader is not None
-          kokoro_module = importlib.util.module_from_spec(kokoro_spec)
-          sys.modules[kokoro_spec.name] = kokoro_module
-          kokoro_spec.loader.exec_module(kokoro_module)
-          assert callable(kokoro_module.register)
-          kokoro = kokoro_module.KokoroProvider()
-          assert kokoro.name == "kokoro"
-          assert not kokoro.is_available()
-          from providers import get_provider_profile
-          from hermes_cli.auth import resolve_external_process_provider_credentials
-          profile = get_provider_profile("claude-acp")
-          assert profile is not None and profile.base_url == "acp://claude", profile
-          creds = resolve_external_process_provider_credentials("claude-acp")
-          assert creds["command"] == "/usr/local/bin/hermes-claude-acp-subscription", creds
-          assert creds["args"] == [], creds
-          assert shutil.which(creds["command"]) == creds["command"]
-          client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
-          assert client is not None
-          assert type(client).__name__ == "ClaudeACPClient"
-          acp_spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
-          acp_review = importlib.util.module_from_spec(acp_spec)
-          acp_spec.loader.exec_module(acp_review)
-          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
-          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
-          assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
+          assert not pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/web/perplexity").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/kokoro-voice").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/browser-handoff").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/readonly-source").exists()
+          assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
@@ -306,6 +260,16 @@ jobs:
           assert shutil.which("opencode")
           assert not pathlib.Path("/var/run/docker.sock").exists()
           assert pathlib.Path("/opt/hermes-fleet/contracts/image.json").is_file()
+          '
+          docker run --rm --network none --env EXPECTED_CLAUDE_CODE_VERSION \
+            --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/model-providers/claude-acp,dst=/opt/hermes/plugins/model-providers/claude-acp,readonly" \
+            --entrypoint python3 "$TEST_IMAGE" -c '
+          import importlib.util, os
+          spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
+          acp_review = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(acp_review)
+          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
+          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
           timeout 15s docker run --rm --network none --user root --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent,readonly" --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
@@ -552,61 +516,15 @@ jobs:
           assert adapter["version"] == os.environ["EXPECTED_CLAUDE_AGENT_ACP_VERSION"], adapter
           assert pathlib.Path("/usr/local/bin/claude-agent-acp").is_file()
           assert os.environ["CLAUDE_CODE_EXECUTABLE"] == "/opt/coding-clis/node_modules/.bin/claude"
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/__init__.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/client.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp/tool_bridge_mcp.py").is_file()
           from hermes_cli.plugins import PluginContext
           assert callable(PluginContext.register_profile_service)
           assert not pathlib.Path("/opt/hermes/plugins/linear-agent").exists()
-          perplexity_plugin = pathlib.Path("/opt/hermes/plugins/web/perplexity")
-          assert pathlib.Path("/opt/hermes/plugins/web/perplexity/provider.py").is_file()
-          perplexity_spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.web.perplexity_release",
-              perplexity_plugin / "__init__.py",
-              submodule_search_locations=[str(perplexity_plugin)],
-          )
-          assert perplexity_spec is not None and perplexity_spec.loader is not None
-          perplexity_module = importlib.util.module_from_spec(perplexity_spec)
-          sys.modules[perplexity_spec.name] = perplexity_module
-          perplexity_spec.loader.exec_module(perplexity_module)
-          perplexity = perplexity_module.PerplexityWebSearchProvider()
-          assert perplexity.name == "perplexity"
-          assert perplexity.supports_search() and not perplexity.supports_extract()
-          assert not perplexity.is_available()
-          kokoro_plugin = pathlib.Path("/opt/hermes/plugins/kokoro-voice")
-          assert (kokoro_plugin / "plugin.yaml").is_file()
-          assert (kokoro_plugin / "__init__.py").is_file()
-          kokoro_spec = importlib.util.spec_from_file_location(
-              "hermes_plugins.kokoro_voice_release",
-              kokoro_plugin / "__init__.py",
-              submodule_search_locations=[str(kokoro_plugin)],
-          )
-          assert kokoro_spec is not None and kokoro_spec.loader is not None
-          kokoro_module = importlib.util.module_from_spec(kokoro_spec)
-          sys.modules[kokoro_spec.name] = kokoro_module
-          kokoro_spec.loader.exec_module(kokoro_module)
-          assert callable(kokoro_module.register)
-          kokoro = kokoro_module.KokoroProvider()
-          assert kokoro.name == "kokoro"
-          assert not kokoro.is_available()
-          from providers import get_provider_profile
-          from hermes_cli.auth import resolve_external_process_provider_credentials
-          profile = get_provider_profile("claude-acp")
-          assert profile is not None and profile.base_url == "acp://claude", profile
-          creds = resolve_external_process_provider_credentials("claude-acp")
-          assert creds["command"] == "/usr/local/bin/hermes-claude-acp-subscription", creds
-          assert creds["args"] == [], creds
-          assert shutil.which(creds["command"]) == creds["command"]
-          client = profile.create_client(api_key=creds["api_key"], base_url=creds["base_url"])
-          assert client is not None
-          assert type(client).__name__ == "ClaudeACPClient"
-          acp_spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
-          acp_review = importlib.util.module_from_spec(acp_spec)
-          acp_spec.loader.exec_module(acp_review)
-          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
-          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
-          assert pathlib.Path("/opt/hermes/plugins/browser-handoff/__init__.py").is_file()
-          assert pathlib.Path("/opt/hermes/plugins/readonly-source/__init__.py").is_file()
+          assert not pathlib.Path("/opt/hermes/plugins/model-providers/claude-acp").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/web/perplexity").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/kokoro-voice").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/browser-handoff").exists()
+          assert not pathlib.Path("/opt/hermes/plugins/readonly-source").exists()
+          assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.98.0"
@@ -615,6 +533,16 @@ jobs:
           assert shutil.which("grok")
           assert shutil.which("opencode")
           assert not pathlib.Path("/var/run/docker.sock").exists()
+          '
+          docker run --rm --network none --env EXPECTED_CLAUDE_CODE_VERSION \
+            --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/model-providers/claude-acp,dst=/opt/hermes/plugins/model-providers/claude-acp,readonly" \
+            --entrypoint python3 "$TEST_IMAGE" -c '
+          import importlib.util, os
+          spec = importlib.util.spec_from_file_location("acp_runtime_review", "/opt/hermes/plugins/model-providers/claude-acp/client.py")
+          acp_review = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(acp_review)
+          assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
+          assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
           timeout 15s docker run --rm --network none --user root --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent,readonly" --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'

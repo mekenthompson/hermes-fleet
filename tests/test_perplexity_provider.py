@@ -46,7 +46,7 @@ def load_provider():
 
 
 class PerplexityProviderTests(unittest.TestCase):
-    def test_public_image_contract_bundles_provider_disabled_by_default(self):
+    def test_public_source_contract_externalizes_provider_disabled_by_default(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         workflow = (ROOT / ".github" / "workflows" / "fleet-image.yml").read_text(
             encoding="utf-8"
@@ -59,23 +59,12 @@ class PerplexityProviderTests(unittest.TestCase):
             if item["id"] == "perplexity-web-provider"
         ]
 
+        self.assertNotIn("COPY plugins/web/perplexity/", dockerfile)
+        self.assertIn("RUN test ! -e /opt/hermes/plugins/web/perplexity", dockerfile)
         self.assertIn(
-            "COPY plugins/web/perplexity/ /opt/hermes/plugins/web/perplexity/",
-            dockerfile,
-        )
-        self.assertIn(
-            "python3 -m py_compile /opt/hermes/plugins/web/perplexity/*.py",
-            dockerfile,
-        )
-        self.assertIn(
-            "hermes plugins doctor /opt/hermes/plugins/web/perplexity --ci",
-            dockerfile,
-        )
-        self.assertIn(
-            'pathlib.Path("/opt/hermes/plugins/web/perplexity/provider.py").is_file()',
+            'assert not pathlib.Path("/opt/hermes/plugins/web/perplexity").exists()',
             workflow,
         )
-        self.assertIn("PerplexityWebSearchProvider", workflow)
         self.assertEqual(matches, [
             {
                 "id": "perplexity-web-provider",

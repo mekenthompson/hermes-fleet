@@ -76,9 +76,10 @@ class PublicFattenContractTests(unittest.TestCase):
             text,
         )
 
-    def test_image_scope_includes_fatten_inputs(self) -> None:
+    def test_image_scope_excludes_plugin_only_changes(self) -> None:
         text = SCOPE.read_text(encoding="utf-8")
-        self.assertIn('"plugins/web/perplexity/"', text)
+        self.assertNotIn('"plugins/web/perplexity/"', text)
+        self.assertIn('"contracts/"', text)
         self.assertNotIn("webkite", text.lower())
 
     def test_release_workflow_proves_fattened_runtime(self) -> None:

@@ -29,7 +29,7 @@ North Star is **trusted unsupervised turns**: work the principal did not sit thr
 
 **No shared credentials.** The child image includes the 1Password CLI with no vault config. The overlay injects Connect host, token, and allowed origins per container. Vault item bindings stay in that overlay. Two agents never share a Connect token or an OAuth login. Recreating a profile or borrowing another agent's secrets to get past a blocker is out of product.
 
-**Plugins stay off until the overlay turns them on.** The image may bundle optional plugins. Default-enabled is empty. Enabling a plugin without its policy or origin fails closed. That is how we keep a generic image from becoming someone's deployment.
+**Plugins stay off until the overlay turns them on.** The Fleet-owned plugin source trees live in this repository but are not baked into the child image. A deployment mounts one immutable, read-only copy at each expected plugin path and enables it per profile; the image still includes pinned CLI/runtime dependencies. Without the mount, a pruned plugin is absent rather than silently falling back to a baked copy. Default-enabled is empty for optional Fleet plugins; enabling one without its policy or origin fails closed.
 
 **Digest or it did not happen.** Consume `ghcr.io/mekenthompson/hermes-fleet-public@sha256:<digest>`. Mutable tags are not a supported interface. Built, published, and deployed are different claims. A green unit run is not publication. Publication is not a production rollout.
 

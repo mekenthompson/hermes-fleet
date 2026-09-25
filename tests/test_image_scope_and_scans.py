@@ -49,6 +49,9 @@ class ChangeScopeDecisionTests(unittest.TestCase):
 
     def test_docs_and_tests_only_changes_skip_the_bake(self):
         for paths in (["README.md"], ["docs/image-release.md", "tests/test_image_release.py"], [".github/workflows/ci.yml"],
+                      ["plugins/model-providers/claude-acp/client.py", "plugins/browser-handoff/__init__.py",
+                       "plugins/kokoro-voice/__init__.py", "plugins/readonly-source/__init__.py",
+                       "plugins/web/perplexity/provider.py"],
                       ["scripts/verify-public-tree.py", "compose.example.yaml", "examples/operator-managed.yaml"], []):
             with self.subTest(paths=paths):
                 run, reason, matched = self.scope.decide("push", "a" * 40, "b" * 40, lambda *_: list(paths))
@@ -56,7 +59,7 @@ class ChangeScopeDecisionTests(unittest.TestCase):
                 self.assertEqual(matched, [])
 
     def test_image_inputs_run_the_bake_for_push_and_pull_request(self):
-        for path in ("Dockerfile", "package-lock.json", "plugins/web/perplexity/provider.py", "contracts/image.json",
+        for path in ("Dockerfile", "package-lock.json", "contracts/image.json",
                      "release/agent-image-manifest.json", "release/vex-exceptions.json", ".github/workflows/fleet-image.yml",
                      "scripts/verify-trivy-vex.py", "scripts/scan-fleet-image.py", "scripts/fleet-image-change-scope.py"):
             for event in ("push", "pull_request"):
@@ -88,11 +91,11 @@ class ChangeScopeDecisionTests(unittest.TestCase):
             base = commit(repo, "docs/a.md", "a\n", "base")
             docs = commit(repo, "docs/a.md", "b\n", "docs")
             git(repo, "checkout", "-q", "-b", "feature", base)
-            feature = commit(repo, "plugins/web/perplexity/provider.py", "x\n", "plugin")
+            feature = commit(repo, "Dockerfile", "FROM scratch\n", "image")
             changed = self.scope.git_changed_paths
             self.assertEqual(changed(base, docs, cwd=repo, merge_base=False), ["docs/a.md"])
             # Three-dot: only the PR side, not main's docs change made after the branch point.
-            self.assertEqual(changed(docs, feature, cwd=repo, merge_base=True), ["plugins/web/perplexity/provider.py"])
+            self.assertEqual(changed(docs, feature, cwd=repo, merge_base=True), ["Dockerfile"])
             self.assertEqual(changed(base, base, cwd=repo, merge_base=False), [])
             self.assertIsNone(changed("0" * 40, feature, cwd=repo, merge_base=False))
             self.assertIsNone(changed("f" * 40, feature, cwd=repo, merge_base=False))
