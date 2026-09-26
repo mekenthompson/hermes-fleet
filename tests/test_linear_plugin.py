@@ -16,6 +16,7 @@ from linear_fake_api import ROOT, Clock, load_plugin
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import api as linear_api  # noqa: E402
+from hermes_fleet_linear_plugin import oauth  # noqa: E402
 from hermes_fleet_linear_plugin.store import Store  # noqa: E402
 
 PLUGIN = ROOT / "plugins" / "linear"
@@ -134,6 +135,91 @@ class LinearPluginUnitTests(unittest.TestCase):
             store.revive_failed(now)  # the older status write is superseded: it must not land late
             self.assertEqual([r["payload"]["state"] for r in store.pending() if r["kind"] == "status"], ["done"])
 
+
+
+class FakeConnect:
+    """A 1Password Connect item: whole-field PATCH semantics, as the live service needs."""
+
+    def __init__(self) -> None:
+        self.fields = [{"id": "f1", "label": "client_id", "value": "cid"},
+                       {"id": "f2", "label": "client_secret", "value": "secret"},
+                       {"id": "f3", "label": "refresh_token", "value": "r0"}]
+        self.fail_patch = False
+        self.patches = 0
+
+    def __call__(self, method, url, headers, body):
+        if method == "PATCH":
+            if self.fail_patch:
+                raise OSError("Connect down")
+            self.patches += 1
+            [op] = json.loads(body)
+            index = next(i for i, f in enumerate(self.fields) if op["path"] == f"/fields/{f['id']}")
+            self.fields[index] = op["value"]
+        return {"id": "item-x", "vault": {"id": "vault-x"}, "fields": [dict(f) for f in self.fields]}
+
+
+class ConnectOAuthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cache = Path(tmp.name) / "secrets" / "linear-oauth.json"
+        self.connect, self.clock, self.posts = FakeConnect(), Clock(), []
+        item = oauth.ConnectItem("https://connect.example", "t", "vault-x", "item-x", transport=self.connect)
+        self.provider = oauth.ConnectOAuth(item, self.cache, clock=self.clock, post=self.post)
+
+    def post(self, form):
+        self.posts.append(form["refresh_token"])
+        n = len(self.posts)
+        return {"access_token": f"a{n}", "refresh_token": f"r{n}", "expires_in": 3600}
+
+    def refresh_token(self) -> str:
+        return next(f["value"] for f in self.connect.fields if f["label"] == "refresh_token")
+
+    def test_refresh_rotates_into_connect_and_caches_the_access_token(self) -> None:
+        self.assertEqual(self.provider(), "a1")
+        self.assertEqual(self.posts, ["r0"])
+        self.assertEqual(self.refresh_token(), "r1")  # rotation stored, whole-field PATCH
+        self.assertEqual(self.provider(), "a1")  # cached until near expiry
+        self.clock.now += 3600
+        self.assertEqual(self.provider(), "a2")
+        self.assertEqual(self.posts, ["r0", "r1"])
+        self.assertEqual(oct(self.cache.stat().st_mode & 0o777), "0o600")
+
+    def test_connect_outage_keeps_the_rotated_token_and_retries(self) -> None:
+        self.connect.fail_patch = True
+        self.assertEqual(self.provider(), "a1")
+        self.assertEqual(self.refresh_token(), "r0")
+        self.clock.now += 3600  # expired: the next refresh must use the rotated token, not the stale one
+        self.assertEqual(self.provider(), "a2")
+        self.assertEqual(self.posts, ["r0", "r1"])
+        self.connect.fail_patch = False
+        self.clock.now += 400
+        self.provider()
+        self.assertEqual(self.refresh_token(), "r2")
+
+    def test_deleted_cache_rebuilds_from_connect(self) -> None:
+        self.provider()
+        self.cache.unlink()
+        self.assertEqual(self.provider(), "a2")
+        self.assertEqual(self.posts, ["r0", "r1"])
+
+    def test_rejected_refresh_token_asks_for_reauthorization(self) -> None:
+        import io
+        import urllib.error
+        from unittest import mock
+
+        error = urllib.error.HTTPError(oauth.TOKEN_ENDPOINT, 400, "bad", {}, io.BytesIO(b"{}"))
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(oauth.ReauthorizationRequired):
+                oauth.ConnectOAuth._post_refresh({"grant_type": "refresh_token"})
+
+    def test_token_failure_is_a_retryable_linear_error(self) -> None:
+        def broken():
+            raise oauth.ReauthorizationRequired("reauthorize")
+
+        with self.assertRaises(linear_api.LinearError) as caught:
+            linear_api.LinearAPI(broken, transport=lambda *a: (200, {}, b"{}")).viewer_id()
+        self.assertTrue(caught.exception.retryable)
 
 if __name__ == "__main__":
     unittest.main()

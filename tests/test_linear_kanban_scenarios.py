@@ -229,6 +229,38 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.types(), ["thought", "error"])
         self.assertIn("repeated failed attempts", self.linear.activities[-1]["content"]["body"])
 
+    def test_queued_claim_never_overrides_a_later_human_close(self) -> None:
+        self.linear.down = True
+        self.delegate()
+        self.clock.now += 600
+        self.linear.set_state(ISSUE, "Canceled")  # a human cancels while our claim is still queued
+        self.linear.down = False
+        self.clock.now += 3600
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Canceled")
+        self.assertEqual([s for _, s in self.tasks()], ["archived"])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+
+    def test_late_stop_for_an_older_session_does_not_stop_newer_work(self) -> None:
+        self.delegate()
+        self.clock.now += 60
+        self.delegate(session="s-2")
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop", at=-120))
+        self.assertEqual([s for _, s in self.tasks()], ["ready"])
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+
+    def test_credential_outage_keeps_the_delegation(self) -> None:
+        def broken() -> str:
+            raise RuntimeError("Connect unreachable")
+
+        self.bridge.api.token = broken
+        self.delegate()
+        self.assertEqual(len(self.tasks()), 1)  # the delegation is not dropped
+        self.bridge.api.token = lambda: "synthetic-token"
+        self.clock.now += 120
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+
     def test_day_long_outage_catches_up_without_duplicates(self) -> None:
         self.linear.down = True
         self.delegate()

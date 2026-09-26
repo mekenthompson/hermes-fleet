@@ -55,6 +55,11 @@ def event_ms(event: dict[str, Any]) -> float:
     return float(stamp) if isinstance(stamp, (int, float)) else time.time() * 1000
 
 
+def evidence_links(text: str) -> list[str]:
+    """Links that can prove a result; the tracker's own issue links cannot."""
+    return [url for url in URL.findall(text or "") if "linear.app/" not in url]
+
+
 def iso_ms(raw: Any) -> float:
     try:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000
@@ -171,8 +176,12 @@ class Bridge:
         if not project_id and not issue_id:
             return
         due = self.clock() + (self.quiet if quiet else 0)
+        with self.lock(f"update:{session_id}:{project_id or issue_id}"):
+            self._queue_update(session_id, project_id, ident, line, session_key, quiet, issue_id, due)
+
+    def _queue_update(self, session_id, project_id, ident, line, session_key, quiet, issue_id, due) -> None:
         row = self.store.project_update(session_id, project_id)
-        if row:
+        if row and int(row["attempts"]) == 0:  # a retried row keeps its body: it may already have landed
             payload = row["payload"]
             payload["lines"][ident] = line
             self.store.rewrite(row["id"], payload, max(due, float(row["next_at"])) if quiet else due)
@@ -202,6 +211,8 @@ class Bridge:
             if event.get("action") == "created":
                 self._delegated(event, issue, session_id, row)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
+                if row and row["owner_ref"] != session_id and event_ms(event) < float(row["last_updated_at"]):
+                    return  # a late Stop for an older session must not stop newer work
                 self._stop(row, session_id, ((activity.get("user") or {}).get("name")) or "a Linear user")
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
@@ -234,9 +245,10 @@ class Bridge:
                           "Could not reach the chat session working on this.")
             return
         if row:
-            self.store.update(issue["id"], owner_ref=session_id,
-                              last_updated_at=max(float(row["last_updated_at"]), event_ms(event)))
-            if self._resume({**row, "owner_ref": session_id}, f"Follow-up from Linear: {body}"):
+            if event_ms(event) >= float(row["last_updated_at"]):  # replies go to the newest session
+                self.store.update(issue["id"], owner_ref=session_id, last_updated_at=event_ms(event))
+                row = {**row, "owner_ref": session_id}
+            if self._resume(row, f"Follow-up from Linear: {body}"):
                 self.activity(issue["id"], session_id, "thought", "Passed to the running task.")
                 return
         # No live work: the follow-up starts work. The session key comes first so an
@@ -287,8 +299,11 @@ class Bridge:
         if not row:
             return
         if row["origin"] == "kanban":
-            self.kanban.block(row["task_id"], f"{OWN} stopped by {who}")
             row = {**row, "owner_ref": session_id}
+            task = self.kanban.get(row["task_id"])
+            if not self.kanban.block(row["task_id"], f"{OWN} stopped by {who}") and (task and task.status) != "blocked":
+                self.say(row, f"Could not stop the task (it is {task and task.status}); stop it on the board.", "error")
+                return
         else:
             self.inject(row["owner_ref"], f"[Linear] {who} stopped work on this issue. Stop now and do not continue it.")
             self.store.delete(row["issue_id"])
@@ -325,7 +340,7 @@ class Bridge:
         task = self.kanban.get(row["task_id"])
         contract = task.completion_contract or "local-only"
         # PR work: core's completion_contract already verified the exact PR head before 'done'.
-        evidence = [contract] if contract.startswith("https://") else URL.findall(self.kanban.evidence_text(task))
+        evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
         self.store.delete(row["issue_id"])
         if not evidence:
             self.status(row["issue_id"], "blocked")
@@ -340,11 +355,12 @@ class Bridge:
                             issue_id=row["issue_id"])
 
     # -- ownership re-reads ------------------------------------------------
-    def may_write(self, issue: dict[str, Any], claim: bool) -> bool:
+    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0) -> bool:
         me = self.api.viewer_id()
         delegate = issue.get("delegate") or {}
         started = (issue.get("state") or {}).get("type")
-        if claim and (delegate.get("id") in (None, me) or started != "started"):
+        human_since = iso_ms(issue.get("updatedAt")) > queued_at * 1000  # edited after we queued the claim
+        if claim and (not human_since or (delegate.get("id") in (None, me) and started not in CLOSED)):
             return True  # an explicit delegation or chat start (re)opens the work
         if started in CLOSED:
             row = self.store.get(issue["id"])
@@ -429,7 +445,7 @@ class Bridge:
         payload, kind = row["payload"], row["kind"]
         if kind == "status":
             issue = self.api.issue(payload["issue_id"])  # re-read before every status write
-            if not self.may_write(issue, bool(payload.get("claim"))):
+            if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0))):
                 return
             name = self.state_name(issue, payload["state"])
             fields = {"stateId": state_id(issue, name)} if name else {}
@@ -468,18 +484,18 @@ class Bridge:
         if not Path(database).exists():
             return
         with closing(sqlite3.connect(database, timeout=10, isolation_level=None)) as db:
-            rows = db.execute("SELECT logical_agent, delivery_id, payload, attempts FROM deliveries WHERE profile = ? "
+            rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at FROM deliveries WHERE profile = ? "
                               "AND status = 'pending' ORDER BY received_at, delivery_id LIMIT ?",
                               (self.profile, limit)).fetchall()
-            for agent, delivery, payload, attempts in rows:
+            for agent, delivery, payload, received in rows:
                 status = "imported"
                 try:
                     self.handle_webhook(json.loads(payload))
                 except (ValueError, TypeError):
                     status = "invalid"
-                except Exception:  # noqa: BLE001 - keep the inbox moving; retry a few times, then park it
+                except Exception:  # noqa: BLE001 - keep the inbox moving; retry for a day, then park it loudly
                     log.exception("linear: delivery %s failed", delivery)
-                    status = "failed" if attempts >= 4 else "pending"
+                    status = "failed" if self.clock() - float(received) > 86_400 else "pending"
                 db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
                            "AND delivery_id = ?", (status, agent, delivery))
 

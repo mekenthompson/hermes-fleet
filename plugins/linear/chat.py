@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from .api import LinearError
-from .bridge import URL, Bridge
+from .bridge import Bridge, evidence_links
 
 SCHEMA = {
     "name": "linear",
@@ -52,7 +52,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action == "done":
-            links = URL.findall(str(args.get("evidence") or ""))
+            links = evidence_links(str(args.get("evidence") or ""))
             if not links:
                 return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
                                      "Without one, use `linear blocked` or `linear release`.")

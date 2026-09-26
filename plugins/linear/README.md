@@ -100,13 +100,18 @@ Every Linear write goes through a local outbox, oldest first per issue.
   write is queued. Linear rejects a repeat with `INPUT_ERROR` "conflict on insert of ..." naming that
   id, and `api.is_duplicate_create_error` treats that as sent. A retry after a lost response
   therefore never duplicates a comment.
-- **Status and delegate writes** are set-to-value, preceded by the ownership re-read.
+- **Status and delegate writes** are set-to-value, preceded by the ownership re-read. A queued
+  claim that meets a newer human edit (a close, or another delegate) is dropped rather than
+  reopening the issue. A late Stop for an older session does not stop newer work.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
   task), and one more try after the next successful write. A superseded status write never
   replays.
 - **Rate limits**: when Linear answers `RATELIMITED`, all calls pause until the
   `X-RateLimit-*-Reset` time (epoch milliseconds).
+- **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
+  outage; inbox deliveries are retried for a day before they are parked. HTTP 403 fails loudly
+  at once.
 - **Missing states**: a configured state name that does not exist on the team fails loudly. Set a
   team's state to `null` to skip that status change. The comment or activity still posts.
 

@@ -106,7 +106,10 @@ class LinearAPI:
             raise RateLimited(self.paused_until)
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
         for attempt in (1, 2):
-            headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.token()}
+            try:
+                headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.token()}
+            except Exception as exc:  # noqa: BLE001 - Connect outage or refresh failure: retry later, loudly
+                raise LinearError(f"Linear credentials unavailable: {exc}") from exc
             try:
                 status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
@@ -123,8 +126,10 @@ class LinearAPI:
         codes = {((e.get("extensions") or {}).get("code")) for e in errors or [] if isinstance(e, dict)}
         if status == 429 or "RATELIMITED" in codes:
             raise RateLimited(self._pause(response_headers))
-        if status >= 500 or status in (401, 403, 408):
+        if status >= 500 or status in (401, 408):
             raise LinearError(f"Linear HTTP {status}")
+        if status == 403:
+            raise LinearError("Linear refused this app (HTTP 403); check its scopes", retryable=False)
         if errors:
             raise LinearError("Linear GraphQL error", errors=errors, retryable=False)
         if status >= 400 or not isinstance(payload.get("data"), dict):
