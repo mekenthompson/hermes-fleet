@@ -63,6 +63,19 @@
       ]
     },
     {
+      "id": "linear",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "kanban_owns_execution",
+        "overlay_config_only",
+        "synthetic_examples_only",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
       "id": "claude-acp-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,

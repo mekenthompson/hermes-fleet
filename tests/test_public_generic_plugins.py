@@ -103,7 +103,8 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertEqual(workflow.count('assert not pathlib.Path("/opt/hermes/plugins/kokoro-voice").exists()'), 2)
 
     def test_generic_plugin_trees_have_no_household_literals(self) -> None:
-        roots = (LINEAR, ACP, KOKORO, HANDOFF, READONLY, ROOT / "plugins" / "web" / "perplexity")
+        roots = (LINEAR, ROOT / "plugins" / "linear", ACP, KOKORO, HANDOFF, READONLY,
+                 ROOT / "plugins" / "web" / "perplexity")
         for root in roots:
             for path in root.rglob("*"):
                 if not path.is_file() or path.suffix not in {".py", ".yaml", ".json", ".md"}:
