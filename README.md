@@ -59,6 +59,10 @@ Multi-agent work tracking without a shared inbox. Each profile is a Linear worke
 
 The principal assigns work in Linear. Specialists pick up the cards they own. They do not read each other's queues. Stop containment stays durable across a bounce. Policy and plugin settings must agree on profile, workspace, vault item binding, and rollout scope. Details: [`docs/linear-agent.md`](docs/linear-agent.md).
 
+### Linear (replacement, in pilot)
+
+`plugins/linear/` is the smaller replacement for the Linear Agent worker. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Enable it with one settings block in the overlay; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
+
 ### Browser handoff
 
 The agent can run an isolated browser and hand the live session to the human when a login or a visual check needs a person. Cookies and origin stay on that profile's broker and sidecar. The public origin comes from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` at deploy time, not from this git tree. Sidecar images (broker, Camofox) publish separately; the Fleet child does not bake them in.
@@ -157,6 +161,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`docs/image-release.md`](docs/image-release.md) — image bake, scan, and publication
 - [`docs/linear-agent.md`](docs/linear-agent.md) — Linear worker plugin (policy stays external)
 - [`docs/perplexity.md`](docs/perplexity.md) — optional search provider
+- [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (replacement in pilot)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
 - [`plugins/browser-handoff/`](plugins/browser-handoff/) — optional browser handoff
 - [`plugins/readonly-source/`](plugins/readonly-source/) — optional allowlisted read-only snapshot tools
