@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import time
 import urllib.error
@@ -109,6 +110,7 @@ class LinearAPI:
             try:
                 headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.token()}
             except Exception as exc:  # noqa: BLE001 - Connect outage or refresh failure: retry later, loudly
+                logging.getLogger("linear").error("linear: credentials unavailable: %s", exc)
                 raise LinearError(f"Linear credentials unavailable: {exc}") from exc
             try:
                 status, response_headers, raw = self.transport(self.endpoint, body, headers)

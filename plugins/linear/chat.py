@@ -85,7 +85,7 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
         return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")
     project = (issue.get("project") or {}).get("id")
     bridge.store.put(issue["id"], "chat", session_key, project_id=project)
-    bridge.status(issue["id"], "in_progress", claim=True)
+    bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id"))
     bridge.project_update(session_id, project, ident, "In progress", session_key=session_key)
     return _reply(True, f"Tracking {ident} from this chat: {url}")
 

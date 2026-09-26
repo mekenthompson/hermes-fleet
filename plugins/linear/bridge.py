@@ -152,8 +152,10 @@ class Bridge:
             return None
 
     # -- outbox helpers ----------------------------------------------------
-    def status(self, issue_id: str, state: str, *, claim: bool = False) -> None:
-        self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim}, at=self.clock())
+    def status(self, issue_id: str, state: str, *, claim: bool = False, seen: str | None = None) -> None:
+        """``seen``: the delegate when a claim was decided; a later human change to it wins."""
+        self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen},
+                           at=self.clock())
 
     def comment(self, issue_id: str, body: str) -> None:
         self.store.enqueue("comment", {"issue_id": issue_id, "body": body}, at=self.clock())
@@ -292,7 +294,7 @@ class Bridge:
         self.kanban.subscribe(task.id, issue_id)
         self.store.put(issue_id, "kanban", session_id, task_id=task.id, project_id=project, last_updated_at=stamp)
         self.activity(issue_id, session_id, "thought", f"On it. Queued as Kanban task {task.id}.")  # ack first (10 s)
-        self.status(issue_id, "in_progress", claim=True)
+        self.status(issue_id, "in_progress", claim=True, seen=me or delegate or "self")
         return True
 
     def _stop(self, row: dict | None, session_id: str, who: str) -> None:
@@ -355,12 +357,13 @@ class Bridge:
                             issue_id=row["issue_id"])
 
     # -- ownership re-reads ------------------------------------------------
-    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0) -> bool:
+    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None) -> bool:
         me = self.api.viewer_id()
+        seen = me if seen == "self" else seen
         delegate = issue.get("delegate") or {}
         started = (issue.get("state") or {}).get("type")
         human_since = iso_ms(issue.get("updatedAt")) > queued_at * 1000  # edited after we queued the claim
-        if claim and (not human_since or (delegate.get("id") in (None, me) and started not in CLOSED)):
+        if claim and (not human_since or (delegate.get("id") in (seen, me) and started not in CLOSED)):
             return True  # an explicit delegation or chat start (re)opens the work
         if started in CLOSED:
             row = self.store.get(issue["id"])
@@ -433,7 +436,9 @@ class Bridge:
                         if not exc.retryable:
                             self.store.mark(row["id"], "failed")
                         if not exc.retryable or self.store.retry(row, self.clock()):
-                            self._loud(row, exc)
+                            if not row["payload"].get("reported"):  # warn once per row, not per revival
+                                self._loud(row, exc)
+                                self.store.report(row["id"])
                         continue
                     self.store.mark(row["id"], "sent")
                     sent, progress = sent + 1, True
@@ -445,7 +450,8 @@ class Bridge:
         payload, kind = row["payload"], row["kind"]
         if kind == "status":
             issue = self.api.issue(payload["issue_id"])  # re-read before every status write
-            if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0))):
+            if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
+                                  payload.get("seen")):
                 return
             name = self.state_name(issue, payload["state"])
             fields = {"stateId": state_id(issue, name)} if name else {}
@@ -470,7 +476,9 @@ class Bridge:
         log.error("linear: gave up on %s write for %s after retries: %s (retrying after the next successful write)",
                   row["kind"], payload.get("issue_id"), exc)
         work = self.store.get(str(payload.get("issue_id")))
-        note = f"Linear has not accepted a {row['kind']} update for this issue: {exc}. It will be retried."
+        note = f"Linear has not accepted a {row['kind']} update for this issue: {exc}. " + (
+            "It will be retried after the next successful write." if getattr(exc, "retryable", True)
+            else "It will not be retried; fix the cause and redo the step.")
         if work and work["origin"] == "chat":
             self.inject(work["owner_ref"], "[Linear] " + note)
         elif work and work["task_id"]:

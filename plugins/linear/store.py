@@ -134,9 +134,14 @@ class Store:
     def project_update(self, session_id: str, project_id: str) -> dict[str, Any] | None:
         with self._tx() as db:
             row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND state = 'pending' AND "
-                             "json_extract(payload, '$.session_id') = ? AND json_extract(payload, '$.project_id') = ?",
+                             "attempts = 0 AND json_extract(payload, '$.session_id') = ? AND "
+                             "json_extract(payload, '$.project_id') IS ?",
                              (session_id, project_id)).fetchone()
         return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+
+    def report(self, row_id: str) -> None:
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET payload = json_set(payload, '$.reported', 1) WHERE id = ?", (row_id,))
 
     def rewrite(self, row_id: str, payload: dict[str, Any], next_at: float) -> None:
         with self._tx() as db:

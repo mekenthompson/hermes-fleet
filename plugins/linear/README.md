@@ -125,6 +125,8 @@ state)` has three states: pending, sent, failed.
   Core's `request_stop` only covers plugin-dispatched executions.
 - **Chat commands need Linear reachable** to resolve an identifier. When it is not, the tool says
   so and asks the agent to retry.
+- **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
+  the plugin says so in Linear instead of claiming it stopped.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
 
 ## Tests

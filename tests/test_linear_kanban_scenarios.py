@@ -241,6 +241,18 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual([s for _, s in self.tasks()], ["archived"])
         self.assertIsNone(self.bridge.store.get(ISSUE))
 
+    def test_queued_claim_never_undoes_a_later_delegate_removal(self) -> None:
+        self.linear.down = True
+        self.delegate()
+        self.clock.now += 600
+        self.linear.set_delegate(ISSUE, None)  # a human takes the agent off while our claim is queued
+        self.linear.down = False
+        self.clock.now += 3600
+        self.bridge.tick()
+        self.assertIsNone(self.linear.issues[ISSUE]["delegate"])
+        self.assertEqual([s for _, s in self.tasks()], ["archived"])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+
     def test_late_stop_for_an_older_session_does_not_stop_newer_work(self) -> None:
         self.delegate()
         self.clock.now += 60
