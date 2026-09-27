@@ -1249,6 +1249,56 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("ABC-1: Done", self.linear.project_updates[1]["body"])
         self.assertIn("ABC-2: Done", self.linear.project_updates[1]["body"])
 
+    def test_unmarked_deferred_update_stays_bounded_after_restart(self) -> None:
+        from hermes_fleet_linear_plugin.api import LinearError
+        from unittest.mock import patch
+        self.linear.add_issue("iss-2", "ABC-2")
+        self.linear.add_issue("iss-3", "ABC-3")
+        for ident in ("ABC-1", "ABC-2", "ABC-3"):
+            self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ident},
+                                                   Context("chat-key", "chat-key-id")))["ok"])
+        self.bridge.tick()
+        with patch.object(self.bridge, "flush", return_value=0):
+            for ident in ("ABC-1", "ABC-2", "ABC-3"):
+                self.assertTrue(json.loads(chat.handle(
+                    self.bridge, {"action": "done", "issue": ident,
+                                  "evidence": "https://docs.example/findings/9"},
+                    Context("chat-key", "chat-key-id")))["ok"])
+        failing = {ISSUE, "iss-2"}
+
+        def flush_with_failures() -> None:
+            update_issue = self.bridge.api.update_issue
+
+            def fail_done(issue_id, fields):
+                if issue_id in failing and "stateId" in fields:
+                    raise LinearError("synthetic terminal outage")
+                return update_issue(issue_id, fields)
+
+            with patch.object(self.bridge.api, "update_issue", side_effect=fail_done):
+                self.bridge.flush()
+
+        self.clock.now += 31 * 60
+        flush_with_failures()
+        self.assertEqual(len(self.linear.project_updates), 1)
+        with sqlite3.connect(self.bridge.store.path) as db:
+            deferred = db.execute("SELECT id, payload FROM outbox WHERE kind='project_update' "
+                                  "AND state='pending'").fetchall()
+            self.assertEqual(len(deferred), 1)
+            self.assertTrue(json.loads(deferred[0][1])["followup"])
+            db.execute("UPDATE outbox SET payload=json_remove(payload, '$.followup') WHERE id=?",
+                       (deferred[0][0],))  # row persisted by pre-upgrade code
+        self.bridge = self.make_bridge()
+        failing.remove(ISSUE)
+        self.clock.now += 121
+        flush_with_failures()
+        self.assertEqual(len(self.linear.project_updates), 1)
+        failing.clear()
+        self.clock.now += 121
+        flush_with_failures()
+        self.assertEqual(len(self.linear.project_updates), 2)
+        self.assertIn("ABC-1: Done", self.linear.project_updates[1]["body"])
+        self.assertIn("ABC-2: Done", self.linear.project_updates[1]["body"])
+
     def test_deferred_terminal_line_is_fenced_after_takeover(self) -> None:
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
