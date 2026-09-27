@@ -368,6 +368,44 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.tick()
                 self.assertEqual(len(self.linear.activities), before)
 
+    def test_pending_legacy_alert_is_not_replayed_after_cursor_upgrade(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task_id, reason="needs review", kind="needs_input"))
+        old = self.bridge.store.enqueue("activity", {"issue_id": ISSUE, "session_id": "s-1",
+                                                      "content": {"type": "elicitation", "body":
+                                                                  "Blocked: needs review. Reply here to unblock."}},
+                                        at=self.clock() + 3600)
+        before = len(self.linear.activities)
+        self._migrate_old_work_row()
+        self.bridge.tick()
+        pending = [p for p in self.bridge.store.pending(ISSUE) if p["kind"] == "activity"]
+        self.assertEqual([p["id"] for p in pending], [old])
+        self.assertEqual(len(self.linear.activities), before)
+        self.clock.now += 3601
+        self.bridge.flush()
+        self.assertEqual(len(self.linear.activities), before + 1)
+
+    def test_retryable_failed_legacy_alert_is_not_replayed_after_cursor_upgrade(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task_id, reason="needs review", kind="needs_input"))
+        old = self.bridge.store.enqueue("activity", {"issue_id": ISSUE, "session_id": "s-1",
+                                                      "content": {"type": "elicitation", "body":
+                                                                  "Blocked: needs review. Reply here to unblock."}},
+                                        at=self.clock() + 3600)
+        with sqlite3.connect(self.bridge.store.path) as db:
+            db.execute("UPDATE outbox SET state='failed', attempts=1 WHERE id=?", (old,))
+        self._migrate_old_work_row()
+        self.bridge.tick()
+        with sqlite3.connect(self.bridge.store.path) as db:
+            rows = db.execute("SELECT id FROM outbox WHERE kind='activity' AND "
+                              "json_extract(payload, '$.issue_id')=? AND "
+                              "json_extract(payload, '$.content.type')='elicitation'", (ISSUE,)).fetchall()
+        self.assertEqual([row[0] for row in rows], [old])
+
     def test_legacy_other_session_does_not_hide_unreported_block(self) -> None:
         self.delegate()
         task_id = self.task_id()
