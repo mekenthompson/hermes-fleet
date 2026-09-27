@@ -68,18 +68,24 @@ attempts)`. The plugin reads pending rows for its profile and marks them `import
 | Worker completes without evidence | task done | Blocked state, one error: unfinished |
 | Worker blocks (`needs_input`) | task blocked | Blocked state, one elicitation |
 | Retry breaker trips | task blocked (`gave_up`) | Blocked state, one error |
-| Stop (a prompt with `signal: stop`) | `block_task(needs_input)`, which survives restarts; chat: stop injected | Blocked state, "Stopped by ..."; the delegate is kept |
+| Stop (a prompt with `signal: stop`) | `block_task(needs_input)`, which survives restarts; bound chat: generation-fenced core chat Stop | Kanban: Blocked and "Stopped by ...". Chat: Blocked with a Stop receipt activity; the delegate is kept |
 | Re-delegate or prompt after a stop or block | same task unblocked | In Progress |
 | Re-delegate after Done | new task (new session, new key) | as delegation |
 | Delegate moved to someone else (seen on re-read) | task blocked and archived; chat: told to stop | "Reassigned to ..." comment |
 | Human moves the issue to Done or Canceled | task blocked and archived | nothing; the human wins |
 
-**Done needs evidence.** For a PR, set `completion_contracts` so the task gets core's
-`completion_contract`: core checks the exact PR head on GitHub before the task can complete. For
-other work, the result must contain a link: the merged commit, a deploy check, or the findings.
+**Done needs evidence.** A GitHub PR link is checked against the exact head and required checks
+before either a Kanban result or chat command marks Linear Done, including projects without a
+configured contract. Set `completion_contracts` to make core enforce that check before Kanban
+completion too. A non-GitHub pull-request link is not accepted as completion evidence. Other
+work needs a destination link such as a merged commit, deploy check, or findings.
 
 **Restart.** Core respawns Kanban workers. The task body starts with a reconcile step, so a retry
 checks what already happened before continuing. When the breaker trips, the issue goes to Blocked.
+The bridge records each Kanban event and its queued Linear writes in one local transaction;
+after a crash it replays events beyond that local cursor even if core's notification claim advanced.
+Rows upgraded from the older work schema reconcile historical transitions against the current
+task state, so an old breaker event cannot block a task that has since resumed.
 Chat work is asked to reconcile. If its session cannot be reached, it becomes Blocked with
 "interrupted by restart".
 
@@ -89,8 +95,17 @@ Session events older than the newest one handled for that issue are ignored, so 
 delegation cannot take work back. Ordering uses the session and activity `createdAt`. The issue's
 `updatedAt` is not used, because Linear creates the session before it updates the issue.
 
-**Project updates.** For chat, one per project per session, sent `quiet_minutes` after the last
-turn. For Kanban, one per finished task.
+**Project updates.** For chat, normally one per project per session, sent `quiet_minutes` after the
+last observed turn. If a terminal status is still retrying, owned nonterminal lines can publish
+first; the terminal line stays queued and can publish in a second update after the status succeeds.
+Later turns in the same session cannot edit an update already sent. For
+Kanban, one per finished task. At send time each issue's line is checked against its current
+delegate and state; a taken-over issue is omitted without dropping other owned lines. The
+batch is frozen from the latest committed rows before its first send, so a concurrent terminal
+capture cannot disappear behind a stale outbox snapshot. A pending or retryable failed claim
+holds its issue's line until ownership is decided. An unpublished batch with no owned lines is
+forgotten, leaving the session able to publish later valid work. The quiet deadline stops moving
+when the first send begins.
 
 ## Delivery guarantees
 
@@ -105,8 +120,8 @@ Every Linear write goes through a local outbox, oldest first per issue.
   reopening the issue. A late Stop for an older session does not stop newer work.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
-  task), and one more try after the next successful write. A superseded status write never
-  replays.
+  task), and one more try after the next successful write. A failed chat alert remains due until
+  injection succeeds. A superseded status write never replays.
 - **Rate limits**: when Linear answers `RATELIMITED`, all calls pause until the
   `X-RateLimit-*-Reset` time (epoch milliseconds).
 - **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
@@ -115,19 +130,35 @@ Every Linear write goes through a local outbox, oldest first per issue.
 - **Missing states**: a configured state name that does not exist on the team fails loudly. Set a
   team's state to `null` to skip that status change. The comment or activity still posts.
 
-State: `work(issue_id, origin, owner_ref, task_id, project_id, last_updated_at)` holds a row only
-while work is active; there are no tombstones. `outbox(id, kind, payload, attempts, next_at,
-state)` has three states: pending, sent, failed.
+State: `work` holds the active issue, including nullable `run_generation`; upgrades never infer a
+generation for earlier chat work. `chat_stop` retains the original profile, issue, Linear session,
+activity, session key and generation across crashes. Its Stop receipt and worker observation may
+be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
+core accepted an interrupt request; worker completion never proves external effects stopped.
+The outbox keeps the same UUID v4 for each acknowledgement across retries, so Linear sees one
+activity even if the response is lost. `outbox` has pending, sent and failed states.
 
 ## Known limits
 
-- **Stopping chat work is a request, not a hard stop.** The stop is injected into the session.
-  Core's `request_stop` only covers plugin-dispatched executions.
+- **Chat Stop is scoped to a bound ordinary chat run.** The plugin saves the host-provided session
+  key and run generation at `linear start`. A Linear Stop records that exact target durably before
+  calling core on the gateway loop. A restarted or late request can only retry that generation;
+  it cannot stop a successor. Legacy and unbound chat rows report unsupported and stay Blocked
+  until a newer Linear prompt; chat start cannot prove a newer turn without a saved generation.
+  An ambiguous response stays visible as unknown or stale, never as proof of cancellation.
+  `linear done` stays fenced until a newer prompt or explicit chat start resumes it. Stop does not
+  undo tools, child processes or external effects that already ran; reconcile before resuming.
 - **Chat commands need Linear reachable** to resolve an identifier. When it is not, the tool says
   so and asks the agent to retry.
 - **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
   the plugin says so in Linear instead of claiming it stopped.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
+- **An uncertain project-update send keeps its original UUID and body.** The body freezes before
+  the create call, including a possible crash just before the call. If Linear accepted the create
+  but its response was lost, changing a retry could not change the update already published.
+  A later terminal result remains on the issue status and evidence comment, but may not appear in
+  that session's project update. If ownership changes before retry, the write holds for remote
+  reconciliation instead of publishing a changed body under the same UUID.
 
 ## Tests
 

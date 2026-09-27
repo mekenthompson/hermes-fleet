@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -20,7 +21,9 @@ from hermes_fleet_linear_plugin import oauth  # noqa: E402
 from hermes_fleet_linear_plugin.store import Store  # noqa: E402
 
 PLUGIN = ROOT / "plugins" / "linear"
-BUDGET = 1800
+# Durable chat Stop adds a profile/generation-fenced receipt path to this plugin.
+# Keep a bounded production surface without compressing safety-critical branches.
+BUDGET = 2000
 
 
 class FakeContext:
@@ -38,6 +41,35 @@ class FakeContext:
 
     def register_profile_service(self, name, factory):
         self.services.append(name)
+
+
+class LinearOutboxOrderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = Store(Path(tmp.name) / "state.db")
+        self.store.put("issue-1", "chat", "chat-key")
+        self.store.finish("issue-1", [("status", {"issue_id": "issue-1", "state": "done"}),
+                                      ("comment", {"issue_id": "issue-1", "body": "evidence"})], at=100)
+        self.status = next(row for row in self.store.pending() if row["kind"] == "status")
+
+    def test_retryable_failed_status_holds_evidence_until_recovery_or_supersession(self) -> None:
+        self.assertTrue(self.store.retry(self.status, 100 + 86_401))
+        self.assertEqual(self.store.due(100 + 86_401), [])
+        newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=100 + 86_402)
+        self.assertEqual([row["id"] for row in self.store.due(100 + 86_402)], [newer])
+        self.store.mark_sent(newer, True)
+        self.assertEqual([row["kind"] for row in self.store.due(100 + 86_402)], ["comment"])
+        self.assertFalse(self.store.terminal_status_applied(self.status["id"]))
+        self.assertEqual(self.store.revive_failed(100 + 86_402), 0)
+
+    def test_nonretryable_failed_status_does_not_block_later_issue_writes(self) -> None:
+        self.store.mark(self.status["id"], "failed")
+        [dependent] = self.store.due(100)
+        self.assertEqual(dependent["kind"], "comment")
+        self.store.mark_sent(dependent["id"], False)
+        newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101)
+        self.assertEqual([row["id"] for row in self.store.due(101)], [newer])
 
 
 class LinearPluginUnitTests(unittest.TestCase):
@@ -134,6 +166,75 @@ class LinearPluginUnitTests(unittest.TestCase):
             self.assertEqual([r["kind"] for r in store.due(now)], ["status"])  # one issue, in order
             store.revive_failed(now)  # the older status write is superseded: it must not land late
             self.assertEqual([r["payload"]["state"] for r in store.pending() if r["kind"] == "status"], ["done"])
+
+    def test_terminal_outbox_capture_and_work_removal_are_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            store.put("i", "kanban", "session", task_id="task")
+            with self.assertRaises(TypeError):
+                store.finish("i", [("status", {"issue_id": "i", "state": "done"}),
+                                   ("activity", {"issue_id": "i", "body": object()})], at=1000)
+            self.assertIsNotNone(store.get("i"))
+            self.assertEqual(store.pending(), [])
+            self.assertTrue(store.finish("i", [("status", {"issue_id": "i", "state": "done"})], at=1000))
+            self.assertIsNone(store.get("i"))
+            self.assertEqual(len(store.pending()), 1)
+
+    def test_existing_work_table_adds_chat_panel_and_stop_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE work (issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, "
+                           "owner_ref TEXT NOT NULL, task_id TEXT, project_id TEXT, "
+                           "last_updated_at REAL NOT NULL DEFAULT 0)")
+                db.execute("INSERT INTO work VALUES ('i', 'chat', 'chat-key', NULL, NULL, 0)")
+            store = Store(path)
+            self.assertEqual(store.get("i")["stop_requested_at"], 0)
+            store.update("i", panel_note="Need input", stop_requested_at=123)
+            self.assertEqual(Store(path).get("i")["panel_note"], "Need input")
+
+    def test_legacy_chat_generation_stays_null_and_kanban_cannot_be_targeted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE work (issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, "
+                           "owner_ref TEXT NOT NULL, task_id TEXT, project_id TEXT, "
+                           "last_updated_at REAL NOT NULL DEFAULT 0)")
+                db.execute("INSERT INTO work VALUES ('old', 'chat', 'chat-key', NULL, NULL, 0)")
+            store = Store(path)
+            self.assertIsNone(store.get("old")["run_generation"])
+            self.assertIsNone(store.capture_chat_stop("old", "linear-s", "activity-1", "alpha", at=100))
+            store.put("board", "kanban", "linear-s", task_id="task")
+            self.assertIsNone(store.capture_chat_stop("board", "linear-s", "activity-2", "alpha", at=100))
+
+    def test_stop_intent_is_durable_idempotent_and_keeps_original_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            store = Store(path)
+            store.put("i", "chat", "chat-key", run_generation=7)
+            store.update("i", linear_session_id="linear-s")
+            first = store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=100)
+            self.assertEqual(first["run_generation"], 7)
+            self.assertEqual(first["session_key"], "chat-key")
+            store.update("i", run_generation=8)
+            self.assertEqual(store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=101)["id"], first["id"])
+            self.assertEqual(Store(path).stop_intents()[0]["run_generation"], 7)
+            self.assertEqual(len(store.stop_intents()), 1)
+
+    def test_stop_guard_rolls_back_if_intent_insert_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.db"
+            store = Store(path)
+            store.put("i", "chat", "chat-key", run_generation=7)
+            store.update("i", linear_session_id="linear-s")
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TRIGGER fail_stop BEFORE INSERT ON chat_stop BEGIN "
+                           "SELECT RAISE(ABORT, 'synthetic crash'); END")
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=100, stamp=100_000)
+            self.assertEqual(store.get("i")["stop_requested_at"], 0)
+            self.assertEqual(store.stop_intents(), [])
+            self.assertEqual(store.pending(), [])
 
 
 

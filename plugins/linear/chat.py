@@ -35,6 +35,11 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         return _reply(False, "The Linear service is not running on this profile.")
     session_key = str(getattr(invocation_context, "session_key", "") or "")
     session_id = str(getattr(invocation_context, "session_id", "") or session_key)
+    profile = str(getattr(invocation_context, "profile", "") or "")
+    generation = getattr(invocation_context, "run_generation", None)
+    generation = generation if profile == bridge.profile and type(generation) is int and generation > 0 else None
+    if profile != bridge.profile:
+        return _reply(False, "linear needs a tool turn bound to this profile.")
     if not session_key:
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
     action, ref = str(args.get("action", "")), str(args.get("issue", "")).strip()
@@ -48,45 +53,83 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     with bridge.lock(issue_id):
         row = bridge.store.get(issue_id)
         if action == "start":
-            return _start(bridge, issue, row, me, session_key, session_id)
+            return _start(bridge, issue, row, me, session_key, session_id, generation)
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action == "done":
+            if row.get("stop_requested_at"):
+                return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "
+                                     "instruction explicitly resumes it.")
             links = evidence_links(str(args.get("evidence") or ""))
             if not links:
                 return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
                                      "Without one, use `linear blocked` or `linear release`.")
-            bridge.store.delete(issue_id)
-            bridge.status(issue_id, "done")
-            bridge.comment(issue_id, f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"))
-            bridge.project_update(session_id, project, ident, f"Done: {' '.join(links)}", session_key=session_key)
+            if not bridge.accepted_evidence(links):
+                return _reply(False, "PR acceptance on the exact head and required checks could not be verified; "
+                                     "leave this issue open and reconcile the PR.")
+            _finish(bridge, row, session_key, session_id, project, ident, "done",
+                    f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
+                    f"Done: {' '.join(links)}")
             return _reply(True, f"{ident} marked Done in Linear.")
         if action == "blocked":
+            message = f"Blocked: {note or 'needs input'}."
             bridge.status(issue_id, "blocked")
-            bridge.comment(issue_id, f"Blocked: {note or 'needs input'}.")
-            bridge.project_update(session_id, project, ident, f"Blocked: {note}", session_key=session_key)
+            if row.get("linear_session_id"):
+                bridge.activity(issue_id, row["linear_session_id"], "elicitation", message, row=row)
+                bridge.store.update(issue_id, panel_note=None)
+            else:
+                bridge.store.update(issue_id, panel_note=message)
+                bridge.comment(issue_id, message)
+            bridge.project_update(session_id, project, ident, f"Blocked: {note}", session_key=session_key,
+                                  issue_id=issue_id)
             return _reply(True, f"{ident} marked Blocked; it stays yours.")
         if action == "release":
-            bridge.store.delete(issue_id)
-            bridge.status(issue_id, "blocked")
-            bridge.comment(issue_id, f"Released unfinished from chat: {note or 'no reason given'}.")
-            bridge.project_update(session_id, project, ident, "Released unfinished", session_key=session_key)
+            _finish(bridge, row, session_key, session_id, project, ident, "blocked",
+                    f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished")
             return _reply(True, f"Stopped tracking {ident}; it is Blocked in Linear.")
     return _reply(False, f"Unknown action {action!r}.")
 
 
-def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str, session_id: str) -> str:
+def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
+            ident: str, state: str, message: str, update: str) -> None:
+    issue_id = row["issue_id"]
+    route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
+    bridge.store.finish(issue_id, [
+        ("status", {"issue_id": issue_id, "state": state, **route}),
+        ("comment", {"issue_id": issue_id, "body": message, **route}),
+        ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
+                            "session_id": session_id, "project_id": project, "resolve": issue_id,
+                            "lines": {ident: update}, "line_issues": {ident: issue_id},
+                            "quiet": bridge.quiet, **route}),
+    ], at=bridge.clock())
+
+
+def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
+           session_id: str, generation: int | None) -> str:
     ident, url = issue.get("identifier"), issue.get("url", "")
     if row and row["origin"] == "kanban":
         return _reply(False, f"{ident} is already running here as Kanban task {row['task_id']}; "
                              f"reply in its Linear session to steer it: {url}")
+    if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
+        return _reply(False, f"{ident} is already tracked in another chat session: {url}")
     delegate = issue.get("delegate") or {}
     if delegate.get("id") not in (None, me) and (issue.get("state") or {}).get("type") == "started":
         return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")
     project = (issue.get("project") or {}).get("id")
-    bridge.store.put(issue["id"], "chat", session_key, project_id=project)
+    if row:
+        if row.get("stop_requested_at") and (row.get("run_generation") is None or generation is None or
+                                             generation <= row["run_generation"]):
+            return _reply(False, "Stop is still fenced; a newer bound chat turn must explicitly resume this issue.")
+        if generation is not None and generation > (row.get("run_generation") or 0):
+            bridge.store.update(issue["id"], run_generation=generation)
+        if row.get("stop_requested_at"):
+            fence = max(bridge.clock() * 1000, row["last_updated_at"] + 1)
+            bridge.store.update(issue["id"], stop_requested_at=0,
+                                last_updated_at=fence, resume_fence_at=fence)
+    else:
+        bridge.store.put(issue["id"], "chat", session_key, project_id=project, run_generation=generation)
     bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id"))
-    bridge.project_update(session_id, project, ident, "In progress", session_key=session_key)
+    bridge.project_update(session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"])
     return _reply(True, f"Tracking {ident} from this chat: {url}")
 
 
