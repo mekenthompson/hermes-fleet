@@ -233,7 +233,8 @@ class Store:
                 "COUNT(*) FROM outbox WHERE kind = 'activity' AND json_extract(payload, '$.issue_id') = ? "
                 "AND (json_extract(payload, '$.task_id') = ? OR "
                 "(json_extract(payload, '$.task_id') IS NULL AND "
-                "json_extract(payload, '$.session_id') = ? AND state = 'sent')) GROUP BY 1, 2",
+                "json_extract(payload, '$.session_id') = ? AND "
+                "(state IN ('sent', 'pending') OR (state = 'failed' AND attempts > 0)))) GROUP BY 1, 2",
                 (issue_id, task_id, session_id)).fetchall()
         return Counter({(kind, body): count for kind, body, count in rows})
 
