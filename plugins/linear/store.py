@@ -421,6 +421,14 @@ class Store:
                 return False
             if json.loads(row["payload"]) != expected:
                 return None
+            # An older deferred row has no followup marker. Its sibling proves the
+            # session/project already split, so it must wait rather than split again.
+            sibling = db.execute("SELECT 1 FROM outbox WHERE kind='project_update' AND id != ? AND "
+                                 "json_extract(payload, '$.session_id') = ? AND "
+                                 "json_extract(payload, '$.project_id') IS ? LIMIT 1",
+                                 (row_id, expected["session_id"], expected.get("project_id"))).fetchone()
+            if sibling:
+                return False
             if not waiting or waiting == set(expected["lines"]):
                 return False
             ready, deferred = dict(expected), dict(expected)
