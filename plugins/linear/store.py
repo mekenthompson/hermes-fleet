@@ -424,6 +424,7 @@ class Store:
             if not waiting or waiting == set(expected["lines"]):
                 return False
             ready, deferred = dict(expected), dict(expected)
+            deferred["followup"] = True
             for part, idents in ((ready, set(expected["lines"]) - waiting), (deferred, waiting)):
                 part["lines"] = {ident: expected["lines"][ident] for ident in idents}
                 part["line_issues"] = {ident: value for ident, value in expected.get("line_issues", {}).items()

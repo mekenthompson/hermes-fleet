@@ -710,7 +710,7 @@ class Bridge:
                     continue
                 lines_to_send.append(f"- {ident}: {line}")
             if waiting_lines:
-                if not lines_to_send:
+                if payload.get("followup") or not lines_to_send:
                     raise ProjectUpdateDeferred
                 split = self.store.split_project_update(row_id, payload, self.clock(), waiting_lines)
                 if split is None or split:
