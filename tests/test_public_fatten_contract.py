@@ -51,7 +51,9 @@ class PublicFattenContractTests(unittest.TestCase):
 
     def test_dockerfile_installs_honcho_extra_without_workspace_ids(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
-        self.assertIn("uv export --frozen --no-dev --no-emit-project --extra honcho", text)
+        self.assertIn('facts["packages"]["uv"]["entry"]', text)
+        self.assertIn('"$UV" export --frozen --no-dev --no-emit-project --extra honcho', text)
+        self.assertNotIn("\n    && uv export ", text)
         self.assertIn(f"assert version('honcho-ai') == '{HONCHO_AI_VERSION}'", text)
         lowered = text.lower()
         for token in ("workspace_id", "switchroom", "kenthompson.com.au"):
