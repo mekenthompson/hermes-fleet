@@ -25,9 +25,12 @@ RUN set -eux; \
     install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
     rm -rf "/tmp/${archive}" "/tmp/gh_${GH_VERSION}_linux_amd64"; \
     test "$(gh --version | awk 'NR==1{print $3}')" = "${GH_VERSION}"
+# Agent images stage uv under the pm runtime dir and do not put it on PATH.
 RUN cd /opt/hermes \
-    && uv export --frozen --no-dev --no-emit-project --extra honcho --output-file /tmp/hermes-honcho-requirements.txt \
-    && uv pip install --python /opt/hermes/.venv/bin/python --requirement /tmp/hermes-honcho-requirements.txt \
+    && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
+    && test -x "$UV" \
+    && "$UV" export --frozen --no-dev --no-emit-project --extra honcho --output-file /tmp/hermes-honcho-requirements.txt \
+    && "$UV" pip install --python /opt/hermes/.venv/bin/python --requirement /tmp/hermes-honcho-requirements.txt \
     && rm -f /tmp/hermes-honcho-requirements.txt \
     && /opt/hermes/.venv/bin/python -c "from importlib.metadata import version; import honcho; assert version('honcho-ai') == '2.2.0'"
 COPY package.json package-lock.json /opt/coding-clis/
