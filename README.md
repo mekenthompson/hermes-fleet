@@ -149,6 +149,10 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/verify-public-tree.py
 ```
 
+CI also runs the Linear Kanban scenarios in a separate process with the exact manifest-pinned
+Agent source; see [the local invocation](plugins/linear/README.md#tests). A green source run does
+not establish image publication or deployment readiness.
+
 Pull requests build a non-publishing `linux/amd64` candidate, verify runtime/provenance, and run the critical-vulnerability gate. Pushes to `main` that touch image inputs publish the exact scanned candidate. See [`docs/image-release.md`](docs/image-release.md).
 
 Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`reference/`](reference/).

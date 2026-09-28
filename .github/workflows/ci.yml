@@ -15,7 +15,7 @@ concurrency:
 jobs:
   source-checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -43,6 +43,31 @@ jobs:
             --dry-run
       - name: Public tree policy
         run: python3 scripts/verify-public-tree.py
+      - name: Read pinned Agent revision
+        id: agent
+        run: |
+          python3 scripts/read-agent-image-manifest.py \
+            --manifest release/agent-image-manifest.json \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: mekenthompson/hermes-agent
+          ref: ${{ steps.agent.outputs.AGENT_REVISION }}
+          path: agent-source
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.7'
+      - name: Real Agent Kanban scenarios
+        env:
+          HERMES_AGENT_SRC: ${{ github.workspace }}/agent-source
+        run: |
+          python -m venv "$RUNNER_TEMP/linear-scenarios"
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt
+          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$HERMES_AGENT_SRC"
 
   history-root:
     runs-on: ubuntu-latest

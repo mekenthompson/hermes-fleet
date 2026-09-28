@@ -168,6 +168,16 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
 Kanban board from the pinned Agent:
 
 ```bash
-HERMES_AGENT_SRC=/path/to/hermes-agent /path/to/agent-venv/bin/python \
-  -m unittest discover -s tests -p 'test_linear_kanban_scenarios.py'
+python3 -m venv .venv-linear
+.venv-linear/bin/python -m pip install --require-hashes --only-binary=:all: \
+  -r release/linear-scenario-requirements.txt
+.venv-linear/bin/python scripts/run-linear-scenarios.py \
+  --agent-source /path/to/manifest-pinned/hermes-agent
 ```
+
+Run from this repository with Python 3.14.7 and a separate process from general unit discovery.
+The runner checks the source Git HEAD against `release/agent-image-manifest.json`, then fails for
+missing source, import errors, zero tests, failures, or any skipped scenario. CI checks out that
+exact revision and runs this lane on every pull request and main push. The scenarios use fake
+Linear traffic and local Kanban state; they do not enable the runtime plugin. Unit tests and this
+scenario lane prove source behavior, while image publication and deployment require their own gates.
