@@ -1,9 +1,10 @@
 """Integration scenarios for plugins/linear: a fake Linear over HTTP and a REAL Kanban board.
 
 Needs the pinned Hermes Agent source (and its Python deps) on the path:
-    HERMES_AGENT_SRC=/path/to/hermes-agent <agent-venv>/bin/python -m unittest tests.test_linear_kanban_scenarios
+    <scenario-venv>/bin/python scripts/run-linear-scenarios.py --agent-source /path/to/hermes-agent
 Run it in its own process: older Linear tests stub `agent.*` modules in-process.
-Skipped when the Agent source is unavailable (public CI has no Agent checkout).
+General unit discovery skips when Agent source is unavailable. The dedicated CI runner
+checks the manifest revision and fails on any skip.
 One test per rule in the rebuild plan's flows 1-10.
 """
 from __future__ import annotations
