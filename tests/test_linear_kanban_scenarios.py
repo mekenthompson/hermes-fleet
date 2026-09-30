@@ -856,6 +856,32 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.bridge.store.pending(), [])
         self.assertEqual(self.linear.requests, [])
 
+    def test_activation_cutoff_rejects_undated_signed_delivery_without_any_effect(self) -> None:
+        import sqlite3
+        from linear_ingress_fixture import IngressStore, Route
+
+        cutoff_ms = int(self.clock() * 1000)
+        self.bridge = self.make_bridge({"activation_cutoff_ms": cutoff_ms})
+        inbox = self.dir / "fresh-ingress.db"
+        ingress = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "secret", inbox)
+        event = self.linear.session_event("created", ISSUE, "s-undated", at=1)
+        for field in ("agentActivity", "agentSession", "data"):
+            if isinstance(event.get(field), dict):
+                event[field].pop("createdAt", None)
+                event[field].pop("updatedAt", None)
+        event.pop("createdAt", None)
+        # Valid signed delivery time proves freshness, not when the source action happened.
+        event["webhookTimestamp"] = cutoff_ms + 1000
+        ingress.enqueue(route, "delivery-undated", json.dumps(event).encode())
+        self.bridge.tick(inbox)
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.bridge.store.pending(), [])
+        self.assertEqual(self.linear.requests, [])
+
     def test_activation_cutoff_admits_equal_boundary_and_survives_duplicate_restart(self) -> None:
         import sqlite3
         from linear_ingress_fixture import IngressStore, Route

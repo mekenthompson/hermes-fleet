@@ -75,11 +75,9 @@ def activation_event_ms(event: dict[str, Any]) -> float | None:
             continue
         if math.isfinite(stamp):
             return stamp
-    stamp = event.get("webhookTimestamp")
-    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
-        return None
-    numeric = float(stamp)
-    return numeric if math.isfinite(numeric) else None
+    # webhookTimestamp proves delivery freshness, not source-event age.
+    # Never let a delayed or undated event cross the activation boundary on it.
+    return None
 
 
 def validate_activation_cutoff_ms(value: Any) -> int | None:
