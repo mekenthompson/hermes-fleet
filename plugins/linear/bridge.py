@@ -197,10 +197,8 @@ class Bridge:
         return override[key] if key in override else self.states.get(key)
 
     def me(self) -> str | None:
-        try:
-            return self.api.viewer_id()
-        except LinearError:
-            return None
+        try: return self.api.viewer_id()
+        except LinearError: return None
 
     @staticmethod
     def _needs_reauthorization(exc: Exception) -> bool:
@@ -342,8 +340,18 @@ class Bridge:
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
 
+    def may_execute_existing(self, issue_id: str) -> bool:
+        try:
+            issue, me = self.api.issue(issue_id), self.api.viewer_id()
+            return bool(me) and (issue.get("delegate") or {}).get("id") == me
+        except LinearError as exc:
+            log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
+            return False
+
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
+        if row and row["origin"] == "kanban" and not self.may_execute_existing(issue_id):
+            return
         session = event.get("agentSession") or {}
         creator = session.get("creatorId") or (session.get("creator") or {}).get("id")
         echo = creator is not None and creator == self.me()  # our own chat-start delegation fires 'created'
@@ -369,6 +377,8 @@ class Bridge:
 
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         if row and event_ms(event) < float(row["last_updated_at"]):
+            return
+        if row and not self.may_execute_existing(issue["id"]):
             return
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
@@ -608,6 +618,8 @@ class Bridge:
             if row.get("stop_requested_at"):
                 self.inject(row["owner_ref"], "[Linear] Stop was requested before the restart. Do not resume this issue "
                                                "until a newer instruction explicitly reopens it.")
+                continue
+            if not self.may_execute_existing(row["issue_id"]):
                 continue
             if not self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a Linear "
                                                  "issue. Reconcile what already happened, then continue; finish "

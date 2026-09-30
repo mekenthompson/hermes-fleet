@@ -140,6 +140,109 @@ class LinearKanbanScenarios(unittest.TestCase):
     def types(self) -> list[str]:
         return [a["content"]["type"] for a in self.linear.activities]
 
+    def bind_identity(self) -> None:
+        self.bound_actor = SELF
+        transport = self.bridge.api.transport
+
+        def bound_transport(url, body, headers):
+            query = json.loads(body)["query"]
+            if "IdentityBinding" in query:
+                self.linear.requests.append("query IdentityBinding { viewer { id } organization { id } }")
+                return 200, {}, json.dumps({"data": {
+                    "viewer": {"id": self.bound_actor}, "organization": {"id": "fixture-org"},
+                }}).encode()
+            return transport(url, body, headers)
+
+        self.bridge.api = plugin.BoundLinearAPI(lambda: "synthetic-token", endpoint=self.linear.url,
+            identity={"viewer_id": SELF, "organization_id": "fixture-org"}, transport=bound_transport)
+
+    def test_existing_task_resume_refuses_issue_read_outage(self) -> None:
+        from hermes_fleet_linear_plugin.api import LinearError
+        self.bind_identity()
+        self.delegate()
+        task = self.task_id()
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+        self.clock.now += 1
+        before = self.bridge.store.get(ISSUE)
+        self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(LinearError("fixture read outage"))
+        self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
+        self.bridge.tick()
+        self.assertEqual(self.tasks(), [(task, "blocked")])
+        self.assertEqual(self.bridge.store.get(ISSUE), before)
+
+    def test_existing_task_resume_requires_current_owner_identity_and_scope(self) -> None:
+        self.bind_identity()
+        self.delegate()
+        task = self.task_id()
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+        self.clock.now += 1
+        before = self.bridge.store.get(ISSUE)
+        for refusal in ("delegate", "unassigned", "actor", "scope"):
+            self.bound_actor = OTHER["id"] if refusal == "actor" else SELF
+            self.bridge.api.identity.pop("projects", None)
+            self.linear.set_delegate(ISSUE, OTHER if refusal == "delegate" else None if refusal == "unassigned"
+                                     else {"id": SELF, "name": "This Agent"})
+            if refusal == "scope":
+                self.bridge.api.identity["projects"] = ["outside-project"]
+            with self.subTest(refusal=refusal):
+                self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
+                with self.bridge.kanban.conn() as conn:
+                    self.assertIsNone(kb.claim_task(conn, task, claimer="isolated-no-executor"))
+                self.assertEqual(self.tasks(), [(task, "blocked")])
+                self.assertEqual(self.bridge.store.get(ISSUE), before)
+        self.bound_actor = SELF
+        self.bridge.api.identity.pop("projects", None)
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-2", body="authorized continue"))
+        self.assertEqual(self.tasks(), [(task, "ready")])
+
+    def test_chat_followup_requires_current_owner_identity_and_scope(self) -> None:
+        self.bind_identity()
+        self.assertTrue(self.chat("start")["ok"])
+        original_issue = self.bridge.api.issue
+        before = self.bridge.store.get(ISSUE)
+        for refusal in ("delegate", "unassigned", "actor", "scope", "read"):
+            self.bridge.api.issue = original_issue
+            self.bound_actor = OTHER["id"] if refusal == "actor" else SELF
+            self.bridge.api.identity.pop("projects", None)
+            self.linear.set_delegate(ISSUE, OTHER if refusal == "delegate" else None if refusal == "unassigned"
+                                     else {"id": SELF, "name": "This Agent"})
+            if refusal == "scope":
+                self.bridge.api.identity["projects"] = ["outside-project"]
+            if refusal == "read":
+                self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(plugin.LinearError("fixture read outage"))
+            with self.subTest(refusal=refusal):
+                injected = list(self.injected)
+                self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write"))
+                self.assertEqual(self.injected, injected)
+                self.assertEqual(self.bridge.store.get(ISSUE), before)
+        self.bridge.api.issue = original_issue
+        self.bound_actor = SELF
+        self.bridge.api.identity.pop("projects", None)
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="authorized follow-up"))
+        self.assertTrue(any("authorized follow-up" in body for _, body in self.injected))
+
+    def test_existing_redelegation_refuses_owner_replacement_after_takeover(self) -> None:
+        self.bind_identity()
+        self.delegate()
+        task = self.task_id()
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+        self.clock.now += 1
+        before = self.bridge.store.get(ISSUE)
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.handle_webhook(self.linear.session_event("created", ISSUE, "s-2"))
+        self.assertEqual(self.tasks(), [(task, "blocked")])
+        self.assertEqual(self.bridge.store.get(ISSUE), before)
+
+    def test_chat_recovery_does_not_resume_after_authoritative_takeover(self) -> None:
+        self.bind_identity()
+        self.assertTrue(self.chat("start")["ok"])
+        self.linear.set_delegate(ISSUE, OTHER)
+        before = list(self.injected), self.bridge.store.get(ISSUE)
+        self.bridge.recover()
+        self.assertEqual((self.injected, self.bridge.store.get(ISSUE)), before)
+
     # -- flows ---------------------------------------------------------------
     def test_delegated_run_reaches_done_with_one_message(self) -> None:
         self.delegate()
@@ -202,6 +305,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         # Chat-owned work: the follow-up is injected into the owning chat session.
         self.linear.add_issue("iss-2", "ABC-2")
         chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-id"))
+        self.bridge.flush()  # Work-bearing steering waits for the queued claim to be confirmed.
+        self.assertEqual(self.linear.issues["iss-2"]["delegate"]["id"], SELF)
         self.deliver(self.linear.session_event("prompted", "iss-2", "s-9", body="Use the staging data"))
         self.assertIn(("chat-key", "[Linear follow-up on ABC-2] Use the staging data"), self.injected)
 
