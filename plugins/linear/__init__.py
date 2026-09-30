@@ -12,13 +12,13 @@ from typing import Any
 
 from . import chat
 from .api import ENDPOINT, LinearAPI, LinearError
-from .bridge import Bridge, Kanban
+from .bridge import Bridge, Kanban, validate_activation_cutoff_ms
 from .oauth import token_provider
 from .store import Store
 
 log = logging.getLogger("linear")
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
-            "api_url", "board", "ingress_database", "state_database", "tick_seconds")
+            "api_url", "board", "ingress_database", "state_database", "tick_seconds", "activation_cutoff_ms")
 
 
 class BoundLinearAPI(LinearAPI):
@@ -133,6 +133,7 @@ def register(ctx: Any) -> None:
 
     async def service(runtime: Any) -> None:
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
+        validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         home = Path(runtime.profile_home)
         api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
                              endpoint=settings.get("api_url") or ENDPOINT)

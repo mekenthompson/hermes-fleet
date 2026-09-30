@@ -55,6 +55,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
+        (self.dir / "kanban").mkdir(mode=0o700)
         os.environ["HERMES_KANBAN_HOME"] = str(self.dir / "kanban")
         self.clock = Clock()
         self.linear = FakeLinear(self.clock)
@@ -830,6 +831,80 @@ class LinearKanbanScenarios(unittest.TestCase):
         with sqlite3.connect(inbox) as db:
             self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "failed")
         self.assertEqual(len([c for c in self.linear.comments if "parked" in c["body"]]), 1)
+
+    def test_activation_cutoff_discards_delayed_valid_delivery_before_work_or_writes(self) -> None:
+        import sqlite3
+        from linear_ingress_fixture import IngressStore, Route
+
+        cutoff_ms = int(self.clock() * 1000)
+        self.bridge = self.make_bridge({"activation_cutoff_ms": cutoff_ms})
+        inbox = self.dir / "fresh-ingress.db"
+        ingress = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "secret", inbox)
+        delayed = self.linear.session_event("created", ISSUE, "s-delayed", at=-1)
+        ingress.enqueue(route, "delivery-delayed", json.dumps(delayed).encode())
+
+        self.bridge.tick(inbox)
+
+        db = sqlite3.connect(inbox)
+        try:
+            self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+        finally:
+            db.close()
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.bridge.store.pending(), [])
+        self.assertEqual(self.linear.requests, [])
+
+    def test_activation_cutoff_admits_equal_boundary_and_survives_duplicate_restart(self) -> None:
+        import sqlite3
+        from linear_ingress_fixture import IngressStore, Route
+
+        cutoff_ms = int(self.clock() * 1000)
+        self.bridge = self.make_bridge({"activation_cutoff_ms": cutoff_ms})
+        inbox = self.dir / "fresh-ingress.db"
+        ingress = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "secret", inbox)
+        event = self.linear.session_event("created", ISSUE, "s-boundary", at=0)
+        payload = json.dumps(event).encode()
+        ingress.enqueue(route, "delivery-boundary", payload)
+
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.tasks()), 1)
+        writes_after_first_admission = [query for query in self.linear.requests if query.startswith("mutation")]
+
+        self.bridge = self.make_bridge()  # The persisted cutoff remains active without config.
+        ingress.enqueue(route, "delivery-boundary-duplicate", payload)
+        self.bridge.tick(inbox)
+
+        db = sqlite3.connect(inbox)
+        try:
+            statuses = [row[0] for row in db.execute("SELECT status FROM deliveries ORDER BY delivery_id")]
+        finally:
+            db.close()
+        self.assertEqual(statuses, ["imported", "imported"])
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual([query for query in self.linear.requests if query.startswith("mutation")],
+                         writes_after_first_admission)
+
+    def test_activation_cutoff_requires_positive_integer_and_refuses_existing_work(self) -> None:
+        cutoff_ms = int(self.clock() * 1000)
+        for invalid in (0, -1, True, 1.5, str(cutoff_ms)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.make_bridge({"activation_cutoff_ms": invalid})
+
+        self.bridge.store.put(ISSUE, "kanban", "legacy-task", task_id="old-task")
+        with self.assertRaisesRegex(ValueError, "existing work"):
+            self.make_bridge({"activation_cutoff_ms": cutoff_ms})
+        self.assertEqual(self.bridge.store.get(ISSUE)["task_id"], "old-task")
+        self.assertEqual(self.linear.requests, [])
+
+    def test_activation_cutoff_cannot_change_after_it_is_persisted(self) -> None:
+        cutoff_ms = int(self.clock() * 1000)
+        self.bridge = self.make_bridge({"activation_cutoff_ms": cutoff_ms})
+
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            self.make_bridge({"activation_cutoff_ms": cutoff_ms + 1})
 
     def test_day_long_outage_catches_up_without_duplicates(self) -> None:
         self.delegate()  # existing authorized execution survives an API outage
