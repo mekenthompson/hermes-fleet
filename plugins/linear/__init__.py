@@ -11,14 +11,69 @@ from pathlib import Path
 from typing import Any
 
 from . import chat
-from .api import ENDPOINT, LinearAPI
+from .api import ENDPOINT, LinearAPI, LinearError
 from .bridge import Bridge, Kanban
 from .oauth import token_provider
 from .store import Store
 
 log = logging.getLogger("linear")
-SETTINGS = ("credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
+SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "state_database", "tick_seconds")
+
+
+class BoundLinearAPI(LinearAPI):
+    """Bind configured credentials to an immutable deployment actor and workspace."""
+
+    def __init__(self, token, *, identity, **kwargs):
+        if not isinstance(identity, dict) or any(
+                not isinstance(identity.get(k), str) or not identity[k].strip()
+                for k in ("viewer_id", "organization_id")):
+            raise ValueError("linear: identity needs viewer_id and organization_id")
+        for key in ("teams", "projects"):
+            if key in identity and (not isinstance(identity[key], list) or not identity[key] or
+                                    any(not isinstance(v, str) or not v.strip() for v in identity[key])):
+                raise ValueError(f"linear: identity.{key} must be a nonempty list of IDs or keys")
+        self.identity = {k: list(v) if isinstance(v, list) else v for k, v in identity.items()}
+        super().__init__(token, **kwargs)
+
+    def verify_identity(self):
+        identity = super().graphql("query IdentityBinding { viewer { id } organization { id } }")
+        if any(not isinstance(identity.get(field), dict) or
+               identity[field].get("id") != self.identity[expected]
+               for field, expected in (("viewer", "viewer_id"), ("organization", "organization_id"))):
+            raise LinearError("Linear actor/workspace does not match configured identity", retryable=False)
+
+    def graphql(self, query, variables=None):
+        self.verify_identity()
+        return super().graphql(query, variables)
+
+    def viewer_id(self) -> str:
+        self.verify_identity()
+        return str(self.identity["viewer_id"])
+
+    def issue(self, ref):
+        issue = super().issue(ref)
+        team = issue.get("team") or {}
+        if self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]):
+            raise LinearError("Linear issue team is outside configured scope", retryable=False)
+        if self.identity.get("projects") and (issue.get("project") or {}).get("id") not in self.identity["projects"]:
+            raise LinearError("Linear issue project is outside configured scope", retryable=False)
+        return issue
+
+    def update_issue(self, issue_id, fields):
+        if self.identity.get("teams") or self.identity.get("projects"):
+            self.issue(issue_id)
+        return super().update_issue(issue_id, fields)
+
+    def create_comment(self, client_id, issue_id, body):
+        if self.identity.get("teams") or self.identity.get("projects"):
+            self.issue(issue_id)
+        return super().create_comment(client_id, issue_id, body)
+
+    def create_project_update(self, client_id, project_id, body):
+        if self.identity.get("projects") and project_id not in self.identity["projects"]:
+            raise LinearError("Linear project is outside configured scope", retryable=False)
+        return super().create_project_update(client_id, project_id, body)
 
 
 async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
@@ -79,7 +134,10 @@ def register(ctx: Any) -> None:
     async def service(runtime: Any) -> None:
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
         home = Path(runtime.profile_home)
-        api = LinearAPI(token_provider(settings, home), endpoint=settings.get("api_url") or ENDPOINT)
+        api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
+                             endpoint=settings.get("api_url") or ENDPOINT)
+        api.token = token_provider(settings, home)  # identity settings validated before credentials
+        await asyncio.to_thread(api.viewer_id)  # refuse before state, recovery, or service admission
         bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
                         await asyncio.to_thread(Kanban, settings.get("board")), profile=runtime.profile_name,
                         settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
