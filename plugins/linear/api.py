@@ -34,6 +34,16 @@ class RateLimited(LinearError):
         self.until = until
 
 
+def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
+    result = data.get(mutation)
+    success = result.get("success") if isinstance(result, dict) else None
+    if success is True:
+        return
+    if success is False:
+        raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
+    raise LinearError(f"Linear {mutation} response did not confirm success")
+
+
 def is_duplicate_create_error(errors: Any, client_id: str) -> bool:
     """True when Linear rejected a create because an entity with our client ``id`` exists.
 
@@ -139,9 +149,14 @@ class LinearAPI:
         return payload["data"]
 
     def viewer_id(self) -> str:
-        if self._viewer is None:
-            self._viewer = str(self.graphql("query Viewer { viewer { id } }")["viewer"]["id"])
-        return self._viewer
+        if self._viewer is not None:
+            return self._viewer
+        viewer = self.graphql("query Viewer { viewer { id } }").get("viewer")
+        candidate = viewer.get("id") if isinstance(viewer, dict) else None
+        if not isinstance(candidate, str) or not candidate:
+            raise LinearError("Linear viewer identity response is missing an id")
+        self._viewer = candidate
+        return candidate
 
     def issue(self, ref: str) -> dict[str, Any]:
         data = self.graphql(f"query Issue($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}", {"id": ref})
@@ -150,13 +165,16 @@ class LinearAPI:
         return data["issue"]
 
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> None:
-        self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
-                     "{ issueUpdate(id: $id, input: $input) { success } }", {"id": issue_id, "input": fields})
+        data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
+                            "{ issueUpdate(id: $id, input: $input) { success } }",
+                            {"id": issue_id, "input": fields})
+        _require_mutation_success(data, "issueUpdate")
 
     def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
         try:
-            self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",
-                         {"input": fields})
+            data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",
+                                {"input": fields})
+            _require_mutation_success(data, mutation)
         except LinearError as exc:
             if not is_duplicate_create_error(exc.errors, fields["id"]):
                 raise
