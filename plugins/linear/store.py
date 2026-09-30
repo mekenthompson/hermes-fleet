@@ -1,4 +1,4 @@
-"""Profile-local plugin state: two tables, ``work`` and ``outbox``. No cross-container state.
+"""Profile-local plugin state. No cross-container state.
 
 ``work``: one row per issue this profile is actively working (deleted when work ends, so
 there are no tombstones). ``outbox``: pending Linear writes. Creates reuse the row ``id``
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS chat_stop (
   status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
   completion_activity_id TEXT, uncertainty_activity_id TEXT,
   UNIQUE(profile, issue_id, linear_session_id, source_activity_id));
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
@@ -68,6 +69,23 @@ class Store:
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
+
+    def activation_cutoff_ms(self, configured: int | None = None) -> int | None:
+        """Persist the first fresh-work cutoff; never replace legacy or differently-cut state."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key='activation_cutoff_ms'").fetchone()
+            if row:
+                stored = int(row["value"])
+                if configured is not None and configured != stored:
+                    raise ValueError("linear: activation_cutoff_ms cannot change after it is persisted")
+                return stored
+            if configured is None:
+                return None
+            for table in ("work", "outbox", "chat_stop"):
+                if db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    raise ValueError("linear: cannot establish activation_cutoff_ms over existing work state")
+            db.execute("INSERT INTO metadata (key, value) VALUES ('activation_cutoff_ms', ?)", (str(configured),))
+            return configured
 
     # -- work -------------------------------------------------------------
     def get(self, issue_id: str) -> dict[str, Any] | None:

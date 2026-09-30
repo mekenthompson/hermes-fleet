@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -61,6 +62,32 @@ def event_ms(event: dict[str, Any]) -> float:
             return parsed
     stamp = event.get("webhookTimestamp")
     return float(stamp) if isinstance(stamp, (int, float)) else time.time() * 1000
+
+
+def activation_event_ms(event: dict[str, Any]) -> float | None:
+    """Return a signed source timestamp, without the legacy current-time fallback."""
+    activity, session, data = event.get("agentActivity") or {}, event.get("agentSession") or {}, event.get("data") or {}
+    for raw in (activity.get("createdAt"), session.get("createdAt"), session.get("updatedAt"),
+                event.get("createdAt"), data.get("updatedAt")):
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000
+        except (ValueError, OverflowError, OSError):
+            continue
+        if math.isfinite(stamp):
+            return stamp
+    stamp = event.get("webhookTimestamp")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        return None
+    numeric = float(stamp)
+    return numeric if math.isfinite(numeric) else None
+
+
+def validate_activation_cutoff_ms(value: Any) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ValueError("linear: activation_cutoff_ms must be a positive integer Unix epoch in milliseconds")
+    return value
 
 
 def evidence_links(text: str) -> list[str]:
@@ -149,6 +176,8 @@ class Bridge:
                  clock: Callable[[], float] = time.time) -> None:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.inject, self.clock = store, api, kanban, profile, inject, clock
+        cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
+        self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
         self.states = {"in_progress": "In Progress", "done": "Done", "blocked": "Blocked", **(settings.get("states") or {})}
         self.team_states = settings.get("team_states") or {}
         self.contracts = settings.get("completion_contracts") or {}
@@ -279,6 +308,10 @@ class Bridge:
 
     # -- Linear -> Kanban -------------------------------------------------
     def handle_webhook(self, event: dict[str, Any]) -> None:
+        if self.activation_cutoff_ms is not None:
+            stamp = activation_event_ms(event)
+            if stamp is None or stamp < self.activation_cutoff_ms:
+                return
         data = event.get("data") or {}
         if event.get("type") == "Issue" and "delegateId" in (event.get("updatedFrom") or {}) and data.get("id"):
             row = self.store.get(data["id"])

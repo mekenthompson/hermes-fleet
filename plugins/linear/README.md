@@ -49,6 +49,13 @@ plugins:
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
 `api_url`, `tick_seconds` (default 2).
 
+For an approved fresh-work pilot only, set `activation_cutoff_ms` to a positive integer Unix epoch
+timestamp in milliseconds. Events with a source timestamp before it (or without a usable source
+timestamp) are imported without being applied; the boundary is inclusive. The cutoff is persisted
+in the state database, cannot be changed, and cannot first be set over existing work, outbox, or
+chat-stop state. Use a fresh isolated state database and inbox for activation. Leave it unset to
+preserve legacy behavior; this boundary does not recover or clear legacy state.
+
 Credentials: with `connect`, 1Password Connect is the source of truth for the OAuth client and the
 current refresh token. The local cache holds only the access token, plus a rotated refresh token
 until Connect accepts it. Delete the cache and it rebuilds. Each profile uses its own Linear app
