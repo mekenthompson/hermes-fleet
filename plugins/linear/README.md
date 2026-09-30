@@ -18,11 +18,15 @@ Add one block to the profile's config, in the deployment overlay. The values bel
 
 ```yaml
 plugins:
+  enabled: [linear]  # append to the existing list; preserve other enabled plugins
   entries:
     linear:
       allow_gateway_injection: true   # lets follow-ups and stop requests reach chat sessions
       settings:
         enabled: true
+        identity:
+          viewer_id: example-app-user-id
+          organization_id: example-workspace-id
         credentials:
           mode: connect                     # or: token_file (with path:)
           vault_id: example-vault-id
@@ -48,7 +52,13 @@ Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (
 Credentials: with `connect`, 1Password Connect is the source of truth for the OAuth client and the
 current refresh token. The local cache holds only the access token, plus a rotated refresh token
 until Connect accepts it. Delete the cache and it rebuilds. Each profile uses its own Linear app
-identity; the plugin reads `viewer.id` to learn who "self" is.
+identity. Deployment requires the immutable `identity.viewer_id` and
+`identity.organization_id` binding above. Startup validates the binding before credential access
+or state admission. API calls and chat authorization revalidate the actor/workspace and refuse
+mismatches rather than falling back to a delegate. Optional `identity.teams` and
+`identity.projects` lists restrict issue lookups and issue writes; they are not a complete
+specialist authorization boundary for Agent Session activity or arbitrary GraphQL calls.
+Keep specialist activation disabled until its separate scope contract is accepted.
 
 Webhooks: the host ingress verifies the HMAC signature and the one-minute `webhookTimestamp`
 window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Delivery` header, not
