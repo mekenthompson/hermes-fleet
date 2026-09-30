@@ -377,13 +377,12 @@ class Bridge:
 
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
         issue_id = issue["id"]
-        try:
-            fresh = self.api.issue(issue_id)
-        except LinearError:
-            fresh = None  # Linear unreachable: trust the event; the pre-write re-read catches takeovers
-        me = self.me() if fresh else None
+        fresh = self.api.issue(issue_id)  # refuse new execution until current ownership is known
+        me = self.me()
+        if not me:
+            raise LinearError("Linear viewer identity unavailable; cannot create or claim Kanban work")
         delegate = ((fresh or {}).get("delegate") or {}).get("id")
-        if fresh and me and delegate and delegate != me:
+        if fresh and delegate and delegate != me:
             log.info("linear: ignoring delegation of %s; delegate is now %s", issue_id, delegate)
             return True
         info = {**issue, **(fresh or {})}
@@ -399,7 +398,7 @@ class Bridge:
         self.kanban.subscribe(task.id, issue_id)
         self.store.put(issue_id, "kanban", session_id, task_id=task.id, project_id=project, last_updated_at=stamp)
         self.activity(issue_id, session_id, "thought", f"On it. Queued as Kanban task {task.id}.")  # ack first (10 s)
-        self.status(issue_id, "in_progress", claim=True, seen=me or delegate or "self")
+        self.status(issue_id, "in_progress", claim=True, seen=me)
         return True
 
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> None:

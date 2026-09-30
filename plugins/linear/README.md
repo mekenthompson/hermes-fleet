@@ -90,6 +90,11 @@ configured contract. Set `completion_contracts` to make core enforce that check 
 completion too. A non-GitHub pull-request link is not accepted as completion evidence. Other
 work needs a destination link such as a merged commit, deploy check, or findings.
 
+Chat closeout receipts acknowledge durable local queuing, not remote acceptance.
+Named mutations require literal `success: true`; refusals retain failed recovery rows and
+alert the owning destination. New execution requires a fresh issue ownership read as well
+as verified actor identity. An API outage delays new delegation rather than admitting stale work.
+
 **Restart.** Core respawns Kanban workers. The task body starts with a reconcile step, so a retry
 checks what already happened before continuing. When the breaker trips, the issue goes to Blocked.
 The bridge records each Kanban event and its queued Linear writes in one local transaction;

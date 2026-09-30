@@ -99,6 +99,43 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.tick()
         return json.loads(out)
 
+    def test_chat_mutations_require_the_exact_recorded_owner(self) -> None:
+        self.assertTrue(self.chat("start", session="owner-chat")["ok"])
+
+        def snapshot():
+            with sqlite3.connect(self.dir / "state.db") as db:
+                outbox = db.execute("SELECT id, kind, payload, attempts, next_at, state FROM outbox ORDER BY rowid").fetchall()
+            return (
+                self.bridge.store.get(ISSUE), tuple(outbox),
+                self.linear.issues[ISSUE]["updatedAt"], self.linear.state(ISSUE),
+                tuple(json.dumps(row, sort_keys=True) for row in self.linear.comments),
+                tuple(json.dumps(row, sort_keys=True) for row in self.linear.activities),
+                tuple(json.dumps(row, sort_keys=True) for row in self.linear.project_updates),
+                tuple(query for query in self.linear.requests if query.startswith("mutation")),
+            )
+
+        actions = {
+            "done": {"evidence": "https://docs.example/findings/owner-work"},
+            "blocked": {"note": "synthetic cross-session probe"},
+            "release": {"note": "synthetic cross-session probe"},
+        }
+        for action, args in actions.items():
+            with self.subTest(action=action, owner="foreign"):
+                before = snapshot()
+                reply = json.loads(chat.handle(
+                    self.bridge, {"action": action, "issue": "ABC-1", **args}, Context("other-chat", "other-chat-id")))
+                self.assertFalse(reply["ok"])
+                self.assertEqual(snapshot(), before)
+
+            self.bridge.store.update(ISSUE, owner_ref="")
+            with self.subTest(action=action, owner="missing"):
+                before = snapshot()
+                reply = json.loads(chat.handle(
+                    self.bridge, {"action": action, "issue": "ABC-1", **args}, Context("owner-chat", "owner-chat-id")))
+                self.assertFalse(reply["ok"])
+                self.assertEqual(snapshot(), before)
+            self.bridge.store.update(ISSUE, owner_ref="owner-chat")
+
     def types(self) -> list[str]:
         return [a["content"]["type"] for a in self.linear.activities]
 
@@ -677,8 +714,10 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("repeated failed attempts", self.linear.activities[-1]["content"]["body"])
 
     def test_queued_claim_never_overrides_a_later_human_close(self) -> None:
+        from unittest.mock import patch
+        with patch.object(self.bridge, "flush", return_value=0):
+            self.delegate()  # verified issue read, but claim remains durably queued
         self.linear.down = True
-        self.delegate()
         self.clock.now += 600
         self.linear.set_state(ISSUE, "Canceled")  # a human cancels while our claim is still queued
         self.linear.down = False
@@ -689,8 +728,10 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIsNone(self.bridge.store.get(ISSUE))
 
     def test_queued_claim_never_undoes_a_later_delegate_removal(self) -> None:
+        from unittest.mock import patch
+        with patch.object(self.bridge, "flush", return_value=0):
+            self.delegate()  # verified issue read, but claim remains durably queued
         self.linear.down = True
-        self.delegate()
         self.clock.now += 600
         self.linear.set_delegate(ISSUE, None)  # a human takes the agent off while our claim is queued
         self.linear.down = False
@@ -708,16 +749,43 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual([s for _, s in self.tasks()], ["ready"])
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
 
-    def test_credential_outage_keeps_the_delegation(self) -> None:
-        def broken() -> str:
-            raise RuntimeError("Connect unreachable")
+    def test_start_fails_closed_when_viewer_identity_fails_before_kanban_creation(self) -> None:
+        from hermes_fleet_linear_plugin.api import LinearError
 
-        self.bridge.api.token = broken
-        self.delegate()
-        self.assertEqual(len(self.tasks()), 1)  # the delegation is not dropped
-        self.bridge.api.token = lambda: "synthetic-token"
-        self.clock.now += 120
-        self.bridge.tick()
+        self.linear.set_delegate(ISSUE, OTHER)
+        original_me = self.bridge.me
+        calls = 0
+
+        def one_viewer_failure():
+            nonlocal calls
+            calls += 1
+            return None if calls == 2 else original_me()
+
+        self.bridge.me = one_viewer_failure
+        event = self.linear.session_event("created", ISSUE, "foreign-session", creator="human-1")
+        with self.assertRaisesRegex(LinearError, "viewer identity"):
+            self.bridge.handle_webhook(event)
+
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.linear.issues[ISSUE]["delegate"]["id"], OTHER["id"])
+        self.assertEqual(self.linear.state(ISSUE), "Todo")
+        self.assertEqual(self.bridge.store.pending(), [])
+        self.assertEqual([query for query in self.linear.requests if query.startswith("mutation")], [])
+
+    def test_issue_read_outage_does_not_admit_stale_delegation(self) -> None:
+        from hermes_fleet_linear_plugin.api import LinearError
+
+        original_issue = self.bridge.api.issue
+        event = self.linear.session_event("created", ISSUE, "s-retry")
+        self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(LinearError("issue read unavailable"))
+        with self.assertRaises(LinearError):
+            self.bridge.handle_webhook(event)
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.bridge.api.issue = original_issue
+        self.deliver(event)
+        self.assertEqual(len(self.tasks()), 1)
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
 
     def test_revoked_refresh_token_alerts_chat_on_first_failed_write(self) -> None:
@@ -764,17 +832,25 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(len([c for c in self.linear.comments if "parked" in c["body"]]), 1)
 
     def test_day_long_outage_catches_up_without_duplicates(self) -> None:
+        self.delegate()  # existing authorized execution survives an API outage
         self.linear.down = True
-        self.delegate()
-        self.assertEqual(len(self.tasks()), 1)  # work starts even while Linear is unreachable
+        self.assertEqual(len(self.tasks()), 1)
         task_id = self.task_id()
         self.complete(task_id, "Deployed and checked: https://status.example/check/1")
         for _ in range(23):
             self.clock.now += 3600
             self.bridge.tick()
-        self.assertEqual(self.linear.activities, [])
+        self.assertEqual(self.types(), ["thought"])  # no new effects during outage
         self.linear.down = False
-        self.linear.lose_next_response = True  # a write lands but its response is lost
+        original_apply = self.linear._apply
+        lose_comment = True
+        def lose_one_comment_response(query, variables):
+            nonlocal lose_comment
+            if lose_comment and "commentCreate" in query:
+                self.linear.lose_next_response = True
+                lose_comment = False
+            return original_apply(query, variables)
+        self.linear._apply = lose_one_comment_response  # idempotent create lands but response is lost
         for _ in range(6):
             self.clock.now += 3600
             self.bridge.tick()
@@ -782,6 +858,36 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(len(self.linear.project_updates), 1)
         self.assertEqual(self.bridge.store.pending(), [])
+
+    def test_refused_terminal_mutation_keeps_recovery_rows_and_truthful_receipt(self) -> None:
+        from hermes_fleet_linear_plugin.store import Store
+        self.assertTrue(self.chat("start")["ok"])
+        original = self.linear._apply
+        def rejected(query, variables):
+            for mutation in ("issueUpdate", "commentCreate", "projectUpdateCreate"):
+                if mutation in query:
+                    return 200, {"data": {mutation: {"success": False}}}
+            return original(query, variables)
+        self.linear._apply = rejected
+        result = self.chat("done", evidence="https://docs.example/findings/1")
+        self.assertTrue(result["ok"])  # receipt acknowledges durable local capture only
+        self.assertIn("queued", result["message"])
+        self.assertIn("not yet confirmed", result["message"])
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        with self.bridge.store._tx() as db:
+            rows = db.execute("SELECT id, state, payload FROM outbox WHERE kind='status'").fetchall()
+        terminal = [r for r in rows if json.loads(r["payload"]).get("terminal")][0]
+        self.assertEqual(terminal["state"], "failed")
+        self.assertFalse(json.loads(terminal["payload"]).get("applied"))
+        status_id = terminal["id"]
+        self.bridge.store = Store(self.dir / "state.db")
+        self.assertFalse(self.bridge.store.terminal_status_applied(status_id))
+        self.assertIsNotNone(self.bridge.store.outbox_row(status_id))
+        self.clock.now += self.bridge.quiet
+        self.bridge.flush()
+        self.assertEqual(self.linear.comments, [])
+        self.assertEqual(self.linear.project_updates, [])
+        self.assertTrue(any("has not accepted" in message for _, message in self.injected))
 
     def test_give_up_after_a_day_is_loud_and_retried_later(self) -> None:
         self.assertTrue(self.chat("start")["ok"])
@@ -997,8 +1103,11 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertTrue(any("has not accepted" in body for body in comments))
 
     def test_rate_limit_reset_header_is_honoured(self) -> None:
+        from unittest.mock import patch
+        with patch.object(self.bridge, "flush", return_value=0):
+            self.delegate()  # pause applies to queued writes, not unverified execution admission
         self.linear.rate_limited_until = self.clock() + 120
-        self.delegate()
+        self.bridge.tick()
         calls = len(self.linear.requests)
         self.clock.now += 60
         self.bridge.tick()

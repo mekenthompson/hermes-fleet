@@ -23,7 +23,8 @@ from hermes_fleet_linear_plugin.store import Store  # noqa: E402
 PLUGIN = ROOT / "plugins" / "linear"
 # Durable chat Stop adds a profile/generation-fenced receipt path to this plugin.
 # Keep a bounded production surface without compressing safety-critical branches.
-BUDGET = 2000
+# Actor/workspace binding and mutation-refusal regressions require explicit safety branches.
+BUDGET = 2100
 
 
 class FakeContext:
@@ -128,6 +129,54 @@ class LinearPluginUnitTests(unittest.TestCase):
         with self.assertRaises(linear_api.RateLimited):
             client.viewer_id()
         self.assertEqual(len(calls), 1)
+
+    def test_malformed_viewer_identity_is_a_linear_error(self) -> None:
+        client = linear_api.LinearAPI(
+            lambda: "t",
+            transport=lambda *args: (200, {}, json.dumps({"data": {"viewer": {}}}).encode()),
+        )
+        with self.assertRaises(linear_api.LinearError):
+            client.viewer_id()
+        self.assertIsNone(client._viewer)
+
+    def test_named_mutations_require_literal_success_true(self) -> None:
+        mutations = (
+            ("issueUpdate", lambda api: api.update_issue("issue-1", {"stateId": "done"})),
+            ("commentCreate", lambda api: api.create_comment("client-1", "issue-1", "body")),
+            ("agentActivityCreate", lambda api: api.create_activity("client-1", "session-1", {"type": "response"})),
+            ("projectUpdateCreate", lambda api: api.create_project_update("client-1", "project-1", "body")),
+        )
+        malformed = (False, None, 1, "true", {}, "missing")
+        for mutation, invoke in mutations:
+            for success in malformed:
+                with self.subTest(mutation=mutation, success=success):
+                    def transport(url, body, headers):
+                        query = json.loads(body)["query"]
+                        self.assertIn(mutation, query)
+                        field = {} if success == "missing" else {"success": success}
+                        return 200, {}, json.dumps({"data": {mutation: field}}).encode()
+
+                    api = linear_api.LinearAPI(lambda: "t", transport=transport)
+                    with self.assertRaises(linear_api.LinearError) as caught:
+                        invoke(api)
+                    if success is False:
+                        self.assertFalse(caught.exception.retryable)
+
+    def test_named_mutations_accept_literal_success_true(self) -> None:
+        mutations = (
+            ("issueUpdate", lambda api: api.update_issue("issue-1", {"stateId": "done"})),
+            ("commentCreate", lambda api: api.create_comment("client-1", "issue-1", "body")),
+            ("agentActivityCreate", lambda api: api.create_activity("client-1", "session-1", {"type": "response"})),
+            ("projectUpdateCreate", lambda api: api.create_project_update("client-1", "project-1", "body")),
+        )
+        for mutation, invoke in mutations:
+            with self.subTest(mutation=mutation):
+                def transport(url, body, headers):
+                    query = json.loads(body)["query"]
+                    self.assertIn(mutation, query)
+                    return 200, {}, json.dumps({"data": {mutation: {"success": True}}}).encode()
+
+                invoke(linear_api.LinearAPI(lambda: "t", transport=transport))
 
     def test_unauthorized_refreshes_the_token_once(self) -> None:
         class Token:

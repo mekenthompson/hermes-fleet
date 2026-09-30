@@ -56,6 +56,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _start(bridge, issue, row, me, session_key, session_id, generation)
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
+        if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
+            return _reply(False, f"{ident} is not owned by this chat session; no change was made.")
         if action == "done":
             if row.get("stop_requested_at"):
                 return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "
@@ -70,7 +72,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             _finish(bridge, row, session_key, session_id, project, ident, "done",
                     f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
                     f"Done: {' '.join(links)}")
-            return _reply(True, f"{ident} marked Done in Linear.")
+            return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
         if action == "blocked":
             message = f"Blocked: {note or 'needs input'}."
             bridge.status(issue_id, "blocked")
@@ -82,11 +84,11 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 bridge.comment(issue_id, message)
             bridge.project_update(session_id, project, ident, f"Blocked: {note}", session_key=session_key,
                                   issue_id=issue_id)
-            return _reply(True, f"{ident} marked Blocked; it stays yours.")
+            return _reply(True, f"{ident} Blocked update queued; it stays yours. Delivery is not yet confirmed.")
         if action == "release":
             _finish(bridge, row, session_key, session_id, project, ident, "blocked",
                     f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished")
-            return _reply(True, f"Stopped tracking {ident}; it is Blocked in Linear.")
+            return _reply(True, f"Stopped chat tracking {ident}; Blocked closeout queued, not yet confirmed in Linear.")
     return _reply(False, f"Unknown action {action!r}.")
 
 
