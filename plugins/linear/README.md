@@ -67,6 +67,13 @@ mismatches rather than falling back to a delegate. Optional `identity.teams` and
 specialist authorization boundary for Agent Session activity or arbitrary GraphQL calls.
 Keep specialist activation disabled until its separate scope contract is accepted.
 
+Existing work has the same authorization requirement: delegation-driven task resumption,
+work-bearing follow-ups, and chat recovery re-read the bound actor/workspace, applicable
+issue scope and current delegate before scheduling or injection. A failed read, foreign
+or absent delegate, or identity/scope mismatch leaves the existing work and owner unchanged.
+A queued chat claim is not confirmation of delegation. Stop remains a separate fail-safe
+control path and does not depend on permission to resume.
+
 Webhooks: the host ingress verifies the HMAC signature and the one-minute `webhookTimestamp`
 window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Delivery` header, not
 `webhookId`, which is constant. It then writes each delivery to this profile's inbox table
