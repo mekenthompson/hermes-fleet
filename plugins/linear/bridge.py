@@ -373,6 +373,8 @@ class Bridge:
             return (bool(me) and (issue.get("delegate") or {}).get("id") == me and
                     (not closed or (source_ms is not None and source_ms >= self.closure_ms(issue))))
         except LinearError as exc:
+            if exc.retryable:
+                raise  # ingress must retain the delivery until authorization can be read
             log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
             return False
 
@@ -690,8 +692,11 @@ class Bridge:
                 self.inject(row["owner_ref"], "[Linear] Stop was requested before the restart. Do not resume this issue "
                                                "until a newer instruction explicitly reopens it.")
                 continue
-            if not self.may_execute_existing(row["issue_id"]):
-                continue
+            try:
+                if not self.may_execute_existing(row["issue_id"]):
+                    continue
+            except LinearError:
+                continue  # startup recovery retains work; ingress retries raise instead
             if not self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a Linear "
                                                  "issue. Reconcile what already happened, then continue; finish "
                                                  "with `linear done` or `linear blocked`."):
@@ -786,11 +791,12 @@ class Bridge:
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                   payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
-                        and (row["attempts"] or payload.get("write_started")) and (issue.get("state") or {}).get("type") == "completed"
-                        and not payload.get("reported")):
-                    self._alert_uncertain_terminal(row)
-                    self.store.report(row["id"])
-                    payload["reported"] = True
+                        and (row["attempts"] or payload.get("write_started")) and (issue.get("state") or {}).get("type") == "completed"):
+                    if not payload.get("reported"):
+                        self._alert_uncertain_terminal(row)
+                        self.store.report(row["id"])
+                        payload["reported"] = True
+                    # Reporting the alert does not resolve an uncertain mutation.
                     self._hold_terminal(row, "A prior status attempt failed and Linear now shows Done; reconcile its evidence")
                 return False
             if payload.get("terminal") and payload.get("state") == "done" and payload.get("pr_heads"):

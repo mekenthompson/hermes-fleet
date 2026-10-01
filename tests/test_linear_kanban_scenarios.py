@@ -156,6 +156,77 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.api = plugin.BoundLinearAPI(lambda: "synthetic-token", endpoint=self.linear.url,
             identity={"viewer_id": SELF, "organization_id": "fixture-org"}, transport=bound_transport)
 
+    def test_pending_resume_survives_authorization_outage_in_ingress(self) -> None:
+        from unittest.mock import patch
+        from linear_ingress_fixture import IngressStore, Route
+        for origin in ("chat", "kanban"):
+            # Independent databases and fake API even when a subcase fails.
+            self.doCleanups()
+            self.setUp()
+            with self.subTest(origin=origin):
+                task = None
+                self.bind_identity()
+                if origin == "chat":
+                    self.assertTrue(self.chat("start")["ok"])
+                else:
+                    self.delegate()
+                    task = self.task_id()
+                    self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+                self.clock.now += 1
+                event = self.linear.session_event("prompted", ISSUE, "chat-linear" if origin == "chat" else "s-2",
+                                                  body="Continue with destination B", activity_id=origin)
+                inbox = self.dir / f"{origin}-resume-ingress.db"
+                producer = IngressStore(inbox)
+                producer.enqueue(Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox),
+                                 origin, json.dumps(event).encode())
+                with sqlite3.connect(inbox) as db:
+                    db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
+                if origin == "chat":
+                    self.inject_ok = False
+                    self.bridge.drain_ingress(inbox)
+                else:
+                    with patch.object(self.bridge.kanban, "unblock", side_effect=RuntimeError("interrupted unblock")):
+                        self.bridge.drain_ingress(inbox)
+                intent = self.bridge.store.get(ISSUE)["pending_resume"]
+                self.assertTrue(intent)
+                before = len(self.injected)
+                self.bridge = self.make_bridge()
+                self.bind_identity()
+                self.inject_ok = True
+                self.linear.down = True
+                self.bridge.drain_ingress(inbox)
+                with sqlite3.connect(inbox) as db:
+                    self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "pending")
+                self.assertEqual(self.bridge.store.get(ISSUE)["pending_resume"], intent)
+                self.assertEqual(len(self.injected), before)
+                if origin == "kanban":
+                    self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+                self.linear.down = False
+                self.bridge.drain_ingress(inbox)
+                with sqlite3.connect(inbox) as db:
+                    self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+                self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+                if origin == "kanban":
+                    self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+                else:
+                    self.assertEqual(len(self.injected), before + 1)
+                self.bridge.drain_ingress(inbox)
+                self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], event["webhookTimestamp"])
+
+    def test_chat_restart_authorization_outage_preserves_work_for_later_recovery(self) -> None:
+        self.bind_identity()
+        self.assertTrue(self.chat("start")["ok"])
+        before = self.bridge.store.get(ISSUE)
+        injected = list(self.injected)
+        self.linear.down = True
+        self.bridge.recover()
+        self.assertEqual(self.bridge.store.get(ISSUE), before)
+        self.assertEqual(self.injected, injected)
+        self.linear.down = False
+        self.bridge.recover()
+        self.assertEqual(len(self.injected), len(injected) + 1)
+        self.assertIn("Reconcile what already happened", self.injected[-1][1])
+
     def test_existing_task_resume_refuses_issue_read_outage(self) -> None:
         from hermes_fleet_linear_plugin.api import LinearError
         self.bind_identity()
@@ -165,7 +236,9 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 1
         before = self.bridge.store.get(ISSUE)
         self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(LinearError("fixture read outage"))
-        self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
+        with self.assertRaises(LinearError) as failure:
+            self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
+        self.assertTrue(failure.exception.retryable)
         self.bridge.tick()
         self.assertEqual(self.tasks(), [(task, "blocked")])
         self.assertEqual(self.bridge.store.get(ISSUE), before)
@@ -213,7 +286,12 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(plugin.LinearError("fixture read outage"))
             with self.subTest(refusal=refusal):
                 injected = list(self.injected)
-                self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write"))
+                if refusal == "read":
+                    with self.assertRaises(plugin.LinearError) as failure:
+                        self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write"))
+                    self.assertTrue(failure.exception.retryable)
+                else:
+                    self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write"))
                 self.assertEqual(self.injected, injected)
                 self.assertEqual(self.bridge.store.get(ISSUE), before)
         self.bridge.api.issue = original_issue
@@ -1378,6 +1456,51 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(len([c for c in self.linear.comments if c["issueId"] == ISSUE]), 1)
+
+    def test_reported_uncertain_terminal_send_stays_held_after_interruption(self) -> None:
+        from unittest.mock import patch
+        for origin in ("chat", "kanban"):
+            self.doCleanups()
+            self.setUp()
+            with self.subTest(origin=origin):
+                if origin == "chat":
+                    self.assertTrue(self.chat("start")["ok"])
+                    self.linear.lose_next_response = True
+                    self.assertTrue(self.chat("done", evidence="https://docs.example/findings/reconcile")["ok"])
+                else:
+                    self.delegate()
+                    self.linear.lose_next_response = True
+                    self.complete(self.task_id(), "https://docs.example/findings/reconcile")
+                terminal = next(r for r in self.bridge.store.pending(ISSUE) if r["kind"] == "status")
+                self.assertEqual(self.linear.state(ISSUE), "Done")  # mutation landed, response was lost
+                self.clock.now += 61
+                with patch.object(self.bridge.store, "hold_terminal", side_effect=RuntimeError("crash before hold commit")):
+                    with self.assertRaisesRegex(RuntimeError, "crash before hold commit"):
+                        self.bridge.tick()
+                interrupted = self.bridge.store.outbox_row(terminal["id"])
+                self.assertTrue(interrupted["payload"]["reported"])
+                self.assertEqual(interrupted["state"], "pending")
+                self.bridge = self.make_bridge()
+                self.bridge.tick()
+                self.clock.now += self.bridge.quiet
+                self.bridge.tick()
+                held = self.bridge.store.outbox_row(terminal["id"])
+                self.assertTrue(held["payload"].get("reconcile_required"))
+                self.assertEqual(held["state"], "failed")
+                self.assertFalse(self.bridge.store.terminal_status_applied(terminal["id"]))
+                dependents = [r for r in self.bridge.store.pending() if
+                              r["payload"].get("requires_status_id") == terminal["id"]]
+                self.assertTrue(dependents)
+                self.assertEqual(self.linear.comments, [])
+                self.assertEqual(self.linear.project_updates, [])
+                self.assertFalse(any(a["content"]["type"] == "response" for a in self.linear.activities))
+                if origin == "chat":
+                    alerts = [text for _, text in self.injected if "prior status attempt failed" in text]
+                else:
+                    with self.bridge.kanban.conn() as conn:
+                        alerts = [c.body for c in kb.list_comments(conn, terminal["payload"]["task_id"])
+                                  if "prior status attempt failed" in c.body]
+                self.assertEqual(len(alerts), 1)
 
     def test_lost_terminal_status_response_reports_uncertainty_once(self) -> None:
         self.assertTrue(self.chat("start")["ok"])
