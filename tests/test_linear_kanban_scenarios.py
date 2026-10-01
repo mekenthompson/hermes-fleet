@@ -1738,9 +1738,9 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 31 * 60
         create = self.bridge.api.create_project_update
 
-        def end_turn_before_create(*args):
+        def end_turn_before_create(*args, **kwargs):
             chat.on_turn_end(self.bridge, "chat-key-id")
-            return create(*args)
+            return create(*args, **kwargs)
 
         with patch.object(self.bridge.api, "create_project_update", side_effect=end_turn_before_create):
             self.bridge.flush()

@@ -303,12 +303,53 @@ class Bridge:
                                         due=due, quiet=quiet)
 
     # -- Linear -> Kanban -------------------------------------------------
+    def _specialist_scope_active(self) -> bool:
+        return getattr(self.api, "specialist_scope", None) is not None
+
+    def _specialist_session_event(self, event: dict[str, Any], issue_id: str, session_id: str):
+        session = self.api.agent_session(session_id)
+        authoritative_issue_id = session["issue"]["id"]
+        if authoritative_issue_id != issue_id:
+            raise LinearError("Agent Session payload issue does not match Linear", retryable=False)
+        payload_session = event.get("agentSession") or {}
+        payload_creator = payload_session.get("creatorId") or (payload_session.get("creator") or {}).get("id")
+        creator = (session.get("creator") or {}).get("id")
+        if payload_creator and payload_creator != creator:
+            raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
+        issue = self.api.issue(authoritative_issue_id)
+        if issue.get("id") != authoritative_issue_id:
+            raise LinearError("Agent Session issue could not be authoritatively resolved", retryable=False)
+        activity = event.get("agentActivity") or {}
+        if event.get("action") == "prompted":
+            activity_id = activity.get("id")
+            if not isinstance(activity_id, str) or not activity_id:
+                raise LinearError("Specialist prompt has no authoritative activity id", retryable=False)
+            verified = self.api.agent_activity(activity_id, session_id)
+            user_id = verified["user"]["id"]
+            payload_user = (activity.get("user") or {}).get("id")
+            if payload_user and payload_user != user_id:
+                raise LinearError("Agent Activity payload actor does not match Linear", retryable=False)
+            activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
+        return issue, activity
+
+    def _reject_specialist_scope(self, exc: LinearError) -> bool:
+        if exc.retryable:
+            raise exc
+        log.warning("linear: specialist authorization refused: %s", exc)
+        return True
+
     def handle_webhook(self, event: dict[str, Any]) -> None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
                 return
         data = event.get("data") or {}
+        if self._specialist_scope_active() and event.get("type") == "Issue" and data.get("id"):
+            try:
+                self.api.issue(data["id"])
+            except LinearError as exc:
+                if self._reject_specialist_scope(exc):
+                    return
         if event.get("type") == "Issue" and "delegateId" in (event.get("updatedFrom") or {}) and data.get("id"):
             row = self.store.get(data["id"])
             if row:  # confirm by re-reading, never trust the snapshot
@@ -325,6 +366,13 @@ class Bridge:
         if event.get("type") != "AgentSessionEvent" or not issue_id or not session_id:
             return
         activity = event.get("agentActivity") or {}
+        if self._specialist_scope_active():
+            try:
+                issue, activity = self._specialist_session_event(event, issue_id, session_id)
+                issue_id = issue["id"]
+            except LinearError as exc:
+                if self._reject_specialist_scope(exc):
+                    return
         with self.lock(issue_id):
             row = self.store.get(issue_id)
             if event.get("action") == "created":
@@ -709,7 +757,8 @@ class Bridge:
             self.api.create_comment(row["id"], payload["issue_id"], payload["body"])
             return True
         elif kind == "activity":
-            self.api.create_activity(row["id"], payload["session_id"], payload["content"])
+            self.api.create_activity(row["id"], payload["session_id"], payload["content"],
+                                     issue_id=payload["issue_id"])
             return True
         elif kind == "project_update":
             return self._send_project_update(row["id"])
@@ -726,6 +775,7 @@ class Bridge:
             project_id = payload["project_id"] or ((self.api.issue(payload["resolve"]).get("project") or {})
                                                        .get("id"))
             lines_to_send = []
+            issue_ids_to_send = []
             waiting_lines: set[str] = set()
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
@@ -751,6 +801,7 @@ class Bridge:
                         ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
                     continue
                 lines_to_send.append(f"- {ident}: {line}")
+                issue_ids_to_send.append(issue["id"])
             if waiting_lines:
                 if payload.get("followup") or not lines_to_send:
                     raise ProjectUpdateDeferred
@@ -764,7 +815,7 @@ class Bridge:
                     raise LinearError("project update changed after an uncertain create; reconcile the remote update")
                 if not project_id or not body:
                     return False
-                self.api.create_project_update(row_id, project_id, body)
+                self.api.create_project_update(row_id, project_id, body, issue_ids=issue_ids_to_send)
                 return True
             if not project_id or not body:
                 dropped = self.store.drop_unpublished_update(row_id, payload, self.clock())
@@ -776,7 +827,7 @@ class Bridge:
                 continue  # a terminal capture committed during preflight; read it again
             if not frozen:
                 raise ProjectUpdateDeferred
-            self.api.create_project_update(row_id, project_id, body)
+            self.api.create_project_update(row_id, project_id, body, issue_ids=issue_ids_to_send)
             return True
         raise LinearError("project update changed repeatedly during send preflight")
 

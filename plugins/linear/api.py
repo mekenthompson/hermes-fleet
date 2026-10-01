@@ -14,7 +14,7 @@ from typing import Any, Callable
 ENDPOINT = "https://api.linear.app/graphql"
 DEFAULT_RATE_LIMIT_PAUSE = 60.0
 
-ISSUE_FIELDS = """id identifier title description url updatedAt
+ISSUE_FIELDS = """id identifier title description url updatedAt creator { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type } } }"""
 
@@ -179,14 +179,22 @@ class LinearAPI:
             if not is_duplicate_create_error(exc.errors, fields["id"]):
                 raise
 
+    def agent_session(self, session_id: str) -> dict[str, Any]:
+        raise LinearError("Agent Session authorization requires a bound specialist client", retryable=False)
+
+    def agent_activity(self, activity_id: str, session_id: str) -> dict[str, Any]:
+        raise LinearError("Agent Activity authorization requires a bound specialist client", retryable=False)
+
     def create_comment(self, client_id: str, issue_id: str, body: str) -> None:
         self._create("commentCreate", "CommentCreateInput", {"id": client_id, "issueId": issue_id, "body": body})
 
-    def create_activity(self, client_id: str, session_id: str, content: dict[str, Any]) -> None:
+    def create_activity(self, client_id: str, session_id: str, content: dict[str, Any], *,
+                        issue_id: str | None = None) -> None:
         self._create("agentActivityCreate", "AgentActivityCreateInput",
                      {"id": client_id, "agentSessionId": session_id, "content": content})
 
-    def create_project_update(self, client_id: str, project_id: str, body: str) -> None:
+    def create_project_update(self, client_id: str, project_id: str, body: str, *,
+                              issue_ids: list[str] | None = None) -> None:
         self._create("projectUpdateCreate", "ProjectUpdateCreateInput",
                      {"id": client_id, "projectId": project_id, "body": body})
 

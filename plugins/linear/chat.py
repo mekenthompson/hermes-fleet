@@ -48,6 +48,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         issue = bridge.api.issue(ref)
         me = bridge.api.viewer_id()
     except LinearError as exc:
+        if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:
+            return _reply(False, "This issue is outside the configured Linear specialist scope.")
         return _reply(False, f"Linear is unavailable ({exc}); try again shortly.")
     issue_id, ident, project = issue["id"], issue.get("identifier") or ref, (issue.get("project") or {}).get("id")
     with bridge.lock(issue_id):
