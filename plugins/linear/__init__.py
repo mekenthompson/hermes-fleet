@@ -88,7 +88,7 @@ class BoundLinearAPI(LinearAPI):
     def _check_issue(self, issue):
         if self.specialist_scope is None:
             return
-        if not isinstance(issue, dict):
+        if (not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip()):
             raise LinearError("Linear issue authorization response is malformed", retryable=False)
         team, project, creator = issue.get("team"), issue.get("project"), issue.get("creator")
         if (not isinstance(team, dict) or team.get("id") not in self.specialist_scope["allowed_team_ids"] or
@@ -105,6 +105,12 @@ class BoundLinearAPI(LinearAPI):
         if self.identity.get("projects") and (issue.get("project") or {}).get("id") not in self.identity["projects"]:
             raise LinearError("Linear issue project is outside configured scope", retryable=False)
         self._check_issue(issue)
+        return issue
+
+    def _mutation_issue(self, issue_id):
+        issue = self.issue(issue_id)
+        if not isinstance(issue_id, str) or not issue_id.strip() or issue.get("id") != issue_id:
+            raise LinearError("Linear issue authorization does not match mutation target", retryable=False)
         return issue
 
     def agent_session(self, session_id):
@@ -144,7 +150,7 @@ class BoundLinearAPI(LinearAPI):
 
     def update_issue(self, issue_id, fields):
         if self.specialist_scope is not None:
-            issue = self.issue(issue_id)
+            issue = self._mutation_issue(issue_id)
             if (not isinstance(fields, dict) or set(fields) - {"stateId", "delegateId"} or
                     ("delegateId" in fields and fields["delegateId"] != self.identity["viewer_id"]) or
                     ("stateId" in fields and fields["stateId"] not in {
@@ -152,13 +158,13 @@ class BoundLinearAPI(LinearAPI):
                     })):
                 raise LinearError("Linear issue update exceeds specialist scope", retryable=False)
         elif self.identity.get("teams") or self.identity.get("projects"):
-            self.issue(issue_id)
+            self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().update_issue(issue_id, fields)
 
     def create_comment(self, client_id, issue_id, body):
         if self.specialist_scope is not None or self.identity.get("teams") or self.identity.get("projects"):
-            self.issue(issue_id)
+            self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().create_comment(client_id, issue_id, body)
 
@@ -169,7 +175,7 @@ class BoundLinearAPI(LinearAPI):
             session = self.agent_session(session_id)
             if session["issue"]["id"] != issue_id:
                 raise LinearError("Agent Activity session does not belong to the authorized issue", retryable=False)
-            self.issue(issue_id)
+            self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().create_activity(client_id, session_id, content)
 
@@ -180,7 +186,7 @@ class BoundLinearAPI(LinearAPI):
             if project_id not in self.specialist_scope["allowed_project_ids"]:
                 raise LinearError("Linear project is outside configured specialist scope", retryable=False)
             for issue_id in issue_ids:
-                if (self.issue(issue_id).get("project") or {}).get("id") != project_id:
+                if (self._mutation_issue(issue_id).get("project") or {}).get("id") != project_id:
                     raise LinearError("Project update issue is outside configured specialist scope", retryable=False)
         elif self.identity.get("projects") and project_id not in self.identity["projects"]:
             raise LinearError("Linear project is outside configured scope", retryable=False)
