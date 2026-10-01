@@ -53,6 +53,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         return _reply(False, f"Linear is unavailable ({exc}); try again shortly.")
     issue_id, ident, project = issue["id"], issue.get("identifier") or ref, (issue.get("project") or {}).get("id")
     with bridge.lock(issue_id):
+        if not bridge.authorize_specialist_effect(issue_id):
+            return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         row = bridge.store.get(issue_id)
         if action == "start":
             return _start(bridge, issue, row, me, session_key, session_id, generation)
@@ -71,9 +73,10 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             if not bridge.accepted_evidence(links):
                 return _reply(False, "PR acceptance on the exact head and required checks could not be verified; "
                                      "leave this issue open and reconcile the PR.")
-            _finish(bridge, row, session_key, session_id, project, ident, "done",
-                    f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
-                    f"Done: {' '.join(links)}")
+            if not _finish(bridge, row, session_key, session_id, project, ident, "done",
+                           f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
+                           f"Done: {' '.join(links)}"):
+                return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
             return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
         if action == "blocked":
             message = f"Blocked: {note or 'needs input'}."
@@ -88,17 +91,20 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                                   issue_id=issue_id)
             return _reply(True, f"{ident} Blocked update queued; it stays yours. Delivery is not yet confirmed.")
         if action == "release":
-            _finish(bridge, row, session_key, session_id, project, ident, "blocked",
-                    f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished")
+            if not _finish(bridge, row, session_key, session_id, project, ident, "blocked",
+                           f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished"):
+                return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
             return _reply(True, f"Stopped chat tracking {ident}; Blocked closeout queued, not yet confirmed in Linear.")
     return _reply(False, f"Unknown action {action!r}.")
 
 
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
-            ident: str, state: str, message: str, update: str) -> None:
+            ident: str, state: str, message: str, update: str) -> bool:
     issue_id = row["issue_id"]
+    if not bridge.authorize_specialist_effect(issue_id):
+        return False
     route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
-    bridge.store.finish(issue_id, [
+    return bridge.store.finish(issue_id, [
         ("status", {"issue_id": issue_id, "state": state, **route}),
         ("comment", {"issue_id": issue_id, "body": message, **route}),
         ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
