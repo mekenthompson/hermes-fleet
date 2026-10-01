@@ -210,3 +210,26 @@ missing source, import errors, zero tests, failures, or any skipped scenario. CI
 exact revision and runs this lane on every pull request and main push. The scenarios use fake
 Linear traffic and local Kanban state; they do not enable the runtime plugin. Unit tests and this
 scenario lane prove source behavior, while image publication and deployment require their own gates.
+
+## Specialist authorization
+
+An optional `specialist_scope` requires all three nonempty, unique exact-ID lists:
+
+```yaml
+specialist_scope:
+  allowed_team_ids: [team-id]
+  allowed_project_ids: [project-id]
+  allowed_requester_ids: [user-id]
+```
+
+This is separate from the immutable app/workspace identity. The client resolves
+issues, Agent Sessions and prompt activities through Linear before admitting
+work, and rechecks the owning issue before every effect. A foreign requester,
+team, project or mismatched session is refused without creating a task or effect.
+Transient resolution failures retain delivery work for retry. Arbitrary GraphQL
+is disabled in specialist mode; only the bounded operations are available.
+General-mode behavior is unchanged. Specialist chat actions obey the same issue
+boundary and still require the owning session for terminal actions.
+
+The production implementation is capped at 2,400 lines, including this bounded
+authorization contract; the unit suite enforces that limit.
