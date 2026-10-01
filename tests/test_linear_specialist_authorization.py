@@ -102,13 +102,36 @@ class FakeKanban:
     def __init__(self):
         self.creates = []
         self.subscriptions = []
+        self.tasks = {}
+        self.histories = {}
+        self.event_calls = []
+        self.comments = []
 
     def create(self, **fields):
         self.creates.append(fields)
-        return SimpleNamespace(id="task-1", status="ready")
+        task = SimpleNamespace(id="task-1", status="ready", completion_contract=None,
+                               result="", title=fields.get("title", "Synthetic task"))
+        self.tasks[task.id] = task
+        return task
+
+    def get(self, task_id):
+        return self.tasks.get(task_id)
+
+    def events(self, task_id, issue_id):
+        self.event_calls.append((task_id, issue_id))
+        return []
+
+    def history(self, task_id, after_id):
+        return [event for event in self.histories.get(task_id, []) if event.id > after_id]
+
+    def evidence_text(self, _task):
+        return ""
 
     def subscribe(self, task_id, issue_id):
         self.subscriptions.append((task_id, issue_id))
+
+    def comment(self, task_id, body):
+        self.comments.append((task_id, body))
 
 
 class LinearSpecialistAuthorizationTests(unittest.TestCase):
@@ -120,6 +143,14 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.store = Store(Path(self.tmp.name) / "state.db")
         self.api = self.authority.api()
         self.bridge = Bridge(self.store, self.api, self.kanban, profile="synthetic")
+
+    def seed_kanban_work(self, issue_id=ISSUE, *, task_status="ready", events=()):
+        task_id = f"task-{issue_id}"
+        self.kanban.tasks[task_id] = SimpleNamespace(id=task_id, status=task_status,
+                                                     completion_contract=None, result="", title="OPS-1: task")
+        self.kanban.histories[task_id] = list(events)
+        self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
+        return task_id
 
     def session_event(self, action="created", *, event_issue=ISSUE, creator=USER,
                       user=USER, event_team=TEAM, event_project=PROJECT, event_user=USER):
@@ -263,6 +294,84 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(self.kanban.creates, [])
+
+    def test_pump_fences_permanently_revoked_authoritative_scope_before_history_admission(self):
+        changes = (
+            ("team", {"team": {"id": "team-foreign", "key": "NO", "states": {"nodes": []}}}),
+            ("project", {"project": {"id": "project-foreign"}}),
+            ("requester", {"creator": {"id": "user-foreign"}}),
+        )
+        for suffix, (field, change) in enumerate(changes, start=1):
+            issue_id, task_id = f"{ISSUE}-{suffix}", f"task-{suffix}"
+            self.authority.issues[issue_id] = issue_record(id=issue_id, **change)
+            self.kanban.tasks[task_id] = SimpleNamespace(id=task_id, status="blocked",
+                                                         completion_contract=None, result="", title="OPS-1: task")
+            self.kanban.histories[task_id] = [SimpleNamespace(id=1, kind="blocked",
+                                                              payload={"reason": "needs input"})]
+            self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
+
+        self.bridge.pump_kanban()
+
+        for suffix, (field, _change) in enumerate(changes, start=1):
+            issue_id = f"{ISSUE}-{suffix}"
+            with self.subTest(authoritative_field=field):
+                self.assertIsNotNone(self.store.get(issue_id), "revoked work and its history must be preserved")
+                self.assertEqual(self.store.get(issue_id)["last_event_id"], 0,
+                                 "a denied effect must not advance the Kanban cursor")
+                self.assertEqual(self.store.pending(issue_id), [], "denied activity/status must not enter the outbox")
+
+    def test_tick_keeps_pending_and_uncertain_writes_untouched_after_revocation_and_restart(self):
+        self.seed_kanban_work(task_status="blocked", events=[SimpleNamespace(
+            id=1, kind="blocked", payload={"reason": "needs input"})])
+        status_id = self.store.enqueue("status", {"issue_id": ISSUE, "state": "done"}, at=1)
+        comment_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved evidence"}, at=1)
+        activity_id = self.store.enqueue("activity", {"issue_id": ISSUE, "session_id": SESSION,
+                                                       "content": {"type": "response", "body": "saved"}}, at=1)
+        project_id = self.store.enqueue("project_update", {"issue_id": "update:session:project",
+                                                            "resolve": ISSUE, "project_id": PROJECT,
+                                                            "lines": {"OPS-1": "Done"},
+                                                            "line_issues": {"OPS-1": ISSUE}}, at=1)
+        frozen_payload = self.store.outbox_row(project_id)["payload"]
+        self.assertTrue(self.store.freeze_project_update(project_id, frozen_payload, self.bridge.clock(),
+                                                         "Agent update\n\n- OPS-1: Done", PROJECT))
+        original = {row_id: self.store.outbox_row(row_id) for row_id in
+                    (status_id, comment_id, activity_id, project_id)}
+        self.authority.issues[ISSUE] = issue_record(project={"id": "project-foreign"})
+
+        self.bridge.tick()
+
+        self.assertEqual(self.authority.mutations, [], "revocation must prevent every Linear mutation")
+        self.assertIsNotNone(self.store.get(ISSUE), "the active task must not be deleted by recheck")
+        self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
+        self.assertEqual(self.kanban.event_calls, [], "scope must be checked before Kanban event admission")
+        for row_id, before in original.items():
+            after = self.store.outbox_row(row_id)
+            self.assertEqual(after, before, "pending and uncertain outbox rows must remain byte-for-byte intact")
+
+        restarted_store = Store(self.store.path)
+        restarted = Bridge(restarted_store, self.api, self.kanban, profile="synthetic")
+        self.authority.issues[ISSUE] = issue_record(creator={"id": "user-foreign"})
+        restarted.tick()
+        self.assertEqual(self.authority.mutations, [])
+        self.assertIsNotNone(restarted_store.get(ISSUE))
+        self.assertEqual(restarted_store.get(ISSUE)["last_event_id"], 0)
+        for row_id, before in original.items():
+            self.assertEqual(restarted_store.outbox_row(row_id), before)
+
+    def test_transient_scope_resolution_failure_retries_without_permanent_fence(self):
+        self.seed_kanban_work(task_status="blocked", events=[SimpleNamespace(id=1, kind="blocked",
+                                                       payload={"reason": "needs input"})])
+        self.authority.fail_issue = True
+
+        self.bridge.pump_kanban()
+
+        self.assertIsNotNone(self.store.get(ISSUE))
+        self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
+        self.assertEqual(self.store.pending(ISSUE), [])
+        self.authority.fail_issue = False
+        self.bridge.pump_kanban()
+        self.assertEqual(self.store.get(ISSUE)["last_event_id"], 1)
+        self.assertEqual([row["kind"] for row in self.store.pending(ISSUE)], ["status", "activity"])
 
     def test_all_specialist_effects_recheck_the_authoritative_resource_before_mutation(self):
         for name, action in (

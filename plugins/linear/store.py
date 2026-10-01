@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS chat_stop (
   completion_activity_id TEXT, uncertainty_activity_id TEXT,
   UNIQUE(profile, issue_id, linear_session_id, source_activity_id));
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS specialist_scope_fence (
+  issue_id TEXT PRIMARY KEY, reason TEXT NOT NULL, fenced_at REAL NOT NULL);
 """
 
 
@@ -185,6 +187,17 @@ class Store:
     def delete(self, issue_id: str) -> None:
         with self._tx() as db:
             db.execute("DELETE FROM work WHERE issue_id = ?", (issue_id,))
+
+    def scope_fenced(self, issue_id: str) -> bool:
+        with self._tx() as db:
+            return db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?",
+                              (issue_id,)).fetchone() is not None
+
+    def fence_scope(self, issue_id: str, reason: str, *, at: float) -> None:
+        """Persist a permanent authorization denial without deleting work or its evidence."""
+        with self._tx() as db:
+            db.execute("INSERT OR IGNORE INTO specialist_scope_fence (issue_id, reason, fenced_at) "
+                       "VALUES (?, ?, ?)", (issue_id, reason[:500], at))
 
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
