@@ -113,12 +113,24 @@ class LinearAPI:
         return self.paused_until
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._graphql(query, variables)
+
+    def _graphql(self, query: str, variables: dict[str, Any] | None = None, *,
+                 token_provider: Callable[[], str] | None = None,
+                 verify_credential: Callable[[Callable[[], str]], tuple[Callable[[], str], str]] | None = None) -> dict[str, Any]:
         if self.clock() < self.paused_until:
             raise RateLimited(self.paused_until)
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
         for attempt in (1, 2):
+            provider = token_provider if token_provider is not None else self.token
+            credential = None
+            if verify_credential is not None:
+                provider, credential = verify_credential(provider)
+            if self.clock() < self.paused_until:
+                raise RateLimited(self.paused_until)
             try:
-                headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.token()}
+                headers = {"Content-Type": "application/json",
+                           "Authorization": "Bearer " + (credential if credential is not None else provider())}
             except Exception as exc:  # noqa: BLE001 - Connect outage or refresh failure: retry later, loudly
                 logging.getLogger("linear").error("linear: credentials unavailable: %s", exc)
                 raise LinearError(f"Linear credentials unavailable: {exc}") from exc
@@ -126,8 +138,9 @@ class LinearAPI:
                 status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
                 raise LinearError(f"Linear unreachable: {exc}") from exc
-            if status == 401 and attempt == 1 and callable(getattr(self.token, "invalidate", None)):
-                self.token.invalidate()
+            refresh_provider = provider if token_provider is not None or verify_credential is not None else self.token
+            if status == 401 and attempt == 1 and callable(getattr(refresh_provider, "invalidate", None)):
+                refresh_provider.invalidate()
                 continue
             break
         try:

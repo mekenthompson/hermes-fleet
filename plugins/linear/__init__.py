@@ -37,15 +37,33 @@ class BoundLinearAPI(LinearAPI):
         super().__init__(token, **kwargs)
 
     def verify_identity(self):
-        identity = super().graphql("query IdentityBinding { viewer { id } organization { id } }")
+        self._verified_credential(self.token)
+
+    def _verified_credential(self, provider):
+        """Return the verified provider and credential captured for this call only."""
+        credential = None
+
+        def capture():
+            nonlocal credential
+            credential = provider()
+            return credential
+
+        def invalidate():
+            nonlocal provider
+            provider.invalidate()
+            provider = self.token
+
+        capture.invalidate = invalidate if callable(getattr(provider, "invalidate", None)) else None
+        identity = super()._graphql("query IdentityBinding { viewer { id } organization { id } }",
+                                   token_provider=capture)
         if any(not isinstance(identity.get(field), dict) or
                identity[field].get("id") != self.identity[expected]
                for field, expected in (("viewer", "viewer_id"), ("organization", "organization_id"))):
             raise LinearError("Linear actor/workspace does not match configured identity", retryable=False)
+        return provider, credential
 
     def graphql(self, query, variables=None):
-        self.verify_identity()
-        return super().graphql(query, variables)
+        return super()._graphql(query, variables, verify_credential=self._verified_credential)
 
     def viewer_id(self) -> str:
         self.verify_identity()
