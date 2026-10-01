@@ -213,6 +213,20 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.authority.issues[ISSUE] = issue_record()
         self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
 
+    def test_mutations_refuse_unverified_issue_resource_ids(self):
+        operations = (
+            lambda: self.api.update_issue(ISSUE, {"stateId": "state-progress"}),
+            lambda: self.api.create_comment("comment-1", ISSUE, "body"),
+            lambda: self.api.create_activity("activity-1", SESSION, {"type": "response", "body": "body"}, issue_id=ISSUE),
+            lambda: self.api.create_project_update("update-1", PROJECT, "body", issue_ids=[ISSUE]),
+        )
+        for resolved_id in (None, "", " ", "issue-foreign"):
+            for index, operation in enumerate(operations):
+                self.authority.issues[ISSUE] = issue_record(id=resolved_id)
+                with self.subTest(resolved_id=resolved_id, operation=index), self.assertRaises(LinearError):
+                    operation()
+                self.assertEqual(self.authority.mutations, [])
+
     def test_session_ingress_denies_resolver_failure_foreign_issue_user_and_actor_before_task(self):
         probes = (
             ("session resolver", lambda: setattr(self.authority, "fail_session", True), False),
