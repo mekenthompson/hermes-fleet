@@ -640,6 +640,8 @@ class Bridge:
                     "unfinished. Reply or re-delegate to continue." if not evidence else
                     "PR acceptance on the exact head and required checks could not be verified. "
                     "The result remains unfinished; reconcile the PR before marking Done.")
+            if not self.authorize_specialist_effect(issue_id):
+                return
             self.store.finish(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
                                                     "owner_issue_id": issue_id}),
@@ -659,6 +661,8 @@ class Bridge:
                                       "project_id": row["project_id"], "resolve": issue_id,
                                       "lines": {task.title.split(":")[0]: f"Done: {links}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
+        if not self.authorize_specialist_effect(issue_id):
+            return
         self.store.finish(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock())
 

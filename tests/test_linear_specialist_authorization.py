@@ -345,6 +345,24 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.pending(), [])
         self.assertEqual(self.authority.mutations, [])
 
+    def test_kanban_closeout_rechecks_scope_after_evidence_verification(self):
+        for accepted in (True, False):
+            with self.subTest(evidence_accepted=accepted):
+                issue_id = f"{ISSUE}-{accepted}"
+                self.authority.issues[issue_id] = issue_record(id=issue_id)
+                self.kanban.tasks["task"] = SimpleNamespace(id="task", completion_contract="https://docs.example/findings/1", result="Done", title="OPS-1: task")
+                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT)
+                before = self.store.get(issue_id)
+                def evidence_checked(_links, _contract):
+                    self.authority.issues[issue_id] = issue_record(id=issue_id, project={"id": "project-foreign"})
+                    return accepted
+                self.bridge.accepted_evidence = evidence_checked
+                self.bridge._finished(before)
+                self.assertTrue(self.store.scope_fenced(issue_id))
+                self.assertEqual(self.store.get(issue_id), before)
+                self.assertEqual(self.store.pending(issue_id), [])
+                self.assertEqual(self.authority.mutations, [])
+
     def test_terminal_capture_refuses_persisted_fence_atomically(self):
         self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
         before = self.store.get(ISSUE)
