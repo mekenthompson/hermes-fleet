@@ -247,6 +247,8 @@ class Bridge:
     def status(self, issue_id: str, state: str, *, claim: bool = False, seen: str | None = None,
                row: dict[str, Any] | None = None, terminal: bool = False) -> str:
         """``seen``: the delegate when a claim was decided; a later human change to it wins."""
+        if not self.authorize_specialist_effect(issue_id):
+            return ""
         route = self._alert_route(row or self.store.get(issue_id))
         return self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen,
                                              "terminal": terminal, **route}, at=self.clock())
@@ -261,6 +263,8 @@ class Bridge:
 
     def comment(self, issue_id: str, body: str, *, row: dict[str, Any] | None = None,
                 terminal: bool = False, requires_status_id: str = "", takeover: bool = False) -> None:
+        if not self.authorize_specialist_effect(issue_id):
+            return
         self.store.enqueue("comment", {"issue_id": issue_id, "body": body,
                                        "terminal": terminal, "requires_status_id": requires_status_id,
                                        "takeover": takeover,
@@ -268,6 +272,8 @@ class Bridge:
 
     def activity(self, issue_id: str, session_id: str, kind: str, body: str,
                  *, row: dict[str, Any] | None = None) -> None:
+        if not self.authorize_specialist_effect(issue_id):
+            return
         self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id,
                                         "content": {"type": kind, "body": body},
                                         **self._alert_route(row or self.store.get(issue_id))}, at=self.clock())
@@ -285,6 +291,8 @@ class Bridge:
         """One update per project per session, sent after the quiet period (or now for Kanban terminal).
         An unknown project (work started while Linear was down) is resolved from ``issue_id`` at send."""
         if not project_id and not issue_id:
+            return
+        if self._specialist_scope_active() and not self.authorize_specialist_effect(issue_id):
             return
         due = self.clock() + (self.quiet if quiet else 0)
         with self.lock(f"update:{session_id}:{project_id or issue_id}"):
@@ -305,6 +313,48 @@ class Bridge:
     # -- Linear -> Kanban -------------------------------------------------
     def _specialist_scope_active(self) -> bool:
         return getattr(self.api, "specialist_scope", None) is not None
+
+    def _fence_scope_denial(self, issue_id: str, exc: LinearError) -> None:
+        if self._specialist_scope_active() and issue_id:
+            self.store.fence_scope(issue_id, "permanent specialist authorization denial", at=self.clock())
+            log.warning("linear: specialist scope permanently fenced issue %s: %s", issue_id, exc)
+
+    def authorize_specialist_effect(self, issue_id: str) -> bool:
+        """Freshly resolve the authoritative issue before specialist work/effect admission."""
+        if not self._specialist_scope_active():
+            return True
+        if not issue_id or self.store.scope_fenced(issue_id):
+            return False
+        try:
+            issue = self.api.issue(issue_id)
+        except LinearError as exc:
+            if not exc.retryable:
+                self._fence_scope_denial(issue_id, exc)
+            return False
+        if not isinstance(issue, dict) or issue.get("id") != issue_id:
+            self._fence_scope_denial(issue_id, LinearError("Linear issue resolution changed its identity",
+                                                            retryable=False))
+            return False
+        return not self.store.scope_fenced(issue_id)
+
+    def _outbox_scope_issue_ids(self, row: dict[str, Any]) -> list[str]:
+        payload = row["payload"]
+        if row["kind"] != "project_update":
+            return [payload.get("owner_issue_id") or payload.get("issue_id") or ""]
+        candidates = [payload.get("owner_issue_id"), payload.get("resolve")]
+        candidates.extend((payload.get("line_issues") or {}).values())
+        return list(dict.fromkeys(issue_id for issue_id in candidates if issue_id))
+
+    def _authorize_outbox_effect(self, row: dict[str, Any]) -> bool:
+        if not self._specialist_scope_active():
+            return True
+        targets = self._outbox_scope_issue_ids(row)
+        return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
+
+    @staticmethod
+    def _is_specialist_scope_denial(exc: LinearError) -> bool:
+        message = str(exc).lower()
+        return not exc.retryable and ("specialist scope" in message or "specialist authorization" in message)
 
     def _specialist_session_event(self, event: dict[str, Any], issue_id: str, session_id: str):
         session = self.api.agent_session(session_id)
@@ -349,6 +399,7 @@ class Bridge:
                 self.api.issue(data["id"])
             except LinearError as exc:
                 if self._reject_specialist_scope(exc):
+                    self._fence_scope_denial(data["id"], exc)
                     return
         if event.get("type") == "Issue" and "delegateId" in (event.get("updatedFrom") or {}) and data.get("id"):
             row = self.store.get(data["id"])
@@ -389,11 +440,15 @@ class Bridge:
                 self._prompted(event, issue, session_id, row, activity)
 
     def may_execute_existing(self, issue_id: str) -> bool:
+        if not self.authorize_specialist_effect(issue_id):
+            return False
         try:
             issue, me = self.api.issue(issue_id), self.api.viewer_id()
             return bool(me) and (issue.get("delegate") or {}).get("id") == me
         except LinearError as exc:
             log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
+            if not exc.retryable:
+                self._fence_scope_denial(issue_id, exc)
             return False
 
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
@@ -514,6 +569,8 @@ class Bridge:
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban"):
             with self.lock(row["issue_id"]):
+                if not self.authorize_specialist_effect(row["issue_id"]):
+                    continue
                 # Core's claim cursor can advance before our outbox commits.
                 # Our own cursor moves atomically with the writes below.
                 task = self.kanban.get(row["task_id"])
@@ -536,6 +593,8 @@ class Bridge:
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
         payload, issue_id = event.payload or {}, row["issue_id"]
+        if not self.authorize_specialist_effect(issue_id):
+            return
         if event.kind == "completed":
             self._finished(row)
             return
@@ -567,6 +626,8 @@ class Bridge:
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=event.kind == "archived")
 
     def _finished(self, row: dict[str, Any]) -> None:
+        if not self.authorize_specialist_effect(row["issue_id"]):
+            return
         task = self.kanban.get(row["task_id"])
         if task is None:
             return
@@ -646,6 +707,8 @@ class Bridge:
         self._last_recheck = now
         for row in self.store.active():
             with self.lock(row["issue_id"]):
+                if self._specialist_scope_active() and self.store.scope_fenced(row["issue_id"]):
+                    continue
                 try:
                     issue = self.api.issue(row["issue_id"])
                     # An initial self-claim may still be queued, but activities
@@ -658,6 +721,8 @@ class Bridge:
                 except LinearError as exc:
                     if self._needs_reauthorization(exc):
                         self._alert_reauthorization()
+                    if not exc.retryable:
+                        self._fence_scope_denial(row["issue_id"], exc)
                     continue
 
     def recover(self) -> None:
@@ -685,6 +750,8 @@ class Bridge:
             progress = False
             for row in self.store.due(self.clock()):
                 with self.lock(row["payload"]["issue_id"]):
+                    if not self._authorize_outbox_effect(row):
+                        continue
                     try:
                         applied = self._send(row)
                     except ProjectUpdateDeferred:
@@ -695,6 +762,13 @@ class Bridge:
                     except LinearError as exc:
                         if self._needs_reauthorization(exc):
                             self._alert_reauthorization()
+                        if self._specialist_scope_active() and self._is_specialist_scope_denial(exc):
+                            targets = self._outbox_scope_issue_ids(row)
+                            denied = [issue_id for issue_id in targets
+                                      if not self.authorize_specialist_effect(issue_id)]
+                            if not denied and targets:
+                                self._fence_scope_denial(targets[0], exc)
+                            continue  # preserve pending/uncertain writes after permanent scope denial
                         if not exc.retryable:
                             self.store.mark(row["id"], "failed")
                             failed = True
