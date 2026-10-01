@@ -66,12 +66,13 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             if not links:
                 return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
                                      "Without one, use `linear blocked` or `linear release`.")
-            if not bridge.accepted_evidence(links):
+            heads: dict[str, str] = {}
+            if not bridge.accepted_evidence(links, heads=heads):
                 return _reply(False, "PR acceptance on the exact head and required checks could not be verified; "
                                      "leave this issue open and reconcile the PR.")
             _finish(bridge, row, session_key, session_id, project, ident, "done",
                     f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
-                    f"Done: {' '.join(links)}")
+                    f"Done: {' '.join(links)}", links, heads)
             return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
         if action == "blocked":
             message = f"Blocked: {note or 'needs input'}."
@@ -93,11 +94,13 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
 
 
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
-            ident: str, state: str, message: str, update: str) -> None:
+            ident: str, state: str, message: str, update: str, evidence: list[str] | None = None,
+            heads: dict[str, str] | None = None) -> None:
     issue_id = row["issue_id"]
     route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
     bridge.store.finish(issue_id, [
-        ("status", {"issue_id": issue_id, "state": state, **route}),
+        ("status", {"issue_id": issue_id, "state": state, "evidence": evidence or [],
+                    "evidence_contract": "local-only", "pr_heads": heads or {}, **route}),
         ("comment", {"issue_id": issue_id, "body": message, **route}),
         ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
                             "session_id": session_id, "project_id": project, "resolve": issue_id,

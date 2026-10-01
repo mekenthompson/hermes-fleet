@@ -94,13 +94,13 @@ def evidence_links(text: str) -> list[str]:
             and "linear.app/" not in clean]
 
 
-def pr_acceptance(url: str) -> bool:
+def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
     """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
     try:
         from hermes_cli.kanban_pr_acceptance import collect_acceptance
-        return bool(collect_acceptance(url, url)["ok"])
+        return collect_acceptance(contract or url, url)
     except (ImportError, KeyError, TypeError):
-        return False
+        return {}
 
 
 def iso_ms(raw: Any) -> float:
@@ -196,6 +196,24 @@ class Bridge:
         override = self.team_states.get(team.get("key")) or self.team_states.get(team.get("id")) or {}
         return override[key] if key in override else self.states.get(key)
 
+    def closure_ms(self, issue: dict[str, Any]) -> float:
+        """A delegation echo can move updatedAt without changing when the human closed work."""
+        state = (issue.get("state") or {}).get("type")
+        if state not in CLOSED:
+            return 0
+        field = "completedAt" if state == "completed" else "canceledAt"
+        if field not in issue:
+            latest = self.api.graphql("query Closure($id:String!){issue(id:$id){state{type} updatedAt completedAt canceledAt}}",
+                                  {"id": issue["id"]}).get("issue")
+            if not latest:
+                raise LinearError("Issue closure timestamp unavailable; retry before resuming work")
+            issue.update(latest)
+            state = (issue.get("state") or {}).get("type")
+            if state not in CLOSED:
+                return 0
+            field = "completedAt" if state == "completed" else "canceledAt"
+        return iso_ms(issue.get(field)) or iso_ms(issue.get("updatedAt")) or math.inf
+
     def me(self) -> str | None:
         try: return self.api.viewer_id()
         except LinearError: return None
@@ -233,7 +251,8 @@ class Bridge:
                 continue
             self._reauth_alerted.add((kind, target))
 
-    def accepted_evidence(self, links: list[str], contract: str = "local-only") -> bool:
+    def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
+                          heads: dict[str, str] | None = None) -> bool:
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
             return False
@@ -241,23 +260,30 @@ class Bridge:
             return True
         # A PR can move after core accepted task completion. Verify its
         # current exact head again before translating that completion.
-        return all(pr_acceptance(url) for url in prs)
+        for url in prs:
+            receipt = pr_acceptance(url) if contract in ("local-only", url) else pr_acceptance(url, contract)
+            if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
+                    r"[0-9a-f]{40}", str(receipt.get("head_sha") or "")):
+                return False
+            if heads is not None:
+                heads[url] = receipt["head_sha"]
+        return True
 
     # -- outbox helpers ----------------------------------------------------
     def status(self, issue_id: str, state: str, *, claim: bool = False, seen: str | None = None,
-               row: dict[str, Any] | None = None, terminal: bool = False) -> str:
+               row: dict[str, Any] | None = None, terminal: bool = False, source_ms: float | None = None) -> str:
         """``seen``: the delegate when a claim was decided; a later human change to it wins."""
         route = self._alert_route(row or self.store.get(issue_id))
         return self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen,
-                                             "terminal": terminal, **route}, at=self.clock())
+                                             "terminal": terminal, "source_ms": source_ms, **route}, at=self.clock())
 
     @staticmethod
-    def _alert_route(row: dict[str, Any] | None) -> dict[str, str]:
+    def _alert_route(row: dict[str, Any] | None) -> dict[str, Any]:
         if not row:
             return {}
         if row["origin"] == "chat":
-            return {"session_key": row["owner_ref"]}
-        return {"task_id": row["task_id"]} if row.get("task_id") else {}
+            return {"session_key": row["owner_ref"], "work_owner": row.get("ownership_id")}
+        return {"task_id": row["task_id"], "work_owner": row.get("ownership_id")} if row.get("task_id") else {}
 
     def comment(self, issue_id: str, body: str, *, row: dict[str, Any] | None = None,
                 terminal: bool = False, requires_status_id: str = "", takeover: bool = False) -> None:
@@ -340,17 +366,19 @@ class Bridge:
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
 
-    def may_execute_existing(self, issue_id: str) -> bool:
+    def may_execute_existing(self, issue_id: str, source_ms: float | None = None) -> bool:
         try:
             issue, me = self.api.issue(issue_id), self.api.viewer_id()
-            return bool(me) and (issue.get("delegate") or {}).get("id") == me
+            closed = (issue.get("state") or {}).get("type") in CLOSED
+            return (bool(me) and (issue.get("delegate") or {}).get("id") == me and
+                    (not closed or (source_ms is not None and source_ms >= self.closure_ms(issue))))
         except LinearError as exc:
             log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
             return False
 
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
-        if row and row["origin"] == "kanban" and not self.may_execute_existing(issue_id):
+        if row and row["origin"] == "kanban" and not self.may_execute_existing(issue_id, stamp):
             return
         session = event.get("agentSession") or {}
         creator = session.get("creatorId") or (session.get("creator") or {}).get("id")
@@ -366,11 +394,10 @@ class Bridge:
             if row and row["origin"] == "chat" and row.get("panel_note"):
                 self.activity(issue_id, session_id, "elicitation", row["panel_note"])
         elif row:
-            if row["owner_ref"] == session_id or stamp < float(row["last_updated_at"]):
+            if (row["owner_ref"] == session_id and not row.get("pending_resume")) or stamp < float(row["last_updated_at"]):
                 return  # duplicate delivery, or an older session arriving late
-            self.store.update(issue_id, owner_ref=session_id, last_updated_at=stamp)
-            self.activity(issue_id, session_id, "thought", "Resuming the existing task.")
-            if not self._resume(row, "Re-delegated in Linear; continue the existing work."):
+            if not self._resume(row, "Re-delegated in Linear; continue the existing work.", session_id, stamp,
+                                "Resuming the existing task."):
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
         else:
             self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
@@ -378,26 +405,15 @@ class Bridge:
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         if row and event_ms(event) < float(row["last_updated_at"]):
             return
-        if row and not self.may_execute_existing(issue["id"]):
+        if row and not self.may_execute_existing(issue["id"], event_ms(event)):
             return
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
         if row and row["origin"] == "chat":
-            ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
-            if ok and row.get("stop_requested_at"):
-                self.store.update(issue["id"], stop_requested_at=0, last_updated_at=event_ms(event),
-                                  resume_fence_at=event_ms(event))
-                self.status(issue["id"], "in_progress", row=row)
-            self.activity(issue["id"], session_id, "thought" if ok else "error",
-                          "Passed to the chat session working on this." if ok else
-                          "Could not reach the chat session working on this.")
+            self._chat_followup(row, session_id, str(activity.get("id") or ""), event_ms(event), ident, body)
             return
         if row:
-            if event_ms(event) >= float(row["last_updated_at"]):  # replies go to the newest session
-                self.store.update(issue["id"], owner_ref=session_id, last_updated_at=event_ms(event))
-                row = {**row, "owner_ref": session_id}
-            if self._resume(row, f"Follow-up from Linear: {body}"):
-                self.activity(issue["id"], session_id, "thought", "Passed to the running task.")
+            if self._resume(row, f"Follow-up from Linear: {body}", session_id, event_ms(event), "Passed to the running task."):
                 return
         # No live work: the follow-up starts work. The session key comes first so an
         # out-of-order prompt and its own 'created' event can never create two tasks.
@@ -405,15 +421,59 @@ class Bridge:
         if not self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}", body):
             self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}:{activity.get('id')}", body)
 
-    def _resume(self, row: dict[str, Any], note: str) -> bool:
+    def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
+                       ident: str, body: str) -> None:
+        issue_id = row["issue_id"]
+        marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
+        if self.store.followup_captured(marker):
+            return
+        pending = json.loads(row["pending_resume"]) if row.get("pending_resume") else {}
+        if pending and stamp < pending["stamp"]:
+            return
+        route = self._alert_route(row)
+        error = {"issue_id": issue_id, "session_id": session_id, "content": {"type": "error", "body":
+                 "Chat follow-up delivery outcome is unknown; reconcile the owning chat before repeating it."}, **route}
+        if pending.get("attempting") and stamp <= pending["stamp"]:
+            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
+            raise LinearError("Chat follow-up outcome unknown; reconcile instead of repeating injection", retryable=False)
+        intent = {"marker": marker, "stamp": stamp, "attempting": True}
+        self.store.update(issue_id, pending_resume=json.dumps(intent))  # crash after injection is uncertain
+        try:
+            ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
+        except Exception:
+            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
+            raise
+        if not ok:
+            self.store.update(issue_id, pending_resume=json.dumps({**intent, "attempting": False}))
+            error["content"]["body"] = "Could not reach the owning chat; this follow-up remains queued for retry."
+            self.store.enqueue_once("activity", error, f"followup-refused:{marker}", at=self.clock())
+            raise LinearError("Owning chat refused injection; retry the durable ingress delivery")
+        writes = [("activity", {"issue_id": issue_id, "session_id": session_id, "followup_marker": marker,
+                                "content": {"type": "thought", "body": "Passed to the chat session working on this."}, **route})]
+        if row.get("stop_requested_at"):
+            writes.insert(0, ("status", {"issue_id": issue_id, "state": "in_progress", **route}))
+        self.store.complete_resume(issue_id, stamp, writes, at=self.clock())
+
+    def _resume(self, row: dict[str, Any], note: str, session_id: str, stamp: float, receipt: str) -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
         task = self.kanban.get(row["task_id"])
         if task is None or task.status in ("done", "archived"):
-            self.store.delete(row["issue_id"])
+            if task and task.status == "done":
+                self._finished(row)  # a successor cannot erase an uncaptured predecessor result
+            else:
+                self.store.delete(row["issue_id"])
             return False
+        self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp, pending_resume=note)
         self.kanban.comment(task.id, note)
         if task.status == "blocked":
-            self.kanban.unblock(task.id)
+            if not self.kanban.unblock(task.id) and self.kanban.get(task.id).status == "blocked":
+                raise LinearError("Core task remains blocked; retry the saved resume transition")
+        route = self._alert_route(row)
+        self.store.complete_resume(row["issue_id"], stamp, [
+            ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
+                        "source_ms": stamp, "seen": "self", **route}),
+            ("activity", {"issue_id": row["issue_id"], "session_id": session_id,
+                          "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
         return True
 
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
@@ -426,6 +486,8 @@ class Bridge:
         if fresh and delegate and delegate != me:
             log.info("linear: ignoring delegation of %s; delegate is now %s", issue_id, delegate)
             return True
+        if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
+            return True  # closure after this source event wins, even before the next periodic read
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
@@ -434,12 +496,15 @@ class Bridge:
             title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
             body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),
             idempotency_key=key, completion_contract=self.contracts.get(project))
-        if task.status in ("done", "archived"):
+        if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(task.id)):
             return False  # this session's work already finished
         self.kanban.subscribe(task.id, issue_id)
         self.store.put(issue_id, "kanban", session_id, task_id=task.id, project_id=project, last_updated_at=stamp)
+        if task.status == "done":
+            self._finished(self.store.get(issue_id))  # core finished between create and mapping commit
+            return True
         self.activity(issue_id, session_id, "thought", f"On it. Queued as Kanban task {task.id}.")  # ack first (10 s)
-        self.status(issue_id, "in_progress", claim=True, seen=me)
+        self.status(issue_id, "in_progress", claim=True, seen=me, source_ms=stamp)
         return True
 
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> None:
@@ -526,7 +591,8 @@ class Bridge:
         # PR work: core's completion_contract already verified the exact PR head before 'done'.
         evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
         issue_id = row["issue_id"]
-        if not evidence or not self.accepted_evidence(evidence, contract):
+        heads: dict[str, str] = {}
+        if not evidence or not self.accepted_evidence(evidence, contract, heads=heads):
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
                     "unfinished. Reply or re-delegate to continue." if not evidence else
                     "PR acceptance on the exact head and required checks could not be verified. "
@@ -541,7 +607,8 @@ class Bridge:
             return
         summary = (task.result or "").strip()[:1500]
         links = " ".join(dict.fromkeys(evidence))
-        writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"]}),
+        writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
+                              "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                 "task_id": row["task_id"],
                                 "content": {"type": "response", "body": f"Done. {summary}\n\nEvidence: {links}"}}),
@@ -554,12 +621,15 @@ class Bridge:
                                      for kind, payload in writes], at=self.clock())
 
     # -- ownership re-reads ------------------------------------------------
-    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None) -> bool:
+    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
+                  source_ms: float | None = None) -> bool:
         me = self.api.viewer_id()
         seen = me if seen == "self" else seen
         delegate = issue.get("delegate") or {}
         started = (issue.get("state") or {}).get("type")
-        human_since = iso_ms(issue.get("updatedAt")) > queued_at * 1000  # edited after we queued the claim
+        fence = source_ms if source_ms is not None else queued_at * 1000
+        updated = self.closure_ms(issue) if source_ms is not None and started in CLOSED else iso_ms(issue.get("updatedAt"))
+        human_since = updated > fence
         if claim and (not human_since or (delegate.get("id") in (seen, me) and started not in CLOSED)):
             return True  # an explicit delegation or chat start (re)opens the work
         if started in CLOSED:
@@ -602,10 +672,11 @@ class Bridge:
                     issue = self.api.issue(row["issue_id"])
                     # An initial self-claim may still be queued, but activities
                     # and other writes must never hide a later takeover.
-                    pending_claim = any(p["kind"] == "status" and p["payload"].get("claim")
-                                        for p in self.store.pending(row["issue_id"]))
-                    if pending_claim and not (issue.get("delegate") or {}).get("id"):
-                        continue
+                    pending_claim = next((p["payload"] for p in self.store.pending(row["issue_id"])
+                                          if p["kind"] == "status" and p["payload"].get("claim")), None)
+                    if pending_claim and self.may_write(issue, True, pending_claim["enqueued_at"],
+                                                        pending_claim.get("seen"), pending_claim.get("source_ms")):
+                        continue  # a fresh explicit claim may reopen before the first post-restart flush
                     self.may_write(issue, claim=False)
                 except LinearError as exc:
                     if self._needs_reauthorization(exc):
@@ -652,6 +723,8 @@ class Bridge:
                             failed = True
                         else:
                             failed = self.store.retry(row, self.clock())
+                        if row["payload"].get("reconcile_required"):
+                            progress = True  # this held predecessor no longer blocks the successor
                         if failed and not row["payload"].get("reported"):
                             try:
                                 if self._loud(row, exc):
@@ -663,7 +736,9 @@ class Bridge:
                     sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 try:
-                    if self._loud(row, LinearError("delivery failed", retryable=bool(row["attempts"]))):
+                    held = row["payload"].get("reconcile_required")
+                    if self._loud(row, LinearError("Uncertain terminal send; reconcile the remote outcome" if held else
+                                                   "delivery failed", retryable=bool(row["attempts"]) and not held)):
                         self.store.report(row["id"])
                 except Exception:  # noqa: BLE001 - preserve the unreported row across restarts
                     log.exception("linear: alert delivery failed")
@@ -673,14 +748,32 @@ class Bridge:
 
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        if kind == "status" and payload.get("terminal") and payload.get("state") == "done" and not payload.get("pr_heads"):
+            links = payload.get("evidence") or evidence_links(self.store.terminal_text(row["id"]))
+            if any(PR_URL.fullmatch(url) for url in links):
+                self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile the original "
+                                         "evidence and remote outcome before retrying")
+        if kind == "status" and payload.get("terminal") and self.store.superseded(row):
+            if payload.get("write_started") or row["attempts"]:
+                self._hold_terminal(row, "Earlier terminal send is uncertain and newer work owns this issue; reconcile "
+                                         "the remote outcome before resolving this closeout")
+            self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
+            return False
         if kind != "project_update" and payload.get("requires_status_id") and \
                 not self.store.terminal_status_applied(payload["requires_status_id"]):
-            return False
+            status = self.store.outbox_row(payload["requires_status_id"])
+            if not status or not status["payload"].get("superseded") or kind not in ("activity", "comment"):
+                return False
+            content = payload["content"] if kind == "activity" else payload
+            content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
+                               content["body"].replace("Done.", "Finished locally.", 1))
         if kind != "project_update" and payload.get("terminal"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self.api.issue(owner_issue_id)
             if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
                     or (issue.get("state") or {}).get("type") == "canceled"):
+                if kind == "status" and (payload.get("write_started") or row["attempts"]):
+                    self._hold_terminal(row, "Ownership changed after an uncertain terminal send; reconcile the remote outcome")
                 return False  # no completion message or update after a human takeover/cancel
         elif kind in ("comment", "activity") and not payload.get("takeover") and \
                 (payload.get("session_key") or payload.get("task_id")):
@@ -691,18 +784,30 @@ class Bridge:
         if kind == "status":
             issue = self.api.issue(payload["issue_id"])  # re-read before every status write
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen")):
+                                  payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
-                        and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
+                        and (row["attempts"] or payload.get("write_started")) and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):
                     self._alert_uncertain_terminal(row)
                     self.store.report(row["id"])
+                    payload["reported"] = True
+                    self._hold_terminal(row, "A prior status attempt failed and Linear now shows Done; reconcile its evidence")
                 return False
+            if payload.get("terminal") and payload.get("state") == "done" and payload.get("pr_heads"):
+                current: dict[str, str] = {}
+                if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current) or
+                        current != payload["pr_heads"]):
+                    if payload.get("write_started") or row["attempts"]:
+                        self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
+                    raise LinearError("PR acceptance on the recorded exact head could not be verified at delivery; "
+                                      "reconcile the PR before redoing closeout", retryable=False)
             name = self.state_name(issue, payload["state"])
             fields = {"stateId": state_id(issue, name)} if name else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if fields:
+                if payload.get("terminal"):
+                    self.store.rewrite(row["id"], {**payload, "write_started": True}, row["next_at"])
                 self.api.update_issue(issue["id"], fields)
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
@@ -714,6 +819,11 @@ class Bridge:
         elif kind == "project_update":
             return self._send_project_update(row["id"])
         return False
+
+    def _hold_terminal(self, row: dict[str, Any], message: str) -> None:
+        self.store.hold_terminal(row["id"])
+        row["payload"]["reconcile_required"] = True
+        raise LinearError(message, retryable=False)
 
     def _send_project_update(self, row_id: str) -> bool:
         for _ in range(10):
@@ -770,7 +880,7 @@ class Bridge:
                 dropped = self.store.drop_unpublished_update(row_id, payload, self.clock())
                 if dropped is None:
                     continue
-                raise ProjectUpdateDeferred  # no create occurred; later work may queue a new batch
+                return False  # the empty batch was removed; continue with later issue writes
             frozen = self.store.freeze_project_update(row_id, payload, self.clock(), body, project_id)
             if frozen is None:
                 continue  # a terminal capture committed during preflight; read it again
@@ -786,8 +896,14 @@ class Bridge:
                   row["kind"], payload.get("issue_id"), exc)
         work = self.store.get(str(payload.get("issue_id")))
         note = f"Linear has not accepted a {row['kind']} update for this issue: {exc}. " + (
+            "It stays held; reconcile the original remote outcome before any retry." if payload.get("reconcile_required") else
             "It will be retried after the next successful write." if getattr(exc, "retryable", True)
             else "It will not be retried; fix the cause and redo the step.")
+        if payload.get("terminal") and payload.get("session_key"):
+            return bool(self.inject(payload["session_key"], "[Linear] " + note))
+        if payload.get("terminal") and payload.get("task_id"):
+            self.kanban.comment(payload["task_id"], note)
+            return True
         if work and work["origin"] == "chat":
             return bool(self.inject(work["owner_ref"], "[Linear] " + note))
         elif work and work["task_id"]:

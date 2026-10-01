@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS work (
   task_id TEXT, project_id TEXT, last_updated_at REAL NOT NULL DEFAULT 0,
   linear_session_id TEXT, panel_note TEXT, stop_requested_at REAL NOT NULL DEFAULT 0,
   last_event_id INTEGER NOT NULL DEFAULT 0, resume_fence_at REAL NOT NULL DEFAULT 0,
-  run_generation INTEGER);
+  run_generation INTEGER, ownership_id TEXT, pending_resume TEXT);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending');
@@ -46,7 +46,7 @@ class Store:
         with closing(sqlite3.connect(self.path)) as db:
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(work)")}
-            for name in ("linear_session_id", "panel_note"):
+            for name in ("linear_session_id", "panel_note", "pending_resume"):
                 if name not in columns:
                     db.execute(f"ALTER TABLE work ADD COLUMN {name} TEXT")
             if "stop_requested_at" not in columns:
@@ -57,6 +57,10 @@ class Store:
                 db.execute("ALTER TABLE work ADD COLUMN resume_fence_at REAL NOT NULL DEFAULT 0")
             if "run_generation" not in columns:
                 db.execute("ALTER TABLE work ADD COLUMN run_generation INTEGER")
+            if "ownership_id" not in columns:
+                db.execute("ALTER TABLE work ADD COLUMN ownership_id TEXT")
+            db.execute("UPDATE work SET ownership_id=lower(hex(randomblob(16))) WHERE ownership_id IS NULL")
+            db.commit()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -98,8 +102,8 @@ class Store:
             run_generation: int | None = None) -> None:
         with self._tx() as db:
             db.execute("INSERT OR REPLACE INTO work (issue_id, origin, owner_ref, task_id, project_id, "
-                       "last_updated_at, run_generation) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation))
+                       "last_updated_at, run_generation, ownership_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation, str(uuid.uuid4())))
 
     def capture_chat_stop(self, issue_id: str, linear_session_id: str, activity_id: str,
                           profile: str, *, at: float, stamp: float = 0.0) -> dict[str, Any] | None:
@@ -186,13 +190,32 @@ class Store:
         with self._tx() as db:
             db.execute("DELETE FROM work WHERE issue_id = ?", (issue_id,))
 
+    def complete_resume(self, issue_id: str, stamp: float, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> None:
+        """Clear the transition intent only with its durable acknowledgement and status."""
+        with self._tx() as db:
+            if not db.execute("SELECT 1 FROM work WHERE issue_id=? AND pending_resume IS NOT NULL", (issue_id,)).fetchone():
+                return
+            for kind, payload in writes:
+                db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
+                           (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
+            db.execute("UPDATE work SET pending_resume=NULL, last_updated_at=MAX(last_updated_at, ?), "
+                       "resume_fence_at=CASE WHEN origin='kanban' OR stop_requested_at>0 THEN ? ELSE resume_fence_at END, "
+                       "stop_requested_at=0 WHERE issue_id=?", (stamp, stamp, issue_id))
+
+    def followup_captured(self, marker: str) -> bool:
+        with self._tx() as db:
+            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND "
+                                   "json_extract(payload, '$.followup_marker')=? LIMIT 1", (marker,)).fetchone())
+
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
-            if not db.execute("SELECT 1 FROM work WHERE issue_id = ?", (issue_id,)).fetchone():
+            work = db.execute("SELECT * FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
+            if not work:
                 return False
             status_id = str(uuid.uuid4())
             for kind, payload in writes:
+                payload = {**payload, "work_owner": work["ownership_id"]}
                 row_id = status_id if kind == "status" else str(uuid.uuid4())
                 if kind != "status":
                     payload = {**payload, "requires_status_id": status_id}
@@ -256,6 +279,12 @@ class Store:
                 (issue_id, task_id, session_id)).fetchall()
         return Counter({(kind, body): count for kind, body, count in rows})
 
+    def terminal_captured(self, task_id: str) -> bool:
+        with self._tx() as db:
+            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
+                                   "json_extract(payload, '$.task_id')=? AND "
+                                   "json_extract(payload, '$.terminal')=1 LIMIT 1", (task_id,)).fetchone())
+
     # -- outbox -----------------------------------------------------------
     def enqueue(self, kind: str, payload: dict[str, Any], *, at: float | None = None) -> str:
         row_id = str(uuid.uuid4())
@@ -282,11 +311,15 @@ class Store:
         """Oldest pending row per issue, if due: writes for one issue go out in order."""
         def eligible(alias: str) -> str:
             dependency = f"json_extract({alias}.payload, '$.requires_status_id')"
-            return (f"({alias}.kind = 'project_update' OR COALESCE({dependency}, '') = '' OR "
+            return (f"(NOT EXISTS (SELECT 1 FROM outbox h WHERE h.id={dependency} "
+                    "AND json_extract(h.payload, '$.reconcile_required')=1 AND "
+                    f"({alias}.kind != 'project_update' OR json_extract({alias}.payload, '$.issue_id')="
+                    "json_extract(h.payload, '$.issue_id'))) AND "
+                    f"({alias}.kind = 'project_update' OR COALESCE({dependency}, '') = '' OR "
                     f"EXISTS (SELECT 1 FROM outbox s WHERE s.id = {dependency} "
                     "AND (s.state = 'sent' OR (s.state = 'failed' AND (s.attempts = 0 OR EXISTS ("
                     "SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.state = 'sent' AND l.rowid > s.rowid "
-                    "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id')))))))")
+                    "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id'))))))))")
 
         with self._tx() as db:
             rows = db.execute(
@@ -323,6 +356,32 @@ class Store:
                              (row_id,)).fetchone()
         return bool(row and row["state"] == "sent" and row["kind"] == "status" and row[2] == 1)
 
+    def terminal_text(self, status_id: str) -> str:
+        with self._tx() as db:
+            rows = db.execute("SELECT COALESCE(json_extract(payload, '$.body'), "
+                              "json_extract(payload, '$.content.body'), '') FROM outbox WHERE "
+                              "json_extract(payload, '$.requires_status_id')=?", (status_id,)).fetchall()
+        return " ".join(row[0] for row in rows)
+
+    def superseded(self, row: dict[str, Any]) -> bool:
+        """A later local owner fences a predecessor, even after the successor finishes."""
+        payload = row["payload"]
+        owner = payload.get("work_owner")
+        with self._tx() as db:
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (payload["issue_id"],)).fetchone()
+            if work:
+                return not owner or work["ownership_id"] != owner  # terminal capture already ended the old work
+            return bool(db.execute(
+                "SELECT 1 FROM outbox WHERE kind='status' AND rowid > (SELECT rowid FROM outbox WHERE id=?) "
+                "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.work_owner') IS NOT NULL "
+                "AND (? IS NULL OR json_extract(payload, '$.work_owner') != ?) LIMIT 1",
+                (row["id"], payload["issue_id"], owner, owner)).fetchone())
+
+    def hold_terminal(self, row_id: str) -> None:
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET attempts=MAX(attempts, 1), "
+                       "payload=json_set(payload, '$.reconcile_required', 1) WHERE id=?", (row_id,))
+
     def drop(self, row_id: str) -> None:
         with self._tx() as db:
             db.execute("DELETE FROM outbox WHERE id = ?", (row_id,))
@@ -348,7 +407,8 @@ class Store:
         write superseded by a later one for the same issue stays failed, so it cannot land stale."""
         with self._tx() as db:
             return db.execute(
-                "UPDATE outbox SET state = 'pending', next_at = ? WHERE state = 'failed' AND attempts > 0 AND NOT ("
+                "UPDATE outbox SET state = 'pending', next_at = ? WHERE state = 'failed' AND attempts > 0 "
+                "AND COALESCE(json_extract(payload, '$.reconcile_required'), 0)=0 AND NOT ("
                 " kind = 'status' AND EXISTS (SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > outbox.rowid"
                 " AND json_extract(l.payload, '$.issue_id') = json_extract(outbox.payload, '$.issue_id')))",
                 (now,)).rowcount

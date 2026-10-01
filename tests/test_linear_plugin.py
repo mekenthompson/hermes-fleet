@@ -72,6 +72,15 @@ class LinearOutboxOrderTests(unittest.TestCase):
         newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101)
         self.assertEqual([row["id"] for row in self.store.due(101)], [newer])
 
+    def test_legacy_chat_terminal_write_is_fenced_by_a_successor_in_the_same_session(self) -> None:
+        payload = {**self.status["payload"], "terminal": True, "session_key": "chat-key"}
+        payload.pop("work_owner", None)  # persisted before ownership incarnation tokens existed
+        self.store.rewrite(self.status["id"], payload, 100)
+        self.store.put("issue-1", "chat", "chat-key", run_generation=2)
+        self.assertTrue(self.store.superseded(self.store.outbox_row(self.status["id"])))
+        self.store.finish("issue-1", [("status", {"issue_id": "issue-1", "state": "done"})], at=101)
+        self.assertTrue(self.store.superseded(self.store.outbox_row(self.status["id"])))
+
 
 class LinearPluginUnitTests(unittest.TestCase):
     def test_off_by_default_and_one_block_enables_it(self) -> None:

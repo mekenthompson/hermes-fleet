@@ -104,6 +104,14 @@ configured contract. Set `completion_contracts` to make core enforce that check 
 completion too. A non-GitHub pull-request link is not accepted as completion evidence. Other
 work needs a destination link such as a merged commit, deploy check, or findings.
 
+Queued PR closeouts retain the accepted head and completion contract. Delivery rechecks
+acceptance on that same head before changing status. If acceptance changes after an uncertain
+send, the original write and dependent evidence remain held for remote reconciliation.
+Legacy queued PR closeouts without a recorded head also stay held; current checks cannot
+establish which head the earlier completion accepted or whether an earlier write landed.
+An older task or chat closeout cannot change a successor's status; an unsent predecessor
+can still receive a truthful local-result receipt without a Done claim or project line.
+
 Chat closeout receipts acknowledge durable local queuing, not remote acceptance.
 Named mutations require literal `success: true`; refusals retain failed recovery rows and
 alert the owning destination. New execution requires a fresh issue ownership read as well
@@ -122,7 +130,13 @@ Chat work is asked to reconcile. If its session cannot be reached, it becomes Bl
 re-reads the issue. An Issue webhook that changes the delegate triggers an immediate re-read.
 Session events older than the newest one handled for that issue are ignored, so a delayed
 delegation cannot take work back. Ordering uses the session and activity `createdAt`. The issue's
-`updatedAt` is not used, because Linear creates the session before it updates the issue.
+closure timestamps fence claims against an authoritative closed state; `updatedAt` is a
+conservative fallback when the closure timestamp is absent. It does not order sessions,
+because Linear creates the session before it updates the issue. A fresh explicit
+delegation can reopen closed work. Every accepted chat follow-up advances the source watermark.
+A refused chat injection remains in ingress for retry across restart, with the existing one-day
+parking limit. An interrupted injection has an unknown outcome and is not repeated; its receipt
+asks for reconciliation, and a newer explicit instruction can steer the same owner.
 
 **Project updates.** For chat, normally one per project per session, sent `quiet_minutes` after the
 last observed turn. If a terminal status is still retrying, owned nonterminal lines can publish
@@ -160,7 +174,9 @@ Every Linear write goes through a local outbox, oldest first per issue.
   team's state to `null` to skip that status change. The comment or activity still posts.
 
 State: `work` holds the active issue, including nullable `run_generation`; upgrades never infer a
-generation for earlier chat work. `chat_stop` retains the original profile, issue, Linear session,
+generation for earlier chat work. `ownership_id` fences each local work incarnation;
+`pending_resume` retains an unfinished Kanban resume or chat injection intent across crashes.
+`chat_stop` retains the original profile, issue, Linear session,
 activity, session key and generation across crashes. Its Stop receipt and worker observation may
 be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
 core accepted an interrupt request; worker completion never proves external effects stopped.
@@ -182,6 +198,9 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
 - **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
   the plugin says so in Linear instead of claiming it stopped.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
+- **Missing closure timestamps leave ordering ambiguous.** The conservative `updatedAt` fallback
+  can refuse a fresh re-delegation if another edit follows its source event. Reconcile or send
+  a newer instruction; the bridge does not infer permission to reopen closed work.
 - **An uncertain project-update send keeps its original UUID and body.** The body freezes before
   the create call, including a possible crash just before the call. If Linear accepted the create
   but its response was lost, changing a retry could not change the update already published.
