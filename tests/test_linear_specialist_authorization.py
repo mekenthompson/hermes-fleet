@@ -363,6 +363,18 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 self.assertEqual(self.store.pending(issue_id), [])
                 self.assertEqual(self.authority.mutations, [])
 
+    def test_history_capture_refuses_persisted_fence_atomically(self):
+        for forget in (False, True):
+            with self.subTest(archived=forget):
+                issue_id = f"{ISSUE}-{forget}"
+                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT)
+                self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved"}, at=1)
+                before, pending = self.store.get(issue_id), self.store.pending(issue_id)
+                self.store.fence_scope(issue_id, "permanent denial", at=1.0)
+                self.assertFalse(self.store.capture_event(issue_id, 2, [("status", {"issue_id": issue_id, "state": "done"})], at=2.0, forget=forget))
+                self.assertEqual(self.store.get(issue_id), before)
+                self.assertEqual(self.store.pending(issue_id), pending)
+
     def test_terminal_capture_refuses_persisted_fence_atomically(self):
         self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
         before = self.store.get(ISSUE)

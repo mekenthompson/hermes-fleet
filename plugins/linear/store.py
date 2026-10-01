@@ -241,6 +241,8 @@ class Store:
                       *, at: float, forget: bool = False) -> bool:
         """Advance our Kanban cursor with its Linear writes, independently of core's claim cursor."""
         with self._tx() as db:
+            if db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?", (issue_id,)).fetchone():
+                return False
             row = db.execute("SELECT last_event_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not row or event_id <= row["last_event_id"]:
                 return False
