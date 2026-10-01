@@ -295,6 +295,50 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(self.kanban.creates, [])
 
+    def test_chat_actions_refuse_persisted_specialist_fence_without_changing_history(self):
+        from hermes_fleet_linear_plugin import chat
+        context = SimpleNamespace(session_key="owner", session_id="owner", profile="synthetic")
+        for action in ("start", "done", "blocked", "release"):
+            with self.subTest(action=action):
+                issue_id = f"{ISSUE}-{action}"
+                self.authority.issues[issue_id] = issue_record(id=issue_id)
+                if action != "start":
+                    self.store.put(issue_id, "chat", "owner", project_id=PROJECT)
+                before = self.store.get(issue_id)
+                self.store.fence_scope(issue_id, "permanent denial", at=1.0)
+                pending = self.store.pending()
+                reply = json.loads(chat.handle(self.bridge, {
+                    "action": action, "issue": issue_id, "evidence": "https://docs.example/findings/1"}, context))
+                self.assertFalse(reply["ok"])
+                self.assertEqual(self.store.get(issue_id), before)
+                self.assertEqual(self.store.pending(), pending)
+                self.assertEqual(self.authority.mutations, [])
+
+    def test_chat_closeout_rechecks_scope_after_evidence_verification(self):
+        from hermes_fleet_linear_plugin import chat
+        self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
+        before = self.store.get(ISSUE)
+        def evidence_checked(_links):
+            self.authority.issues[ISSUE] = issue_record(project={"id": "project-foreign"})
+            return True
+        self.bridge.accepted_evidence = evidence_checked
+        context = SimpleNamespace(session_key="owner", session_id="owner", profile="synthetic")
+        reply = json.loads(chat.handle(self.bridge, {
+            "action": "done", "issue": ISSUE, "evidence": "https://docs.example/findings/1"}, context))
+        self.assertFalse(reply["ok"])
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_terminal_capture_refuses_persisted_fence_atomically(self):
+        self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
+        before = self.store.get(ISSUE)
+        self.store.fence_scope(ISSUE, "permanent denial", at=1.0)
+        self.assertFalse(self.store.finish(ISSUE, [("status", {"issue_id": ISSUE, "state": "done"})], at=2.0))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertEqual(self.store.pending(), [])
+
     def test_pump_fences_permanently_revoked_authoritative_scope_before_history_admission(self):
         changes = (
             ("team", {"team": {"id": "team-foreign", "key": "NO", "states": {"nodes": []}}}),

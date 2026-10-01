@@ -202,6 +202,8 @@ class Store:
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
+            if db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?", (issue_id,)).fetchone():
+                return False
             if not db.execute("SELECT 1 FROM work WHERE issue_id = ?", (issue_id,)).fetchone():
                 return False
             status_id = str(uuid.uuid4())
