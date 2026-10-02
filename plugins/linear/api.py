@@ -23,10 +23,12 @@ ISSUE_FIELDS = """id identifier title description url updatedAt creator { id }
 class LinearError(RuntimeError):
     """A Linear request failed. ``retryable`` is False for a definite GraphQL rejection."""
 
-    def __init__(self, message: str, *, errors: Any = None, retryable: bool = True) -> None:
+    def __init__(self, message: str, *, errors: Any = None, retryable: bool = True,
+                 authoritative_issue_id: str | None = None) -> None:
         super().__init__(message)
         self.errors = errors
         self.retryable = retryable
+        self.authoritative_issue_id = authoritative_issue_id
 
 class RateLimited(LinearError):
     def __init__(self, until: float) -> None:
@@ -94,14 +96,12 @@ class LinearAPI:
         self.paused_until = 0.0
         self._viewer: str | None = None
         self._mutation_guard = threading.local()
-
     @contextmanager
     def guarded_mutation(self, guard):
         previous = getattr(self._mutation_guard, "callback", None)
         self._mutation_guard.callback = guard
         try: yield
         finally: self._mutation_guard.callback = previous
-
     def _pause(self, headers: dict[str, str]) -> float:
         """Linear signals a limit with RATELIMITED; its reset headers are epoch milliseconds."""
         resets = []
@@ -114,7 +114,6 @@ class LinearAPI:
         future = [r for r in resets if r > self.clock()]
         self.paused_until = max(future) if future else self.clock() + DEFAULT_RATE_LIMIT_PAUSE
         return self.paused_until
-
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         if self.clock() < self.paused_until:
             raise RateLimited(self.paused_until)

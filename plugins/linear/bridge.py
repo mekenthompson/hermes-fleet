@@ -282,8 +282,7 @@ class Bridge:
             if task and task.status != "archived": self.kanban.archive(task.id)
     def authorize_specialist_effect(self, issue_id: str) -> bool:
         """Freshly resolve the authoritative issue before specialist work/effect admission."""
-        if not self._specialist_scope_active():
-            return True
+        if not self._specialist_scope_active(): return True
         if not issue_id or self.store.scope_fenced(issue_id):
             if issue_id: self._park_fenced(issue_id)
             return False
@@ -304,8 +303,7 @@ class Bridge:
         candidates.extend((payload.get("line_issues") or {}).values())
         return list(dict.fromkeys(issue_id for issue_id in candidates if issue_id))
     def _authorize_outbox_effect(self, row: dict[str, Any]) -> bool:
-        if not self._specialist_scope_active():
-            return True
+        if not self._specialist_scope_active(): return True
         targets = self._outbox_scope_issue_ids(row)
         return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
     @staticmethod
@@ -323,31 +321,33 @@ class Bridge:
     def _specialist_session_event(self, event: dict[str, Any], issue_id: str, session_id: str):
         session = self.api.agent_session(session_id)
         authoritative_issue_id = session["issue"]["id"]
-        if authoritative_issue_id != issue_id:
-            raise LinearError("Agent Session payload issue does not match Linear", retryable=False)
-        payload_session = event.get("agentSession") or {}
-        payload_creator = payload_session.get("creatorId") or (payload_session.get("creator") or {}).get("id")
-        creator = (session.get("creator") or {}).get("id")
-        if payload_creator and payload_creator != creator:
-            raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
-        issue = self._effect_issue(authoritative_issue_id)
-        activity = event.get("agentActivity") or {}
-        if event.get("action") == "prompted":
-            activity_id = activity.get("id")
-            if not isinstance(activity_id, str) or not activity_id:
-                raise LinearError("Specialist prompt has no authoritative activity id", retryable=False)
-            verified = self.api.agent_activity(activity_id, session_id)
-            user_id = verified["user"]["id"]
-            payload_user = (activity.get("user") or {}).get("id")
-            if payload_user and payload_user != user_id:
-                raise LinearError("Agent Activity payload actor does not match Linear", retryable=False)
-            activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
-        return issue, activity
-    def _reject_specialist_scope(self, exc: LinearError) -> bool:
-        if exc.retryable:
-            raise exc
+        try:
+            if authoritative_issue_id != issue_id:
+                raise LinearError("Agent Session payload issue does not match Linear", retryable=False)
+            payload_session = event.get("agentSession") or {}
+            payload_creator = payload_session.get("creatorId") or (payload_session.get("creator") or {}).get("id")
+            creator = (session.get("creator") or {}).get("id")
+            if payload_creator and payload_creator != creator:
+                raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
+            issue = self._effect_issue(authoritative_issue_id)
+            activity = event.get("agentActivity") or {}
+            if event.get("action") == "prompted":
+                activity_id = activity.get("id")
+                if not isinstance(activity_id, str) or not activity_id:
+                    raise LinearError("Specialist prompt has no authoritative activity id", retryable=False)
+                verified = self.api.agent_activity(activity_id, session_id)
+                user_id = verified["user"]["id"]
+                payload_user = (activity.get("user") or {}).get("id")
+                if payload_user and payload_user != user_id:
+                    raise LinearError("Agent Activity payload actor does not match Linear", retryable=False)
+                activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
+            return issue, activity
+        except LinearError as exc:
+            if not exc.retryable: self._fence_scope_denial(authoritative_issue_id, exc)
+            raise
+    def _reject_specialist_scope(self, exc: LinearError) -> None:
+        if exc.retryable: raise exc
         log.warning("linear: specialist authorization refused: %s", exc)
-        return True
     def handle_webhook(self, event: dict[str, Any]) -> None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
@@ -357,16 +357,15 @@ class Bridge:
         if self._specialist_scope_active() and event.get("type") == "Issue" and data.get("id"):
             if self.store.scope_fenced(data["id"]): return
             try:
-                self.api.issue(data["id"])
+                self._effect_issue(data["id"])
             except LinearError as exc:
-                if self._reject_specialist_scope(exc):
-                    self._fence_scope_denial(data["id"], exc)
-                    return
+                self._reject_specialist_scope(exc)
+                return
         if event.get("type") == "Issue" and "delegateId" in (event.get("updatedFrom") or {}) and data.get("id"):
             row = self.store.get(data["id"])
             if row:  # confirm by re-reading, never trust the snapshot
                 with self.lock(data["id"]), suppress(LinearError):  # unreachable: the periodic re-read retries
-                    issue = self.api.issue(data["id"])
+                    issue = self._effect_issue(data["id"])
                     pending_claim = any(p["kind"] == "status" and p["payload"].get("claim")
                                         for p in self.store.pending(data["id"]))
                     if not (pending_claim and not (issue.get("delegate") or {}).get("id")):
@@ -375,7 +374,8 @@ class Bridge:
         session = event.get("agentSession") or {}
         issue = session.get("issue") or {}
         issue_id, session_id = issue.get("id"), session.get("id")
-        if event.get("type") != "AgentSessionEvent" or not issue_id or not session_id:
+        if (event.get("type") != "AgentSessionEvent" or not session_id or
+                (not issue_id and not self._specialist_scope_active())):
             return
         activity = event.get("agentActivity") or {}
         if self._specialist_scope_active():
@@ -383,8 +383,9 @@ class Bridge:
                 issue, activity = self._specialist_session_event(event, issue_id, session_id)
                 issue_id = issue["id"]
             except LinearError as exc:
-                if self._reject_specialist_scope(exc):
-                    return
+                self._reject_specialist_scope(exc)
+                if exc.authoritative_issue_id: self._fence_scope_denial(exc.authoritative_issue_id, exc)
+                return
             if self.store.scope_fenced(issue_id): return
         with self.lock(issue_id):
             row = self.store.get(issue_id)
@@ -404,7 +405,7 @@ class Bridge:
         if not (self._require_effect(issue_id) if retryable else self.authorize_specialist_effect(issue_id)):
             return False
         try:
-            issue, me = self.api.issue(issue_id), self.api.viewer_id()
+            issue, me = self._effect_issue(issue_id), self.api.viewer_id()
             return bool(me) and (issue.get("delegate") or {}).get("id") == me
         except LinearError as exc:
             log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
@@ -494,7 +495,7 @@ class Bridge:
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
         if not self._require_effect(issue_id): return False
-        fresh = self.api.issue(issue_id)  # refuse new execution until current ownership is known
+        fresh = self._effect_issue(issue_id)  # refuse new execution until current ownership is known
         me = self.me()
         if not me:
             raise LinearError("Linear viewer identity unavailable; cannot create or claim Kanban work")
@@ -708,7 +709,7 @@ class Bridge:
                 if self._specialist_scope_active() and self.store.scope_fenced(row["issue_id"]):
                     continue
                 try:
-                    issue = self.api.issue(row["issue_id"])
+                    issue = self._effect_issue(row["issue_id"])
                     # An initial self-claim may still be queued, but activities
                     # and other writes must never hide a later takeover.
                     pending_claim = any(p["kind"] == "status" and p["payload"].get("claim")
@@ -861,7 +862,7 @@ class Bridge:
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
                 try:
-                    issue = self._effect_issue(issue_id) if self._specialist_scope_active() else self.api.issue(issue_id)
+                    issue = self._effect_issue(issue_id)
                 except LinearError as exc:
                     if exc.retryable:
                         raise
