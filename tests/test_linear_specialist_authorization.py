@@ -204,7 +204,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.api.issue = redirected
         self.assertEqual(self.bridge.flush(), 0)
         self.assertEqual(self.authority.mutations, [])
-        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
         self.assertEqual(self.store.outbox_row(row_id)["state"], "pending")
 
@@ -237,9 +237,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.api.issue = redirected
         self.assertEqual(self.bridge.flush(), 0)
         self.assertEqual(self.authority.mutations, [])
-        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
-        self.assertEqual(self.store.pending(), before)
+        self.assertEqual([(r["id"], r["payload"], r["state"]) for r in self.store.pending()],
+                         [(r["id"], r["payload"], r["state"]) for r in before])
 
     def seed_chat_stop(self):
         self.store.put(ISSUE, "chat", "chat-key", run_generation=1)
@@ -291,6 +292,23 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertEqual(self.store.get(ISSUE), before)
         self.assertEqual(self.kanban.tasks[task_id].status, "ready")
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(self.store.pending(), [])
+
+    def test_first_lookup_redirect_does_not_fence_or_archive_requested_work(self):
+        task_id = self.seed_kanban_work()
+        other = "issue-other"
+        other_task = self.seed_kanban_work(other)
+        self.authority.issues[other] = issue_record(id=other)
+        before = self.store.get(ISSUE)
+        original = self.api.issue
+        self.api.issue = lambda ref: original(other) if ref == ISSUE else original(ref)
+        self.bridge.pump_kanban()
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready")
+        self.assertEqual(self.kanban.tasks[other_task].status, "ready")
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(self.store.pending(), [])
 
@@ -499,8 +517,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 if calls == (2 if second_lookup else 1): return original(other)
             return original(ref)
         self.api.issue = redirect
-        self.bridge.handle_webhook({"type": "Issue", "updatedFrom": {"delegateId": "other"},
-                                    "data": {"id": ISSUE}})
+        from contextlib import nullcontext
+        with nullcontext() if second_lookup else self.assertRaises(LinearError):
+            self.bridge.handle_webhook({"type": "Issue", "updatedFrom": {"delegateId": "other"},
+                                        "data": {"id": ISSUE}})
         self.assertEqual(calls, 2 if second_lookup else 1)
         self.assertEqual(self.store.get(other), work)
         self.assertEqual(self.store.outbox_row(outbox_id), outbox)

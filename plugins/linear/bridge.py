@@ -313,7 +313,7 @@ class Bridge:
         try:
             issue = self.api.issue(issue_id)
             if not isinstance(issue, dict) or issue.get("id") != issue_id:
-                raise LinearError("Linear issue resolution changed its identity", retryable=False, authoritative_issue_id=issue_id)
+                raise LinearError("Linear issue resolution changed its identity")
             return issue
         except LinearError as exc:
             if not exc.retryable: self._fence_scope_denial(issue_id, exc)
