@@ -236,5 +236,6 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 2,400 lines, including this bounded
-authorization contract; the unit suite enforces that limit.
+The production implementation is capped at 2,700 lines, including this bounded
+authorization contract and durable recovery boundaries; the unit suite enforces
+that limit without compressing safety-critical branches.

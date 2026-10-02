@@ -82,13 +82,13 @@ def evidence_links(text: str) -> list[str]:
     return [clean for url in URL.findall(text or "") if (clean := url.rstrip(".,;:!?"))
             and "linear.app/" not in clean]
 
-def pr_acceptance(url: str) -> bool:
+def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
     """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
     try:
         from hermes_cli.kanban_pr_acceptance import collect_acceptance
-        return bool(collect_acceptance(url, url)["ok"])
+        return collect_acceptance(contract or url, url)
     except (ImportError, KeyError, TypeError):
-        return False
+        return {}
 
 def iso_ms(raw: Any) -> float:
     try:
@@ -165,6 +165,12 @@ class Bridge:
         team = issue.get("team") or {}
         override = self.team_states.get(team.get("key")) or self.team_states.get(team.get("id")) or {}
         return override[key] if key in override else self.states.get(key)
+    @staticmethod
+    def closure_ms(issue: dict[str, Any]) -> float:
+        state = (issue.get("state") or {}).get("type")
+        if state not in CLOSED: return 0
+        field = "completedAt" if state == "completed" else "canceledAt"
+        return iso_ms(issue.get(field)) or iso_ms(issue.get("updatedAt")) or math.inf
     def me(self) -> str | None:
         try: return self.api.viewer_id()
         except LinearError: return None
@@ -199,23 +205,31 @@ class Bridge:
                 log.exception("linear: reauthorization alert delivery failed")
                 continue
             self._reauth_alerted.add((kind, target))
-    def accepted_evidence(self, links: list[str], contract: str = "local-only") -> bool:
+    def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
+                          heads: dict[str, str] | None = None) -> bool:
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
             return False
         if not prs:
             return True
         # Verify the current PR head even after core accepted completion.
-        return all(pr_acceptance(url) for url in prs)
+        for url in prs:
+            receipt = pr_acceptance(url) if contract in ("local-only", url) else pr_acceptance(url, contract)
+            if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
+                    r"[0-9a-f]{40}", str(receipt.get("head_sha") or "")):
+                return False
+            if heads is not None: heads[url] = receipt["head_sha"]
+        return True
     # -- outbox helpers ----------------------------------------------------
     def status(self, issue_id: str, state: str, *, claim: bool = False, seen: str | None = None,
-               row: dict[str, Any] | None = None, terminal: bool = False) -> str:
+               row: dict[str, Any] | None = None, terminal: bool = False,
+               source_ms: float | None = None) -> str:
         """``seen``: the delegate when a claim was decided; a later human change to it wins."""
         if not self.authorize_specialist_effect(issue_id):
             return ""
         route = self._alert_route(row or self.store.get(issue_id))
         return self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen,
-                                             "terminal": terminal, **route}, at=self.clock())
+                                             "terminal": terminal, "source_ms": source_ms, **route}, at=self.clock())
     @staticmethod
     def _alert_route(row: dict[str, Any] | None) -> dict[str, str]:
         if not row:
@@ -402,12 +416,15 @@ class Bridge:
                            event_ms(event), str(activity.get("id") or ""))
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
-    def may_execute_existing(self, issue_id: str, *, retryable: bool = False) -> bool:
+    def may_execute_existing(self, issue_id: str, *, retryable: bool = False,
+                             source_ms: float | None = None) -> bool:
         if not (self._require_effect(issue_id) if retryable else self.authorize_specialist_effect(issue_id)):
             return False
         try:
             issue, me = self._effect_issue(issue_id), self.api.viewer_id()
-            return bool(me) and (issue.get("delegate") or {}).get("id") == me
+            return (bool(me) and (issue.get("delegate") or {}).get("id") == me and
+                    ((issue.get("state") or {}).get("type") not in CLOSED or
+                     (source_ms is not None and source_ms >= self.closure_ms(issue))))
         except LinearError as exc:
             log.warning("linear: existing-work authorization refused for %s: %s", issue_id, exc)
             if not exc.retryable:
@@ -419,7 +436,8 @@ class Bridge:
         issue_id, stamp = issue["id"], event_ms(event)
         incomplete = bool(row and row["origin"] == "kanban" and
                           not self.store.has_start_ack(issue_id, row["task_id"]))
-        if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(issue_id, retryable=self._specialist_scope_active()):
+        if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(
+                issue_id, retryable=self._specialist_scope_active(), source_ms=stamp):
             return
         session = event.get("agentSession") or {}
         creator = session.get("creatorId") or (session.get("creator") or {}).get("id")
@@ -441,58 +459,101 @@ class Bridge:
                         issue_id, owner_ref=session_id, last_updated_at=stamp): return
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}", existing=row)
                 return
-            if row["owner_ref"] == session_id: return
-            if not self.store.update(issue_id, owner_ref=session_id, last_updated_at=stamp): return
-            self.activity(issue_id, session_id, "thought", "Resuming the existing task.")
-            if not self._resume(row, "Re-delegated in Linear; continue the existing work."):
+            if row["owner_ref"] == session_id and not row.get("pending_resume"): return
+            if not self._resume(row, "Re-delegated in Linear; continue the existing work.",
+                                session_id, stamp, "Resuming the existing task."):
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
         else:
             self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         if row and event_ms(event) < float(row["last_updated_at"]):
             return
-        if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active()):
+        if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active(),
+                                                 source_ms=event_ms(event)):
             return
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
         if row and row["origin"] == "chat":
-            with self.store.guard_issue(issue["id"]) as admitted:
-                if not admitted or not self._require_effect(issue["id"]): return
-                ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
-                if ok and row.get("stop_requested_at"):
-                    if not self.store.update(issue["id"], stop_requested_at=0, last_updated_at=event_ms(event),
-                                             resume_fence_at=event_ms(event)): return
-                    self.status(issue["id"], "in_progress", row=row)
-                self.activity(issue["id"], session_id, "thought" if ok else "error",
-                              "Passed to the chat session working on this." if ok else
-                              "Could not reach the chat session working on this.")
+            self._chat_followup(row, session_id, str(activity.get("id") or ""), event_ms(event), ident, body)
             return
         if row:
-            if event_ms(event) >= float(row["last_updated_at"]):  # replies go to the newest session
-                if not self.store.update(issue["id"], owner_ref=session_id,
-                                         last_updated_at=event_ms(event)): return
-                row = {**row, "owner_ref": session_id}
-            if self._resume(row, f"Follow-up from Linear: {body}"):
-                self.activity(issue["id"], session_id, "thought", "Passed to the running task.")
+            if self._resume(row, f"Follow-up from Linear: {body}", session_id,
+                            event_ms(event), "Passed to the running task."):
                 return
         # The session key comes first so an out-of-order prompt and created event share a task.
         stamp = event_ms(event)
         if not self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}", body) and \
                 self._require_effect(issue["id"]):
             self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}:{activity.get('id')}", body)
-    def _resume(self, row: dict[str, Any], note: str) -> bool:
+    def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
+                       ident: str, body: str) -> None:
+        issue_id = row["issue_id"]
+        marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
+        if self.store.followup_captured(marker): return
+        pending = json.loads(row["pending_resume"]) if row.get("pending_resume") else {}
+        if pending and stamp < pending["stamp"]: return
+        route = self._alert_route(row)
+        error = {"issue_id": issue_id, "session_id": session_id, "content": {"type": "error", "body":
+                 "Chat follow-up delivery outcome is unknown; reconcile the owning chat before repeating it."}, **route}
+        if pending.get("attempting") and stamp <= pending["stamp"]:
+            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
+            raise LinearError("Chat follow-up outcome unknown; reconcile instead of repeating injection", retryable=False)
+        intent = {"marker": marker, "stamp": stamp, "attempting": True}
+        if not self.store.update(issue_id, pending_resume=json.dumps(intent)): return
+        failure = None
+        with self.store.guard_issue(issue_id) as admitted:
+            if not admitted or not self._require_effect(issue_id): return
+            try: ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
+            except Exception as exc:
+                failure, ok = exc, False
+            if ok:
+                writes = [("activity", {"issue_id": issue_id, "session_id": session_id, "followup_marker": marker,
+                                        "content": {"type": "thought", "body": "Passed to the chat session working on this."}, **route})]
+                if row.get("stop_requested_at"):
+                    writes.insert(0, ("status", {"issue_id": issue_id, "state": "in_progress", **route}))
+                if not self.store.complete_resume(issue_id, stamp, writes, at=self.clock()): return
+                return
+        if failure:
+            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
+            raise failure
+        error["content"]["body"] = "Could not reach the owning chat; this follow-up remains queued for retry."
+        self.store.update(issue_id, pending_resume=json.dumps({**intent, "attempting": False}))
+        self.store.enqueue_once("activity", error, f"followup-refused:{marker}", at=self.clock())
+        raise LinearError("Owning chat refused injection; retry the durable ingress delivery")
+    def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
+                stamp: float | None = None, receipt: str = "Resuming the existing task.") -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
         if not self._require_effect(row["issue_id"]): return False
+        session_id = session_id or row["owner_ref"]
+        stamp = stamp if stamp is not None else float(row["last_updated_at"])
         task = self.kanban.get(row["task_id"])
         if task is None or task.status in ("done", "archived"):
-            self.store.delete(row["issue_id"])
+            if task and task.status == "done": self._finished(row)
+            else: self.store.delete(row["issue_id"])
+            return False
+        intent = json.loads(row["pending_resume"]) if row.get("pending_resume") else None
+        if intent and intent.get("kind") == "kanban":
+            note, session_id, stamp, receipt = (intent[key] for key in ("note", "session_id", "stamp", "receipt"))
+        elif not self.store.activate_task(row["issue_id"], task.id, lambda: True):
+            return False
+        elif not self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp,
+                                   pending_resume=json.dumps({"kind": "kanban", "note": note,
+                                                              "session_id": session_id, "stamp": stamp,
+                                                              "receipt": receipt})):
             return False
         def steer() -> bool:
             self.kanban.comment(task.id, note)
             if task.status != "blocked" or self.kanban.unblock(task.id): return True
             current = self.kanban.get(task.id)
-            return bool(current and current.status not in ("done", "archived"))
-        return self.store.activate_task(row["issue_id"], task.id, steer)
+            if current and current.status != "blocked": return True
+            raise LinearError("Core task remains blocked; retry the saved resume transition")
+        if not self.store.activate_task(row["issue_id"], task.id, steer): return False
+        route = self._alert_route(row)
+        return self.store.complete_resume(row["issue_id"], stamp, [
+            ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
+                        "source_ms": stamp, "seen": "self", **route}),
+            ("activity", {"issue_id": row["issue_id"], "session_id": session_id,
+                          "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
         if not self._require_effect(issue_id): return False
@@ -504,6 +565,8 @@ class Bridge:
         if fresh and delegate and delegate != me:
             log.info("linear: ignoring delegation of %s; delegate is now %s", issue_id, delegate)
             return True
+        if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
+            return True
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
@@ -514,8 +577,8 @@ class Bridge:
             idempotency_key=key, completion_contract=self.contracts.get(project),
             initial_status="blocked" if self._specialist_scope_active() else "running")
         if task is None: return False
-        if task.status in ("done", "archived"):
-            return False  # this session's work already finished
+        if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(task.id)):
+            return False
         if not self._require_effect(issue_id):
             self.kanban.archive(task.id)
             return False
@@ -530,11 +593,14 @@ class Bridge:
                                 "content": {"type": "thought", "body": f"On it. Queued as Kanban task {task.id}."},
                                 **route}),
                   ("status", {"issue_id": issue_id, "state": "in_progress", "claim": True,
-                              "seen": me, "terminal": False, **route})]
+                              "seen": me, "source_ms": stamp, "terminal": False, **route})]
         if not existing and not self.store.put(issue_id, "kanban", session_id, task_id=task.id,
                                                project_id=project, last_updated_at=stamp):
             self.kanban.archive(task.id)
             return False
+        if task.status == "done":
+            self._finished(self.store.get(issue_id))
+            return True
         try:
             if not self.store.activate_task(issue_id, task.id, activate):
                 self.kanban.archive(task.id)
@@ -628,6 +694,8 @@ class Bridge:
     def _finished(self, row: dict[str, Any]) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
+        if self.store.terminal_captured(row["task_id"]):
+            return
         task = self.kanban.get(row["task_id"])
         if task is None:
             return
@@ -635,7 +703,10 @@ class Bridge:
         # PR work: core's completion_contract already verified the exact PR head before 'done'.
         evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
         issue_id = row["issue_id"]
-        if not evidence or not self.accepted_evidence(evidence, contract):
+        heads: dict[str, str] = {}
+        accepted = (self.accepted_evidence(evidence, contract, heads=heads) if any(
+                    PR_URL.fullmatch(link) for link in evidence) else self.accepted_evidence(evidence, contract))
+        if not evidence or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
                     "unfinished. Reply or re-delegate to continue." if not evidence else
                     "PR acceptance on the exact head and required checks could not be verified. "
@@ -652,7 +723,8 @@ class Bridge:
             return
         summary = (task.result or "").strip()[:1500]
         links = " ".join(dict.fromkeys(evidence))
-        writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"]}),
+        writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
+                              "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                 "task_id": row["task_id"],
                                 "content": {"type": "response", "body": f"Done. {summary}\n\nEvidence: {links}"}}),
@@ -666,12 +738,15 @@ class Bridge:
         self.store.finish(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock())
     # -- ownership re-reads ------------------------------------------------
-    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None) -> bool:
+    def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
+                  source_ms: float | None = None) -> bool:
         me = self.api.viewer_id()
         seen = me if seen == "self" else seen
         delegate = issue.get("delegate") or {}
         started = (issue.get("state") or {}).get("type")
-        human_since = iso_ms(issue.get("updatedAt")) > queued_at * 1000  # edited after we queued the claim
+        fence = source_ms if source_ms is not None else queued_at * 1000
+        updated = self.closure_ms(issue) if source_ms is not None and started in CLOSED else iso_ms(issue.get("updatedAt"))
+        human_since = updated > fence
         if claim and (not human_since or (delegate.get("id") in (seen, me) and started not in CLOSED)):
             return True  # an explicit delegation or chat start (re)opens the work
         if started in CLOSED:
@@ -713,9 +788,10 @@ class Bridge:
                     issue = self._effect_issue(row["issue_id"])
                     # An initial self-claim may still be queued, but activities
                     # and other writes must never hide a later takeover.
-                    pending_claim = any(p["kind"] == "status" and p["payload"].get("claim")
-                                        for p in self.store.pending(row["issue_id"]))
-                    if pending_claim and not (issue.get("delegate") or {}).get("id"):
+                    pending_claim = next((p["payload"] for p in self.store.pending(row["issue_id"])
+                                          if p["kind"] == "status" and p["payload"].get("claim")), None)
+                    if pending_claim and self.may_write(issue, True, pending_claim["enqueued_at"],
+                                                        pending_claim.get("seen"), pending_claim.get("source_ms")):
                         continue
                     self.may_write(issue, claim=False)
                 except LinearError as exc:
@@ -726,6 +802,15 @@ class Bridge:
                     continue
     def recover(self) -> None:
         """After a restart: Kanban workers are respawned by core; chat work is asked to reconcile."""
+        for row in self.store.active("kanban"):
+            if not row.get("pending_resume"): continue
+            try:
+                intent = json.loads(row["pending_resume"])
+                if (intent.get("kind") == "kanban" and self.may_execute_existing(
+                        row["issue_id"], source_ms=intent["stamp"])):
+                    self._resume(row, intent["note"], intent["session_id"], intent["stamp"], intent["receipt"])
+            except (LinearError, ValueError, KeyError):
+                continue
         for row in self.store.active("chat"):
             if not self.authorize_specialist_effect(row["issue_id"]):
                 continue
@@ -760,6 +845,7 @@ class Bridge:
                     try:
                         applied = self._send(row)
                     except ProjectUpdateDeferred:
+                        if self.store.outbox_row(row["id"]) is None: progress = True
                         continue
                     except RateLimited as exc:
                         self.store.defer(row["id"], exc.until)
@@ -776,6 +862,7 @@ class Bridge:
                             continue
                         if not exc.retryable:
                             self.store.mark(row["id"], "failed")
+                            if row["payload"].get("reconcile_required"): progress = True
                         else:
                             self.store.retry(row, self.clock())
                         continue
@@ -804,9 +891,23 @@ class Bridge:
             action()
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        if kind == "status" and payload.get("terminal") and payload.get("state") == "done" and not payload.get("pr_heads"):
+            links = payload.get("evidence") or evidence_links(self.store.terminal_text(row["id"]))
+            if any(PR_URL.fullmatch(url) for url in links):
+                self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile before retrying")
+        if kind == "status" and payload.get("terminal") and self.store.superseded(row):
+            if row["attempts"] or payload.get("write_started"):
+                self._hold_terminal(row, "Earlier terminal send is uncertain and newer work owns this issue; reconcile the remote outcome")
+            self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
+            return False
         if kind != "project_update" and payload.get("requires_status_id") and \
                 not self.store.terminal_status_applied(payload["requires_status_id"]):
-            return False
+            status = self.store.outbox_row(payload["requires_status_id"])
+            if not status or not status["payload"].get("superseded") or kind not in ("activity", "comment"):
+                return False
+            content = payload["content"] if kind == "activity" else payload
+            content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
+                               content["body"].replace("Done.", "Finished locally.", 1))
         if kind != "project_update" and payload.get("terminal"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
@@ -822,18 +923,27 @@ class Bridge:
         if kind == "status":
             issue = self._effect_issue(payload["issue_id"])  # exact target on every re-read
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen")):
+                                  payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
                         and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):
                     self._alert_uncertain_terminal(row)
                     self.store.report(row["id"])
                 return False
+            if payload.get("terminal") and payload.get("state") == "done" and payload.get("pr_heads"):
+                current: dict[str, str] = {}
+                if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current)
+                        or current != payload["pr_heads"]):
+                    if payload.get("write_started") or row["attempts"]:
+                        self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
+                    raise LinearError("PR acceptance on the recorded exact head failed at delivery", retryable=False)
             name = self.state_name(issue, payload["state"])
             fields = {"stateId": state_id(issue, name)} if name else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if fields:
+                if payload.get("terminal"):
+                    self.store.rewrite(row["id"], {**payload, "write_started": True}, row["next_at"])
                 self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields))
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
@@ -923,6 +1033,9 @@ class Bridge:
         note = f"Linear has not accepted a {row['kind']} update for this issue: {exc}. " + (
             "It will be retried after the next successful write." if getattr(exc, "retryable", True)
             else "It will not be retried; fix the cause and redo the step.")
+        if payload.get("reconcile_required"):
+            note = "Earlier terminal write held after an uncertain send; reconcile its remote outcome. " + str(exc)
+            work = None
         if work and work["origin"] == "chat":
             return bool(self.inject(work["owner_ref"], "[Linear] " + note))
         elif work and work["task_id"]:
@@ -944,6 +1057,10 @@ class Bridge:
             self.inject(payload["session_key"], "[Linear] " + note)
         elif payload.get("task_id"):
             self.kanban.comment(payload["task_id"], note)
+    def _hold_terminal(self, row: dict[str, Any], message: str) -> None:
+        self.store.hold_terminal(row["id"])
+        row["payload"]["reconcile_required"] = True
+        raise LinearError(message, retryable=False)
     # -- ingress + loop ----------------------------------------------------
     def drain_ingress(self, database: Path, limit: int = 50) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
