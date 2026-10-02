@@ -891,10 +891,10 @@ class Bridge:
             if progress:
                 self.store.revive_failed(self.clock())
         return sent
-
-    def _mutate_outbox(self, row_id: str, action: Callable[[], None]) -> None:
+    def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False) -> None:
         @contextmanager
         def guard():
+            if terminal and not self.store.mark_write_started(row_id): raise ProjectUpdateDeferred
             with self.store.guard_mutation(row_id) as admitted:
                 if not admitted: raise ProjectUpdateDeferred
                 yield
@@ -920,8 +920,6 @@ class Bridge:
             if any(PR_URL.fullmatch(url) for url in links):
                 self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile before retrying")
         if kind == "status" and payload.get("terminal") and self.store.superseded(row):
-            if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
-                self._hold_terminal(row, "Earlier terminal send is uncertain and newer work owns this issue; reconcile the remote outcome")
             self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
             return False
         if kind != "project_update" and payload.get("requires_status_id") and \
@@ -958,7 +956,7 @@ class Bridge:
                 current: dict[str, str] = {}
                 if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current)
                         or current != payload["pr_heads"]):
-                    if payload.get("write_started") or row["attempts"]:
+                    if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
                     raise LinearError("PR acceptance on the recorded exact head failed at delivery", retryable=False)
             name = self.state_name(issue, payload["state"])
@@ -966,9 +964,8 @@ class Bridge:
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if fields:
-                if payload.get("terminal"):
-                    self.store.rewrite(row["id"], {**payload, "write_started": True}, row["next_at"])
-                self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields))
+                self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields),
+                                    terminal=bool(payload.get("terminal")))
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(

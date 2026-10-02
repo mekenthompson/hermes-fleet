@@ -674,6 +674,11 @@ class Store:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
             db.execute("UPDATE outbox SET payload = json_set(payload, '$.reported', 1) WHERE id = ?", (row_id,))
+    def mark_write_started(self, row_id: str) -> bool:
+        with self._tx() as db:
+            row = db.execute("SELECT payload FROM outbox WHERE id=? AND state='pending'", (row_id,)).fetchone()
+            if not row or not self._effect_admitted(db, *self._targets(json.loads(row["payload"])), except_id=row_id): return False
+            return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) WHERE id=?", (row_id,)).rowcount)
     def rewrite(self, row_id: str, payload: dict[str, Any], next_at: float) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id) or not self._admitted(db, *self._targets(payload)): return

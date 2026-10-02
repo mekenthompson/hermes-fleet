@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -136,6 +137,26 @@ class CredentialBindingTests(unittest.TestCase):
         self.assertEqual(transport.credentials(), [("identity", provider.initial), ("operation", provider.initial),
                                                    ("identity", provider.refreshed), ("operation", provider.refreshed)])
         self.assertEqual((provider.calls, provider.invalidations), (2, 1))
+
+    def test_mutation_guard_runs_after_each_verified_credential_and_does_not_leak(self):
+        provider = RefreshProvider()
+        transport = SyntheticLinear(lambda kind, credential, _: (401, {}, b"{}")
+                                    if kind == "operation" and credential == provider.initial else None)
+        client = BoundLinearAPI(provider, identity=IDENTITY, transport=transport)
+        seen = []
+
+        @contextmanager
+        def guard():
+            seen.append(transport.credentials())
+            yield
+
+        with client.guarded_mutation(guard):
+            client.update_issue("issue-1", {"stateId": "started"})
+        self.assertEqual(seen, [[("identity", provider.initial)],
+                                [("identity", provider.initial), ("operation", provider.initial),
+                                 ("identity", provider.refreshed)]])
+        client.update_issue("issue-1", {"stateId": "started"})
+        self.assertEqual(len(seen), 2)
 
     def test_foreign_identity_401_refresh_never_reaches_an_operation(self):
         for foreign in ("synthetic-foreign", "synthetic-foreign-org"):
