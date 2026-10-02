@@ -147,6 +147,12 @@ Every Linear write goes through a local outbox, oldest first per issue.
 - **Status and delegate writes** are set-to-value, preceded by the ownership re-read. A queued
   claim that meets a newer human edit (a close, or another delegate) is dropped rather than
   reopening the issue. A late Stop for an older session does not stop newer work.
+- **Uncertain terminal status** holds fresh work and queued writes for that issue, including after
+  restart. An operator must verify the remote outcome and record it with
+  `Store.reconcile_terminal(row_id, outcome="applied" | "not_applied", evidence=..., at=...)`.
+  The original receipt and dependent writes remain available; neither a remote Done nor a newer
+  reopen proves the predecessor's outcome. A failed lookup before send (`write_started=False`)
+  remains retryable and can yield to a successor. Other issues in a shared project update proceed.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
   task), and one more try after the next successful write. A failed chat alert remains due until

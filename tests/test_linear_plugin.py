@@ -73,6 +73,24 @@ class LinearOutboxOrderTests(unittest.TestCase):
         newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101)
         self.assertEqual([row["id"] for row in self.store.due(101)], [newer])
 
+    def test_legacy_attempted_terminal_without_send_marker_requires_explicit_resolution(self) -> None:
+        self.store.rewrite(self.status["id"], {**self.status["payload"], "terminal": True}, 100)
+        attempted = self.store.outbox_row(self.status["id"])
+        self.store.retry(attempted, 100)
+        self.assertTrue(self.store.issue_reconciliation_blocked("issue-1"))
+        self.assertFalse(self.store.put("issue-1", "chat", "fresh"))
+        self.assertEqual(self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101), "")
+        with self.assertRaises(ValueError):
+            self.store.reconcile_terminal(self.status["id"], outcome="applied", evidence="", at=102)
+        self.assertTrue(self.store.reconcile_terminal(
+            self.status["id"], outcome="not_applied", evidence="https://docs.example/verified", at=102))
+        self.assertFalse(self.store.issue_reconciliation_blocked("issue-1"))
+        self.assertTrue(self.store.put("issue-1", "chat", "fresh"))
+        receipt = self.store.outbox_row(self.status["id"])
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["attempts"], 1)
+        self.assertEqual(receipt["payload"]["reconciliation"]["outcome"], "not_applied")
+
 
 class LinearPluginUnitTests(unittest.TestCase):
     def test_off_by_default_and_one_block_enables_it(self) -> None:

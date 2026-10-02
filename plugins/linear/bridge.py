@@ -488,6 +488,7 @@ class Bridge:
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
         issue_id = row["issue_id"]
+        if self.store.issue_reconciliation_blocked(issue_id): return
         marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
         if self.store.followup_captured(marker): return
         pending = json.loads(row["pending_resume"]) if row.get("pending_resume") else {}
@@ -501,7 +502,7 @@ class Bridge:
         intent = {"marker": marker, "stamp": stamp, "attempting": True}
         if not self.store.update(issue_id, pending_resume=json.dumps(intent)): return
         failure = None
-        with self.store.guard_issue(issue_id) as admitted:
+        with self.store.guard_issue_work(issue_id) as admitted:
             if not admitted or not self._require_effect(issue_id): return
             try: ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
             except Exception as exc:
@@ -523,6 +524,7 @@ class Bridge:
     def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
                 stamp: float | None = None, receipt: str = "Resuming the existing task.") -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
+        if self.store.issue_reconciliation_blocked(row["issue_id"]): return False
         if not self._require_effect(row["issue_id"]): return False
         session_id = session_id or row["owner_ref"]
         stamp = stamp if stamp is not None else float(row["last_updated_at"])
@@ -556,6 +558,7 @@ class Bridge:
                           "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
+        if self.store.issue_reconciliation_blocked(issue_id): return False
         if not self._require_effect(issue_id): return False
         fresh = self._effect_issue(issue_id)  # refuse new execution until current ownership is known
         me = self.me()
@@ -571,11 +574,13 @@ class Bridge:
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
         context = "\n\n".join(x for x in (event.get("promptContext") or info.get("description") or "", prompt) if x)
-        task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
-            title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
-            body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),
-            idempotency_key=key, completion_contract=self.contracts.get(project),
-            initial_status="blocked" if self._specialist_scope_active() else "running")
+        with self.store.guard_issue_work(issue_id) as admitted:
+            if not admitted: return False
+            task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
+                title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
+                body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),
+                idempotency_key=key, completion_contract=self.contracts.get(project),
+                initial_status="blocked" if self._specialist_scope_active() else "running")
         if task is None: return False
         if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(task.id)):
             return False
@@ -812,6 +817,8 @@ class Bridge:
             except (LinearError, ValueError, KeyError):
                 continue
         for row in self.store.active("chat"):
+            if self.store.issue_reconciliation_blocked(row["issue_id"]):
+                continue
             if not self.authorize_specialist_effect(row["issue_id"]):
                 continue
             if row.get("stop_requested_at"):
@@ -822,7 +829,7 @@ class Bridge:
                 continue
             if not self.may_execute_existing(row["issue_id"]):
                 continue
-            with self.store.guard_issue(row["issue_id"]) as admitted:
+            with self.store.guard_issue_work(row["issue_id"]) as admitted:
                 if not admitted: continue
                 injected = self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a "
                                        "Linear issue. Reconcile what already happened, then continue; finish "
@@ -841,6 +848,10 @@ class Bridge:
             for row in self.store.due(self.clock()):
                 with self.lock(row["payload"]["issue_id"]):
                     if not self._authorize_outbox_effect(row):
+                        continue
+                    if row["kind"] != "project_update" and any(
+                            self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
+                            for issue_id in self._outbox_scope_issue_ids(row)):
                         continue
                     try:
                         applied = self._send(row)
@@ -884,7 +895,7 @@ class Bridge:
     def _mutate_outbox(self, row_id: str, action: Callable[[], None]) -> None:
         @contextmanager
         def guard():
-            with self.store.guard_outbox(row_id) as admitted:
+            with self.store.guard_mutation(row_id) as admitted:
                 if not admitted: raise ProjectUpdateDeferred
                 yield
         with self.api.guarded_mutation(guard):
@@ -909,7 +920,7 @@ class Bridge:
             if any(PR_URL.fullmatch(url) for url in links):
                 self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile before retrying")
         if kind == "status" and payload.get("terminal") and self.store.superseded(row):
-            if row["attempts"] or payload.get("write_started"):
+            if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self._hold_terminal(row, "Earlier terminal send is uncertain and newer work owns this issue; reconcile the remote outcome")
             self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
             return False
@@ -978,13 +989,14 @@ class Bridge:
             if current["next_at"] > self.clock():
                 raise ProjectUpdateDeferred
             payload = current["payload"]
-            project_id = payload["project_id"] or ((self._effect_issue(payload["resolve"]).get("project") or {})
-                                                       .get("id"))
             lines_to_send = []
             issue_ids_to_send = []
             waiting_lines: set[str] = set()
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
+                if self.store.issue_reconciliation_blocked(issue_id):
+                    waiting_lines.add(ident)
+                    continue
                 try:
                     issue = self._effect_issue(issue_id)
                 except LinearError as exc:
@@ -1009,12 +1021,15 @@ class Bridge:
                 lines_to_send.append(f"- {ident}: {line}")
                 issue_ids_to_send.append(issue["id"])
             if waiting_lines:
+                if payload.get("frozen"): raise ProjectUpdateDeferred
                 if payload.get("followup") or not lines_to_send:
                     raise ProjectUpdateDeferred
                 split = self.store.split_project_update(row_id, payload, self.clock(), waiting_lines)
                 if split is None or split:
                     continue
                 raise ProjectUpdateDeferred
+            project_id = payload["project_id"] or ((self._effect_issue(payload["resolve"]).get("project") or {})
+                                                       .get("id"))
             body = "Agent update\n\n" + "\n".join(lines_to_send) if lines_to_send else ""
             if payload.get("frozen"):
                 if body != payload.get("send_body") or project_id != payload.get("send_project_id"):
