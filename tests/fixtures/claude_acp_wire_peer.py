@@ -19,6 +19,8 @@ BASH_PERMISSION_OPTIONS = [
     {"optionId": "allow-once", "name": "Yes", "kind": "allow_once"},
     {"optionId": "reject", "name": "No", "kind": "reject_once"},
 ]
+RED_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+GREEN_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNg+M8AAAICAQB7CYF4AAAAAElFTkSuQmCC"
 
 
 def send(value):
@@ -42,10 +44,14 @@ for line in sys.stdin:
         update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "rejected-native-bash"}})
         send({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": "end_turn"}})
         continue
-    result = {}
+    result: dict[str, object] = {}
     if method == "initialize":
         assert message["params"]["clientCapabilities"] == {}
         result = {"protocolVersion": 1}
+        if mode in {"images", "no_image_capability"}:
+            result["agentCapabilities"] = {"promptCapabilities": {
+                "image": mode == "images",
+            }}
     elif method == "session/new":
         options = message["params"]["_meta"]["claudeCode"]["options"]
         assert options["allowDangerouslySkipPermissions"] is False
@@ -86,6 +92,17 @@ for line in sys.stdin:
         elif mode == "hang":
             update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ready"}})
             time.sleep(60)
+        elif mode == "images":
+            assert message["params"]["prompt"] == [
+                {"type": "text", "text": "User:\n"},
+                {"type": "text", "text": "Inspect these in order: "},
+                {"type": "image", "mimeType": "image/png", "data": RED_PNG},
+                {"type": "text", "text": " then compare with "},
+                {"type": "image", "mimeType": "image/png", "data": GREEN_PNG},
+                {"type": "text", "text": "."},
+            ], message["params"]["prompt"]
+        elif mode == "no_image_capability":
+            raise AssertionError("image prompt sent without negotiated image capability")
         elif mode in {"bridge", "forged"}:
             if mode == "bridge":
                 address = options["mcpServers"]["hermes_bridge"]["args"][-1]
@@ -103,6 +120,8 @@ for line in sys.stdin:
             update({"sessionUpdate": "tool_call_update", "toolCallId": "call-1",
                     "_meta": {"claudeCode": {"toolName": "mcp__hermes_bridge__probe"}}, "status": "completed"})
         else:
+            if mode == "text":
+                assert message["params"]["prompt"] == [{"type": "text", "text": "User:\ntest"}], message["params"]["prompt"]
             # With no compaction capability, ACP preserves synthetic tool events.
             update({"sessionUpdate": "tool_call", "toolCallId": "compact", "title": "Compacting context",
                     "status": "in_progress", "kind": "other"})
