@@ -312,6 +312,22 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(self.store.pending(), [])
 
+    def test_session_payload_issue_mismatch_preserves_both_existing_tasks(self):
+        other = "issue-other"
+        first_task = self.seed_kanban_work()
+        other_task = self.seed_kanban_work(other)
+        self.authority.issues[other] = issue_record(id=other)
+        self.authority.sessions[SESSION]["issue"]["id"] = other
+        before = (self.store.get(ISSUE), self.store.get(other))
+        self.bridge.handle_webhook(self.session_event())
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual((self.store.get(ISSUE), self.store.get(other)), before)
+        self.assertEqual(self.kanban.tasks[first_task].status, "ready")
+        self.assertEqual(self.kanban.tasks[other_task].status, "ready")
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.authority.mutations, [])
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},
@@ -443,7 +459,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
 
-    def test_verified_session_denials_fence_only_server_issue(self):
+    def test_session_scope_denial_is_distinct_from_untrusted_binding_denials(self):
         forged = "issue-forged"
         cases = (
             ("issue mismatch", self.session_event(event_issue=forged), None),
@@ -465,7 +481,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 if name == "missing activity":
                     event["agentActivity"]["id"] = ""
                 self.bridge.handle_webhook(event)
-                self.assertTrue(self.store.scope_fenced(ISSUE))
+                self.assertEqual(self.store.scope_fenced(ISSUE), name == "activity actor")
                 self.assertFalse(self.store.scope_fenced(forged))
                 self.assertEqual(self.kanban.creates, [])
                 self.assertEqual(self.store.pending(), [])

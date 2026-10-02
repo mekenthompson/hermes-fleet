@@ -321,30 +321,31 @@ class Bridge:
     def _specialist_session_event(self, event: dict[str, Any], issue_id: str, session_id: str):
         session = self.api.agent_session(session_id)
         authoritative_issue_id = session["issue"]["id"]
-        try:
-            if authoritative_issue_id != issue_id:
-                raise LinearError("Agent Session payload issue does not match Linear", retryable=False)
-            payload_session = event.get("agentSession") or {}
-            payload_creator = payload_session.get("creatorId") or (payload_session.get("creator") or {}).get("id")
-            creator = (session.get("creator") or {}).get("id")
-            if payload_creator and payload_creator != creator:
-                raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
-            issue = self._effect_issue(authoritative_issue_id)
-            activity = event.get("agentActivity") or {}
-            if event.get("action") == "prompted":
-                activity_id = activity.get("id")
-                if not isinstance(activity_id, str) or not activity_id:
-                    raise LinearError("Specialist prompt has no authoritative activity id", retryable=False)
+        if authoritative_issue_id != issue_id:
+            raise LinearError("Agent Session payload issue does not match Linear", retryable=False)
+        payload_session = event.get("agentSession") or {}
+        payload_creator = payload_session.get("creatorId") or (payload_session.get("creator") or {}).get("id")
+        creator = (session.get("creator") or {}).get("id")
+        if payload_creator and payload_creator != creator:
+            raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
+        issue = self._effect_issue(authoritative_issue_id)
+        activity = event.get("agentActivity") or {}
+        if event.get("action") == "prompted":
+            activity_id = activity.get("id")
+            if not isinstance(activity_id, str) or not activity_id:
+                raise LinearError("Specialist prompt has no authoritative activity id", retryable=False)
+            try:
                 verified = self.api.agent_activity(activity_id, session_id)
-                user_id = verified["user"]["id"]
-                payload_user = (activity.get("user") or {}).get("id")
-                if payload_user and payload_user != user_id:
-                    raise LinearError("Agent Activity payload actor does not match Linear", retryable=False)
-                activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
-            return issue, activity
-        except LinearError as exc:
-            if not exc.retryable: self._fence_scope_denial(authoritative_issue_id, LinearError(str(exc), retryable=False, authoritative_issue_id=authoritative_issue_id))
-            raise
+            except LinearError as exc:
+                if not exc.retryable and exc.authoritative_session_id == session_id:
+                    self._fence_scope_denial(authoritative_issue_id, LinearError(str(exc), retryable=False, authoritative_issue_id=authoritative_issue_id))
+                raise
+            user_id = verified["user"]["id"]
+            payload_user = (activity.get("user") or {}).get("id")
+            if payload_user and payload_user != user_id:
+                raise LinearError("Agent Activity payload actor does not match Linear", retryable=False)
+            activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
+        return issue, activity
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
         log.warning("linear: specialist authorization refused: %s", exc)
