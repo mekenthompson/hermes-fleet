@@ -891,6 +891,19 @@ class Bridge:
             action()
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        if kind == "status" and payload.get("terminal"):
+            if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
+                self.store.hold_terminal(row["id"])
+                if not payload.get("reported"):
+                    try:
+                        self._alert_uncertain_terminal(row)
+                        self.store.report(row["id"])
+                    except Exception:
+                        log.exception("linear: uncertain terminal alert delivery failed")
+                self._hold_terminal(row, "Prior terminal send has an uncertain outcome; reconcile before another mutation")
+            if "write_started" not in payload:
+                payload["write_started"] = False
+                self.store.rewrite(row["id"], payload, row["next_at"])
         if kind == "status" and payload.get("terminal") and payload.get("state") == "done" and not payload.get("pr_heads"):
             links = payload.get("evidence") or evidence_links(self.store.terminal_text(row["id"]))
             if any(PR_URL.fullmatch(url) for url in links):
@@ -1050,7 +1063,7 @@ class Bridge:
     def _alert_uncertain_terminal(self, row: dict[str, Any]) -> None:
         """A failed status attempt cannot prove who set Done; ask for reconciliation."""
         payload = row["payload"]
-        note = ("A prior status attempt failed and Linear now shows Done. Reconcile who closed it "
+        note = ("A prior status attempt failed, so its remote outcome is uncertain. Reconcile who closed it "
                 "and the exact evidence before reporting this work complete.")
         log.error("linear: uncertain terminal status for %s", payload["issue_id"])
         if payload.get("session_key"):
