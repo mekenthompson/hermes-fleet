@@ -24,7 +24,7 @@ concurrency:
 env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-public
   TEST_IMAGE: ghcr.io/mekenthompson/hermes-fleet-public:sha-${{ github.sha }}
-  ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1
+  ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a
   CLAUDE_CODE_VERSION: "2.1.285"
   CLAUDE_AGENT_ACP_VERSION: "0.78.0"
   CODEX_VERSION: "0.160.0"
@@ -234,7 +234,7 @@ jobs:
           assert os.environ["HERMES_FLEET_GROK_VERSION"] == os.environ["EXPECTED_GROK_VERSION"]
           assert os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"] == os.environ["EXPECTED_CLAUDE_ACP_PLUGIN_SOURCE"]
           assert os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"] == os.environ["EXPECTED_CLAUDE_ACP_PLUGIN_REVISION"]
-          assert subprocess.check_output(["/usr/local/bin/op", "--version"], text=True).strip() == "2.39.0"
+          assert subprocess.check_output(["/usr/local/bin/op", "--version"], text=True).strip() == "2.40.0"
           assert subprocess.check_output(["/usr/local/bin/claude", "--version"], text=True).strip() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"] + " (Claude Code)"
           assert subprocess.check_output(["/usr/local/bin/codex", "--version"], text=True).strip() == "codex-cli " + os.environ["EXPECTED_CODEX_VERSION"]
           assert subprocess.check_output(["/usr/local/bin/grok", "--version"], text=True).split()[1] == os.environ["EXPECTED_GROK_VERSION"]
@@ -508,7 +508,7 @@ jobs:
           assert os.environ["HERMES_FLEET_GROK_VERSION"] == os.environ["EXPECTED_GROK_VERSION"]
           assert os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"] == os.environ["EXPECTED_CLAUDE_ACP_PLUGIN_SOURCE"]
           assert os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"] == os.environ["EXPECTED_CLAUDE_ACP_PLUGIN_REVISION"]
-          assert subprocess.check_output(["/usr/local/bin/op", "--version"], text=True).strip() == "2.39.0"
+          assert subprocess.check_output(["/usr/local/bin/op", "--version"], text=True).strip() == "2.40.0"
           assert subprocess.check_output(["/usr/local/bin/claude", "--version"], text=True).strip() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"] + " (Claude Code)"
           assert subprocess.check_output(["/usr/local/bin/codex", "--version"], text=True).strip() == "codex-cli " + os.environ["EXPECTED_CODEX_VERSION"]
           assert subprocess.check_output(["/usr/local/bin/grok", "--version"], text=True).split()[1] == os.environ["EXPECTED_GROK_VERSION"]
