@@ -15,20 +15,19 @@ from typing import Any, Callable
 
 ENDPOINT = "https://api.linear.app/graphql"
 DEFAULT_RATE_LIMIT_PAUSE = 60.0
-
 ISSUE_FIELDS = """id identifier title description url updatedAt creator { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type } } }"""
 
 class LinearError(RuntimeError):
     """A Linear request failed. ``retryable`` is False for a definite GraphQL rejection."""
-
     def __init__(self, message: str, *, errors: Any = None, retryable: bool = True,
-                 authoritative_issue_id: str | None = None) -> None:
+                 authoritative_issue_id: str | None = None, authoritative_session_id: str | None = None) -> None:
         super().__init__(message)
         self.errors = errors
         self.retryable = retryable
         self.authoritative_issue_id = authoritative_issue_id
+        self.authoritative_session_id = authoritative_session_id
 
 class RateLimited(LinearError):
     def __init__(self, until: float) -> None:

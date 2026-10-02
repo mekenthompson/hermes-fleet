@@ -11,7 +11,6 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
 from . import chat
 from .api import ENDPOINT, LinearAPI, LinearError
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms
@@ -130,9 +129,10 @@ class BoundLinearAPI(LinearAPI):
         session = activity.get("agentSession") if isinstance(activity, dict) else None
         user_id = user.get("id") if isinstance(user, dict) else None
         if (not isinstance(activity, dict) or activity.get("id") != activity_id or
-                not isinstance(session, dict) or session.get("id") != session_id or
-                not isinstance(user_id, str) or user_id not in self.specialist_scope["allowed_requester_ids"]):
-            raise LinearError("Linear Agent Activity actor or session is outside specialist scope", retryable=False)
+                not isinstance(session, dict) or session.get("id") != session_id):
+            raise LinearError("Linear Agent Activity could not be authoritatively resolved", retryable=False)
+        if not isinstance(user_id, str) or user_id not in self.specialist_scope["allowed_requester_ids"]:
+            raise LinearError("Linear Agent Activity actor is outside specialist scope", retryable=False, authoritative_session_id=session_id)
         return activity
     def update_issue(self, issue_id, fields):
         if self.specialist_scope is not None:
