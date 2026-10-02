@@ -1,8 +1,12 @@
 """Credential-free wire regressions; authenticated inference is a separate gate."""
+import asyncio
+import base64
+import inspect
 import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -13,6 +17,8 @@ PEER = Path(__file__).parent / "fixtures/claude_acp_wire_peer.py"
 TOOLS = [{"type": "function", "function": {"name": "probe", "parameters": {
     "type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"],
 }}}]
+RED_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+GREEN_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNg+M8AAAICAQB7CYF4AAAAAElFTkSuQmCC"
 
 
 class ClaudeWireTests(unittest.TestCase):
@@ -134,6 +140,138 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertIsNotNone(budget)
         self.assertGreater(budget, 0)
         self.assertLessEqual(budget, 0.5)
+
+    def test_async_completion_is_awaitable_and_does_not_block_the_event_loop(self):
+        client = self.client("text")
+        release = threading.Event()
+
+        def slow_completion(*_args, **_kwargs):
+            release.wait(0.2)
+            return "async-result"
+
+        with patch.object(client, "_complete", side_effect=slow_completion):
+            async def invoke():
+                heartbeat = asyncio.Event()
+                asyncio.get_running_loop().call_soon(heartbeat.set)
+                pending = client.chat.completions.create(
+                    messages=[{"role": "user", "content": "test"}], timeout=1
+                )
+                self.assertTrue(inspect.isawaitable(pending))
+                result = await pending
+                self.assertTrue(heartbeat.is_set())
+                return result
+
+            self.assertEqual(asyncio.run(invoke()), "async-result")
+
+    def test_async_text_completion_remains_compatible(self):
+        client = self.client("text")
+
+        async def invoke():
+            return await client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], timeout=10
+            )
+
+        response = asyncio.run(invoke())
+        self.assertEqual(response.choices[0].message.content, "hello world")
+        self.assertTrue(client.is_closed)
+
+    def test_async_stream_is_awaitable_and_iterable(self):
+        client = self.client("text")
+
+        async def invoke():
+            pending = client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], stream=True, timeout=10
+            )
+            if not inspect.isawaitable(pending):
+                pending.close()
+                self.fail("streaming completion must be awaitable in an event loop")
+            stream = await pending
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            return "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
+
+        self.assertEqual(asyncio.run(invoke()), "hello world")
+        self.assertTrue(client.is_closed)
+
+    def test_async_cancellation_reaps_adapter_process(self):
+        client = self.client("hang")
+
+        async def invoke():
+            loop = asyncio.get_running_loop()
+            task = asyncio.create_task(client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], timeout=2
+            ))
+            deadline = loop.time() + 1.5
+            while client._process is None and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            process = client._process
+            self.assertIsNotNone(process, "async worker never started the ACP adapter")
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return process
+
+        process = asyncio.run(invoke())
+        self.assertIsNotNone(process.poll(), "cancelled async request left the ACP process alive")
+        self.assertIsNone(client._process)
+
+    def test_async_image_prompt_preserves_multiple_ordered_image_blocks_on_the_wire(self):
+        client = self.client("images")
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "Inspect these in order: "},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{RED_PNG}"}},
+            {"type": "text", "text": " then compare with "},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{GREEN_PNG}"}},
+            {"type": "text", "text": "."},
+        ]}]
+
+        async def invoke():
+            return await client.chat.completions.create(messages=messages, timeout=10)
+
+        response = asyncio.run(invoke())
+        # The fixture asserts the exact ACP request and returns no model text.
+        self.assertEqual(response.choices[0].message.content, "")
+        self.assertTrue(client.is_closed)
+
+    def test_image_prompt_requires_negotiated_agent_capability(self):
+        client = self.client("no_image_capability")
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{RED_PNG}"}},
+        ]}]
+
+        async def invoke():
+            return await client.chat.completions.create(messages=messages, timeout=10)
+
+        with self.assertRaisesRegex(RuntimeError, "does not advertise image prompt support"):
+            asyncio.run(invoke())
+        self.assertTrue(client.is_closed)
+
+    def test_image_payloads_reject_remote_urls_malformed_base64_and_unsupported_mime(self):
+        cases = (
+            ("https://example.invalid/image.png", "only base64 data:image URLs are supported"),
+            ("data:image/png;base64,not base64!", "malformed base64 image payload"),
+            ("data:image/tiff;base64,AA==", "unsupported image MIME type"),
+        )
+        for url, error in cases:
+            with self.subTest(url=url):
+                client = self.client("text")
+                messages = [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": url}},
+                ]}]
+                with self.assertRaisesRegex(ValueError, error):
+                    client.chat.completions.create(messages=messages, timeout=10)
+                self.assertIsNone(client._process, "invalid image started an ACP subprocess")
+
+    def test_image_payload_size_uses_the_existing_four_mib_core_ceiling(self):
+        client = self.client("text")
+        oversized = base64.b64encode(b"x" * (4 * 1024 * 1024 + 1)).decode("ascii")
+        messages = [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{oversized}"}},
+        ]}]
+        with self.assertRaisesRegex(ValueError, "exceeds the 4 MiB image limit"):
+            client.chat.completions.create(messages=messages, timeout=10)
+        self.assertIsNone(client._process)
 
 
 if __name__ == "__main__":
