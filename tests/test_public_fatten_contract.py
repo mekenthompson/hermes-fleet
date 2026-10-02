@@ -19,8 +19,8 @@ GH_LINUX_AMD64_SHA256 = (
 )
 HONCHO_AI_VERSION = "2.2.0"
 EXTRA_CLIS = {
-    "@openai/codex": "0.159.1",
-    "@xai-official/grok": "1.0.44",
+    "@openai/codex": "0.160.0",
+    "@xai-official/grok": "1.0.46",
     "opencode-ai": "1.18.29",
 }
 
