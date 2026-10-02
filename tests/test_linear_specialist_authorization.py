@@ -145,6 +145,9 @@ class FakeKanban:
     def archive(self, task_id):
         self.tasks[task_id].status = "archived"
 
+    def block(self, task_id, _reason):
+        self.tasks[task_id].status = "blocked"
+
 
 class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def setUp(self):
@@ -353,6 +356,110 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.bridge.handle_webhook(self.session_event(event_issue=ISSUE))
         self.assertEqual(self.kanban.creates, [])
         self.assertIsNone(self.store.get(ISSUE))
+
+    def test_foreign_session_requester_fences_only_verified_issue_across_replay(self):
+        forged = "issue-forged"
+        self.authority.sessions[SESSION] = {"id": SESSION, "issue": {"id": ISSUE},
+                                            "creator": {"id": "user-foreign"}}
+        event = self.session_event(event_issue=forged)
+        self.bridge.handle_webhook(event)
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(forged))
+        self.authority.sessions[SESSION]["creator"]["id"] = USER
+        self.bridge.handle_webhook(event)
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(self.kanban.creates, [])
+        self.assertIsNone(self.store.get(ISSUE))
+        self.assertEqual(self.store.pending(), [])
+
+    def test_verified_session_denials_fence_only_server_issue(self):
+        forged = "issue-forged"
+        cases = (
+            ("issue mismatch", self.session_event(event_issue=forged), None),
+            ("missing payload issue", self.session_event(event_issue=""), None),
+            ("creator mismatch", self.session_event(creator="user-forged"), None),
+            ("activity actor", self.session_event("prompted"),
+             {"id": ACTIVITY, "user": {"id": "user-foreign"}, "agentSession": {"id": SESSION}}),
+            ("activity session", self.session_event("prompted"),
+             {"id": ACTIVITY, "user": {"id": USER}, "agentSession": {"id": "session-foreign"}}),
+            ("payload activity actor", self.session_event("prompted", user="user-forged"),
+             {"id": ACTIVITY, "user": {"id": USER}, "agentSession": {"id": SESSION}}),
+            ("missing activity", self.session_event("prompted"), None),
+        )
+        for index, (name, event, activity) in enumerate(cases):
+            with self.subTest(name=name):
+                self.store = Store(Path(self.tmp.name) / f"denial-{index}.db")
+                self.bridge = Bridge(self.store, self.api, self.kanban, profile="synthetic")
+                self.authority.activities[ACTIVITY] = activity
+                if name == "missing activity":
+                    event["agentActivity"]["id"] = ""
+                self.bridge.handle_webhook(event)
+                self.assertTrue(self.store.scope_fenced(ISSUE))
+                self.assertFalse(self.store.scope_fenced(forged))
+                self.assertEqual(self.kanban.creates, [])
+                self.assertEqual(self.store.pending(), [])
+
+    def test_transient_session_and_activity_failures_do_not_fence(self):
+        event = self.session_event("prompted")
+        self.authority.fail_session = True
+        with self.assertRaises(LinearError): self.bridge.handle_webhook(event)
+        self.authority.fail_session = False
+        original = self.api.agent_activity
+        self.api.agent_activity = lambda *_: (_ for _ in ()).throw(LinearError("temporary activity outage"))
+        try:
+            with self.assertRaises(LinearError): self.bridge.handle_webhook(event)
+        finally:
+            self.api.agent_activity = original
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.store.pending(), [])
+
+    def test_unresolved_session_has_no_issue_identity_even_when_error_names_one(self):
+        self.authority.sessions[SESSION] = {"id": "session-foreign", "issue": {"id": ISSUE},
+                                            "creator": {"id": "user-foreign"}}
+        with self.assertRaises(LinearError) as denial:
+            self.api.agent_session(SESSION)
+        self.assertIsNone(denial.exception.authoritative_issue_id)
+        self.bridge.handle_webhook(self.session_event())
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        original = self.api.agent_session
+        self.api.agent_session = lambda *_: (_ for _ in ()).throw(
+            LinearError(f"untrusted error text mentions {ISSUE}", retryable=False))
+        try:
+            self.bridge.handle_webhook(self.session_event())
+        finally:
+            self.api.agent_session = original
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+
+    def _assert_issue_webhook_redirect_preserves_other(self, second_lookup):
+        other = "issue-other"
+        self.authority.issues[other] = issue_record(id=other, delegate={"id": "viewer-foreign"})
+        self.seed_kanban_work(ISSUE)
+        task_id = self.seed_kanban_work(other)
+        outbox_id = self.store.enqueue("status", {"issue_id": other, "state": "done"}, at=1)
+        work, outbox = self.store.get(other), self.store.outbox_row(outbox_id)
+        original = self.api.issue
+        calls = 0
+        def redirect(ref):
+            nonlocal calls
+            if ref == ISSUE:
+                calls += 1
+                if calls == (2 if second_lookup else 1): return original(other)
+            return original(ref)
+        self.api.issue = redirect
+        self.bridge.handle_webhook({"type": "Issue", "updatedFrom": {"delegateId": "other"},
+                                    "data": {"id": ISSUE}})
+        self.assertEqual(calls, 2 if second_lookup else 1)
+        self.assertEqual(self.store.get(other), work)
+        self.assertEqual(self.store.outbox_row(outbox_id), outbox)
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready")
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_issue_webhook_first_lookup_redirect_preserves_other(self):
+        self._assert_issue_webhook_redirect_preserves_other(False)
+
+    def test_issue_webhook_second_lookup_redirect_preserves_other(self):
+        self._assert_issue_webhook_redirect_preserves_other(True)
 
     def test_issue_webhook_scope_denial_precedes_any_existing_work_effect(self):
         self.store.put(ISSUE, "kanban", "session-1", task_id="task-1")

@@ -41,8 +41,7 @@ class BoundLinearAPI(LinearAPI):
         super().__init__(token, **kwargs)
     @classmethod
     def _validate_specialist_scope(cls, scope):
-        if scope is None:
-            return None
+        if scope is None: return None
         if not isinstance(scope, dict) or set(scope) != cls.SCOPE_KEYS:
             raise ValueError("linear: specialist_scope requires exactly allowed_team_ids, allowed_project_ids, and allowed_requester_ids")
         result = {}
@@ -113,11 +112,12 @@ class BoundLinearAPI(LinearAPI):
         issue = session.get("issue")
         creator = session.get("creator")
         creator_id = creator.get("id") if isinstance(creator, dict) else None
-        if (not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"] or
-                not isinstance(creator_id, str) or not creator_id or
-                (creator_id != self.identity["viewer_id"] and
-                 creator_id not in self.specialist_scope["allowed_requester_ids"])):
+        if not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip():
             raise LinearError("Linear Agent Session requester or issue is outside specialist scope", retryable=False)
+        if not isinstance(creator_id, str) or creator_id not in (
+                self.identity["viewer_id"], *self.specialist_scope["allowed_requester_ids"]):
+            raise LinearError("Linear Agent Session requester is outside specialist scope", retryable=False,
+                              authoritative_issue_id=issue["id"])
         return session
     def agent_activity(self, activity_id, session_id):
         if self.specialist_scope is None:
