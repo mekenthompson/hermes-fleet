@@ -6,9 +6,11 @@ import hmac
 import json
 import logging
 import math
+import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
 
 ENDPOINT = "https://api.linear.app/graphql"
@@ -18,7 +20,6 @@ ISSUE_FIELDS = """id identifier title description url updatedAt creator { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type } } }"""
 
-
 class LinearError(RuntimeError):
     """A Linear request failed. ``retryable`` is False for a definite GraphQL rejection."""
 
@@ -27,12 +28,10 @@ class LinearError(RuntimeError):
         self.errors = errors
         self.retryable = retryable
 
-
 class RateLimited(LinearError):
     def __init__(self, until: float) -> None:
         super().__init__(f"Linear rate limit; paused until {until:.0f}")
         self.until = until
-
 
 def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
     result = data.get(mutation)
@@ -42,7 +41,6 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
     if success is False:
         raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
     raise LinearError(f"Linear {mutation} response did not confirm success")
-
 
 def is_duplicate_create_error(errors: Any, client_id: str) -> bool:
     """True when Linear rejected a create because an entity with our client ``id`` exists.
@@ -60,7 +58,6 @@ def is_duplicate_create_error(errors: Any, client_id: str) -> bool:
             return True
     return False
 
-
 def verify_webhook(secret: bytes, body: bytes, signature: str, now_ms: float, max_skew_ms: int = 60_000) -> bool:
     """HMAC-SHA256 ``linear-signature`` check plus Linear's one-minute ``webhookTimestamp`` window."""
     try:
@@ -75,7 +72,6 @@ def verify_webhook(secret: bytes, body: bytes, signature: str, now_ms: float, ma
         return False
     return abs(now_ms - stamp) <= max_skew_ms
 
-
 def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
@@ -83,7 +79,6 @@ def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read() or b""
-
 
 class LinearAPI:
     """``token`` is the provider interface: a callable returning an access token, with an
@@ -98,6 +93,14 @@ class LinearAPI:
         self.clock = clock
         self.paused_until = 0.0
         self._viewer: str | None = None
+        self._mutation_guard = threading.local()
+
+    @contextmanager
+    def guarded_mutation(self, guard):
+        previous = getattr(self._mutation_guard, "callback", None)
+        self._mutation_guard.callback = guard
+        try: yield
+        finally: self._mutation_guard.callback = previous
 
     def _pause(self, headers: dict[str, str]) -> float:
         """Linear signals a limit with RATELIMITED; its reset headers are epoch milliseconds."""
@@ -116,6 +119,7 @@ class LinearAPI:
         if self.clock() < self.paused_until:
             raise RateLimited(self.paused_until)
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
+        guard = getattr(self._mutation_guard, "callback", None) if query.lstrip().startswith("mutation") else None
         for attempt in (1, 2):
             try:
                 headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.token()}
@@ -123,7 +127,8 @@ class LinearAPI:
                 logging.getLogger("linear").error("linear: credentials unavailable: %s", exc)
                 raise LinearError(f"Linear credentials unavailable: {exc}") from exc
             try:
-                status, response_headers, raw = self.transport(self.endpoint, body, headers)
+                with guard() if guard else nullcontext():
+                    status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
                 raise LinearError(f"Linear unreachable: {exc}") from exc
             if status == 401 and attempt == 1 and callable(getattr(self.token, "invalidate", None)):
@@ -147,7 +152,6 @@ class LinearAPI:
         if status >= 400 or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
         return payload["data"]
-
     def viewer_id(self) -> str:
         if self._viewer is not None:
             return self._viewer
@@ -157,19 +161,16 @@ class LinearAPI:
             raise LinearError("Linear viewer identity response is missing an id")
         self._viewer = candidate
         return candidate
-
     def issue(self, ref: str) -> dict[str, Any]:
         data = self.graphql(f"query Issue($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}", {"id": ref})
         if not data.get("issue"):
             raise LinearError(f"Linear issue {ref} not found", retryable=False)
         return data["issue"]
-
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
                             "{ issueUpdate(id: $id, input: $input) { success } }",
                             {"id": issue_id, "input": fields})
         _require_mutation_success(data, "issueUpdate")
-
     def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
         try:
             data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",
@@ -178,26 +179,20 @@ class LinearAPI:
         except LinearError as exc:
             if not is_duplicate_create_error(exc.errors, fields["id"]):
                 raise
-
     def agent_session(self, session_id: str) -> dict[str, Any]:
         raise LinearError("Agent Session authorization requires a bound specialist client", retryable=False)
-
     def agent_activity(self, activity_id: str, session_id: str) -> dict[str, Any]:
         raise LinearError("Agent Activity authorization requires a bound specialist client", retryable=False)
-
     def create_comment(self, client_id: str, issue_id: str, body: str) -> None:
         self._create("commentCreate", "CommentCreateInput", {"id": client_id, "issueId": issue_id, "body": body})
-
     def create_activity(self, client_id: str, session_id: str, content: dict[str, Any], *,
                         issue_id: str | None = None) -> None:
         self._create("agentActivityCreate", "AgentActivityCreateInput",
                      {"id": client_id, "agentSessionId": session_id, "content": content})
-
     def create_project_update(self, client_id: str, project_id: str, body: str, *,
                               issue_ids: list[str] | None = None) -> None:
         self._create("projectUpdateCreate", "ProjectUpdateCreateInput",
                      {"id": client_id, "projectId": project_id, "body": body})
-
 
 def state_id(issue: dict[str, Any], name: str) -> str:
     """Resolve a workflow state by name on the issue's team (case-insensitive)."""

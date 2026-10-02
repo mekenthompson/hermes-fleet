@@ -22,13 +22,10 @@ log = logging.getLogger("linear")
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "state_database", "tick_seconds", "activation_cutoff_ms",
             "specialist_scope")
-
-
 class BoundLinearAPI(LinearAPI):
     """Bind credentials to an actor/workspace and, optionally, a bounded specialist scope."""
 
     SCOPE_KEYS = {"allowed_team_ids", "allowed_project_ids", "allowed_requester_ids"}
-
     def __init__(self, token, *, identity, specialist_scope=None, **kwargs):
         if not isinstance(identity, dict) or any(
                 not isinstance(identity.get(k), str) or not identity[k].strip()
@@ -42,7 +39,6 @@ class BoundLinearAPI(LinearAPI):
         self.specialist_scope = self._validate_specialist_scope(specialist_scope)
         self._graphql_permit = threading.local()
         super().__init__(token, **kwargs)
-
     @classmethod
     def _validate_specialist_scope(cls, scope):
         if scope is None:
@@ -58,7 +54,6 @@ class BoundLinearAPI(LinearAPI):
                 raise ValueError(f"linear: specialist_scope.{key} must be a nonempty list of unique exact IDs")
             result[key] = list(values)
         return result
-
     @contextmanager
     def _permit_specialist_operation(self):
         depth = getattr(self._graphql_permit, "depth", 0)
@@ -67,24 +62,20 @@ class BoundLinearAPI(LinearAPI):
             yield
         finally:
             self._graphql_permit.depth = depth
-
     def verify_identity(self):
         identity = super().graphql("query IdentityBinding { viewer { id } organization { id } }")
         if any(not isinstance(identity.get(field), dict) or
                identity[field].get("id") != self.identity[expected]
                for field, expected in (("viewer", "viewer_id"), ("organization", "organization_id"))):
             raise LinearError("Linear actor/workspace does not match configured identity", retryable=False)
-
     def graphql(self, query, variables=None):
         if self.specialist_scope is not None and not getattr(self._graphql_permit, "depth", 0):
             raise LinearError("Arbitrary Linear GraphQL is disabled by specialist_scope", retryable=False)
         self.verify_identity()
         return super().graphql(query, variables)
-
     def viewer_id(self) -> str:
         self.verify_identity()
         return str(self.identity["viewer_id"])
-
     def _check_issue(self, issue):
         if self.specialist_scope is None:
             return
@@ -95,7 +86,6 @@ class BoundLinearAPI(LinearAPI):
                 not isinstance(project, dict) or project.get("id") not in self.specialist_scope["allowed_project_ids"] or
                 not isinstance(creator, dict) or creator.get("id") not in self.specialist_scope["allowed_requester_ids"]):
             raise LinearError("Linear issue is outside configured specialist scope", retryable=False)
-
     def issue(self, ref):
         with self._permit_specialist_operation():
             issue = super().issue(ref)
@@ -106,13 +96,11 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear issue project is outside configured scope", retryable=False)
         self._check_issue(issue)
         return issue
-
     def _mutation_issue(self, issue_id):
         issue = self.issue(issue_id)
         if not isinstance(issue_id, str) or not issue_id.strip() or issue.get("id") != issue_id:
             raise LinearError("Linear issue authorization does not match mutation target", retryable=False)
         return issue
-
     def agent_session(self, session_id):
         if self.specialist_scope is None:
             raise LinearError("Agent Session resolution requires specialist_scope", retryable=False)
@@ -131,7 +119,6 @@ class BoundLinearAPI(LinearAPI):
                  creator_id not in self.specialist_scope["allowed_requester_ids"])):
             raise LinearError("Linear Agent Session requester or issue is outside specialist scope", retryable=False)
         return session
-
     def agent_activity(self, activity_id, session_id):
         if self.specialist_scope is None:
             raise LinearError("Agent Activity resolution requires specialist_scope", retryable=False)
@@ -147,7 +134,6 @@ class BoundLinearAPI(LinearAPI):
                 not isinstance(user_id, str) or user_id not in self.specialist_scope["allowed_requester_ids"]):
             raise LinearError("Linear Agent Activity actor or session is outside specialist scope", retryable=False)
         return activity
-
     def update_issue(self, issue_id, fields):
         if self.specialist_scope is not None:
             issue = self._mutation_issue(issue_id)
@@ -161,13 +147,11 @@ class BoundLinearAPI(LinearAPI):
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().update_issue(issue_id, fields)
-
     def create_comment(self, client_id, issue_id, body):
         if self.specialist_scope is not None or self.identity.get("teams") or self.identity.get("projects"):
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().create_comment(client_id, issue_id, body)
-
     def create_activity(self, client_id, session_id, content, *, issue_id=None):
         if self.specialist_scope is not None:
             if not isinstance(issue_id, str) or not issue_id:
@@ -192,7 +176,6 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear project is outside configured scope", retryable=False)
         with self._permit_specialist_operation():
             return super().create_project_update(client_id, project_id, body)
-
 
 async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
     """Run core's ordinary-chat API on the profile service's gateway loop."""
@@ -232,7 +215,6 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
             bridge.store.stop_result(intent["id"], status, completion, at=bridge.clock())
         except Exception:  # noqa: BLE001 - a crash after core accepted stays ambiguous
             log.exception("linear: chat Stop observation/request uncertain for issue %s", intent["issue_id"])
-
 
 def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
