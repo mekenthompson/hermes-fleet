@@ -69,7 +69,7 @@ The agent can run an isolated browser and hand the live session to the human whe
 
 ### Claude ACP
 
-Stay on the granted Claude plan login via a profile-local ACP client. The overlay wires the account. The image does not silently fall back to an API key.
+Stay on the granted Claude plan login via a profile-local ACP client. The overlay wires the account. The image does not silently fall back to an API key. The provider supports asynchronous auxiliary requests and forwards Hermes-prepared images through ACP; see [image compatibility and limits](docs/image-release.md#asynchronous-auxiliary-requests-and-images).
 
 ### Kokoro voice
 

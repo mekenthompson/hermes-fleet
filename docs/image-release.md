@@ -62,6 +62,29 @@ legacy compaction events are retained. Tool updates continue to use
 bridge capture, forged events, cancellation and deadlines; these are not a
 substitute for authenticated inference on a release candidate.
 
+### Asynchronous auxiliary requests and images
+
+The Claude provider preserves synchronous text callers while returning an awaitable
+completion to asynchronous auxiliary callers. Transport work is admitted to a
+four-worker pool without blocking the event loop; admission and request-lock waits
+consume the request deadline. Caller context is copied into the worker. Cancelling
+a queued request must not cancel another request using the same client, and stream
+cleanup does not wait behind saturated transport workers.
+
+Hermes-prepared base64 `data:image` inputs are forwarded as ordered ACP image blocks,
+with text, profile policy and prior tool history preserved. The adapter must advertise
+image prompt support. PNG, JPEG, GIF and WebP MIME types are supported; malformed,
+empty, unsupported and remote-URL image inputs are rejected before launching an
+adapter. The plugin adds a proactive four-MiB **encoded data URL** bound based on
+core's reactive image-shrink target; this is not an existing core input ceiling.
+It does not fetch URLs or log image payloads. Source provenance in `upstream.json`
+continues to identify the original attributed plugin; these compatibility changes
+are Fleet-local code, not a claim of a new upstream revision.
+
+Credential-free wire tests prove serialization and lifecycle contracts only.
+Release acceptance also requires actual image recognition through the asynchronous
+`vision_analyze` path on the candidate, with provider fallback excluded from the proof.
+
 ## Automated publication gate
 
 Only `main` may enter `fleet-image-publish`, whether the trigger is a push or a `publish=true` dispatch. There is no manual reviewer prerequisite: the exact-SHA CI proof, runtime checks, full SPDX, compact SPDX, Trivy result, VEX revalidation, remote immutable-manifest config binding, and attestations are mandatory and fail closed. Publication still does not authorize rollout.
