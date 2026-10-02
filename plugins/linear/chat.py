@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from .api import LinearError
-from .bridge import Bridge, evidence_links
+from .bridge import Bridge, PR_URL, evidence_links
 
 SCHEMA = {
     "name": "linear",
@@ -70,12 +70,15 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             if not links:
                 return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
                                      "Without one, use `linear blocked` or `linear release`.")
-            if not bridge.accepted_evidence(links):
+            heads: dict[str, str] = {}
+            accepted = (bridge.accepted_evidence(links, heads=heads) if any(PR_URL.fullmatch(link) for link in links)
+                        else bridge.accepted_evidence(links))
+            if not accepted:
                 return _reply(False, "PR acceptance on the exact head and required checks could not be verified; "
                                      "leave this issue open and reconcile the PR.")
             if not _finish(bridge, row, session_key, session_id, project, ident, "done",
                            f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
-                           f"Done: {' '.join(links)}"):
+                           f"Done: {' '.join(links)}", links, heads):
                 return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
             return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
         if action == "blocked":
@@ -100,13 +103,15 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     return _reply(False, f"Unknown action {action!r}.")
 
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
-            ident: str, state: str, message: str, update: str) -> bool:
+            ident: str, state: str, message: str, update: str, evidence: list[str] | None = None,
+            heads: dict[str, str] | None = None) -> bool:
     issue_id = row["issue_id"]
     if not bridge.authorize_specialist_effect(issue_id):
         return False
     route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
     return bridge.store.finish(issue_id, [
-        ("status", {"issue_id": issue_id, "state": state, **route}),
+        ("status", {"issue_id": issue_id, "state": state, "evidence": evidence or [],
+                    "evidence_contract": "local-only", "pr_heads": heads or {}, **route}),
         ("comment", {"issue_id": issue_id, "body": message, **route}),
         ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
                             "session_id": session_id, "project_id": project, "resolve": issue_id,

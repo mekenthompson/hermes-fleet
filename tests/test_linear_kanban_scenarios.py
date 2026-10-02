@@ -1803,5 +1803,359 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.activities[-1]["agentSessionId"], "chat-new")
 
 
+    def test_delayed_delegation_respects_cancel_source_time_but_fresh_redelegation_opens(self) -> None:
+        self.bind_identity()
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        self.bridge.tick()  # the periodic ownership read is not due on delivery
+        old = self.linear.session_event("created", ISSUE, "old-session")
+        self.clock.now += 10
+        self.linear.set_state(ISSUE, "Canceled")
+        self.deliver(old)
+        self.assertEqual(self.linear.state(ISSUE), "Canceled")
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+
+        self.clock.now += 1
+        fresh = self.linear.session_event("created", ISSUE, "fresh-session")
+        self.bridge.handle_webhook(fresh)
+        task = self.task_id()
+        self.bridge.flush()
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertEqual(self.tasks(), [(task, "ready")])
+        # Even a delayed enqueue must compare the original source time at send.
+        self.clock.now += 1
+        self.linear.set_state(ISSUE, "Canceled")
+        self.linear.issues[ISSUE]["canceledAt"] = self.clock.iso()
+        self.clock.now += 1
+        self.bridge.status(ISSUE, "in_progress", claim=True, seen=SELF,
+                           source_ms=fresh["webhookTimestamp"])
+        self.bridge.flush()
+        self.assertEqual(self.linear.state(ISSUE), "Canceled")
+        self.assertEqual(self.tasks(), [(task, "archived")])
+
+        self.clock.now += 1
+        cold_fresh = self.linear.session_event("created", ISSUE, "cold-fresh-session")
+        self.clock.now += 1
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})  # delegation echo updates issue later
+        self.bridge = self.make_bridge()
+        self.bind_identity()
+        self.deliver(cold_fresh)
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertEqual(self.bridge.kanban.get(self.task_id()).status, "ready")
+
+
+    def test_predecessor_terminal_outbox_cannot_close_successor_and_retains_receipts(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        for uncertain, capture_first in ((False, True), (True, True), (False, False)):
+            with self.subTest(uncertain=uncertain, capture_first=capture_first):
+                case = f"{uncertain}-{capture_first}"
+                issue_id = f"predecessor-{case}"
+                self.linear.add_issue(issue_id, f"OLD-{int(uncertain) + 1}")
+                self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
+                self.deliver(self.linear.session_event("created", issue_id, f"old-{case}"))
+                old_task = self.bridge.store.get(issue_id)["task_id"]
+                with self.bridge.kanban.conn() as conn:
+                    kb.complete_task(conn, old_task, summary="Findings https://docs.example/predecessor", metadata={})
+                if capture_first:
+                    self.bridge.pump_kanban()
+                if uncertain:
+                    with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("uncertain send")):
+                        self.bridge.flush()
+                self.clock.now += 1
+                self.bridge.handle_webhook(self.linear.session_event("created", issue_id, f"new-{case}"))
+                new_task = self.bridge.store.get(issue_id)["task_id"]
+                terminal_rows = [r for r in self.bridge.store.pending(issue_id) if r["kind"] == "status"
+                                 and r["payload"].get("terminal") and r["payload"].get("task_id") == old_task]
+                self.assertTrue(terminal_rows, "The predecessor result must be captured before replacing its mapping")
+                terminal = terminal_rows[0]
+                self.clock.now += 61
+                if uncertain:
+                    with patch.object(self.bridge.kanban, "comment", side_effect=RuntimeError("alert destination unavailable")):
+                        self.bridge.tick()
+                    self.bridge = self.make_bridge()
+                    self.bridge.tick()  # the held write's failed alert must stay truthful on replay
+                else:
+                    self.bridge.tick()
+                self.assertEqual(self.bridge.kanban.get(new_task).status, "ready")
+                self.assertEqual(self.bridge.kanban.get(old_task).status, "done")
+                self.assertEqual(self.linear.state(issue_id), "In Progress")
+                self.assertEqual(self.bridge.store.get(issue_id)["task_id"], new_task)
+                with self.bridge.store._tx() as db:
+                    successor_claim = db.execute("SELECT state, json_extract(payload, '$.applied') FROM outbox "
+                                                 "WHERE kind='status' AND json_extract(payload, '$.task_id')=?",
+                                                 (new_task,)).fetchone()
+                self.assertEqual(tuple(successor_claim), ("sent", 1))
+                old_receipts = [a for a in self.linear.activities if a["agentSessionId"] == f"old-{case}"
+                                and a["content"]["type"] != "thought"]
+                status = self.bridge.store.outbox_row(terminal["id"])
+                if uncertain:
+                    self.assertEqual(status["state"], "failed")
+                    self.assertTrue(status["payload"]["reconcile_required"])
+                    self.assertEqual(old_receipts, [])
+                    with self.bridge.kanban.conn() as conn:
+                        comments = [c.body for c in kb.list_comments(conn, old_task)]
+                        self.assertTrue(any("reconcile" in body.lower() and "held" in body.lower() for body in comments))
+                        self.assertFalse(any("retried after the next successful write" in body for body in comments))
+                    self.bridge = self.make_bridge()
+                    self.bridge.tick()
+                    self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "failed")
+                    self.assertEqual(len([r for r in self.bridge.store.pending(issue_id)
+                                          if r["payload"].get("requires_status_id") == terminal["id"]]), 2)
+                else:
+                    self.assertFalse(status["payload"]["applied"])
+                    self.assertEqual(len(old_receipts), 1)
+                    self.assertIn("superseded", old_receipts[0]["content"]["body"].lower())
+                    self.assertIn("https://docs.example/predecessor", old_receipts[0]["content"]["body"])
+                self.assertFalse(any(f"OLD-{int(uncertain) + 1}: Done" in u["body"]
+                                     for u in self.linear.project_updates))
+
+
+    def test_interrupted_resume_replays_core_unblock_after_restart(self) -> None:
+        from unittest.mock import patch
+        from linear_ingress_fixture import IngressStore, Route
+        self.bind_identity()
+        inbox = self.dir / "resume-ingress.db"
+        producer = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
+        for action in ("created", "prompted"):
+            with self.subTest(action=action):
+                issue_id = f"resume-issue-{action}"
+                self.linear.add_issue(issue_id, f"RESUME-{action}")
+                self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
+                self.deliver(self.linear.session_event("created", issue_id, f"start-{action}"))
+                task = self.bridge.store.get(issue_id)["task_id"]
+                self.clock.now += 1
+                stop = self.linear.session_event("prompted", issue_id, "s-1", signal="stop")
+                self.deliver(stop)
+                self.clock.now += 1
+                session = f"resume-{action}"
+                event = self.linear.session_event(action, issue_id, session, body="Continue the same work")
+                producer.enqueue(route, session, json.dumps(event).encode())
+                with sqlite3.connect(inbox) as db:
+                    db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
+                with patch.object(self.bridge.kanban, "unblock", side_effect=RuntimeError("interrupted before core unblock")):
+                    self.bridge.drain_ingress(inbox)
+                with sqlite3.connect(inbox) as db:
+                    self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id=?", (session,)).fetchone()[0], "pending")
+                self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+                self.assertEqual(self.bridge.store.get(issue_id)["owner_ref"], session)
+                self.bridge = self.make_bridge()
+                self.bind_identity()
+                self.bridge.recover()
+                self.bridge.tick(inbox)
+                self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+                self.assertEqual(self.linear.state(issue_id), "In Progress")
+                self.assertFalse(self.bridge.store.get(issue_id)["stop_requested_at"])
+                with sqlite3.connect(inbox) as db:
+                    self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id=?", (session,)).fetchone()[0], "imported")
+                receipt_count = len(self.linear.activities)
+                self.bridge = self.make_bridge()
+                self.bind_identity()
+                with self.bridge.kanban.conn() as conn:
+                    kb.recompute_ready(conn)  # mirror core's scheduler after reopening the board
+                self.bridge.tick(inbox)
+                self.bridge.handle_webhook(stop)  # stale Stop cannot undo the recovered resume
+                self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+                self.assertEqual(len(self.linear.activities), receipt_count)
+
+    def test_false_unblock_retains_resume_intent_while_core_is_blocked(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        self.delegate()
+        task = self.task_id()
+        self.clock.now += 1
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+        self.clock.now += 1
+        event = self.linear.session_event("prompted", ISSUE, "s-1", body="Continue")
+        with patch.object(self.bridge.kanban, "unblock", return_value=False):
+            with self.assertRaises(LinearError):
+                self.bridge.handle_webhook(event)
+        self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+        self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+        self.bridge = self.make_bridge()
+        self.bridge.recover()
+        self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+
+
+    def test_task_creation_crash_recovers_mapping_and_existing_terminal_evidence_once(self) -> None:
+        from unittest.mock import patch
+        for outcome in ("evidence", "missing", "active"):
+            with self.subTest(outcome=outcome):
+                issue_id = f"creation-crash-{outcome}"
+                self.linear.add_issue(issue_id, f"CRASH-{outcome}")
+                self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
+                event = self.linear.session_event("created", issue_id, f"creation-{outcome}")
+                with patch.object(self.bridge.store, "put", side_effect=RuntimeError("interrupted after core create")):
+                    with self.assertRaisesRegex(RuntimeError, "after core create"):
+                        self.bridge.handle_webhook(event)
+                self.assertIsNone(self.bridge.store.get(issue_id))
+                with self.bridge.kanban.conn() as conn:
+                    task = conn.execute("SELECT id FROM tasks WHERE idempotency_key=?",
+                                        (f"linear:{issue_id}:creation-{outcome}",)).fetchone()[0]
+                    if outcome != "active":
+                        summary = "Persisted result https://docs.example/durable-evidence" if outcome == "evidence" else "No evidence"
+                        self.assertTrue(kb.complete_task(conn, task, summary=summary, metadata={}))
+                self.bridge = self.make_bridge()
+                self.bridge.recover()
+                self.bridge.handle_webhook(event)
+                self.bridge.tick()
+                expected = {"evidence": "Done", "missing": "Blocked", "active": "In Progress"}[outcome]
+                self.assertEqual(self.linear.state(issue_id), expected)
+                receipts = [a for a in self.linear.activities if a["agentSessionId"] == f"creation-{outcome}"]
+                self.assertEqual(len(receipts), 1)
+                self.assertEqual(receipts[0]["content"]["type"], {"evidence": "response", "missing": "error", "active": "thought"}[outcome])
+                if outcome == "evidence":
+                    self.assertIn("https://docs.example/durable-evidence", receipts[0]["content"]["body"])
+                    self.assertTrue(any("https://docs.example/durable-evidence" in u["body"] for u in self.linear.project_updates))
+                if outcome == "active":
+                    self.assertEqual(self.bridge.store.get(issue_id)["task_id"], task)
+                else:
+                    self.assertIsNone(self.bridge.store.get(issue_id))
+                before = len(self.tasks()), len(self.linear.activities), len(self.linear.project_updates)
+                self.bridge = self.make_bridge()
+                self.bridge.handle_webhook(event)
+                self.bridge.tick()
+                self.assertEqual((len(self.tasks()), len(self.linear.activities), len(self.linear.project_updates)), before)
+
+
+    def test_delayed_terminal_delivery_revalidates_recorded_pr_head_and_keeps_uncertain_send(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        url = "https://github.com/example/repo/pull/8"
+        for origin, change in (("chat", "checks"), ("kanban", "head"), ("chat", "same"),
+                               ("kanban", "same"), ("chat", "uncertain"), ("kanban", "uncertain"),
+                               ("chat", "legacy"), ("kanban", "legacy")):
+            with self.subTest(origin=origin, change=change):
+                issue_id, session = f"pr-{origin}-{change}", f"session-{origin}-{change}"
+                self.linear.add_issue(issue_id, f"PR-{origin}-{change}")
+                self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
+                if origin == "chat":
+                    self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": issue_id},
+                                                          Context(session, session)))["ok"])
+                    self.bridge.tick()
+                else:
+                    self.deliver(self.linear.session_event("created", issue_id, session))
+                accepted = {"ok": True, "head_sha": "a" * 40}
+                with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance", return_value=accepted) as check:
+                    if origin == "chat":
+                        result = json.loads(chat.handle(self.bridge, {"action": "done", "issue": issue_id,
+                                                                     "evidence": url}, Context(session, session)))
+                        self.assertTrue(result["ok"])
+                    else:
+                        task = self.bridge.store.get(issue_id)["task_id"]
+                        with self.bridge.kanban.conn() as conn:
+                            kb.complete_task(conn, task, result=f"PR {url}")
+                        self.bridge.pump_kanban()
+                    terminal = next(r for r in self.bridge.store.pending(issue_id) if r["kind"] == "status")
+                    if change == "legacy":
+                        payload = dict(terminal["payload"])
+                        for field in ("pr_heads", "evidence", "evidence_contract"):
+                            payload.pop(field, None)
+                        self.bridge.store.rewrite(terminal["id"], payload, terminal["next_at"])
+                    if change == "uncertain":
+                        with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("lost response")):
+                            self.bridge.flush()
+                        self.clock.now += 61
+                    check.return_value = ({"ok": False, "head_sha": "a" * 40} if change in ("checks", "uncertain") else
+                                          {"ok": True, "head_sha": "b" * 40} if change == "head" else accepted)
+                    self.bridge.flush()
+                    expected = "Done" if change == "same" else "In Progress"
+                    self.assertEqual(self.linear.state(issue_id), expected)
+                    if change == "legacy":
+                        status = self.bridge.store.outbox_row(terminal["id"])
+                        self.assertTrue(status["payload"]["reconcile_required"])
+                        self.assertEqual(status["state"], "failed")
+                        self.assertTrue(any(r["payload"].get("requires_status_id") == terminal["id"]
+                                            for r in self.bridge.store.pending(issue_id)))
+                        continue  # absent historical heads must be reconciled, never inferred from current checks
+                    self.assertGreaterEqual(check.call_count, 2)
+                    status = self.bridge.store.outbox_row(terminal["id"])
+                    self.assertEqual(status["payload"]["pr_heads"], {url: "a" * 40})
+                    self.assertEqual(status["payload"]["evidence_contract"], "local-only")
+                    if change == "uncertain":
+                        self.assertEqual(status["state"], "failed")
+                        self.assertTrue(status["payload"]["reconcile_required"])
+                        self.bridge = self.make_bridge()
+                        self.bridge.tick()
+                        self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "failed")
+                    if change != "same":
+                        self.assertFalse(any(c["issueId"] == issue_id and c["body"].startswith("Done")
+                                             for c in self.linear.comments))
+                        self.assertFalse(any(a.get("issueId") == issue_id and a["content"]["body"].startswith("Done")
+                                             for a in self.linear.activities))
+
+
+    def test_chat_followup_ordering_replay_and_failed_or_uncertain_injection_are_durable(self) -> None:
+        from unittest.mock import patch
+        from linear_ingress_fixture import IngressStore, Route
+        self.bind_identity()
+        self.assertTrue(self.chat("start")["ok"])
+        self.deliver(self.linear.session_event("created", ISSUE, "chat-linear", creator=SELF))
+        self.clock.now += 1
+        old = self.linear.session_event("prompted", ISSUE, "chat-linear", body="OLD destination A", activity_id="old")
+        self.clock.now += 1
+        new = self.linear.session_event("prompted", ISSUE, "chat-linear", body="NEW destination B", activity_id="new")
+        self.deliver(new)
+        self.deliver(old)
+        self.assertFalse(any("OLD destination A" in body for _, body in self.injected))
+        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], new["webhookTimestamp"])
+        count = len(self.injected)
+        self.bridge = self.make_bridge()
+        self.bind_identity()
+        self.deliver(new)
+        self.assertEqual(len(self.injected), count)
+
+        inbox = self.dir / "chat-followup-ingress.db"
+        producer = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
+        self.clock.now += 1
+        retry = self.linear.session_event("prompted", ISSUE, "chat-linear", body="Retry destination C", activity_id="retry")
+        producer.enqueue(route, "retry", json.dumps(retry).encode())
+        with sqlite3.connect(inbox) as db:
+            db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
+        self.inject_ok = False  # a definitive refusal is safe to retry
+        self.bridge.tick(inbox)
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='retry'").fetchone()[0], "pending")
+        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], new["webhookTimestamp"])
+        self.bridge = self.make_bridge()
+        self.bind_identity()
+        self.inject_ok = True
+        self.bridge.tick(inbox)
+        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], retry["webhookTimestamp"])
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='retry'").fetchone()[0], "imported")
+        count = len(self.injected)
+        self.deliver(retry)
+        self.assertEqual(len(self.injected), count)
+
+        self.clock.now += 1
+        unknown = self.linear.session_event("prompted", ISSUE, "chat-linear", body="Uncertain destination D", activity_id="unknown")
+        producer.enqueue(route, "unknown", json.dumps(unknown).encode())
+        with sqlite3.connect(inbox) as db:
+            db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='unknown'", (int(self.clock()),))
+        def interrupted(key, body):
+            self.injected.append((key, body))
+            raise RuntimeError("response lost after chat accepted")
+        with patch.object(self.bridge, "inject", side_effect=interrupted):
+            self.bridge.tick(inbox)
+        count = len(self.injected)
+        self.bridge = self.make_bridge()
+        self.bind_identity()
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.injected), count)  # uncertain injection must not be repeated
+        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], retry["webhookTimestamp"])
+        self.assertTrue(any("unknown" in a["content"]["body"].lower() for a in self.linear.activities))
+        self.clock.now += 86_401
+        self.bridge.tick(inbox)
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='unknown'").fetchone()[0], "failed")
+        self.clock.now += 1
+        self.deliver(self.linear.session_event("prompted", ISSUE, "chat-linear", body="Fresh explicit destination E", activity_id="fresh"))
+        self.assertIn("Fresh explicit destination E", self.injected[-1][1])
+        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], self.clock() * 1000)
+
+
 if __name__ == "__main__":
     unittest.main()

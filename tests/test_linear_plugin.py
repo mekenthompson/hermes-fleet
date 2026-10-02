@@ -24,7 +24,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Durable chat Stop adds a profile/generation-fenced receipt path to this plugin.
 # Keep a bounded production surface without compressing safety-critical branches.
 # Actor/workspace binding and mutation-refusal regressions require explicit safety branches.
-BUDGET = 2400
+# Durable recovery and exact credential binding retain explicit, readable safety branches.
+BUDGET = 2700
 
 
 class FakeContext:

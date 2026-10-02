@@ -57,16 +57,29 @@ class BoundLinearAPI(LinearAPI):
         finally:
             self._graphql_permit.depth = depth
     def verify_identity(self):
-        identity = super().graphql("query IdentityBinding { viewer { id } organization { id } }")
+        self._verified_credential(self.token)
+    def _verified_credential(self, provider):
+        credential = None
+        def capture():
+            nonlocal credential
+            credential = provider()
+            return credential
+        def invalidate():
+            nonlocal provider
+            provider.invalidate()
+            provider = self.token
+        capture.invalidate = invalidate if callable(getattr(provider, "invalidate", None)) else None
+        identity = super()._graphql("query IdentityBinding { viewer { id } organization { id } }",
+                                    token_provider=capture)
         if any(not isinstance(identity.get(field), dict) or
                identity[field].get("id") != self.identity[expected]
                for field, expected in (("viewer", "viewer_id"), ("organization", "organization_id"))):
             raise LinearError("Linear actor/workspace does not match configured identity", retryable=False)
+        return provider, credential
     def graphql(self, query, variables=None):
         if self.specialist_scope is not None and not getattr(self._graphql_permit, "depth", 0):
             raise LinearError("Arbitrary Linear GraphQL is disabled by specialist_scope", retryable=False)
-        self.verify_identity()
-        return super().graphql(query, variables)
+        return super()._graphql(query, variables, verify_credential=self._verified_credential)
     def viewer_id(self) -> str:
         self.verify_identity()
         return str(self.identity["viewer_id"])
@@ -192,12 +205,14 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
             if intent["status"] == "accepted":
                 observed = await gateway.get_chat_run_stop_observation(
                     **target, run_generation=intent["run_generation"])
+                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
                 completion = observed.get("worker_completion", "unknown") if observed.get("status") == "observed" else "unknown"
                 if completion != intent["worker_completion"]:
                     bridge.store.stop_result(intent["id"], "accepted", completion, at=bridge.clock())
                 continue
             observed = await gateway.get_chat_run_stop_observation(
                 **target, run_generation=intent["run_generation"])
+            if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
             if observed.get("status") == "observed":
                 status = observed.get("stop_status", "unknown")
                 completion = observed.get("worker_completion", "unknown")
@@ -205,6 +220,7 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
                 if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
                 receipt = await gateway.request_chat_run_stop(
                     **target, expected_run_generation=intent["run_generation"])
+                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
                 status = receipt.get("status", "unknown")
                 completion = receipt.get("worker_completion", "unknown")
             if status not in ("accepted", "stale", "not_running", "unsupported"): status = "unknown"
