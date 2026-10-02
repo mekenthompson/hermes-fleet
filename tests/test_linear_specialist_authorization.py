@@ -853,7 +853,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.kanban.comments, [])
         self.assertEqual(self.store.outbox_row(row_id), before)
 
-    def test_outbox_effect_holds_fence_commit_during_remote_mutation(self):
+    def test_outbox_effect_releases_writer_after_atomic_admission(self):
         row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved"}, at=1)
         began, finished = threading.Event(), threading.Event()
         worker = None
@@ -868,12 +868,13 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 worker = threading.Thread(target=fence)
                 worker.start()
                 self.assertTrue(began.wait(1))
-                self.assertFalse(finished.wait(0.05), "fence committed during an authorized send")
+                self.assertTrue(finished.wait(2), "fence waited for remote transport after admission")
             return transport(url, body, headers)
         self.api.transport = send
         self.bridge.flush()
         worker.join(2)
         self.assertTrue(finished.is_set())
+        self.assertEqual(len(self.authority.mutations), 1)
         self.assertIn(self.store.outbox_row(row_id)["state"], ("pending", "sent"))
         self.assertTrue(self.store.scope_fenced(ISSUE))
 
