@@ -241,6 +241,48 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(other))
         self.assertEqual(self.store.pending(), before)
 
+    def seed_chat_stop(self):
+        self.store.put(ISSUE, "chat", "chat-key", run_generation=1)
+        self.bridge.handle_webhook(self.session_event())
+        intent = self.store.capture_chat_stop(ISSUE, SESSION, ACTIVITY, "synthetic", at=1)
+        self.assertIsNotNone(intent)
+        return intent
+
+    def test_chat_stop_fenced_before_gateway_calls_preserves_intent(self):
+        import asyncio
+        self.seed_chat_stop()
+        before = self.store.stop_intents()
+        self.store.fence_scope(ISSUE, "permanent denial", at=2)
+        calls = []
+        class Gateway:
+            async def get_chat_run_stop_observation(inner, **kwargs):
+                calls.append("observe")
+                return {"status": "unknown"}
+            async def request_chat_run_stop(inner, **kwargs):
+                calls.append("stop")
+                return {"status": "accepted", "worker_completion": "pending"}
+        asyncio.run(plugin.process_chat_stops(self.bridge, SimpleNamespace(
+            gateway=Gateway(), profile_home=str(self.tmp.name))))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.stop_intents(), before)
+
+    def test_chat_stop_fenced_during_observation_never_requests_stop(self):
+        import asyncio
+        self.seed_chat_stop()
+        before = self.store.stop_intents()
+        calls = []
+        class Gateway:
+            async def get_chat_run_stop_observation(inner, **kwargs):
+                self.store.fence_scope(ISSUE, "permanent denial", at=2)
+                return {"status": "unknown"}
+            async def request_chat_run_stop(inner, **kwargs):
+                calls.append("stop")
+                return {"status": "accepted", "worker_completion": "pending"}
+        asyncio.run(plugin.process_chat_stops(self.bridge, SimpleNamespace(
+            gateway=Gateway(), profile_home=str(self.tmp.name))))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.stop_intents(), before)
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},

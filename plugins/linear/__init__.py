@@ -183,8 +183,8 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
     for intent in bridge.store.stop_intents():
         if intent["profile"] != bridge.profile or intent["status"] not in ("requested", "accepted"):
             continue
-        if intent["status"] == "accepted" and intent["worker_completion"] == "completed":
-            continue
+        if intent["status"] == "accepted" and intent["worker_completion"] == "completed": continue
+        if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
         if not callable(getattr(gateway, "request_chat_run_stop", None)) or not callable(
                 getattr(gateway, "get_chat_run_stop_observation", None)):
             bridge.store.stop_result(intent["id"], "unsupported", "unknown", at=bridge.clock())
@@ -204,12 +204,12 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
                 status = observed.get("stop_status", "unknown")
                 completion = observed.get("worker_completion", "unknown")
             else:
+                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
                 receipt = await gateway.request_chat_run_stop(
                     **target, expected_run_generation=intent["run_generation"])
                 status = receipt.get("status", "unknown")
                 completion = receipt.get("worker_completion", "unknown")
-            if status not in ("accepted", "stale", "not_running", "unsupported"):
-                status = "unknown"
+            if status not in ("accepted", "stale", "not_running", "unsupported"): status = "unknown"
             if completion not in ("pending", "completed", "unknown"):
                 completion = "unknown"
             bridge.store.stop_result(intent["id"], status, completion, at=bridge.clock())
