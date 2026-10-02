@@ -89,7 +89,11 @@ for line in sys.stdin:
             # Right id, but neither "result" nor "error": not a valid JSON-RPC reply.
             send({"jsonrpc": "2.0", "id": message["id"]})
             continue
-        elif mode == "hang":
+        if mode == "rpc_error":
+            send({"jsonrpc": "2.0", "id": prompt_id,
+                  "error": {"code": -32603, "message": "synthetic prompt failure"}})
+            continue
+        if mode == "hang":
             update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ready"}})
             time.sleep(60)
         elif mode == "images":

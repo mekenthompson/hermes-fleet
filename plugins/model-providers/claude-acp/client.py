@@ -659,6 +659,7 @@ class LiveStream:
         self._stopped = threading.Event()
         self._cancel = cancel
         self._finished = threading.Event()
+        self._completion = concurrent.futures.Future()
         self._error = None
 
         def put(value):
@@ -696,6 +697,7 @@ class LiveStream:
                     self._error = exc
             finally:
                 self._finished.set()
+                self._completion.set_result(None)
 
         context = contextvars.copy_context()
         self._worker = threading.Thread(target=context.run, args=(run,), daemon=True)
@@ -1009,7 +1011,20 @@ class ClaudeACPClient:
         except BaseException:
             _ASYNC_SUBMISSIONS.release()
             raise
-        worker.add_done_callback(lambda _completed: _ASYNC_SUBMISSIONS.release())
+        def release_admission(completed):
+            try:
+                value = completed.result()
+            except BaseException:
+                _ASYNC_SUBMISSIONS.release()
+            else:
+                if isinstance(value, LiveStream):
+                    # Returning a stream transfers slot ownership to its producer;
+                    # every producer exit (success/error/close/deadline) releases it.
+                    value._completion.add_done_callback(lambda _: _ASYNC_SUBMISSIONS.release())
+                else:
+                    _ASYNC_SUBMISSIONS.release()
+
+        worker.add_done_callback(release_admission)
         result = asyncio.wrap_future(worker)
         try:
             return await result

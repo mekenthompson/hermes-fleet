@@ -245,6 +245,74 @@ class ClaudeWireTests(unittest.TestCase):
 
         asyncio.run(invoke())
 
+    def test_async_streams_keep_admission_slots_for_their_full_lifetime(self):
+        clients = [self.client("hang") for _ in range(8)]
+
+        async def invoke():
+            pending = [asyncio.create_task(client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], stream=True, timeout=8
+            )) for client in clients]
+            streams = []
+            try:
+                deadline = asyncio.get_running_loop().time() + 2
+                while sum(task.done() for task in pending) < 4:
+                    self.assertLess(asyncio.get_running_loop().time(), deadline)
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.1)
+                completed = [task for task in pending if task.done()]
+                streams = [task.result() for task in completed]
+                self.assertEqual(len(streams), 4, "async streams bypassed admission bound")
+                for stream in streams:
+                    await stream.__anext__()
+                self.assertEqual(sum(client._process is not None for client in clients), 4)
+                waiting = [task for task in pending if not task.done()]
+                await streams[0].aclose()
+                newly_done, _ = await asyncio.wait_for(asyncio.wait(
+                    waiting, return_when=asyncio.FIRST_COMPLETED
+                ), timeout=2)
+                self.assertEqual(len(newly_done), 1, "closing one stream released more than one slot")
+            finally:
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, self.module.LiveStream):
+                        await result.aclose()
+                semaphore = self.module._ASYNC_SUBMISSIONS
+                for _ in range(4):
+                    self.assertTrue(semaphore.acquire(blocking=False), "stream cleanup leaked a slot")
+                self.assertFalse(semaphore.acquire(blocking=False))
+                for _ in range(4):
+                    semaphore.release()
+
+        asyncio.run(invoke())
+
+    def test_async_stream_admission_is_released_on_success_error_and_deadline(self):
+        async def invoke():
+            for mode, expected in (("text", None), ("rpc_error", RuntimeError), ("hang", TimeoutError)):
+                with self.subTest(mode=mode):
+                    stream = await self.client(mode).chat.completions.create(
+                        messages=[{"role": "user", "content": "test"}], stream=True,
+                        timeout=0.5 if mode == "hang" else 3,
+                    )
+                    if expected:
+                        with self.assertRaises(expected):
+                            async for _ in stream:
+                                pass
+                    else:
+                        async for _ in stream:
+                            pass
+                    await asyncio.wrap_future(stream._completion)
+                    semaphore = self.module._ASYNC_SUBMISSIONS
+                    for _ in range(4):
+                        self.assertTrue(semaphore.acquire(blocking=False))
+                    self.assertFalse(semaphore.acquire(blocking=False))
+                    for _ in range(4):
+                        semaphore.release()
+
+        asyncio.run(invoke())
+
     def test_async_stream_cancellation_reaps_adapter_process(self):
         client = self.client("hang")
 
@@ -267,6 +335,12 @@ class ClaudeWireTests(unittest.TestCase):
         process = asyncio.run(invoke())
         self.assertIsNotNone(process.poll(), "cancelled async stream left the ACP process alive")
         self.assertIsNone(client._process)
+        semaphore = self.module._ASYNC_SUBMISSIONS
+        for _ in range(4):
+            self.assertTrue(semaphore.acquire(blocking=False), "cancelled stream leaked admission")
+        self.assertFalse(semaphore.acquire(blocking=False))
+        for _ in range(4):
+            semaphore.release()
 
     def test_async_cancellation_reaps_adapter_process(self):
         client = self.client("hang")
