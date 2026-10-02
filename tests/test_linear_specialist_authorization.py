@@ -328,6 +328,52 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.pending(), [])
         self.assertEqual(self.authority.mutations, [])
 
+    def test_chat_start_rejects_wrong_resource_without_fencing_either_issue(self):
+        from hermes_fleet_linear_plugin import chat
+        other = "issue-requested"
+        context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
+        original = self.api.issue
+        self.api.issue = lambda ref: original(ISSUE)
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": other}, context))
+        self.assertFalse(reply["ok"])
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.store.active(), [])
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_chat_verified_scope_denial_fences_before_scope_recovery(self):
+        from hermes_fleet_linear_plugin import chat
+        context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
+        self.authority.issues[ISSUE] = issue_record(project={"id": "foreign-project"})
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))["ok"])
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.authority.issues[ISSUE] = issue_record()
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))["ok"])
+        self.assertEqual(self.store.active(), [])
+        self.assertEqual(self.store.pending(), [])
+
+    def test_resolver_redirect_scope_error_cannot_fence_returned_issue(self):
+        from hermes_fleet_linear_plugin import chat
+        other = "issue-other"
+        task_id = self.seed_kanban_work(other)
+        self.authority.issues[ISSUE] = issue_record(id=other, project={"id": "foreign-project"})
+        context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))
+        self.assertFalse(reply["ok"])
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready")
+        self.assertEqual(self.store.pending(), [])
+
+    def test_chat_identifier_alias_resolves_only_its_own_canonical_issue(self):
+        from hermes_fleet_linear_plugin import chat
+        self.authority.issues["OPS-1"] = issue_record()
+        context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "OPS-1"}, context))
+        self.assertTrue(reply["ok"])
+        self.assertIsNotNone(self.store.get(ISSUE))
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},

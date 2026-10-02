@@ -1,8 +1,4 @@
-"""Linear integration: Linear is the human record, this profile's Kanban board runs the work.
-
-Off by default. Enable per profile with ``plugins.entries.linear.settings.enabled: true``;
-the settings schema is in README.md.
-"""
+"""Default-disabled Linear integration: Linear records work; profile Kanban executes it. Settings are in README.md."""
 from __future__ import annotations
 
 import asyncio
@@ -87,6 +83,8 @@ class BoundLinearAPI(LinearAPI):
     def issue(self, ref):
         with self._permit_specialist_operation():
             issue = super().issue(ref)
+        if ref not in (issue.get("id"), issue.get("identifier")):
+            raise LinearError("Linear issue resolution does not match the requested ref")
         team = issue.get("team") or {}
         if self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]):
             raise LinearError("Linear issue team is outside configured scope", retryable=False, authoritative_issue_id=issue.get("id"))
