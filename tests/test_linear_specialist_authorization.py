@@ -185,6 +185,59 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                                       "content": {"type": "prompt", "body": "untrusted prompt"}}
         return event
 
+    def test_status_send_refuses_second_lookup_redirect(self):
+        other = "issue-other"
+        self.authority.issues[other] = issue_record(id=other)
+        row_id = self.bridge.status(ISSUE, "in_progress", claim=True)
+        original = self.api.issue
+        calls = 0
+        def redirected(ref):
+            nonlocal calls
+            if ref == ISSUE:
+                calls += 1
+                if calls == 2:
+                    return original(other)
+            return original(ref)
+        self.api.issue = redirected
+        self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(self.authority.mutations, [])
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual(self.store.outbox_row(row_id)["state"], "pending")
+
+    def test_created_scope_denial_fences_authoritative_issue_across_replay(self):
+        self.authority.issues[ISSUE] = issue_record(project={"id": "foreign-project"})
+        event = self.session_event()
+        self.bridge.handle_webhook(event)
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.authority.issues[ISSUE] = issue_record()
+        self.bridge.handle_webhook(event)
+        self.assertEqual(self.kanban.creates, [])
+        self.assertIsNone(self.store.get(ISSUE))
+        self.assertEqual(self.store.pending(), [])
+
+    def test_project_send_refuses_second_lookup_redirect(self):
+        other = "issue-other"
+        self.authority.issues[ISSUE] = issue_record(delegate={"id": VIEWER})
+        self.authority.issues[other] = issue_record(id=other, delegate={"id": VIEWER})
+        self.bridge.project_update(SESSION, PROJECT, "OPS-1", "result", issue_id=ISSUE, quiet=False)
+        before = self.store.pending()
+        original = self.api.issue
+        calls = 0
+        def redirected(ref):
+            nonlocal calls
+            if ref == ISSUE:
+                calls += 1
+                if calls == 2:
+                    return original(other)
+            return original(ref)
+        self.api.issue = redirected
+        self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(self.authority.mutations, [])
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertFalse(self.store.scope_fenced(other))
+        self.assertEqual(self.store.pending(), before)
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},
