@@ -7,6 +7,10 @@ server directly and consumes its private capture stream before Hermes receives a
 from __future__ import annotations
 
 import contextlib
+import asyncio
+import base64
+import binascii
+import concurrent.futures
 import hashlib
 import json
 import contextvars
@@ -32,6 +36,14 @@ _MAX_SCHEMA_BYTES = 1024 * 1024
 _MAX_TOOLS = 128
 _MAX_UPDATES = 4096
 _MAX_RESPONSE_CHARS = 8 * 1024 * 1024
+# Keep the encoded image URL under the same reactive recovery target used by
+# core conversation_compression._IMAGE_SHRINK_TARGET_BYTES (4 MiB).
+_MAX_IMAGE_URL_CHARS = 4 * 1024 * 1024
+_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_ASYNC_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="claude-acp"
+)
+_ASYNC_SUBMISSIONS = threading.BoundedSemaphore(4)
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTEXT_HINT_SUFFIX_RE = re.compile(r"-(\d+m)$", re.I)
 _ROLE_LABELS = {"user": "User", "assistant": "Assistant", "tool": "Tool", "context": "Context"}
@@ -202,6 +214,57 @@ def _content(value: Any) -> str:
     return str(value or "")
 
 
+def _acp_image_block(value: dict[str, Any]) -> dict[str, str]:
+    """Convert an OpenAI image part to a validated ACP image block."""
+    image_url = value.get("image_url")
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+    elif isinstance(image_url, str):
+        url = image_url
+    else:
+        url = value.get("image")
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise ValueError("only base64 data:image URLs are supported")
+    if len(url) > _MAX_IMAGE_URL_CHARS:
+        raise ValueError("image payload exceeds the 4 MiB image limit")
+    header, separator, payload = url.partition(",")
+    if not separator or not header.startswith("data:image/"):
+        raise ValueError("only base64 data:image URLs are supported")
+    parameters = header.split(";")
+    if len(parameters) != 2 or parameters[1].lower() != "base64":
+        raise ValueError("only base64 data:image URLs are supported")
+    mime_type = parameters[0][len("data:"):].lower()
+    if mime_type not in _IMAGE_MIME_TYPES:
+        raise ValueError(f"unsupported image MIME type: {mime_type}")
+    try:
+        image_bytes = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("malformed base64 image payload") from exc
+    if not image_bytes:
+        raise ValueError("malformed base64 image payload")
+    return {"type": "image", "mimeType": mime_type, "data": payload}
+
+
+def _acp_content_blocks(value: Any) -> tuple[list[dict[str, str]], bool]:
+    """Parse content parts without flattening image payloads into transcript text."""
+    if not isinstance(value, list):
+        text = _content(value)
+        return ([{"type": "text", "text": text}] if text else []), False
+    blocks: list[dict[str, str]] = []
+    has_images = False
+    for item in value:
+        if isinstance(item, dict) and item.get("type") in {"image_url", "input_image"}:
+            blocks.append(_acp_image_block(item))
+            has_images = True
+            continue
+        if isinstance(item, dict) and str(item.get("type") or "").startswith("image"):
+            raise ValueError(f"unsupported image input type: {item.get('type')}")
+        text = _content(item)
+        if text:
+            blocks.append({"type": "text", "text": text})
+    return blocks, has_images
+
+
 def _tool_call_dict(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         call_id = value.get("id")
@@ -232,23 +295,29 @@ def split_messages(
     messages: list[dict[str, Any]],
     *,
     tool_choice: Any = None,
-) -> tuple[str, str]:
-    """Return trusted policy and a lossless-enough untrusted conversation transcript."""
+) -> tuple[str, list[dict[str, str]]]:
+    """Return trusted policy and ordered ACP prompt content blocks."""
     del tool_choice  # Enforcement happens structurally in select_bridge_tools and _create.
     policy: list[str] = []
-    transcript: list[str] = []
+    transcript: list[str | list[dict[str, str]]] = []
+    has_images = False
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").lower()
-        text = _content(message.get("content")).strip()
+        content = message.get("content")
+        content_blocks, message_has_images = _acp_content_blocks(content)
         if role in {"system", "developer"}:
+            if message_has_images:
+                raise ValueError("images are only supported in conversation messages")
+            text = _content(content).strip()
             if text:
                 policy.append(text)
             continue
 
+        text = _content(content).strip()
         historical: dict[str, Any] = {}
-        if text:
+        if text and not message_has_images:
             historical["content"] = text
         if role == "assistant":
             calls = [
@@ -265,15 +334,43 @@ def split_messages(
                 historical["tool_call_id"] = tool_call_id
             if isinstance(name, str) and name:
                 historical["name"] = name
-        if not historical:
+        if not historical and not message_has_images:
             continue
-        if set(historical) == {"content"}:
+        if not message_has_images and set(historical) == {"content"}:
             rendered = historical["content"]
-        else:
+            transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
+            continue
+        if not message_has_images:
             rendered = json.dumps(historical, ensure_ascii=True, separators=(",", ":"))
-        transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
+            transcript.append(f"{_ROLE_LABELS.get(role, 'Context')}:\n{rendered}")
+            continue
 
-    return "\n\n".join([*policy, _BRIDGE_POLICY]), "\n\n".join(transcript)
+        has_images = True
+        blocks = [{"type": "text", "text": f"{_ROLE_LABELS.get(role, 'Context')}:\n"}]
+        if historical:
+            # Content remains in its original text/image order below. Keep only
+            # the historical tool envelope here so image blocks are never JSON-flattened.
+            blocks.append({
+                "type": "text",
+                "text": json.dumps(historical, ensure_ascii=True, separators=(",", ":")) + "\n",
+            })
+        blocks.extend(content_blocks)
+        transcript.append(blocks)
+
+    system = "\n\n".join([*policy, _BRIDGE_POLICY])
+    if not has_images:
+        return system, [{"type": "text", "text": "\n\n".join(
+            section for section in transcript if isinstance(section, str)
+        )}]
+    prompt: list[dict[str, str]] = []
+    for section in transcript:
+        if prompt:
+            prompt.append({"type": "text", "text": "\n\n"})
+        if isinstance(section, str):
+            prompt.append({"type": "text", "text": section})
+        else:
+            prompt.extend(section)
+    return system, prompt
 
 
 def build_subprocess_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -607,6 +704,9 @@ class LiveStream:
     def __iter__(self):
         return self
 
+    def __aiter__(self):
+        return self
+
     def __next__(self):
         while not self._stopped.is_set():
             try:
@@ -626,6 +726,36 @@ class LiveStream:
                 raise item
             return item
         raise StopIteration
+
+    async def __anext__(self):
+        try:
+            while not self._stopped.is_set():
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    if self._finished.is_set():
+                        if not self._queue.empty():
+                            continue
+                        if self._error is not None:
+                            error, self._error = self._error, None
+                            raise error
+                        raise StopAsyncIteration
+                    await asyncio.sleep(0.01)
+                    continue
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+            raise StopAsyncIteration
+        except asyncio.CancelledError:
+            try:
+                await self.aclose()
+            except BaseException:
+                pass
+            raise
+
+    async def aclose(self):
+        """Cancel and reap an abandoned async stream without blocking its event loop."""
+        await asyncio.to_thread(self.close)
 
     def close(self):
         self._stopped.set()
@@ -688,6 +818,8 @@ def _finish_reason(prompt_result: Mapping[str, Any], has_tool_calls: bool) -> st
 
 
 class ClaudeACPClient:
+    # Hermes leaves this profile-local transport alone; _create() adapts itself
+    # to the caller's sync or async context without core changes.
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
@@ -835,12 +967,98 @@ class ClaudeACPClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
-        bridge_tools, requirement = select_bridge_tools(tools or [], tool_choice)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._create_sync(
+                model=model, messages=messages, tools=tools, tool_choice=tool_choice,
+                timeout=timeout, stream=stream,
+            )
+        return self._create_async(
+            model=model, messages=messages, tools=tools, tool_choice=tool_choice,
+            timeout=timeout, stream=stream,
+        )
+
+    async def _create_async(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        timeout: Any = None,
+        stream: bool = False,
+    ) -> Any:
+        """Run the sync ACP transport on a bounded worker, preserving cancel ownership."""
+        cancelled = threading.Event()
+        context = contextvars.copy_context()
         deadline = time.monotonic() + _timeout(timeout)
-        if not self._request_lock.acquire(timeout=max(0, deadline - time.monotonic())):
-            raise TimeoutError("Claude ACP request deadline exceeded waiting for active request")
+        while not _ASYNC_SUBMISSIONS.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Claude ACP request deadline expired during admission")
+            await asyncio.sleep(0.01)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Claude ACP request deadline expired during admission")
+            worker = _ASYNC_EXECUTOR.submit(
+                context.run, self._create_sync,
+                model=model, messages=messages, tools=tools, tool_choice=tool_choice,
+                timeout=remaining, stream=stream, _cancel_event=cancelled,
+            )
+        except BaseException:
+            _ASYNC_SUBMISSIONS.release()
+            raise
+        worker.add_done_callback(lambda _completed: _ASYNC_SUBMISSIONS.release())
+        result = asyncio.wrap_future(worker)
+        try:
+            return await result
+        except asyncio.CancelledError:
+            cancelled.set()
+            if worker.cancel():
+                raise
+            # The wrapper awaited above is cancelled with this task. Re-wrap
+            # the still-running concurrent future so cleanup is observed without
+            # giving the queued request permission to close another call.
+            result = asyncio.wrap_future(worker)
+            try:
+                completed = await result
+            except BaseException:
+                pass
+            else:
+                if isinstance(completed, LiveStream):
+                    await completed.aclose()
+            raise
+
+    def _create_sync(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        timeout: Any = None,
+        stream: bool = False,
+        _cancel_event: threading.Event | None = None,
+    ) -> Any:
+        bridge_tools, requirement = select_bridge_tools(tools or [], tool_choice)
+        messages = messages or []
+        prepared = split_messages(messages)
+        cancelled = _cancel_event or threading.Event()
+        deadline = time.monotonic() + _timeout(timeout)
+        while True:
+            if cancelled.is_set():
+                raise RuntimeError("Claude ACP request cancelled while waiting for an active request")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Claude ACP request deadline exceeded waiting for active request")
+            if self._request_lock.acquire(timeout=min(0.05, remaining)):
+                break
         with self._lock:
-            self._cancelled = cancelled = threading.Event()
+            if cancelled.is_set():
+                self._request_lock.release()
+                raise RuntimeError("Claude ACP request cancelled while waiting for an active request")
+            self._cancelled = cancelled
             self._deadline = deadline
 
         def cancel():
@@ -850,7 +1068,7 @@ class ClaudeACPClient:
 
         def complete(publish=None):
             try:
-                return self._complete(model, messages, bridge_tools, requirement, publish)
+                return self._complete(model, messages, bridge_tools, requirement, publish, prepared)
             finally:
                 self._request_lock.release()
 
@@ -858,10 +1076,10 @@ class ClaudeACPClient:
             return LiveStream(complete, cancel, model or "claude-acp", self._deadline)
         return complete()
 
-    def _complete(self, model, messages, bridge_tools, requirement, publish):
+    def _complete(self, model, messages, bridge_tools, requirement, publish, prepared=None):
         text, reasoning, tool_calls, prompt_result = self._run(
             messages or [], bridge_tools, requirement, model,
-            max(0, self._deadline - time.monotonic()), publish,
+            max(0, self._deadline - time.monotonic()), publish, prepared,
         )
         if requirement and not tool_calls:
             label = "a tool" if requirement == "*" else f"tool '{requirement}'"
@@ -896,6 +1114,7 @@ class ClaudeACPClient:
         model: str | None,
         timeout: float,
         publish=None,
+        prepared: tuple[str, list[dict[str, str]]] | None = None,
     ) -> tuple[str, str, list[SimpleNamespace], dict[str, Any]]:
         del requirement  # The completion owns the shared absolute deadline.
         assert_reviewed_claude_code_version(timeout=max(0.01, self._deadline - time.monotonic()))
@@ -1211,12 +1430,17 @@ class ClaudeACPClient:
                         raise TypeError(f"Claude ACP {method} returned a non-object result")
                     return result
 
-            request("initialize", {
+            initialize_result = request("initialize", {
                 "protocolVersion": 1,
                 "clientCapabilities": {},
                 "clientInfo": {"name": "hermes-agent", "title": "Hermes Agent", "version": "0.0.0"},
             })
-            system, prompt = split_messages(messages)
+            system, prompt = prepared if prepared is not None else split_messages(messages)
+            if any(block.get("type") == "image" for block in prompt):
+                capabilities = initialize_result.get("agentCapabilities")
+                prompt_capabilities = capabilities.get("promptCapabilities") if isinstance(capabilities, dict) else None
+                if not isinstance(prompt_capabilities, dict) or prompt_capabilities.get("image") is not True:
+                    raise RuntimeError("Claude ACP adapter does not advertise image prompt support")
             bridge_config: dict[str, Any] = {}
             acp_mcp_servers: list[dict[str, Any]] = []
             if bridge_tools:
@@ -1295,7 +1519,7 @@ class ClaudeACPClient:
             prompt_active = True
             prompt_result = request("session/prompt", {
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
+                "prompt": prompt,
             })
             prompt_active = False
             return "".join(output), "".join(reasoning), captured_calls, prompt_result

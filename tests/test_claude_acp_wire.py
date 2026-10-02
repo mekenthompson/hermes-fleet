@@ -194,6 +194,80 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertEqual(asyncio.run(invoke()), "hello world")
         self.assertTrue(client.is_closed)
 
+    def test_async_request_preserves_callers_context(self):
+        import contextvars
+        marker = contextvars.ContextVar("acp_aux_marker", default="lost")
+        client = self.client("text")
+
+        async def invoke():
+            marker.set("caller-context")
+            with patch.object(client, "_create_sync", side_effect=lambda **kwargs: marker.get()):
+                return await client.chat.completions.create(messages=[])
+
+        self.assertEqual(asyncio.run(invoke()), "caller-context")
+
+    def test_async_admission_wait_obeys_request_timeout(self):
+        client = self.client("text")
+
+        async def invoke():
+            semaphore = self.module._ASYNC_SUBMISSIONS
+            for _ in range(4):
+                self.assertTrue(semaphore.acquire(blocking=False))
+            try:
+                with self.assertRaisesRegex(TimeoutError, "deadline"):
+                    await asyncio.wait_for(client.chat.completions.create(
+                        messages=[], timeout=0.05
+                    ), timeout=0.5)
+            finally:
+                for _ in range(4):
+                    semaphore.release()
+
+        asyncio.run(invoke())
+
+    def test_async_stream_cleanup_does_not_wait_for_transport_worker_capacity(self):
+        client = self.client("hang")
+
+        async def invoke():
+            stream = await client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], stream=True, timeout=8
+            )
+            await stream.__anext__()
+            executor = self.module._ASYNC_EXECUTOR
+            release = threading.Event()
+            occupied = [executor.submit(release.wait) for _ in range(4)]
+            try:
+                await asyncio.wait_for(stream.aclose(), timeout=1)
+                self.assertIsNone(client._process)
+            finally:
+                release.set()
+                for future in occupied:
+                    future.result(timeout=2)
+
+        asyncio.run(invoke())
+
+    def test_async_stream_cancellation_reaps_adapter_process(self):
+        client = self.client("hang")
+
+        async def invoke():
+            stream = await client.chat.completions.create(
+                messages=[{"role": "user", "content": "test"}], stream=True, timeout=8
+            )
+            first = await stream.__anext__()
+            self.assertEqual(first.choices[0].delta.content, "ready")
+            process = client._process
+            self.assertIsNotNone(process, "async stream did not keep its ACP process active")
+            assert process is not None
+            pending = asyncio.create_task(stream.__anext__())
+            await asyncio.sleep(0.05)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            return process
+
+        process = asyncio.run(invoke())
+        self.assertIsNotNone(process.poll(), "cancelled async stream left the ACP process alive")
+        self.assertIsNone(client._process)
+
     def test_async_cancellation_reaps_adapter_process(self):
         client = self.client("hang")
 
@@ -215,6 +289,39 @@ class ClaudeWireTests(unittest.TestCase):
         process = asyncio.run(invoke())
         self.assertIsNotNone(process.poll(), "cancelled async request left the ACP process alive")
         self.assertIsNone(client._process)
+
+    def test_cancelling_queued_async_request_does_not_abort_active_request(self):
+        client = self.client("hang")
+
+        async def invoke():
+            loop = asyncio.get_running_loop()
+
+            async def request():
+                return await client.chat.completions.create(
+                    messages=[{"role": "user", "content": "test"}], timeout=8
+                )
+
+            active = asyncio.create_task(request())
+            deadline = loop.time() + 1.5
+            while client._process is None and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            process = client._process
+            self.assertIsNotNone(process, "active async request never started the ACP adapter")
+            queued = asyncio.create_task(request())
+            await asyncio.sleep(0.05)
+            queued.cancel()
+            await asyncio.sleep(0.05)
+            self.assertIsNone(process.poll(), "cancelling a queued call aborted another active ACP request")
+            self.assertIs(client._process, process)
+            active.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await active
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            return process
+
+        process = asyncio.run(invoke())
+        self.assertIsNotNone(process.poll(), "cancelled active request left the ACP process alive")
 
     def test_async_image_prompt_preserves_multiple_ordered_image_blocks_on_the_wire(self):
         client = self.client("images")
@@ -247,6 +354,32 @@ class ClaudeWireTests(unittest.TestCase):
             asyncio.run(invoke())
         self.assertTrue(client.is_closed)
 
+    def test_image_prompt_keeps_policy_and_tool_history(self):
+        client = self.client("text")
+        messages = [
+            {"role": "system", "content": "Apply the user's profile policy."},
+            {"role": "assistant", "content": "Checking first.", "tool_calls": [{
+                "id": "call-1", "type": "function", "function": {"name": "probe", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "name": "probe", "content": "{\"result\":\"kept\"}"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Compare "},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{RED_PNG}"}},
+                {"type": "text", "text": " now."},
+            ]},
+        ]
+        system, prompt = self.module.split_messages(messages)
+        self.assertIn("Apply the user's profile policy.", system)
+        self.assertIn("Hermes owns all local side effects.", system)
+        text = "\n".join(part["text"] for part in prompt if part["type"] == "text")
+        self.assertIn('"tool_calls"', text)
+        self.assertIn("Checking first.", text)
+        self.assertIn('"tool_call_id":"call-1"', text)
+        self.assertIn("kept", text)
+        images = [part for part in prompt if part["type"] == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["data"], RED_PNG)
+
     def test_image_payloads_reject_remote_urls_malformed_base64_and_unsupported_mime(self):
         cases = (
             ("https://example.invalid/image.png", "only base64 data:image URLs are supported"),
@@ -263,7 +396,7 @@ class ClaudeWireTests(unittest.TestCase):
                     client.chat.completions.create(messages=messages, timeout=10)
                 self.assertIsNone(client._process, "invalid image started an ACP subprocess")
 
-    def test_image_payload_size_uses_the_existing_four_mib_core_ceiling(self):
+    def test_image_payload_size_uses_the_core_four_mib_shrink_target(self):
         client = self.client("text")
         oversized = base64.b64encode(b"x" * (4 * 1024 * 1024 + 1)).decode("ascii")
         messages = [{"role": "user", "content": [
