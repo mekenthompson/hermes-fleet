@@ -288,14 +288,8 @@ class Bridge:
             if issue_id: self._park_fenced(issue_id)
             return False
         try:
-            issue = self.api.issue(issue_id)
-        except LinearError as exc:
-            if not exc.retryable:
-                self._fence_scope_denial(issue_id, exc)
-            return False
-        if not isinstance(issue, dict) or issue.get("id") != issue_id:
-            self._fence_scope_denial(issue_id, LinearError("Linear issue resolution changed its identity",
-                                                            retryable=False))
+            self._effect_issue(issue_id)
+        except LinearError:
             return False
         return not self.store.scope_fenced(issue_id)
     def _require_effect(self, issue_id: str) -> bool:
@@ -316,8 +310,16 @@ class Bridge:
         return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
     @staticmethod
     def _is_specialist_scope_denial(exc: LinearError) -> bool:
-        message = str(exc).lower()
-        return not exc.retryable and ("specialist scope" in message or "specialist authorization" in message)
+        return not exc.retryable and any(text in str(exc).lower() for text in ("specialist scope", "specialist authorization"))
+    def _effect_issue(self, issue_id: str) -> dict[str, Any]:
+        try:
+            issue = self.api.issue(issue_id)
+            if not isinstance(issue, dict) or issue.get("id") != issue_id:
+                raise LinearError("Linear issue resolution changed its identity", retryable=False)
+            return issue
+        except LinearError as exc:
+            if not exc.retryable: self._fence_scope_denial(issue_id, exc)
+            raise
     def _specialist_session_event(self, event: dict[str, Any], issue_id: str, session_id: str):
         session = self.api.agent_session(session_id)
         authoritative_issue_id = session["issue"]["id"]
@@ -328,9 +330,7 @@ class Bridge:
         creator = (session.get("creator") or {}).get("id")
         if payload_creator and payload_creator != creator:
             raise LinearError("Agent Session payload creator does not match Linear", retryable=False)
-        issue = self.api.issue(authoritative_issue_id)
-        if issue.get("id") != authoritative_issue_id:
-            raise LinearError("Agent Session issue could not be authoritatively resolved", retryable=False)
+        issue = self._effect_issue(authoritative_issue_id)
         activity = event.get("agentActivity") or {}
         if event.get("action") == "prompted":
             activity_id = activity.get("id")
@@ -807,18 +807,18 @@ class Bridge:
             return False
         if kind != "project_update" and payload.get("terminal"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
-            issue = self.api.issue(owner_issue_id)
+            issue = self._effect_issue(owner_issue_id)
             if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
                     or (issue.get("state") or {}).get("type") == "canceled"):
                 return False  # no completion message or update after a human takeover/cancel
         elif kind in ("comment", "activity") and not payload.get("takeover") and \
                 (payload.get("session_key") or payload.get("task_id")):
-            issue = self.api.issue(payload["issue_id"])
+            issue = self._effect_issue(payload["issue_id"])
             if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
                     or (issue.get("state") or {}).get("type") in CLOSED):
                 return False
         if kind == "status":
-            issue = self.api.issue(payload["issue_id"])  # re-read before every status write
+            issue = self._effect_issue(payload["issue_id"])  # exact target on every re-read
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                   payload.get("seen")):
                 if (payload.get("terminal") and payload.get("state") == "done"
@@ -832,7 +832,7 @@ class Bridge:
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if fields:
-                self._mutate_outbox(row["id"], lambda: self.api.update_issue(issue["id"], fields))
+                self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields))
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
@@ -853,7 +853,7 @@ class Bridge:
             if current["next_at"] > self.clock():
                 raise ProjectUpdateDeferred
             payload = current["payload"]
-            project_id = payload["project_id"] or ((self.api.issue(payload["resolve"]).get("project") or {})
+            project_id = payload["project_id"] or ((self._effect_issue(payload["resolve"]).get("project") or {})
                                                        .get("id"))
             lines_to_send = []
             issue_ids_to_send = []
@@ -861,7 +861,7 @@ class Bridge:
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
                 try:
-                    issue = self.api.issue(issue_id)
+                    issue = self._effect_issue(issue_id) if self._specialist_scope_active() else self.api.issue(issue_id)
                 except LinearError as exc:
                     if exc.retryable:
                         raise
