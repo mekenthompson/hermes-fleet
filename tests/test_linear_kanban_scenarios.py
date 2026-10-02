@@ -2111,6 +2111,84 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.bridge.flush()
             self.assertEqual(self.linear.state(ISSUE), "Done")
 
+    def test_retryable_pre_send_then_changed_pr_head_fails_without_reconciliation(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        url = "https://github.com/example/repo/pull/8"
+        with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
+                   return_value={"ok": True, "head_sha": "a" * 40}) as check:
+            self.assertTrue(self.chat("start")["ok"])
+            with patch.object(self.bridge, "flush", return_value=0):
+                self.assertTrue(self.chat("done", evidence=url)["ok"])
+            terminal = next(r for r in self.bridge.store.pending(ISSUE)
+                            if r["kind"] == "status" and r["payload"].get("terminal"))
+            with patch.object(self.bridge, "_effect_issue",
+                              side_effect=LinearError("pre-send issue read failed", retryable=True)):
+                self.bridge.flush()
+            unsent = self.bridge.store.outbox_row(terminal["id"])
+            self.assertEqual(unsent["attempts"], 1)
+            self.assertIs(unsent["payload"]["write_started"], False)
+            self.assertFalse(self.bridge.store.issue_reconciliation_blocked(ISSUE))
+            check.return_value = {"ok": True, "head_sha": "b" * 40}
+            self.clock.now += 61
+            self.bridge.flush()
+            rejected = self.bridge.store.outbox_row(terminal["id"])
+            self.assertEqual(rejected["state"], "failed")
+            self.assertIs(rejected["payload"]["write_started"], False)
+            self.assertNotIn("reconcile_required", rejected["payload"])
+            self.assertFalse(self.bridge.store.issue_reconciliation_blocked(ISSUE))
+            self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), 1)  # initial claim only
+
+    def test_bound_update_preflight_query_failure_is_known_unsent_and_retries(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        self.bind_identity()
+        self.bridge.api.identity["teams"] = ["team-1"]
+        self.assertTrue(self.chat("start")["ok"])
+        with patch.object(self.bridge, "flush", return_value=0):
+            self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
+        terminal = next(r for r in self.bridge.store.pending(ISSUE)
+                        if r["kind"] == "status" and r["payload"].get("terminal"))
+        mutations = sum("IssueUpdate" in q for q in self.linear.requests)
+        with patch.object(self.bridge.api, "_mutation_issue",
+                          side_effect=LinearError("pre-send scope query failed", retryable=True)):
+            self.bridge.flush()
+        unsent = self.bridge.store.outbox_row(terminal["id"])
+        self.assertEqual(unsent["attempts"], 1)
+        self.assertIs(unsent["payload"]["write_started"], False)
+        self.assertFalse(self.bridge.store.issue_reconciliation_blocked(ISSUE))
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations)
+        self.clock.now += 61
+        self.bridge.flush()
+        self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "sent")
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations + 1)
+
+    def test_terminal_transport_requires_durable_started_marker(self) -> None:
+        from unittest.mock import patch
+        self.assertTrue(self.chat("start")["ok"])
+        with patch.object(self.bridge, "flush", return_value=0):
+            self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
+        terminal = next(r for r in self.bridge.store.pending(ISSUE)
+                        if r["kind"] == "status" and r["payload"].get("terminal"))
+        mutations = sum("IssueUpdate" in q for q in self.linear.requests)
+        with patch.object(self.bridge.store, "mark_write_started", return_value=False):
+            self.bridge.flush()
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations)
+        self.assertIs(self.bridge.store.outbox_row(terminal["id"])["payload"]["write_started"], False)
+        original = self.bridge.api.transport
+        observed = []
+
+        def inspect_marker(url, body, headers):
+            if "mutation IssueUpdate" in json.loads(body)["query"]:
+                observed.append(self.bridge.store.outbox_row(terminal["id"])["payload"]["write_started"])
+            return original(url, body, headers)
+
+        self.bridge.api.transport = inspect_marker
+        self.bridge.flush()
+        self.assertEqual(observed, [True])
+        self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "sent")
+
     def test_uncertain_done_never_replays_after_a_human_reopens(self) -> None:
         from unittest.mock import patch
         url = "https://github.com/example/repo/pull/8"
@@ -2146,7 +2224,6 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_delayed_terminal_delivery_revalidates_recorded_pr_head_and_keeps_uncertain_send(self) -> None:
         from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
         url = "https://github.com/example/repo/pull/8"
         for origin, change in (("chat", "checks"), ("kanban", "head"), ("chat", "same"),
                                ("kanban", "same"), ("chat", "uncertain"), ("kanban", "uncertain"),
@@ -2179,13 +2256,13 @@ class LinearKanbanScenarios(unittest.TestCase):
                             payload.pop(field, None)
                         self.bridge.store.rewrite(terminal["id"], payload, terminal["next_at"])
                     if change == "uncertain":
-                        with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("lost response")):
-                            self.bridge.flush()
+                        self.linear.lose_next_response = True  # apply, then lose the mutation response
+                        self.bridge.flush()
                         self.clock.now += 61
                     check.return_value = ({"ok": False, "head_sha": "a" * 40} if change in ("checks", "uncertain") else
                                           {"ok": True, "head_sha": "b" * 40} if change == "head" else accepted)
                     self.bridge.flush()
-                    expected = "Done" if change == "same" else "In Progress"
+                    expected = "Done" if change in ("same", "uncertain") else "In Progress"
                     self.assertEqual(self.linear.state(issue_id), expected)
                     if change == "legacy":
                         status = self.bridge.store.outbox_row(terminal["id"])
