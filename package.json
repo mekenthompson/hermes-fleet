@@ -5,8 +5,8 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.78.0",
     "@anthropic-ai/claude-code": "2.1.285",
-    "@openai/codex": "0.159.1",
-    "@xai-official/grok": "1.0.44",
+    "@openai/codex": "0.160.0",
+    "@xai-official/grok": "1.0.46",
     "opencode-ai": "1.18.29"
   }
 }
