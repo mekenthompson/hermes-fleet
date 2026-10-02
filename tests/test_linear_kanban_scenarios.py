@@ -1498,14 +1498,14 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
                                                Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
-        update_issue = self.bridge.api.update_issue
+        resolve_state = self.bridge.state_name
 
-        def fail_done(issue_id, fields):
-            if issue_id == ISSUE and "stateId" in fields:
-                raise LinearError("synthetic terminal outage")
-            return update_issue(issue_id, fields)
+        def fail_done(issue, key):
+            if issue["id"] == ISSUE and key == "done":
+                raise LinearError("synthetic pre-send status resolution outage", retryable=True)
+            return resolve_state(issue, key)
 
-        with patch.object(self.bridge.api, "update_issue", side_effect=fail_done):
+        with patch.object(self.bridge, "state_name", side_effect=fail_done):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/9")["ok"])
             self.clock.now += 31 * 60
             self.bridge.flush()
@@ -1541,16 +1541,16 @@ class LinearKanbanScenarios(unittest.TestCase):
                     self.bridge, {"action": "done", "issue": ident,
                                   "evidence": "https://docs.example/findings/9"},
                     Context("chat-key", "chat-key-id")))["ok"])
-        update_issue = self.bridge.api.update_issue
+        resolve_state = self.bridge.state_name
         failing = {ISSUE, "iss-2"}
 
-        def fail_done(issue_id, fields):
-            if issue_id in failing and "stateId" in fields:
-                raise LinearError("synthetic terminal outage")
-            return update_issue(issue_id, fields)
+        def fail_done(issue, key):
+            if issue["id"] in failing and key == "done":
+                raise LinearError("synthetic pre-send status resolution outage", retryable=True)
+            return resolve_state(issue, key)
 
         self.clock.now += 31 * 60
-        with patch.object(self.bridge.api, "update_issue", side_effect=fail_done):
+        with patch.object(self.bridge, "state_name", side_effect=fail_done):
             self.bridge.flush()
             self.assertEqual(len(self.linear.project_updates), 1)
             self.assertIn("ABC-3: Done", self.linear.project_updates[0]["body"])
@@ -1583,14 +1583,14 @@ class LinearKanbanScenarios(unittest.TestCase):
         failing = {ISSUE, "iss-2"}
 
         def flush_with_failures() -> None:
-            update_issue = self.bridge.api.update_issue
+            resolve_state = self.bridge.state_name
 
-            def fail_done(issue_id, fields):
-                if issue_id in failing and "stateId" in fields:
-                    raise LinearError("synthetic terminal outage")
-                return update_issue(issue_id, fields)
+            def fail_done(issue, key):
+                if issue["id"] in failing and key == "done":
+                    raise LinearError("synthetic pre-send status resolution outage", retryable=True)
+                return resolve_state(issue, key)
 
-            with patch.object(self.bridge.api, "update_issue", side_effect=fail_done):
+            with patch.object(self.bridge, "state_name", side_effect=fail_done):
                 self.bridge.flush()
 
         self.clock.now += 31 * 60
@@ -2018,6 +2018,57 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.tick()
                 self.assertEqual((len(self.tasks()), len(self.linear.activities), len(self.linear.project_updates)), before)
 
+
+    def test_terminal_pre_send_resolution_failure_can_retry(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
+                   return_value={"ok": True, "head_sha": "a" * 40}):
+            self.assertTrue(self.chat("start")["ok"])
+            result = chat.handle(self.bridge, {"action": "done", "issue": "ABC-1",
+                                "evidence": "https://github.com/example/repo/pull/8"},
+                                 Context("chat-key", "chat-key-id"))
+            self.assertTrue(json.loads(result)["ok"])
+            with patch.object(self.bridge, "_effect_issue",
+                              side_effect=LinearError("temporary lookup failure", retryable=True)):
+                self.bridge.flush()
+            self.assertEqual(self.linear.state(ISSUE), "In Progress")
+            self.clock.now += 61
+            self.bridge.flush()
+            self.assertEqual(self.linear.state(ISSUE), "Done")
+
+    def test_uncertain_done_never_replays_after_a_human_reopens(self) -> None:
+        from unittest.mock import patch
+        url = "https://github.com/example/repo/pull/8"
+        with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
+                   return_value={"ok": True, "head_sha": "a" * 40}):
+            self.assertTrue(self.chat("start")["ok"])
+            self.linear.lose_next_response = True
+            self.assertTrue(self.chat("done", evidence=url)["ok"])
+            self.assertEqual(self.linear.state(ISSUE), "Done")
+            terminal = next(r for r in self.bridge.store.pending(ISSUE)
+                            if r["kind"] == "status" and r["payload"].get("state") == "done")
+            self.assertTrue(terminal["payload"]["write_started"])
+            self.clock.now += 1
+            self.linear.set_state(ISSUE, "In Progress")
+            mutations = sum("IssueUpdate" in q for q in self.linear.requests)
+            self.clock.now += 60
+            self.bridge.flush()
+            self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations)
+            self.assertEqual(self.linear.state(ISSUE), "In Progress")
+            held = self.bridge.store.outbox_row(terminal["id"])
+            self.assertEqual(held["state"], "failed")
+            self.assertTrue(held["payload"]["reconcile_required"])
+            self.assertTrue(held["payload"]["write_started"])
+            self.assertTrue(any(r["payload"].get("requires_status_id") == terminal["id"]
+                                for r in self.bridge.store.pending(ISSUE)))
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.clock.now += 61
+            self.bridge.tick()
+            self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations)
+            self.assertEqual(self.linear.state(ISSUE), "In Progress")
+            self.assertTrue(self.bridge.store.outbox_row(terminal["id"])["payload"]["reconcile_required"])
 
     def test_delayed_terminal_delivery_revalidates_recorded_pr_head_and_keeps_uncertain_send(self) -> None:
         from unittest.mock import patch
