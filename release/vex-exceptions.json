@@ -1,28 +1,4 @@
 {
   "schema_version": 1,
-  "exceptions": [
-    {
-      "id": "KEN-275-GO-2026-6303",
-      "status": "not_affected",
-      "justification": "vulnerable_code_not_present",
-      "vulnerability_id": "CVE-2026-56854",
-      "go_advisory_id": "GO-2026-6303",
-      "package": "golang.org/x/crypto",
-      "installed_version": "v0.52.0",
-      "fixed_version": "0.55.0",
-      "target": "usr/local/bin/op",
-      "target_class": "lang-pkgs",
-      "target_type": "gobinary",
-      "component_image": "docker.io/1password/op@sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1",
-      "binary_sha256": "ee3e9f2aecb27e31509ff48920b2e262a0996e176184f6d89abf8ebeb41e627c",
-      "affected_symbols": [
-        "golang.org/x/crypto/ssh.NewServerConn",
-        "golang.org/x/crypto/ssh.(*connection).serverAuthenticate"
-      ],
-      "approved_by": "Ken Thompson (CPO)",
-      "approved_at": "2026-09-01T13:31:49Z",
-      "expires_at": "2026-10-01T00:00:00Z",
-      "evidence": "Exact digest-pinned op binary lacks both affected SSH server symbols; Fleet invokes op read as a client and does not run an SSH server."
-    }
-  ]
+  "exceptions": []
 }

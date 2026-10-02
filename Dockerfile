@@ -1,5 +1,5 @@
 ARG AGENT_IMAGE
-ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:d7d12b409ec699c9fa139d3bdfc80671f744380d39db8c539d9dc6e7e553d3c1
+ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a
 FROM ${ONEPASSWORD_CLI_IMAGE} AS onepassword_cli
 FROM ${AGENT_IMAGE}
 
@@ -16,7 +16,7 @@ ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
 ENV DISABLE_AUTOUPDATER=1
 
 COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op
-RUN test "$(/usr/local/bin/op --version)" = "2.39.0"
+RUN test "$(/usr/local/bin/op --version)" = "2.40.0"
 RUN set -eux; \
     archive="gh_${GH_VERSION}_linux_amd64.tar.gz"; \
     curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o "/tmp/${archive}"; \

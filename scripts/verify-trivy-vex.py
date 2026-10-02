@@ -80,8 +80,10 @@ def validate_policy(policy: dict[str, Any], now: datetime) -> list[dict[str, Any
     if set(policy) != POLICY_KEYS or policy.get("schema_version") != 1:
         fail("VEX policy has unknown fields or unsupported schema")
     exceptions = policy.get("exceptions")
-    if not isinstance(exceptions, list) or not exceptions:
-        fail("VEX policy must contain at least one exception")
+    if not isinstance(exceptions, list):
+        fail("VEX policy exceptions must be a list")
+    if not exceptions:
+        return []
     ids: set[str] = set()
     vulnerabilities: set[str] = set()
     validated: list[dict[str, Any]] = []

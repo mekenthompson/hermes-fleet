@@ -163,6 +163,30 @@ class TrivyVexGateTests(unittest.TestCase):
             result = self.run_gate(policy, report, directory / "op", output)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_empty_policy_passes_only_without_critical_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            policy, report, output = self.fixture(directory)
+            data = json.loads(policy.read_text(encoding="utf-8"))
+            data["exceptions"] = []
+            policy.write_text(json.dumps(data), encoding="utf-8")
+            report.write_text(json.dumps({"SchemaVersion": 2, "Results": []}), encoding="utf-8")
+            result = self.run_gate(policy, report, directory / "op", output)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            evaluation = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(evaluation["critical_findings"], 0)
+            self.assertEqual(evaluation["excepted_vulnerabilities"], [])
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            policy, report, output = self.fixture(directory)
+            data = json.loads(policy.read_text(encoding="utf-8"))
+            data["exceptions"] = []
+            policy.write_text(json.dumps(data), encoding="utf-8")
+            result = self.run_gate(policy, report, directory / "op", output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexcepted critical vulnerability", result.stderr)
+
     def test_unknown_policy_fields_and_duplicate_exceptions_fail(self) -> None:
         for mutation in ("unknown", "duplicate"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as raw:
