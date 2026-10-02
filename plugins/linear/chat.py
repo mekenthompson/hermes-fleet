@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from typing import Any
-
 from .api import LinearError
 from .bridge import Bridge, evidence_links
 
@@ -44,9 +43,12 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     note = str(args.get("note") or "").strip()
     try:
         issue = bridge.api.issue(ref)
+        if ref not in (issue.get("id"), issue.get("identifier")):
+            raise LinearError("Linear issue resolution does not match the requested ref")
         me = bridge.api.viewer_id()
     except LinearError as exc:
         if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:
+            bridge._fence_scope_denial(exc.authoritative_issue_id or "", exc)
             return _reply(False, "This issue is outside the configured Linear specialist scope.")
         return _reply(False, f"Linear is unavailable ({exc}); try again shortly.")
     issue_id, ident, project = issue["id"], issue.get("identifier") or ref, (issue.get("project") or {}).get("id")
