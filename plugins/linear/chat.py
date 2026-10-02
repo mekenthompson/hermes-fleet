@@ -57,6 +57,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         row = bridge.store.get(issue_id)
         if action == "start":
+            if bridge.store.issue_reconciliation_blocked(issue_id):
+                return _reply(False, "An earlier terminal write needs reconciliation before fresh work.")
             return _start(bridge, issue, row, me, session_key, session_id, generation)
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")

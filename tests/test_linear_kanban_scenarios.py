@@ -1844,14 +1844,14 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.bridge.kanban.get(self.task_id()).status, "ready")
 
 
-    def test_predecessor_terminal_outbox_cannot_close_successor_and_retains_receipts(self) -> None:
+    def test_known_unsent_predecessor_can_yield_to_successor_with_receipts(self) -> None:
         from unittest.mock import patch
         from hermes_fleet_linear_plugin.api import LinearError
-        for uncertain, capture_first in ((False, True), (True, True), (False, False)):
-            with self.subTest(uncertain=uncertain, capture_first=capture_first):
-                case = f"{uncertain}-{capture_first}"
+        for resolution_failed, capture_first in ((False, True), (True, True), (False, False)):
+            with self.subTest(resolution_failed=resolution_failed, capture_first=capture_first):
+                case = f"{resolution_failed}-{capture_first}"
                 issue_id = f"predecessor-{case}"
-                self.linear.add_issue(issue_id, f"OLD-{int(uncertain) + 1}")
+                self.linear.add_issue(issue_id, f"OLD-{int(resolution_failed) + 1}")
                 self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
                 self.deliver(self.linear.session_event("created", issue_id, f"old-{case}"))
                 old_task = self.bridge.store.get(issue_id)["task_id"]
@@ -1859,9 +1859,14 @@ class LinearKanbanScenarios(unittest.TestCase):
                     kb.complete_task(conn, old_task, summary="Findings https://docs.example/predecessor", metadata={})
                 if capture_first:
                     self.bridge.pump_kanban()
-                if uncertain:
-                    with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("uncertain send")):
+                if resolution_failed:
+                    with patch.object(self.bridge, "_effect_issue",
+                                      side_effect=LinearError("pre-send issue resolution unavailable")):
                         self.bridge.flush()
+                    status = next(r for r in self.bridge.store.pending(issue_id)
+                                  if r["kind"] == "status" and r["payload"].get("terminal"))
+                    self.assertIs(status["payload"]["write_started"], False)
+                    self.assertEqual(status["attempts"], 1)
                 self.clock.now += 1
                 self.bridge.handle_webhook(self.linear.session_event("created", issue_id, f"new-{case}"))
                 new_task = self.bridge.store.get(issue_id)["task_id"]
@@ -1870,13 +1875,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.assertTrue(terminal_rows, "The predecessor result must be captured before replacing its mapping")
                 terminal = terminal_rows[0]
                 self.clock.now += 61
-                if uncertain:
-                    with patch.object(self.bridge.kanban, "comment", side_effect=RuntimeError("alert destination unavailable")):
-                        self.bridge.tick()
-                    self.bridge = self.make_bridge()
-                    self.bridge.tick()  # the held write's failed alert must stay truthful on replay
-                else:
-                    self.bridge.tick()
+                self.bridge.tick()
                 self.assertEqual(self.bridge.kanban.get(new_task).status, "ready")
                 self.assertEqual(self.bridge.kanban.get(old_task).status, "done")
                 self.assertEqual(self.linear.state(issue_id), "In Progress")
@@ -1889,26 +1888,101 @@ class LinearKanbanScenarios(unittest.TestCase):
                 old_receipts = [a for a in self.linear.activities if a["agentSessionId"] == f"old-{case}"
                                 and a["content"]["type"] != "thought"]
                 status = self.bridge.store.outbox_row(terminal["id"])
-                if uncertain:
-                    self.assertEqual(status["state"], "failed")
-                    self.assertTrue(status["payload"]["reconcile_required"])
-                    self.assertEqual(old_receipts, [])
-                    with self.bridge.kanban.conn() as conn:
-                        comments = [c.body for c in kb.list_comments(conn, old_task)]
-                        self.assertTrue(any("reconcile" in body.lower() and "held" in body.lower() for body in comments))
-                        self.assertFalse(any("retried after the next successful write" in body for body in comments))
-                    self.bridge = self.make_bridge()
-                    self.bridge.tick()
-                    self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "failed")
-                    self.assertEqual(len([r for r in self.bridge.store.pending(issue_id)
-                                          if r["payload"].get("requires_status_id") == terminal["id"]]), 2)
-                else:
-                    self.assertFalse(status["payload"]["applied"])
-                    self.assertEqual(len(old_receipts), 1)
-                    self.assertIn("superseded", old_receipts[0]["content"]["body"].lower())
-                    self.assertIn("https://docs.example/predecessor", old_receipts[0]["content"]["body"])
-                self.assertFalse(any(f"OLD-{int(uncertain) + 1}: Done" in u["body"]
+                self.assertNotIn("reconcile_required", status["payload"])
+                self.assertFalse(status["payload"]["applied"])
+                self.assertEqual(len(old_receipts), 1)
+                self.assertIn("superseded", old_receipts[0]["content"]["body"].lower())
+                self.assertIn("https://docs.example/predecessor", old_receipts[0]["content"]["body"])
+                self.assertFalse(any(f"OLD-{int(resolution_failed) + 1}: Done" in u["body"]
                                      for u in self.linear.project_updates))
+
+    def test_applied_terminal_lost_response_blocks_fresh_admission_and_stale_claim(self) -> None:
+        from unittest.mock import patch
+        self.delegate("old-session")
+        old_task = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            kb.complete_task(conn, old_task, summary="Findings https://docs.example/predecessor", metadata={})
+        self.bridge.pump_kanban()
+        terminal = next(row for row in self.bridge.store.pending(ISSUE)
+                        if row["kind"] == "status" and row["payload"].get("terminal"))
+        # This successor claim was captured before the predecessor's send outcome was known.
+        claim = self.bridge.status(ISSUE, "in_progress", claim=True, seen=SELF,
+                                   source_ms=self.clock() * 1000 + 1000)
+        stale_comment = self.bridge.comment(ISSUE, "Stale successor comment")
+        stale_activity = self.bridge.activity(ISSUE, "old-session", "thought", "Stale successor activity")
+        self.linear.lose_next_response = True
+        self.bridge.flush()
+        self.assertEqual(self.linear.state(ISSUE), "Done")  # FakeLinear applied the mutation before 502.
+        self.assertTrue(self.bridge.store.outbox_row(terminal["id"])["payload"]["write_started"])
+        self.assertEqual(self.bridge.store.outbox_row(claim)["state"], "pending")
+        self.assertEqual([self.bridge.store.outbox_row(row_id)["state"]
+                          for row_id in (stale_comment, stale_activity)], ["pending", "pending"])
+
+        self.clock.now += 1
+        created = self.linear.session_event("created", ISSUE, "fresh-session")
+        before_tasks = self.tasks()
+        before_mapping = self.bridge.store.get(ISSUE)
+        before_injected = list(self.injected)
+        before_mutations = tuple(q for q in self.linear.requests if q.startswith("mutation"))
+        self.bridge.handle_webhook(created)
+        self.assertEqual(self.tasks(), before_tasks)
+        self.assertEqual(self.bridge.store.get(ISSUE), before_mapping)
+        self.assertEqual(self.injected, before_injected)
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                               Context("fresh-chat", "fresh-chat-id")))["ok"])
+        self.clock.now += 61
+        with patch.object(self.bridge.kanban, "comment", side_effect=RuntimeError("alert unavailable")):
+            self.bridge.tick()
+        self.assertTrue(self.bridge.store.outbox_row(terminal["id"])["payload"]["reconcile_required"])
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.assertEqual(tuple(q for q in self.linear.requests if q.startswith("mutation")), before_mutations)
+        self.assertEqual(self.injected, before_injected)
+        self.assertFalse(any("Stale successor" in body for body in self.linear.bodies(ISSUE)))
+        self.assertEqual(self.bridge.store.outbox_row(claim)["state"], "pending")
+        self.bridge = self.make_bridge()
+        self.clock.now += 1
+        self.linear.set_state(ISSUE, "In Progress")  # A newer human reopen is not reconciliation.
+        self.bridge.handle_webhook(self.linear.session_event("created", ISSUE, "later-session"))
+        self.bridge.tick()
+        self.assertEqual(self.tasks(), before_tasks)
+        self.assertEqual(self.bridge.store.get(ISSUE), before_mapping)
+        self.assertEqual(tuple(q for q in self.linear.requests if q.startswith("mutation")), before_mutations)
+        self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "failed")
+        self.assertTrue(any(row["payload"].get("requires_status_id") == terminal["id"]
+                            for row in self.bridge.store.pending(ISSUE)))
+        self.assertTrue(self.bridge.store.reconcile_terminal(
+            terminal["id"], outcome="applied", evidence="https://docs.example/verified-remote-result",
+            at=self.clock()))
+        resolved = self.bridge.store.outbox_row(terminal["id"])
+        self.assertEqual((resolved["state"], resolved["payload"]["write_started"]), ("failed", True))
+        self.assertTrue(resolved["payload"]["reconcile_required"])
+        self.assertTrue(any(row["payload"].get("requires_status_id") == terminal["id"]
+                            for row in self.bridge.store.pending(ISSUE)))
+        self.bridge = self.make_bridge()
+        self.clock.now += 1
+        self.deliver(self.linear.session_event("created", ISSUE, "reconciled-session"))
+        self.assertEqual(len(self.tasks()), len(before_tasks) + 1)
+        self.assertNotEqual(self.bridge.store.get(ISSUE), before_mapping)
+
+    def test_uncertain_terminal_does_not_widen_shared_project_batch(self) -> None:
+        self.linear.add_issue("iss-2", "ABC-2")
+        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+                                               Context("chat-key", "chat-key-id")))["ok"])
+        self.bridge.tick()
+        self.linear.lose_next_response = True
+        self.assertTrue(self.chat("done", evidence="https://docs.example/findings/9")["ok"])
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.clock.now += 61
+        self.bridge.tick()
+        self.assertTrue(self.bridge.store.issue_reconciliation_blocked(ISSUE))
+        self.clock.now += 31 * 60
+        self.bridge.flush()
+        self.assertEqual(len(self.linear.project_updates), 1)
+        self.assertIn("ABC-2: In progress", self.linear.project_updates[0]["body"])
+        self.assertNotIn("ABC-1", self.linear.project_updates[0]["body"])
+        self.assertTrue(any("ABC-1" in row["payload"].get("lines", {})
+                            for row in self.bridge.store.pending() if row["kind"] == "project_update"))
 
 
     def test_interrupted_resume_replays_core_unblock_after_restart(self) -> None:

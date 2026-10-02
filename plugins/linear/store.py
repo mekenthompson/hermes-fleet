@@ -79,6 +79,61 @@ class Store:
         return all(not db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id=?", (ident,)).fetchone()
                    for ident in issue_ids if ident)
     @staticmethod
+    def _unresolved_terminal(db: sqlite3.Connection, issue_id: str, *, except_id: str = "") -> bool:
+        """An attempted terminal write has an unknown effect until an explicit durable resolution."""
+        if not issue_id or issue_id.startswith("update:"):
+            return False
+        rows = db.execute("SELECT id, state, attempts, payload FROM outbox WHERE kind='status' AND "
+                          "json_extract(payload, '$.issue_id')=?", (issue_id,)).fetchall()
+        for row in rows:
+            if row["id"] == except_id:
+                continue
+            payload = json.loads(row["payload"])
+            if not payload.get("terminal") or payload.get("reconciliation"):
+                continue
+            if (payload.get("reconcile_required") or
+                    (row["state"] in ("pending", "failed") and
+                     (payload.get("write_started") is True or
+                      (row["attempts"] > 0 and "write_started" not in payload)))):
+                return True
+        return False
+    @classmethod
+    def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
+        return cls._admitted(db, *issue_ids) and all(
+            not cls._unresolved_terminal(db, ident, except_id=except_id) for ident in issue_ids)
+    def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> bool:
+        with self._tx() as db:
+            return self._unresolved_terminal(db, issue_id, except_id=except_id)
+    @contextmanager
+    def guard_issue_work(self, issue_id: str) -> Iterator[bool]:
+        with self._tx() as db:
+            yield self._effect_admitted(db, issue_id)
+    @contextmanager
+    def guard_mutation(self, row_id: str) -> Iterator[bool]:
+        with self._tx() as db:
+            row = db.execute("SELECT kind, state, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not row or row["state"] != "pending":
+                yield False
+            else:
+                payload = json.loads(row["payload"])
+                targets = self._targets(payload)
+                yield self._effect_admitted(db, *targets, except_id=row_id)
+    def reconcile_terminal(self, row_id: str, *, outcome: str, evidence: str, at: float) -> bool:
+        """Record an operator's verified remote outcome; keep the attempted receipt intact."""
+        if outcome not in ("applied", "not_applied") or not evidence.strip():
+            raise ValueError("terminal reconciliation requires a verified outcome and evidence")
+        with self._tx() as db:
+            row = db.execute("SELECT kind, state, attempts, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not row or row["kind"] != "status": return False
+            payload = json.loads(row["payload"])
+            attempted = payload.get("reconcile_required") or (row["state"] in ("pending", "failed") and
+                (payload.get("write_started") is True or (row["attempts"] > 0 and "write_started" not in payload)))
+            if not payload.get("terminal") or payload.get("reconciliation") or not attempted: return False
+            payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
+            payload["reconcile_required"] = True
+            db.execute("UPDATE outbox SET payload=?, state='failed' WHERE id=?", (json.dumps(payload), row_id))
+            return True
+    @staticmethod
     def _targets(payload: dict[str, Any]) -> set[str]:
         return {ident for ident in (payload.get("owner_issue_id"), payload.get("resolve"),
                                     *(payload.get("line_issues") or {}).values(),
@@ -121,7 +176,7 @@ class Store:
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
         with self._tx() as db:
-            if not self._admitted(db, issue_id): return False
+            if not self._effect_admitted(db, issue_id): return False
             db.execute("INSERT OR REPLACE INTO work (issue_id, origin, owner_ref, task_id, project_id, "
                        "last_updated_at, run_generation, ownership_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation, str(uuid.uuid4())))
@@ -204,6 +259,8 @@ class Store:
         cols = ", ".join(f"{name} = ?" for name in fields)
         with self._tx() as db:
             if not self._admitted(db, issue_id): return False
+            admits_work = "owner_ref" in fields or "run_generation" in fields or fields.get("stop_requested_at") == 0
+            if admits_work and not self._effect_admitted(db, issue_id): return False
             db.execute(f"UPDATE work SET {cols} WHERE issue_id = ?", (*fields.values(), issue_id))
             return True
     def delete(self, issue_id: str) -> bool:
@@ -217,14 +274,14 @@ class Store:
                               (issue_id,)).fetchone() is not None
     def activate_task(self, issue_id: str, task_id: str, action: Callable[[], bool]) -> bool:
         with self._tx() as db:
-            if not self._admitted(db, issue_id) or not db.execute(
+            if not self._effect_admitted(db, issue_id) or not db.execute(
                     "SELECT 1 FROM work WHERE issue_id=? AND task_id=?", (issue_id, task_id)).fetchone(): return False
             return action()
     def complete_resume(self, issue_id: str, stamp: float, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         with self._tx() as db:
             work = db.execute("SELECT * FROM work WHERE issue_id=? AND pending_resume IS NOT NULL", (issue_id,)).fetchone()
-            if not work or not self._admitted(db, issue_id): return False
-            if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
+            if not work or not self._effect_admitted(db, issue_id): return False
+            if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 body = json.dumps({**payload, "work_owner": work["ownership_id"], "enqueued_at": at})
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
@@ -247,7 +304,7 @@ class Store:
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
-            if db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?", (issue_id,)).fetchone():
+            if not self._effect_admitted(db, issue_id):
                 return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not work:
@@ -297,7 +354,7 @@ class Store:
                       *, at: float, forget: bool = False) -> bool:
         """Advance our Kanban cursor with its Linear writes, independently of core's claim cursor."""
         with self._tx() as db:
-            if db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?", (issue_id,)).fetchone():
+            if not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id)):
                 return False
             row = db.execute("SELECT last_event_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not row or event_id <= row["last_event_id"]:
@@ -352,7 +409,7 @@ class Store:
         row_id = str(uuid.uuid4())
         now = time.time() if at is None else at
         with self._tx() as db:
-            if not self._admitted(db, *self._targets(payload)): return ""
+            if not self._effect_admitted(db, *self._targets(payload)): return ""
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
             body = json.dumps({**payload, "work_owner": work["ownership_id"] if work else None,
                                "enqueued_at": payload.get("enqueued_at", now)})
@@ -360,7 +417,7 @@ class Store:
         return row_id
     def enqueue_many(self, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         with self._tx() as db:
-            if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
+            if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
                 if work: payload = {**payload, "work_owner": work["ownership_id"]}
@@ -484,7 +541,7 @@ class Store:
     def queue_project_update(self, payload: dict[str, Any], *, due: float, quiet: bool) -> bool:
         """Merge a session's update atomically with terminal capture in finish()."""
         with self._tx() as db:
-            if not self._admitted(db, *self._targets(payload)): return False
+            if not self._effect_admitted(db, *self._targets(payload)): return False
             row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
                              "json_extract(payload, '$.session_id') = ? AND "
                              "json_extract(payload, '$.project_id') IS ? "
