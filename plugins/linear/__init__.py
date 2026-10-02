@@ -84,15 +84,15 @@ class BoundLinearAPI(LinearAPI):
         if (not isinstance(team, dict) or team.get("id") not in self.specialist_scope["allowed_team_ids"] or
                 not isinstance(project, dict) or project.get("id") not in self.specialist_scope["allowed_project_ids"] or
                 not isinstance(creator, dict) or creator.get("id") not in self.specialist_scope["allowed_requester_ids"]):
-            raise LinearError("Linear issue is outside configured specialist scope", retryable=False)
+            raise LinearError("Linear issue is outside configured specialist scope", retryable=False, authoritative_issue_id=issue.get("id"))
     def issue(self, ref):
         with self._permit_specialist_operation():
             issue = super().issue(ref)
         team = issue.get("team") or {}
         if self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]):
-            raise LinearError("Linear issue team is outside configured scope", retryable=False)
+            raise LinearError("Linear issue team is outside configured scope", retryable=False, authoritative_issue_id=issue.get("id"))
         if self.identity.get("projects") and (issue.get("project") or {}).get("id") not in self.identity["projects"]:
-            raise LinearError("Linear issue project is outside configured scope", retryable=False)
+            raise LinearError("Linear issue project is outside configured scope", retryable=False, authoritative_issue_id=issue.get("id"))
         self._check_issue(issue)
         return issue
     def _mutation_issue(self, issue_id):

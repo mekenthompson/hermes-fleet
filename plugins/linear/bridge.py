@@ -271,7 +271,7 @@ class Bridge:
     def _specialist_scope_active(self) -> bool:
         return getattr(self.api, "specialist_scope", None) is not None
     def _fence_scope_denial(self, issue_id: str, exc: LinearError) -> None:
-        if self._specialist_scope_active() and issue_id:
+        if self._specialist_scope_active() and issue_id and exc.authoritative_issue_id == issue_id:
             self.store.fence_scope(issue_id, "permanent specialist authorization denial", at=self.clock())
             self._park_fenced(issue_id)
             log.warning("linear: specialist scope permanently fenced issue %s: %s", issue_id, exc)
@@ -313,7 +313,7 @@ class Bridge:
         try:
             issue = self.api.issue(issue_id)
             if not isinstance(issue, dict) or issue.get("id") != issue_id:
-                raise LinearError("Linear issue resolution changed its identity", retryable=False)
+                raise LinearError("Linear issue resolution changed its identity", retryable=False, authoritative_issue_id=issue_id)
             return issue
         except LinearError as exc:
             if not exc.retryable: self._fence_scope_denial(issue_id, exc)
@@ -343,7 +343,7 @@ class Bridge:
                 activity = {**activity, "id": activity_id, "user": {"id": user_id, "name": user_id}}
             return issue, activity
         except LinearError as exc:
-            if not exc.retryable: self._fence_scope_denial(authoritative_issue_id, exc)
+            if not exc.retryable: self._fence_scope_denial(authoritative_issue_id, LinearError(str(exc), retryable=False, authoritative_issue_id=authoritative_issue_id))
             raise
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc

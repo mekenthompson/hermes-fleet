@@ -283,6 +283,17 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(self.store.stop_intents(), before)
 
+    def test_identity_mismatch_before_issue_resolution_does_not_fence_work(self):
+        task_id = self.seed_kanban_work()
+        before = self.store.get(ISSUE)
+        self.authority.viewer = "viewer-foreign"
+        self.bridge.pump_kanban()
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready")
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(self.store.pending(), [])
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},
