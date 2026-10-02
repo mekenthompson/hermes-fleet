@@ -25,10 +25,8 @@ SCHEMA = {
     },
 }
 
-
 def _reply(ok: bool, message: str) -> str:
     return json.dumps({"ok": ok, "message": message})
-
 
 def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any = None) -> str:
     if bridge is None:
@@ -80,15 +78,17 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
         if action == "blocked":
             message = f"Blocked: {note or 'needs input'}."
-            bridge.status(issue_id, "blocked")
+            if not bridge.status(issue_id, "blocked"):
+                return _reply(False, "Specialist authorization is fenced or unavailable; Blocked was not captured.")
             if row.get("linear_session_id"):
-                bridge.activity(issue_id, row["linear_session_id"], "elicitation", message, row=row)
-                bridge.store.update(issue_id, panel_note=None)
+                captured = bridge.activity(issue_id, row["linear_session_id"], "elicitation", message, row=row)
+                updated = bridge.store.update(issue_id, panel_note=None)
             else:
-                bridge.store.update(issue_id, panel_note=message)
-                bridge.comment(issue_id, message)
-            bridge.project_update(session_id, project, ident, f"Blocked: {note}", session_key=session_key,
-                                  issue_id=issue_id)
+                updated = bridge.store.update(issue_id, panel_note=message)
+                captured = bridge.comment(issue_id, message) if updated else ""
+            if not (captured and updated and bridge.project_update(
+                    session_id, project, ident, f"Blocked: {note}", session_key=session_key, issue_id=issue_id)):
+                return _reply(False, "Specialist authorization is fenced or unavailable; Blocked was not fully captured.")
             return _reply(True, f"{ident} Blocked update queued; it stays yours. Delivery is not yet confirmed.")
         if action == "release":
             if not _finish(bridge, row, session_key, session_id, project, ident, "blocked",
@@ -96,7 +96,6 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
             return _reply(True, f"Stopped chat tracking {ident}; Blocked closeout queued, not yet confirmed in Linear.")
     return _reply(False, f"Unknown action {action!r}.")
-
 
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
             ident: str, state: str, message: str, update: str) -> bool:
@@ -112,7 +111,6 @@ def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, projec
                             "lines": {ident: update}, "line_issues": {ident: issue_id},
                             "quiet": bridge.quiet, **route}),
     ], at=bridge.clock())
-
 
 def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
            session_id: str, generation: int | None) -> str:
@@ -131,17 +129,20 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
                                              generation <= row["run_generation"]):
             return _reply(False, "Stop is still fenced; a newer bound chat turn must explicitly resume this issue.")
         if generation is not None and generation > (row.get("run_generation") or 0):
-            bridge.store.update(issue["id"], run_generation=generation)
+            if not bridge.store.update(issue["id"], run_generation=generation):
+                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         if row.get("stop_requested_at"):
             fence = max(bridge.clock() * 1000, row["last_updated_at"] + 1)
-            bridge.store.update(issue["id"], stop_requested_at=0,
-                                last_updated_at=fence, resume_fence_at=fence)
+            if not bridge.store.update(issue["id"], stop_requested_at=0,
+                                       last_updated_at=fence, resume_fence_at=fence):
+                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
     else:
-        bridge.store.put(issue["id"], "chat", session_key, project_id=project, run_generation=generation)
-    bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id"))
-    bridge.project_update(session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"])
+        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project, run_generation=generation):
+            return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
+    if not bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id")) or not bridge.project_update(
+            session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"]):
+        return _reply(False, "Specialist authorization is fenced or unavailable; tracking was not fully captured.")
     return _reply(True, f"Tracking {ident} from this chat: {url}")
-
 
 def on_turn_end(bridge: Bridge | None, session_id: str) -> None:
     """Every finished turn restarts the quiet period for that session's project updates."""

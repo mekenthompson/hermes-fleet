@@ -29,10 +29,8 @@ ALIASES = {"client_id": ("client_id", "username"), "client_secret": ("client_sec
            "refresh_token": ("refresh_token",)}
 log = logging.getLogger("linear.oauth")
 
-
 class ReauthorizationRequired(RuntimeError):
     """Linear rejected the refresh token; an operator must reauthorize this profile's app."""
-
 
 def read_private(path: Path | str, what: str) -> str:
     """Read a regular, uid-owned, 0600 file without following symlinks."""
@@ -48,7 +46,6 @@ def read_private(path: Path | str, what: str) -> str:
         if fd >= 0:
             os.close(fd)
 
-
 def load_env(path: Path | str) -> dict[str, str]:
     values = {}
     for line in read_private(path, "Connect env file").splitlines():
@@ -56,7 +53,6 @@ def load_env(path: Path | str) -> dict[str, str]:
         if sep and not key.startswith("#"):
             values[key.strip()] = value.strip().strip("'\"")
     return values
-
 
 class ConnectItem:
     """One 1Password Connect item addressed by vault id and item id."""
@@ -111,7 +107,6 @@ class ConnectItem:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Connect readback does not show the new refresh token")
             time.sleep(interval)
-
 
 class ConnectOAuth:
     def __init__(self, item: ConnectItem, cache: Path, *, clock: Callable[[], float] = time.time,
@@ -204,14 +199,12 @@ class ConnectOAuth:
                 raise ReauthorizationRequired("Linear rejected the refresh token; reauthorize this profile's app") from exc
             raise RuntimeError(f"Linear token endpoint HTTP {exc.code}; will retry") from exc
 
-
 class TokenFile:
     def __init__(self, path: Path | str) -> None:
         self.path = path
 
     def __call__(self) -> str:
         return read_private(self.path, "Linear token file").strip()
-
 
 def token_provider(settings: dict[str, Any], home: Path) -> Callable[[], str]:
     creds = settings.get("credentials") or {}

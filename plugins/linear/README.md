@@ -225,7 +225,12 @@ specialist_scope:
 This is separate from the immutable app/workspace identity. The client resolves
 issues, Agent Sessions and prompt activities through Linear before admitting
 work, and rechecks the owning issue before every effect. A foreign requester,
-team, project or mismatched session is refused without creating a task or effect.
+team, project or mismatched session is refused without admitting executable work or a Linear effect.
+Permanent scope denials stay fenced even if the issue later appears allowed. The state work
+row, Kanban event history, and queued writes remain for reconciliation. Fenced Kanban tasks
+are archived to stop workers; core may clean their managed workspace. New Kanban tasks stay
+blocked until their issue and work row are durably admitted. Acknowledgements are queued
+before the bridge reports a successful start.
 Transient resolution failures retain delivery work for retry. Arbitrary GraphQL
 is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
