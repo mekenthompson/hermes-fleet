@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import warnings
 from pathlib import Path
@@ -2172,7 +2173,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         terminal = next(r for r in self.bridge.store.pending(ISSUE)
                         if r["kind"] == "status" and r["payload"].get("terminal"))
         mutations = sum("IssueUpdate" in q for q in self.linear.requests)
-        with patch.object(self.bridge.store, "mark_write_started", return_value=False):
+        with patch.object(self.bridge.store, "admit_mutation", return_value=False):
             self.bridge.flush()
         self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), mutations)
         self.assertIs(self.bridge.store.outbox_row(terminal["id"])["payload"]["write_started"], False)
@@ -2188,6 +2189,107 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(observed, [True])
         self.assertEqual(self.bridge.store.outbox_row(terminal["id"])["state"], "sent")
+
+    def test_terminal_admission_commit_is_the_scope_linearization(self) -> None:
+        from contextlib import contextmanager
+        from unittest.mock import patch
+        row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
+                                                       "write_started": False}, at=self.clock())
+        store = self.bridge.store
+        original_tx = store._tx
+        fenced = threading.Event()
+
+        @contextmanager
+        def fence_after_commit():
+            with original_tx() as db:
+                yield db
+            # A second connection fences immediately after the marker transaction commits.
+            # Admission that already committed must have no later denying transaction.
+            if not fenced.is_set():
+                with sqlite3.connect(store.path) as db:
+                    payload = db.execute("SELECT payload FROM outbox WHERE id=?", (row_id,)).fetchone()[0]
+                if json.loads(payload)["write_started"] is True:
+                    Store(store.path).fence_scope(ISSUE, "synthetic concurrent denial", at=self.clock())
+                    fenced.set()
+
+        before = sum("IssueUpdate" in q for q in self.linear.requests)
+        with patch.object(store, "_tx", fence_after_commit):
+            self.bridge._mutate_outbox(row_id, lambda: self.bridge.api.update_issue(ISSUE, {}), terminal=True)
+        self.assertTrue(fenced.is_set())
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), before + 1)
+        self.assertIs(store.outbox_row(row_id)["payload"]["write_started"], True)
+
+    def test_terminal_admission_denial_and_failed_marker_never_transport(self) -> None:
+        from hermes_fleet_linear_plugin.bridge import ProjectUpdateDeferred
+        row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
+                                                       "write_started": False}, at=self.clock())
+        before = sum("IssueUpdate" in q for q in self.linear.requests)
+        self.bridge.store.fence_scope(ISSUE, "synthetic denial", at=self.clock())
+        with self.assertRaises(ProjectUpdateDeferred):
+            self.bridge._mutate_outbox(row_id, lambda: self.bridge.api.update_issue(ISSUE, {}), terminal=True)
+        self.assertIs(self.bridge.store.outbox_row(row_id)["payload"]["write_started"], False)
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), before)
+
+        other_id = self.bridge.store.enqueue("status", {"issue_id": "other-issue", "terminal": True,
+                                                         "write_started": False}, at=self.clock())
+        with sqlite3.connect(self.bridge.store.path) as db:
+            db.execute("CREATE TRIGGER reject_marker BEFORE UPDATE OF payload ON outbox "
+                       "WHEN NEW.id='" + other_id + "' AND json_extract(NEW.payload, '$.write_started')=1 "
+                       "BEGIN SELECT RAISE(ABORT, 'marker failed'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.bridge._mutate_outbox(other_id, lambda: self.bridge.api.update_issue(ISSUE, {}), terminal=True)
+        self.assertIs(self.bridge.store.outbox_row(other_id)["payload"]["write_started"], False)
+        self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), before)
+
+    def test_stalled_mutation_transport_does_not_hold_store_writer(self) -> None:
+        row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
+                                                       "write_started": False}, at=self.clock())
+        entered, release = threading.Event(), threading.Event()
+        put_started, put_done = threading.Event(), threading.Event()
+        failures = []
+        original_transport = self.bridge.api.transport
+
+        def stalled_transport(url, body, headers):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError("test transport was not released")
+            return original_transport(url, body, headers)
+
+        def send():
+            try:
+                self.bridge._mutate_outbox(row_id, lambda: self.bridge.api.update_issue(ISSUE, {}), terminal=True)
+            except BaseException as exc:
+                failures.append(exc)
+
+        def put_unrelated():
+            put_started.set()
+            try:
+                if not Store(self.bridge.store.path).put("unrelated", "chat", "synthetic-owner"):
+                    raise AssertionError("unrelated work refused")
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                put_done.set()
+
+        self.bridge.api.transport = stalled_transport
+        sender = threading.Thread(target=send)
+        writer = threading.Thread(target=put_unrelated)
+        sender.start()
+        try:
+            self.assertTrue(entered.wait(5), "mutation did not reach transport")
+            writer.start()
+            self.assertTrue(put_started.wait(5), "unrelated writer did not start")
+            completed_before_release = put_done.wait(2)
+        finally:
+            release.set()
+            sender.join(10)
+            if writer.ident is not None:
+                writer.join(10)
+            self.bridge.api.transport = original_transport
+        self.assertTrue(completed_before_release, "SQLite writer stayed locked through HTTP")
+        self.assertFalse(sender.is_alive() or writer.is_alive())
+        self.assertEqual(failures, [])
+        self.assertIs(self.bridge.store.outbox_row(row_id)["payload"]["write_started"], True)
 
     def test_uncertain_done_never_replays_after_a_human_reopens(self) -> None:
         from unittest.mock import patch

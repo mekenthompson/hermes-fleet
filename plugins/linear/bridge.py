@@ -894,10 +894,8 @@ class Bridge:
     def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False) -> None:
         @contextmanager
         def guard():
-            if terminal and not self.store.mark_write_started(row_id): raise ProjectUpdateDeferred
-            with self.store.guard_mutation(row_id) as admitted:
-                if not admitted: raise ProjectUpdateDeferred
-                yield
+            if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
+            yield
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:

@@ -108,16 +108,21 @@ class Store:
     def guard_issue_work(self, issue_id: str) -> Iterator[bool]:
         with self._tx() as db:
             yield self._effect_admitted(db, issue_id)
-    @contextmanager
-    def guard_mutation(self, row_id: str) -> Iterator[bool]:
+    def admit_mutation(self, row_id: str, *, terminal: bool = False) -> bool:
+        """Linearize scope admission and the terminal send marker in one short commit."""
+        if getattr(self._local, "db", None) is not None:
+            raise RuntimeError("mutation admission requires its own commit")
         with self._tx() as db:
             row = db.execute("SELECT kind, state, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if not row or row["state"] != "pending":
-                yield False
-            else:
-                payload = json.loads(row["payload"])
-                targets = self._targets(payload)
-                yield self._effect_admitted(db, *targets, except_id=row_id)
+                return False
+            payload = json.loads(row["payload"])
+            if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
+                return False
+            if terminal:
+                return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
+                                       "WHERE id=?", (row_id,)).rowcount)
+            return True
     def reconcile_terminal(self, row_id: str, *, outcome: str, evidence: str, at: float) -> bool:
         """Record an operator's verified remote outcome; keep the attempted receipt intact."""
         if outcome not in ("applied", "not_applied") or not evidence.strip():
@@ -674,11 +679,6 @@ class Store:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
             db.execute("UPDATE outbox SET payload = json_set(payload, '$.reported', 1) WHERE id = ?", (row_id,))
-    def mark_write_started(self, row_id: str) -> bool:
-        with self._tx() as db:
-            row = db.execute("SELECT payload FROM outbox WHERE id=? AND state='pending'", (row_id,)).fetchone()
-            if not row or not self._effect_admitted(db, *self._targets(json.loads(row["payload"])), except_id=row_id): return False
-            return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) WHERE id=?", (row_id,)).rowcount)
     def rewrite(self, row_id: str, payload: dict[str, Any], next_at: float) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id) or not self._admitted(db, *self._targets(payload)): return
