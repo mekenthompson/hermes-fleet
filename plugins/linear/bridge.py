@@ -103,6 +103,7 @@ class Kanban:
         from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
         self.kb, self.kc, self.kn, self.board = kanban_db, kanban_db_connect, kanban_db_notify, board
         self.executor_profile = self.resolve_executor_profile(profile, profile_home) if profile is not None else None
+        self.profile_home = Path(profile_home).resolve(strict=True) if profile is not None else None
         kanban_db_connect.init_db(board=board)
     @staticmethod
     def resolve_executor_profile(profile: str, profile_home: Any) -> str:
@@ -170,6 +171,16 @@ class Bridge:
         self._guard = threading.Lock()
         self._last_recheck = 0.0
         self._reauth_alerted: set[tuple[str, str]] = set()
+    def chat_profile_matches(self, profile: str) -> bool:
+        executor = getattr(self.kanban, "executor_profile", None)
+        home = getattr(self.kanban, "profile_home", None)
+        if not profile or profile not in (self.profile, executor): return False
+        if home is None: return profile == self.profile
+        from hermes_constants import get_hermes_home
+        try:
+            return get_hermes_home().resolve(strict=True) == home
+        except (OSError, RuntimeError):
+            return False
     def lock(self, issue_id: str) -> threading.Lock:
         with self._guard:
             return self._locks[issue_id]
