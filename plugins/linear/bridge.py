@@ -195,6 +195,7 @@ class Bridge:
                  clock: Callable[[], float] = time.time) -> None:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.inject, self.clock = store, api, kanban, profile, inject, clock
+        self._ingress = Path(settings["ingress_database"]) if settings.get("ingress_database") else None
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
         self.states = {"in_progress": "In Progress", "done": "Done", "blocked": "Blocked", **(settings.get("states") or {})}
@@ -587,6 +588,8 @@ class Bridge:
         if not self._require_effect(row["issue_id"]): return False
         session_id = session_id or row["owner_ref"]
         stamp = stamp if stamp is not None else float(row["last_updated_at"])
+        if self._queued_stop(row["issue_id"], stamp):
+            raise LinearError("Newer Stop is queued in ingress; process it before resuming")
         task = self.kanban.get(row["task_id"])
         if task is None or task.status in ("done", "archived"):
             if task and task.status == "done": self._finished(row)
@@ -721,6 +724,11 @@ class Bridge:
                 if not admitted or not self.store.update(
                         row["issue_id"], last_updated_at=max(stamp, float(row["last_updated_at"])),
                         stop_requested_at=stamp, pending_resume=None): return
+            # Commit the Stop fence before any core failure or process exit can occur.
+            with self.store.guard_issue(row["issue_id"]) as admitted:
+                current = self.store.get(row["issue_id"])
+                if not admitted or not current or current["stop_requested_at"] != stamp or current["pending_resume"]: return
+                row = current
                 row = {**row, "owner_ref": session_id}
                 task = self.kanban.get(row["task_id"])
                 if not self.kanban.block(row["task_id"], f"{OWN} stopped by {who}") and (
@@ -901,8 +909,9 @@ class Bridge:
                     if not exc.retryable:
                         self._fence_scope_denial(row["issue_id"], exc)
                     continue
-    def recover(self) -> None:
+    def recover(self, ingress: Path | None = None) -> None:
         """After a restart: Kanban workers are respawned by core; chat work is asked to reconcile."""
+        if ingress is not None: self.drain_ingress(ingress)
         self._recover_kanban()
         self._recover_chats()
     def _recover_kanban(self) -> None:
@@ -912,8 +921,9 @@ class Bridge:
                 intent = json.loads(row["pending_resume"])
                 if (intent.get("kind") == "kanban" and self.may_execute_existing(
                         row["issue_id"], source_ms=intent["stamp"])):
-                    self._resume(row, intent.get("last_note", intent["note"]), intent["session_id"],
-                                 intent["stamp"], intent["receipt"], intent.get("marker", ""))
+                    with self.lock(row["issue_id"]):
+                        self._resume(row, intent.get("last_note", intent["note"]), intent["session_id"],
+                                     intent["stamp"], intent["receipt"], intent.get("marker", ""))
             except (LinearError, ValueError, KeyError):
                 continue
     def _recover_chats(self) -> None:
@@ -1186,14 +1196,33 @@ class Bridge:
         row["payload"]["reconcile_required"] = True
         raise LinearError(message, retryable=False)
     # -- ingress + loop ----------------------------------------------------
+    def _stop_deliveries(self, db) -> list:
+        return db.execute("SELECT logical_agent, delivery_id, payload, received_at, "
+                          "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
+                          "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
+                          "json_extract(payload, '$.agentActivity.signal') END='stop' ORDER BY received_at, delivery_id",
+                          (self.profile,)).fetchall()
+    def _queued_stop(self, issue_id: str, stamp: float) -> bool:
+        if self._ingress is None or not self._ingress.exists(): return False
+        try:
+            with closing(sqlite3.connect(f"file:{self._ingress}?mode=ro", uri=True, timeout=10)) as db:
+                return any((not target or target == issue_id) and event_ms(json.loads(payload)) > stamp
+                           for _, _, payload, _, target in self._stop_deliveries(db))
+        except (sqlite3.Error, ValueError, TypeError, AttributeError) as exc:
+            raise LinearError("Ingress Stop state unavailable; retry the saved resume transition") from exc
     def drain_ingress(self, database: Path, limit: int = 50) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
+        self._ingress = Path(database)
         if not Path(database).exists():
             return
         with closing(sqlite3.connect(database, timeout=10, isolation_level=None)) as db:
+            owned = {row["issue_id"] for row in self.store.active()}
+            stops = [row[:4] for row in self._stop_deliveries(db) if not row[4] or row[4] in owned][:limit]
             rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at FROM deliveries WHERE profile = ? "
                               "AND status = 'pending' ORDER BY received_at, delivery_id LIMIT ?",
                               (self.profile, limit)).fetchall()
+            selected = {(row[0], row[1]) for row in stops}
+            rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
             for agent, delivery, payload, received in rows:
                 status = "imported"
                 try:
