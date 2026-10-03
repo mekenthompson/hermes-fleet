@@ -25,7 +25,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Keep a bounded production surface without compressing safety-critical branches.
 # Actor/workspace binding and mutation-refusal regressions require explicit safety branches.
 # Durable recovery and exact credential binding retain explicit, readable safety branches.
-BUDGET = 2810
+# Same-task triage recovery and durable blocker receipts use core's supported APIs.
+BUDGET = 2840
 
 
 class FakeContext:

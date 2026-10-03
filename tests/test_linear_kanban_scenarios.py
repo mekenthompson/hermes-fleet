@@ -2117,6 +2117,86 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.recover()
         self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
+    def test_repeated_stop_resume_uses_supported_same_task_triage_transition(self):
+        self.delegate()
+        task = self.task_id()
+        for cycle in range(3):
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked" if cycle == 0 else "triage")
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body=f"Resume cycle {cycle}"))
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.assertEqual(self.tasks(), [(task, "ready")])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+        with self.bridge.kanban.conn() as conn:
+            self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "specified"]), 2)
+            self.assertEqual(self.bridge.kanban.get(task).block_recurrences, 3)
+
+    def test_other_core_triage_preserves_instruction_and_reports_blocker_once(self):
+        self.delegate()
+        task = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task, kind="capability", reason="Missing required capability"))
+            self.assertTrue(kb.unblock_task(conn, task))
+            self.assertTrue(kb.block_task(conn, task, kind="capability", reason="Still missing capability"))
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertIn("Kanban triage", self.linear.activities[-1]["content"]["body"])
+        self.clock.now += 1
+        event = self.linear.session_event("prompted", ISSUE, "s-1", body="Keep this instruction")
+        self.deliver(event)
+        self.assertEqual(self.bridge.kanban.get(task).status, "triage")
+        self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertIn("Kanban triage", self.linear.activities[-1]["content"]["body"])
+        count = len(self.linear.activities)
+        self.bridge = self.make_bridge()
+        self.bridge.recover()
+        self.deliver(event)
+        self.assertEqual(len(self.linear.activities), count)
+        with self.bridge.kanban.conn() as conn:
+            self.assertFalse(any(e.kind == "specified" for e in kb.list_events(conn, task)))
+            self.assertTrue(kb.specify_triage_task(conn, task, author="operator"))
+        self.bridge.recover()
+        self.bridge.tick()
+        self.assertEqual(self.tasks(), [(task, "ready")])
+        self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        with self.bridge.kanban.conn() as conn:
+            self.assertEqual(sum(c.body.count("Keep this instruction") for c in kb.list_comments(conn, task)), 1)
+
+    def test_stop_caused_triage_holds_live_worker_across_restart(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            process.terminate(); process.wait(timeout=10)
+            self.deliver(event)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.bridge.kanban.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, task, claimer=kb._claimer_id()))
+                dispatch._set_worker_pid(conn, task, process.pid)
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+            self.assertEqual(self.bridge.kanban.get(task).status, "triage")
+            self.clock.now += 1
+            with self.assertRaises(LinearError):
+                self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Resume same task"))
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "triage")
+            self.assertIsNone(process.poll())
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            process.terminate(); process.wait(timeout=10)
+            self.bridge.recover()
+            self.assertEqual(self.tasks(), [(task, "ready")])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+        finally:
+            if process.poll() is None: process.terminate()
+            process.wait(timeout=10)
+
     @contextmanager
     def stopped_worker(self):
         self.delegate()

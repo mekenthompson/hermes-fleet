@@ -21,7 +21,7 @@ from .oauth import ReauthorizationRequired
 from .store import Store
 
 log = logging.getLogger("linear")
-EVENT_KINDS = ("completed", "blocked", "gave_up", "unblocked", "archived")
+EVENT_KINDS = ("completed", "blocked", "block_loop_detected", "gave_up", "unblocked", "archived")
 
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
@@ -148,6 +148,13 @@ class Kanban:
     def unblock(self, task_id: str) -> bool:
         with self.conn() as conn:
             self._await_worker_exit(conn, task_id)
+            task = self.kb.get_task(conn, task_id)
+            if task and task.status == "triage":
+                event = next((e for e in reversed(self.kb.list_events(conn, task_id))
+                              if e.kind == "block_loop_detected"), None)
+                if event and str(event.payload.get("reason") or "").startswith(OWN + " stopped by "):
+                    return self.kb.specify_triage_task(conn, task_id, author="linear")
+                return False
             return self.kb.unblock_task(conn, task_id)
     def _await_worker_exit(self, conn, task_id: str) -> None:
         from hermes_cli.kanban_db_dispatch import _process_fingerprint
@@ -170,7 +177,7 @@ class Kanban:
     def comment(self, task_id: str, body: str, *, marker: str = "") -> None:
         with self.conn() as conn:
             task = self.kb.get_task(conn, task_id)
-            if task and task.status == "blocked": self._await_worker_exit(conn, task_id)
+            if task and task.status in ("blocked", "triage"): self._await_worker_exit(conn, task_id)
             author = "linear:" + hashlib.sha256(marker.encode()).hexdigest() if marker else "linear"
             if marker:
                 for comment in self.kb.list_comments(conn, task_id):
@@ -530,7 +537,7 @@ class Bridge:
             return
         if row:
             if self._resume(row, f"Follow-up from Linear: {body}", session_id,
-                            event_ms(event), "Passed to the running task.", str(activity.get("id") or "")):
+                            event_ms(event), "Instruction saved on the existing task.", str(activity.get("id") or "")):
                 return
         # The session key comes first so an out-of-order prompt and created event share a task.
         stamp = event_ms(event)
@@ -616,13 +623,25 @@ class Bridge:
             def steer() -> bool:
                 for message in messages:
                     self.kanban.comment(task.id, message["note"], marker=message["key"])
-                if task.status == "blocked" and not self.kanban.unblock(task.id):
+                waiting = self.kanban.get(task.id)
+                if waiting and (waiting.status == "blocked" or
+                                (waiting.status == "triage" and current["stop_requested_at"])) and not self.kanban.unblock(task.id):
                     latest = self.kanban.get(task.id)
                     if latest and latest.status == "blocked":
                         raise LinearError("Core task remains blocked; retry the saved resume transition")
                 return True
             if not self.store.activate_task(row["issue_id"], task.id, steer): return False
             route = self._alert_route(current)
+            latest = self.kanban.get(task.id)
+            if latest and latest.status == "triage":
+                payload = {"issue_id": row["issue_id"], "work_owner": current["ownership_id"], **route}
+                prefix = f"resume-triage:{row['issue_id']}:{stamp}"
+                self.store.enqueue_once("status", {**payload, "state": "blocked", "source_ms": stamp},
+                                        prefix + ":status", at=self.clock())
+                self.store.enqueue_once("activity", {**payload, "session_id": session_id, "content": {
+                    "type": "error", "body": "Instruction saved. Resolve this task's Kanban triage on the board "
+                    "before it can resume."}}, prefix + ":activity", at=self.clock())
+                return True  # Keep the durable intent until core's human triage transition.
             return self.store.complete_resume(row["issue_id"], stamp, [
                 ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
                             "source_ms": stamp, "seen": "self", **route}),
@@ -747,11 +766,12 @@ class Bridge:
             return
         writes: list[tuple[str, dict[str, Any]]] = []
         route = self._alert_route(row)
-        if event.kind == "blocked" and not str(payload.get("reason") or "").startswith(OWN):
+        if event.kind in ("blocked", "block_loop_detected") and not str(payload.get("reason") or "").startswith(OWN):
+            instruction = "Resolve Kanban triage on the board." if task_status == "triage" else "Reply here to unblock."
             writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
                       ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                     "content": {"type": "elicitation", "body":
-                                                f"Blocked: {payload.get('reason') or 'needs input'}. Reply here to unblock."},
+                                                f"Blocked: {payload.get('reason') or 'needs input'}. {instruction}"},
                                     **route})]
         elif event.kind == "gave_up":
             writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
@@ -768,7 +788,8 @@ class Bridge:
                 captured[key] -= 1
                 writes = []
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
-                (event.kind == "unblocked" and task_status == "blocked")):
+                (event.kind == "block_loop_detected" and task_status != "triage") or
+                (event.kind == "unblocked" and task_status in ("blocked", "triage"))):
             writes = []
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=event.kind == "archived")
     def _finished(self, row: dict[str, Any]) -> None:
