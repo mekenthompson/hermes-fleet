@@ -1,6 +1,5 @@
 """Profile-local work, permanent scope fences, and an idempotent Linear outbox."""
 from __future__ import annotations
-
 import json
 import sqlite3
 import threading
@@ -10,9 +9,7 @@ from collections import Counter
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
-
 MIN_BACKOFF, MAX_BACKOFF, GIVE_UP_AFTER = 60.0, 3600.0, 86_400.0
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work (
   issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, owner_ref TEXT NOT NULL,
@@ -30,11 +27,12 @@ CREATE TABLE IF NOT EXISTS chat_stop (
   status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
   completion_activity_id TEXT, uncertainty_activity_id TEXT,
   UNIQUE(profile, issue_id, linear_session_id, source_activity_id));
+CREATE TABLE IF NOT EXISTS retirement (
+  task_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, snapshot TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS specialist_scope_fence (
   issue_id TEXT PRIMARY KEY, reason TEXT NOT NULL, fenced_at REAL NOT NULL);
 """
-
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -177,6 +175,16 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT * FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
         return dict(row) if row else None
+    def retired(self, issue_id: str | None = None) -> list[dict]:
+        with self._tx() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
+    def retire(self, issue_id: str, task_id: str, snapshot: dict) -> None:
+        with self._tx() as db:
+            db.execute("INSERT OR REPLACE INTO retirement VALUES (?, ?, ?)",
+                       (task_id, issue_id, json.dumps(snapshot)))
+    def clear_retirement(self, task_id: str, snapshot: str) -> None:
+        with self._tx() as db:
+            db.execute("DELETE FROM retirement WHERE task_id=? AND snapshot=?", (task_id, snapshot))
     def chat_closeout_ms(self, issue_id: str) -> float:
         """Existing terminal receipts fence pre-closeout chat delegation echoes and prompts."""
         with self._tx() as db:
@@ -188,7 +196,7 @@ class Store:
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
         with self._tx() as db:
-            if not self._effect_admitted(db, issue_id): return False
+            if not self._effect_admitted(db, issue_id) or self.retired(issue_id): return False
             db.execute("INSERT OR REPLACE INTO work (issue_id, origin, owner_ref, task_id, project_id, "
                        "last_updated_at, run_generation, ownership_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation, str(uuid.uuid4())))
@@ -321,11 +329,9 @@ class Store:
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
-            if not self._effect_admitted(db, issue_id):
-                return False
+            if not self._effect_admitted(db, issue_id): return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
-            if not work:
-                return False
+            if not work: return False
             if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 if kind == "project_update":
@@ -681,7 +687,6 @@ class Store:
                                    "json_extract(payload, '$.issue_id')=? AND "
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "json_extract(payload, '$.claim')=1 LIMIT 1", (issue_id, task_id)).fetchone())
-
     def status_pending(self, row_id: str) -> bool:
         with self._tx() as db:
             return bool(db.execute("SELECT 1 FROM outbox WHERE id = ? AND kind = 'status' AND "

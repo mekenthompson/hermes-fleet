@@ -1,11 +1,9 @@
 """Chat-origin work: `linear start|done|blocked|release`. The chat session stays the executor."""
 from __future__ import annotations
-
 import json
 from typing import Any
 from .api import LinearError
 from .bridge import Bridge, PR_URL, evidence_links
-
 SCHEMA = {
     "name": "linear",
     "description": (
@@ -23,10 +21,8 @@ SCHEMA = {
         "required": ["action", "issue"],
     },
 }
-
 def _reply(ok: bool, message: str) -> str:
     return json.dumps({"ok": ok, "message": message})
-
 def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any = None) -> str:
     if bridge is None:
         return _reply(False, "The Linear service is not running on this profile.")
@@ -59,6 +55,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         row = bridge.store.get(issue_id)
         if action == "start":
+            try: bridge.await_retired(issue_id)
+            except LinearError as exc: return _reply(False, str(exc))
             if bridge.store.issue_reconciliation_blocked(issue_id):
                 return _reply(False, "An earlier terminal write needs reconciliation before fresh work.")
             return _start(bridge, issue, row, me, session_key, session_id, generation)
@@ -105,7 +103,6 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
             return _reply(True, f"Stopped chat tracking {ident}; Blocked closeout queued, not yet confirmed in Linear.")
     return _reply(False, f"Unknown action {action!r}.")
-
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
             ident: str, state: str, message: str, update: str, evidence: list[str] | None = None,
             heads: dict[str, str] | None = None) -> bool:
@@ -122,7 +119,6 @@ def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, projec
                             "lines": {ident: update}, "line_issues": {ident: issue_id},
                             "quiet": bridge.quiet, **route}),
     ], at=bridge.clock())
-
 def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
            session_id: str, generation: int | None) -> str:
     ident, url = issue.get("identifier"), issue.get("url", "")
@@ -157,7 +153,6 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
     if generation is None:
         message += " Linear Stop cannot interrupt this chat adapter; use the chat's own Stop control."
     return _reply(True, message)
-
 def on_turn_end(bridge: Bridge | None, session_id: str) -> None:
     """Every finished turn restarts the quiet period for that session's project updates."""
     if bridge is not None and session_id:

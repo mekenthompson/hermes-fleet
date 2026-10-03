@@ -497,6 +497,149 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(sorted(s for _, s in self.tasks()), ["done", "ready"])
         self.assertNotEqual(self.task_id(), first)
 
+    def _registered_child(self):
+        process = subprocess.Popen([sys.executable, "-c", "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(120)"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        def cleanup():
+            if process.poll() is None: process.kill()
+            process.wait(timeout=10)
+            process.stdout.close()
+        self.addCleanup(cleanup)
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.claim_task(conn, self.task_id()))
+            dispatch._set_worker_pid(conn, self.task_id(), process.pid)
+        return process
+
+    def test_running_handoff_uses_core_archive_termination(self):
+        self.delegate()
+        process = self._registered_child()
+        # Core escalates the verified worker from TERM to KILL.
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.recheck(force=True)
+        process.wait(timeout=10)
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertIsNotNone(process.poll())
+
+    def test_blocked_handoff_fences_native_and_chat_until_worker_exit_across_restart(self):
+        self.delegate()
+        old = self.task_id()
+        process = self._registered_child()
+        with self.bridge.kanban.conn() as conn:
+            kb.block_task(conn, old, reason="waiting for operator", kind="needs_input")
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.recheck(force=True)
+        self.assertIsNone(process.poll())
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.bridge = self.make_bridge()
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        event = self.linear.session_event("created", ISSUE, "replacement")
+        with self.assertRaisesRegex(Exception, "still exiting"):
+            self.bridge.handle_webhook(event)
+        self.assertEqual(self.tasks(), [(old, "archived")])
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, Context("other-chat", "chat")))
+        self.assertFalse(reply["ok"])
+        self.assertIn("still exiting", reply["message"])
+        process.kill(); process.wait(timeout=10)
+        self.deliver(event)
+        self.assertNotEqual(self.task_id(), old)
+        self.assertFalse(self.bridge.store.retired(ISSUE))
+
+    def test_retirement_keeps_spawn_identity_after_core_task_delete(self):
+        self.delegate()
+        old = self.task_id()
+        process = self._registered_child()
+        with self.bridge.kanban.conn() as conn:
+            kb.block_task(conn, old, reason="parked", kind="needs_input")
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.recheck(force=True)
+        with self.bridge.kanban.conn() as conn: kb.delete_archived_task(conn, old)
+        self.bridge = self.make_bridge()
+        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+        process.kill(); process.wait(timeout=10)
+        self.bridge.await_retired(ISSUE)
+        self.assertFalse(self.bridge.store.retired(ISSUE))
+
+    def test_claimed_launch_window_stays_fenced_until_registered_child_exits(self):
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn: self.assertTrue(kb.claim_task(conn, task_id))
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.recheck(force=True)
+        self.bridge = self.make_bridge()
+        with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.await_retired(ISSUE)
+        process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
+        def cleanup():
+            if process.poll() is None: process.kill()
+            process.wait(timeout=10)
+        self.addCleanup(cleanup)
+        with self.bridge.kanban.conn() as conn: dispatch._set_worker_pid(conn, task_id, process.pid)
+        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+        process.kill(); process.wait(timeout=10)
+        self.bridge.await_retired(ISSUE)
+        self.assertFalse(self.bridge.store.retired(ISSUE))
+
+    def test_restart_finishes_retirement_committed_before_core_archive(self):
+        from unittest.mock import patch
+        self.delegate()
+        old = self.task_id()
+        process = self._registered_child()
+        self.linear.set_delegate(ISSUE, OTHER)
+        with patch.object(self.bridge.kanban, "archive", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"): self.bridge.recheck(force=True)
+        self.assertTrue(self.bridge.store.retired(ISSUE))
+        self.bridge = self.make_bridge()
+        self.bridge.recover()
+        process.wait(timeout=10)
+        self.bridge.tick()
+        self.assertEqual(self.bridge.kanban.get(old).status, "archived")
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+
+    def test_unreadable_retired_worker_fingerprint_fails_closed(self):
+        from unittest.mock import patch
+        self.delegate()
+        process = self._registered_child()
+        with self.bridge.kanban.conn() as conn: kb.block_task(conn, self.task_id(), reason="parked", kind="needs_input")
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge.recheck(force=True)
+        with patch.object(dispatch, "_process_fingerprint", return_value=None):
+            with self.assertRaisesRegex(Exception, "identity is unavailable"): self.bridge.await_retired(ISSUE)
+        self.assertTrue(self.bridge.store.retired(ISSUE))
+        self.assertFalse(self.bridge.store.put(ISSUE, "chat", "bypass"))
+
+    def test_archive_delete_before_tick_closes_unfinished_and_fences_unknown_identity(self):
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            kb.archive_task(conn, task_id)
+            kb.delete_archived_task(conn, task_id)
+        self.bridge = self.make_bridge()
+        self.bridge.recover()
+        self.bridge.tick()
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertIn("unfinished", self.linear.activities[-1]["content"]["body"])
+        before = len(self.linear.activities)
+        self.bridge.tick()
+        self.assertEqual(len(self.linear.activities), before)
+        with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.await_retired(ISSUE)
+
+    def test_archive_closeout_survives_outage_and_preserves_human_takeover(self):
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn: kb.archive_task(conn, task_id)
+        self.bridge.pump_kanban()
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        pending = self.bridge.store.pending(ISSUE)
+        self.assertEqual([r["kind"] for r in pending], ["status", "activity"])
+        self.assertTrue(all(r["payload"]["terminal"] for r in pending))
+        self.linear.set_delegate(ISSUE, OTHER)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertFalse(self.bridge.store.pending(ISSUE))
+        self.assertEqual(self.linear.issues[ISSUE]["delegate"], OTHER)
+
     def test_takeover_by_delegate_change_is_pulled(self) -> None:
         self.delegate()
         task_id = self.task_id()
@@ -567,7 +710,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                     self.assertEqual(self.linear.state(ISSUE), "In Progress" if kind == "unblocked" else "Blocked")
                     self.assertEqual(len(self.linear.activities), before + (0 if kind == "unblocked" else 1))
                 self.bridge.tick()
-                self.assertEqual(len(self.linear.activities), before + (0 if kind in ("unblocked", "archived") else 1))
+                self.assertEqual(len(self.linear.activities), before + (0 if kind == "unblocked" else 1))
 
     def _migrate_old_work_row(self) -> None:
         """Recreate the pre-cursor work table, then let Store upgrade it on restart."""
