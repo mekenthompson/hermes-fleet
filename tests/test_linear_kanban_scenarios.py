@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -2170,6 +2171,29 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
             self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
             self.assertIsNone(process.poll())
+
+    def test_terminal_sweep_cannot_erase_live_worker_resume_witness(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            with patch.object(dispatch, "_process_fingerprint", return_value=None):
+                with self.bridge.kanban.conn() as conn:
+                    conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?",
+                                 (int(time.time()) - 121, task))
+                    dispatch.reap_terminal_workers(conn)
+                    self.assertIsNone(conn.execute("SELECT worker_pid FROM task_runs WHERE task_id=?",
+                                                   (task,)).fetchone()[0])
+                with self.assertRaises(LinearError): self.deliver(event)
+                self.bridge = self.make_bridge()
+                self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            self.assertIsNone(process.poll())
+            with self.bridge.kanban.conn() as conn:
+                self.assertFalse(kb.claim_task(conn, task, claimer=kb._claimer_id()))
+            process.terminate(); process.wait(timeout=10)
+            self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
     def test_fluctuating_worker_identity_cannot_release_a_live_stopped_worker(self):
         from unittest.mock import patch
