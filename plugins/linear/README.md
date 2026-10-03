@@ -200,6 +200,9 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
   Core's immutable spawn history preserves this guard even after terminal cleanup clears a run's PID.
   A newer Stop cancels that pending resume. Newer follow-ups are retained together while teardown waits.
   Core comments and completion receipts retain each instruction's identity across recovery and ingress retries.
+  Repeated Stop cycles can enter core triage. A newer human instruction reopens Stop-caused triage
+  through core's specification API, preserving recurrence counters and parent gating. Other triage
+  keeps the instruction pending and reports the required board action instead of claiming a resume.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
 - **An uncertain project-update send keeps its original UUID and body.** The body freezes before
   the create call, including a possible crash just before the call. If Linear accepted the create
