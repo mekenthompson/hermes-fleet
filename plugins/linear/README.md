@@ -60,6 +60,17 @@ plugins:
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
 `api_url`, `tick_seconds` (default 2).
 
+API requests share a serialized client within the profile. HTTP 400 GraphQL `RATELIMITED`
+and HTTP 429 pause requests until the exhausted request, complexity, or endpoint budget's
+epoch-millisecond reset; `Retry-After` seconds or HTTP dates can extend that pause.
+Missing or unusable timing falls back to 60 seconds. Successful responses that exhaust a
+budget are returned normally, then subsequent requests pause. Endpoint exhaustion
+conservatively pauses the whole profile client. The longest cooldown survives restarts in
+`<state_database>.rate-limit.json`, containing only a timestamp. Startup waits for it before
+identity validation and work admission. Quota state stays local to the profile; each profile
+uses its own app identity. Ownership and authorization reads remain fresh. Queued writes
+retain their client IDs and wait for quota recovery.
+
 For an approved fresh-work pilot only, set `activation_cutoff_ms` to a positive integer Unix epoch
 timestamp in milliseconds. Events with a source timestamp before it (or without a usable source
 timestamp) are imported without being applied; the boundary is inclusive. The cutoff is persisted
@@ -280,9 +291,10 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 2,900 lines, including this bounded
-authorization contract and durable recovery boundaries; the unit suite enforces
-that limit without compressing safety-critical branches.
+The production implementation is capped at 3,000 lines. The additional 100-line
+allowance covers restart-safe quota admission and serialized identity/request handling,
+alongside the bounded authorization contract and durable recovery boundaries. The unit
+suite enforces the limit without compressing safety-critical branches.
 
 Ownership loss archives directly through core so a running worker retains its termination identity.
 A durable issue fence blocks native and chat replacements until every recorded predecessor exits.

@@ -1653,6 +1653,25 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.types(), ["thought"])
 
+    def test_restart_preserves_quota_pause_and_delivers_the_same_outbox_rows(self) -> None:
+        from unittest.mock import patch
+        with patch.object(self.bridge, "flush", return_value=0): self.delegate()
+        path = self.dir / "rate-limit.json"
+        self.bridge.api.rate_limit_path = path
+        pending_ids = {row["id"] for row in self.bridge.store.pending()}
+        self.linear.rate_limited_until = self.clock() + 120
+        self.bridge.tick()
+        calls = len(self.linear.requests)
+        self.bridge = self.make_bridge()
+        self.bridge.api.rate_limit_path = path
+        self.bridge.tick()
+        self.assertEqual(len(self.linear.requests), calls)
+        self.assertEqual({row["id"] for row in self.bridge.store.pending()}, pending_ids)
+        self.clock.now += 121
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertEqual(self.types(), ["thought"])
+
     def test_chat_start_refused_when_another_agent_holds_it(self) -> None:
         self.linear.set_delegate(ISSUE, OTHER)
         self.linear.set_state(ISSUE, "In Progress")
