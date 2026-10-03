@@ -120,6 +120,67 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("Linear Stop cannot interrupt", reply["message"])
         self.assertIsNone(self.bridge.store.get(ISSUE)["run_generation"])
 
+    def test_real_default_api_context_can_track_and_complete_without_a_worker(self):
+        from hermes_cli.profiles import get_profile_dir
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.session_context import clear_session_vars
+        from tools.registry import _current_tool_invocation_context
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id="api-chat", session_key="api-owner", session_id="api-transcript", profile="")
+        try:
+            context = _current_tool_invocation_context()
+            self.assertEqual(context.profile, "")
+            self.assertEqual(context.platform, "api_server")
+            start = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))
+            self.assertTrue(start["ok"], start)
+            self.assertIn("Linear Stop cannot interrupt", start["message"])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["run_generation"])
+            done = json.loads(chat.handle(self.bridge, {
+                "action": "done", "issue": "ABC-1", "note": "Verified result",
+                "evidence": "https://git.example/org/repo/commit/abc"}, context))
+            self.assertTrue(done["ok"], done)
+            self.bridge.flush()
+            self.assertEqual(self.linear.state(ISSUE), "Done")
+            self.assertIsNone(self.bridge.store.get(ISSUE))
+            self.assertEqual(self.tasks(), [])
+        finally:
+            clear_session_vars(tokens)
+
+    def test_blank_api_context_cannot_claim_from_a_foreign_home(self):
+        from hermes_cli.profiles import get_profile_dir
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.session_context import clear_session_vars
+        from tools.registry import _current_tool_invocation_context
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        tokens = APIServerAdapter._bind_api_server_session(
+            session_key="foreign", session_id="foreign-transcript", profile="")
+        override = set_hermes_home_override(self.dir)
+        try:
+            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                           _current_tool_invocation_context()))
+            self.assertFalse(reply["ok"])
+            self.assertIsNone(self.bridge.store.get(ISSUE))
+            self.assertEqual(self.tasks(), [])
+        finally:
+            reset_hermes_home_override(override)
+            clear_session_vars(tokens)
+
+    def test_blank_non_api_context_and_named_executor_remain_refused(self):
+        from hermes_cli.profiles import get_profile_dir
+        from types import SimpleNamespace
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        for platform in ("", "slack", "telegram"):
+            context = SimpleNamespace(profile="", platform=platform, session_key="owner", session_id="sid")
+            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))
+            self.assertFalse(reply["ok"])
+        self.bridge.kanban.executor_profile = "alpha"
+        context = SimpleNamespace(profile="", platform="api_server", session_key="owner", session_id="sid")
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))["ok"])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.tasks(), [])
+
     def test_named_chat_matches_its_scoped_home_and_retains_generation(self):
         from unittest.mock import patch
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override

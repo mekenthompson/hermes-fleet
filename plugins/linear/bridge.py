@@ -207,9 +207,21 @@ class Bridge:
         self._guard = threading.Lock()
         self._last_recheck = 0.0
         self._reauth_alerted: set[tuple[str, str]] = set()
-    def chat_profile_matches(self, profile: str) -> bool:
+    def chat_profile_matches(self, profile: str, *, platform: str = "") -> bool:
         executor = getattr(self.kanban, "executor_profile", None)
         home = getattr(self.kanban, "profile_home", None)
+        # Standalone API-server turns omit the profile even for /p/default.
+        # Resolve only that adapter's default executor from the active core
+        # scope; a blank name alone is never authority for another profile.
+        if not profile and platform == "api_server" and executor == "default" and home is not None:
+            from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+            try:
+                if (get_active_profile_name() != "default" or
+                        get_profile_dir("default").resolve(strict=True) != home):
+                    return False
+                profile = "default"
+            except (OSError, RuntimeError):
+                return False
         if not profile or profile not in (self.profile, executor): return False
         if home is None: return profile == self.profile
         from hermes_constants import get_hermes_home

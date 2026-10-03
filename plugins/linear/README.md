@@ -17,6 +17,9 @@ container uses `default`; a named-profile gateway uses its matching named profil
 Activation refuses an executor that resolves to a different home.
 
 Chat tools accept that same executor identity only from the service's exact home.
+Standalone API-server turns that omit their profile are accepted only when core's
+active profile and default executor both resolve to that exact home. Blank identities
+from other adapters or named profiles remain refused.
 Adapters without a core chat-run generation can track work, but cannot be interrupted
 by Linear Stop. Start makes that limitation explicit; use the chat's Stop control.
 
