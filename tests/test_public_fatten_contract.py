@@ -49,12 +49,16 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertIn("groupmod -g 1000 hermes", text)
         self.assertRegex(text, r"(?m)^USER 1000:1000$")
 
-    def test_dockerfile_installs_honcho_extra_without_workspace_ids(self) -> None:
+    def test_dockerfile_installs_pinned_honcho_without_workspace_ids(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn('facts["packages"]["uv"]["entry"]', text)
-        self.assertIn('"$UV" export --frozen --no-dev --no-emit-project --extra honcho', text)
+        self.assertIn('"$UV" pip install --python /opt/hermes/.venv/bin/python \'honcho-ai==2.2.0\'', text)
+        self.assertNotIn("--extra honcho", text)
         self.assertNotIn("\n    && uv export ", text)
         self.assertIn(f"assert version('honcho-ai') == '{HONCHO_AI_VERSION}'", text)
+        self.assertIn("f014a64306bac21f233f51a8e5cddf94a704f62d", text)
+        self.assertIn("8694fbf31c8a158eb85d10c12fb161059d787421ee644848d492aa11cf4b12c0", text)
+        self.assertIn("/opt/hermes/plugins/memory/honcho", text)
         lowered = text.lower()
         for token in ("workspace_id", "switchroom", "kenthompson.com.au"):
             self.assertNotIn(token, lowered)
