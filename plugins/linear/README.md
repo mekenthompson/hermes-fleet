@@ -195,6 +195,8 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
   so and asks the agent to retry.
 - **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
   the plugin says so in Linear instead of claiming it stopped.
+  Core owns worker teardown. A prompt received while a stopped worker is still exiting stays
+  queued durably; the task becomes ready only after its fingerprinted worker has exited.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
 - **An uncertain project-update send keeps its original UUID and body.** The body freezes before
   the create call, including a possible crash just before the call. If Linear accepted the create
