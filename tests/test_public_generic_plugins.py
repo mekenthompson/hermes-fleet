@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LINEAR = ROOT / "plugins" / "linear-agent"
+LINEAR = ROOT / "plugins" / "linear"
 ACP = ROOT / "plugins" / "model-providers" / "claude-acp"
 KOKORO = ROOT / "plugins" / "kokoro-voice"
 HANDOFF = ROOT / "plugins" / "browser-handoff"
@@ -27,19 +27,13 @@ HOUSEHOLD = re.compile(
     re.I,
 )
 class PublicGenericPluginTests(unittest.TestCase):
-    def test_linear_agent_keeps_household_maps_out(self) -> None:
+    def test_native_linear_keeps_household_maps_out(self) -> None:
         self.assertFalse((LINEAR / "linear-agents.json").exists())
         self.assertFalse((LINEAR / "linear-publishers.json").exists())
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn("RUN test ! -e /opt/hermes/plugins/linear-agent", dockerfile)
         self.assertNotIn("COPY plugins/linear-agent/", dockerfile)
 
-    def test_public_policy_reader_stays_fail_closed(self) -> None:
-        text = (LINEAR / "linear_policy.py").read_text(encoding="utf-8")
-        self.assertIn("O_NOFOLLOW", text)
-        self.assertIn("metadata.st_uid != 0", text)
-        self.assertIn("os.geteuid() == 0", text)
-        self.assertIn("read_immutable_json", text)
 
     def test_claude_acp_ships_the_profile_local_client(self) -> None:
         text = (ACP / "__init__.py").read_text(encoding="utf-8")
@@ -103,7 +97,7 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertEqual(workflow.count('assert not pathlib.Path("/opt/hermes/plugins/kokoro-voice").exists()'), 2)
 
     def test_generic_plugin_trees_have_no_household_literals(self) -> None:
-        roots = (LINEAR, ROOT / "plugins" / "linear", ACP, KOKORO, HANDOFF, READONLY,
+        roots = (LINEAR, ACP, KOKORO, HANDOFF, READONLY,
                  ROOT / "plugins" / "web" / "perplexity")
         for root in roots:
             for path in root.rglob("*"):

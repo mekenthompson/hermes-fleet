@@ -137,8 +137,8 @@ class ChangeScopeDecisionTests(unittest.TestCase):
             self.assertTrue(prefix.endswith("/") and (ROOT / prefix).is_dir(), prefix)
         for path in ("README.md", "docs/image-release.md", "tests/test_image_release.py", ".github/workflows/ci.yml",
                      "scripts/verify-public-tree.py", "scripts/compose.py", "scripts/build-fleet-image.py",
-                     "compose.example.yaml", "examples/linear-agent-policy.json", "SECURITY.md",
-                     "plugins/linear-agent/linear_runtime.py"):
+                     "compose.example.yaml", "examples/overlay-repo/fleet-overlay.yaml", "SECURITY.md",
+                     "plugins/linear/bridge.py"):
             self.assertFalse(self.scope.is_image_input(path), path)
 
 
