@@ -523,7 +523,7 @@ class Bridge:
             return
         if row:
             if self._resume(row, f"Follow-up from Linear: {body}", session_id,
-                            event_ms(event), "Passed to the running task."):
+                            event_ms(event), "Passed to the running task.", str(activity.get("id") or "")):
                 return
         # The session key comes first so an out-of-order prompt and created event share a task.
         stamp = event_ms(event)
@@ -567,7 +567,7 @@ class Bridge:
         self.store.enqueue_once("activity", error, f"followup-refused:{marker}", at=self.clock())
         raise LinearError("Owning chat refused injection; retry the durable ingress delivery")
     def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
-                stamp: float | None = None, receipt: str = "Resuming the existing task.") -> bool:
+                stamp: float | None = None, receipt: str = "Resuming the existing task.", marker: str = "") -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
         if self.store.issue_reconciliation_blocked(row["issue_id"]): return False
         if not self._require_effect(row["issue_id"]): return False
@@ -578,29 +578,42 @@ class Bridge:
             if task and task.status == "done": self._finished(row)
             else: self.store.delete(row["issue_id"])
             return False
-        intent = json.loads(row["pending_resume"]) if row.get("pending_resume") else None
-        if intent and intent.get("kind") == "kanban":
-            note, session_id, stamp, receipt = (intent[key] for key in ("note", "session_id", "stamp", "receipt"))
-        elif not self.store.activate_task(row["issue_id"], task.id, lambda: True):
-            return False
-        elif not self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp,
-                                   pending_resume=json.dumps({"kind": "kanban", "note": note,
-                                                              "session_id": session_id, "stamp": stamp,
-                                                              "receipt": receipt})):
-            return False
-        def steer() -> bool:
-            self.kanban.comment(task.id, note)
-            if task.status != "blocked" or self.kanban.unblock(task.id): return True
-            current = self.kanban.get(task.id)
-            if current and current.status != "blocked": return True
-            raise LinearError("Core task remains blocked; retry the saved resume transition")
-        if not self.store.activate_task(row["issue_id"], task.id, steer): return False
-        route = self._alert_route(row)
-        return self.store.complete_resume(row["issue_id"], stamp, [
-            ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
-                        "source_ms": stamp, "seen": "self", **route}),
-            ("activity", {"issue_id": row["issue_id"], "session_id": session_id,
-                          "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
+        with self.store.guard_issue_work(row["issue_id"]) as admitted:
+            current = self.store.get(row["issue_id"])
+            if not admitted or not current or current["task_id"] != task.id: return False
+            if stamp < current["last_updated_at"] or (current["stop_requested_at"] and
+                                                      stamp <= current["stop_requested_at"]): return True
+            if not self.store.activate_task(row["issue_id"], task.id, lambda: True): return False
+            intent = json.loads(current["pending_resume"]) if current.get("pending_resume") else None
+            incoming = note
+            key = f"{session_id}:{stamp}:{marker or incoming}"
+            markers = []
+            if intent and intent.get("kind") == "kanban":
+                markers = intent.get("markers", [f"{intent['session_id']}:{intent['stamp']}:{intent['note']}"])
+                note = intent["note"] + ("\n\n" + note if key not in markers else "")
+            if key not in markers: markers.append(key)
+            saved = json.dumps({"kind": "kanban", "note": note, "last_note": incoming, "marker": marker,
+                                "markers": markers, "session_id": session_id, "stamp": stamp, "receipt": receipt})
+            if not self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp,
+                                     pending_resume=saved): return False
+        with self.store.guard_issue_work(row["issue_id"]) as admitted:
+            current = self.store.get(row["issue_id"])
+            if not admitted or not current: return False
+            if current["pending_resume"] != saved: return True  # A newer instruction or Stop superseded this attempt.
+            def steer() -> bool:
+                self.kanban.comment(task.id, note)
+                if task.status == "blocked" and not self.kanban.unblock(task.id):
+                    latest = self.kanban.get(task.id)
+                    if latest and latest.status == "blocked":
+                        raise LinearError("Core task remains blocked; retry the saved resume transition")
+                return True
+            if not self.store.activate_task(row["issue_id"], task.id, steer): return False
+            route = self._alert_route(current)
+            return self.store.complete_resume(row["issue_id"], stamp, [
+                ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
+                            "source_ms": stamp, "seen": "self", **route}),
+                ("activity", {"issue_id": row["issue_id"], "session_id": session_id,
+                              "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
         if self.store.issue_reconciliation_blocked(issue_id): return False
@@ -669,9 +682,12 @@ class Bridge:
             return
         if row["origin"] == "kanban":
             with self.store.guard_issue(row["issue_id"]) as admitted:
+                current = self.store.get(row["issue_id"])
+                if not current or stamp < current["last_updated_at"] or stamp <= current["resume_fence_at"]: return
+                row = current
                 if not admitted or not self.store.update(
                         row["issue_id"], last_updated_at=max(stamp, float(row["last_updated_at"])),
-                        stop_requested_at=stamp): return
+                        stop_requested_at=stamp, pending_resume=None): return
                 row = {**row, "owner_ref": session_id}
                 task = self.kanban.get(row["task_id"])
                 if not self.kanban.block(row["task_id"], f"{OWN} stopped by {who}") and (
@@ -858,7 +874,8 @@ class Bridge:
                 intent = json.loads(row["pending_resume"])
                 if (intent.get("kind") == "kanban" and self.may_execute_existing(
                         row["issue_id"], source_ms=intent["stamp"])):
-                    self._resume(row, intent["note"], intent["session_id"], intent["stamp"], intent["receipt"])
+                    self._resume(row, intent.get("last_note", intent["note"]), intent["session_id"],
+                                 intent["stamp"], intent["receipt"], intent.get("marker", ""))
             except (LinearError, ValueError, KeyError):
                 continue
         for row in self.store.active("chat"):

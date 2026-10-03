@@ -2154,6 +2154,59 @@ class LinearKanbanScenarios(unittest.TestCase):
             with self.bridge.kanban.conn() as conn:
                 self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before + 1)
 
+    def test_newer_stop_cancels_pending_resume_across_worker_exit_and_recovery(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            with self.assertRaises(LinearError): self.deliver(event)
+            stale = self.bridge.store.get(ISSUE)
+            intent = json.loads(stale["pending_resume"])
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+            stopped = self.bridge.store.get(ISSUE)
+            self.assertIsNone(stopped["pending_resume"])
+            process.terminate(); process.wait(timeout=10)
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.bridge._resume(stale, intent["note"], intent["session_id"], intent["stamp"], intent["receipt"])
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stopped["stop_requested_at"])
+            with self.bridge.kanban.conn() as conn:
+                self.assertFalse(kb.claim_task(conn, task, claimer=kb._claimer_id()))
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Now resume explicitly"))
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+            self.assertEqual(self.task_id(), task)
+
+    def test_newer_pending_prompt_preserves_both_instructions_without_retry_duplicates(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        for exit_before_prompt in (False, True):
+            with self.subTest(exit_before_prompt=exit_before_prompt):
+                self.setUp()
+                with self.stopped_worker() as (process, task, first):
+                    with self.assertRaises(LinearError): self.deliver(first)
+                    if exit_before_prompt: process.terminate(); process.wait(timeout=10)
+                    self.clock.now += 1
+                    second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope")
+                    if exit_before_prompt:
+                        self.deliver(second)
+                    else:
+                        for _ in range(2):
+                            with self.assertRaises(LinearError): self.deliver(second)
+                        self.bridge = self.make_bridge()
+                        self.bridge.recover()
+                        saved = json.loads(self.bridge.store.get(ISSUE)["pending_resume"])
+                        self.assertEqual(saved["note"].count("Resume this task"), 1)
+                        self.assertEqual(saved["note"].count("Use the updated scope"), 1)
+                        process.terminate(); process.wait(timeout=10)
+                        self.bridge.recover()
+                    self.deliver(first)  # An older ingress retry cannot overwrite the later instruction.
+                    self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+                    self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+                    with self.bridge.kanban.conn() as conn:
+                        notes = "\n".join(comment.body for comment in kb.list_comments(conn, task))
+                    self.assertEqual(notes.count("Resume this task"), 1)
+                    self.assertEqual(notes.count("Use the updated scope"), 1)
+
     def test_recycled_stopped_worker_pid_does_not_hold_resume_or_signal_stranger(self):
         from unittest.mock import patch
         with self.stopped_worker() as (process, task, event):
