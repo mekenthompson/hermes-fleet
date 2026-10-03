@@ -150,9 +150,15 @@ class Kanban:
             return self.kb.unblock_task(conn, task_id)
     def _await_worker_exit(self, conn, task_id: str) -> None:
         from hermes_cli.kanban_db_dispatch import _process_fingerprint
-        for pid, fingerprint in conn.execute(
+        workers = [tuple(row) for row in conn.execute(
                 "SELECT worker_pid, worker_started_at FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL",
-                (task_id,)):
+                (task_id,))]
+        # Core cleanup may clear run PIDs after an unreadable identity probe.
+        # Its immutable spawn events still prove which workers must have exited.
+        workers.extend((event.payload["pid"], event.payload.get("started_at"))
+                       for event in self.kb.list_events(conn, task_id)
+                       if event.kind in ("spawned", "worker_registered") and event.payload.get("pid"))
+        for pid, fingerprint in dict.fromkeys(workers):
             pid = int(pid)
             if not self.kb._pid_alive(pid): continue
             observed = _process_fingerprint(pid)

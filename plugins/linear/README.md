@@ -197,6 +197,7 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
   the plugin says so in Linear instead of claiming it stopped.
   Core owns worker teardown. A prompt received while a stopped worker is still exiting stays
   queued durably; the task becomes ready only after its fingerprinted worker has exited.
+  Core's immutable spawn history preserves this guard even after terminal cleanup clears a run's PID.
 - **A human edit racing an agent status write** is accepted. The re-read narrows the window.
 - **An uncertain project-update send keeps its original UUID and body.** The body freezes before
   the create call, including a possible crash just before the call. If Linear accepted the create
