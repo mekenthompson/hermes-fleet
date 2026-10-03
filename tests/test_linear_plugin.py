@@ -25,7 +25,7 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Keep a bounded production surface without compressing safety-critical branches.
 # Actor/workspace binding and mutation-refusal regressions require explicit safety branches.
 # Durable recovery and exact credential binding retain explicit, readable safety branches.
-BUDGET = 2700
+BUDGET = 2730
 
 
 class FakeContext:

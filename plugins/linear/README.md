@@ -12,6 +12,10 @@ between them and holds no execution state of its own.
 It is off by default. It shares nothing across containers: the Linear delegate is the only
 cross-agent record.
 
+Kanban uses the executor name that resolves to the service's own home. A standalone
+container uses `default`; a named-profile gateway uses its matching named profile.
+Activation refuses an executor that resolves to a different home.
+
 ## Enable it
 
 Add one block to the profile's config, in the deployment overlay. The values below are synthetic.

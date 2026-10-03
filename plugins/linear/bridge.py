@@ -98,15 +98,28 @@ def iso_ms(raw: Any) -> float:
 
 class Kanban:
     """Adapter over core Kanban's public functions; one short-lived connection per call."""
-    def __init__(self, board: str | None = None) -> None:
+    def __init__(self, board: str | None = None, *, profile: str | None = None,
+                 profile_home: Any = None) -> None:
         from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
         self.kb, self.kc, self.kn, self.board = kanban_db, kanban_db_connect, kanban_db_notify, board
+        self.executor_profile = self.resolve_executor_profile(profile, profile_home) if profile is not None else None
         kanban_db_connect.init_db(board=board)
+    @staticmethod
+    def resolve_executor_profile(profile: str, profile_home: Any) -> str:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+        from pathlib import Path
+        home = Path(profile_home).resolve(strict=True)
+        for candidate in dict.fromkeys((profile, "default")):
+            if profile_exists(candidate) and get_profile_dir(candidate).resolve(strict=True) == home:
+                return candidate
+        raise ValueError("linear: no Kanban executor profile matches the service home")
     @contextmanager
     def conn(self):
         with closing(self.kc.connect(board=self.board)) as conn:
             yield conn
     def create(self, **fields: Any):
+        if self.executor_profile is not None:
+            fields["assignee"] = self.executor_profile
         with self.conn() as conn:
             return self.kb.get_task(conn, self.kb.create_task(conn, board=self.board, **fields))
     def get(self, task_id: str):
