@@ -17,6 +17,10 @@ from .client import ClaudeACPClient
 class ClaudeACPProfile(ProviderProfile):
     """Claude Code external-process provider."""
 
+    def get_model_context_length(self, model: str) -> int | None:
+        """The adapter's logical Opus annotation declares its context window."""
+        return 1_000_000 if model.strip().lower() == "opus[1m]" else None
+
     def create_client(self, **client_kwargs: Any) -> Any:
         """Use the profile-local ACP transport and the subscription launcher."""
         command = self.process_command or "/usr/local/bin/hermes-claude-acp-subscription"

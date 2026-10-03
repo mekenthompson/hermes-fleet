@@ -68,6 +68,12 @@ jobs:
             --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt
           "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
             --agent-source "$HERMES_AGENT_SRC"
+      - name: Real Agent Claude ACP context resolution
+        env:
+          HERMES_AGENT_SRC: ${{ github.workspace }}/agent-source
+        run: |
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -m unittest discover \
+            -s tests -p 'test_claude_acp_context.py' -v
 
   history-root:
     runs-on: ubuntu-latest
