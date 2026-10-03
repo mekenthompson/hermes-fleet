@@ -670,6 +670,7 @@ class Bridge:
         context = "\n\n".join(x for x in (event.get("promptContext") or info.get("description") or "", prompt) if x)
         with self.store.guard_issue_work(issue_id) as admitted:
             if not admitted: return False
+            if stamp <= self.store.chat_closeout_ms(issue_id): return True
             task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
                 title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
                 body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),

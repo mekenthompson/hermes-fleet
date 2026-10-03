@@ -193,6 +193,8 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
   undo tools, child processes or external effects that already ran; reconcile before resuming.
 - **Chat commands need Linear reachable** to resolve an identifier. When it is not, the tool says
   so and asks the agent to retry.
+  Chat closeout receipts fence older delegation echoes and prompts, including after restart;
+  delayed events cannot create a second executor while closeout is still being delivered.
 - **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
   the plugin says so in Linear instead of claiming it stopped.
   Core owns worker teardown. A prompt received while a stopped worker is still exiting stays
