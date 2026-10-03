@@ -17,7 +17,7 @@ GH_VERSION = "2.98.0"
 GH_LINUX_AMD64_SHA256 = (
     "3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de"
 )
-HONCHO_AI_VERSION = "2.2.0"
+HONCHO_AI_VERSION = "2.5.1"
 EXTRA_CLIS = {
     "@openai/codex": "0.160.0",
     "@xai-official/grok": "1.0.46",
@@ -52,10 +52,9 @@ class PublicFattenContractTests(unittest.TestCase):
     def test_dockerfile_installs_pinned_honcho_without_workspace_ids(self) -> None:
         text = DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn('facts["packages"]["uv"]["entry"]', text)
-        self.assertIn('"$UV" pip install --python /opt/hermes/.venv/bin/python \'honcho-ai==2.2.0\'', text)
-        self.assertNotIn("--extra honcho", text)
+        self.assertIn("--no-deps --require-hashes", text)
         self.assertNotIn("\n    && uv export ", text)
-        self.assertIn(f"assert version('honcho-ai') == '{HONCHO_AI_VERSION}'", text)
+        self.assertIn("verify-honcho-runtime.py", text)
         self.assertIn("f014a64306bac21f233f51a8e5cddf94a704f62d", text)
         self.assertIn("8694fbf31c8a158eb85d10c12fb161059d787421ee644848d492aa11cf4b12c0", text)
         self.assertIn("/opt/hermes/plugins/memory/honcho", text)
