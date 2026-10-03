@@ -148,15 +148,16 @@ class Kanban:
         prior = prior or {"workers": [], "pending": [], "missing": False}
         with self.conn() as conn, self.kb.write_txn(conn):
             task = self.kb.get_task(conn, task_id)
-            runs = list(conn.execute("SELECT id, worker_pid, worker_started_at FROM task_runs WHERE task_id=?", (task_id,)))
-            workers = [tuple(row[1:]) for row in runs if row[1]]
-            workers.extend((e.payload["pid"], e.payload.get("started_at")) for e in self.kb.list_events(conn, task_id)
-                           if e.kind in ("spawned", "worker_registered") and e.payload.get("pid"))
+            runs = list(conn.execute("SELECT id, worker_pid, worker_started_at, claim_lock FROM task_runs WHERE task_id=?", (task_id,)))
+            events = [e for e in self.kb.list_events(conn, task_id)
+                      if e.kind in ("spawned", "worker_registered") and e.payload.get("pid")]
+            workers = [tuple(row[1:3]) for row in runs if row[1]]
+            workers.extend((e.payload["pid"], e.payload.get("started_at")) for e in events)
             workers.extend(tuple(row) for row in conn.execute("SELECT worker_pid, worker_started_at FROM tasks WHERE id=? AND worker_pid IS NOT NULL", (task_id,)))
-            pending = set(prior["pending"])
-            if task and task.claim_lock and not task.worker_pid: pending.add(task.current_run_id)
-            pending.difference_update(row[0] for row in runs if row[1])
-            if task and task.worker_pid: pending.clear()
+            identified = {e.run_id for e in events} | {row[0] for row in runs if row[1]}
+            # Late dispatcher registration after archive loses core's current_run_id.
+            if None in identified and runs: identified.add(max(row[0] for row in runs))
+            pending = (set(prior["pending"]) | {row[0] for row in runs if row[3] and not row[1]}) - identified
             return {"workers": list(dict.fromkeys((*map(tuple, prior["workers"]), *workers))),
                     "pending": list(pending), "missing": prior["missing"] or (task is None and not prior["workers"])}
     def await_retirement(self, snapshot: dict) -> None:
@@ -843,8 +844,7 @@ class Bridge:
         if self.store.terminal_captured(row["task_id"]):
             return
         task = self.kanban.get(row["task_id"])
-        if task is None:
-            return
+        if task is None: return
         self._retire_task(row)
         contract = task.completion_contract or "local-only"
         # PR work: core's completion_contract already verified the exact PR head before 'done'.
@@ -1233,7 +1233,6 @@ class Bridge:
         self.store.hold_terminal(row["id"])
         row["payload"]["reconcile_required"] = True
         raise LinearError(message, retryable=False)
-    # -- ingress + loop ----------------------------------------------------
     def _stop_deliveries(self, db) -> list:
         return db.execute("SELECT logical_agent, delivery_id, payload, received_at, "
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "

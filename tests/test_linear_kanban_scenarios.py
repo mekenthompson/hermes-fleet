@@ -579,6 +579,44 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.await_retired(ISSUE)
         self.assertFalse(self.bridge.store.retired(ISSUE))
 
+    def test_board_archive_before_snapshot_and_claim_after_snapshot_hold_replacements(self):
+        from unittest.mock import patch
+        for interleaving in ("board_archive", "late_claim"):
+            with self.subTest(interleaving=interleaving):
+                self.setUp(); self.delegate(); old = self.task_id()
+                if interleaving == "board_archive":
+                    with self.bridge.kanban.conn() as conn:
+                        self.assertTrue(kb.claim_task(conn, old))
+                        kb.archive_task(conn, old)
+                    self.bridge.pump_kanban()
+                else:
+                    original = self.bridge.kanban.archive
+                    def claim_before_archive(task):
+                        with self.bridge.kanban.conn() as conn: self.assertTrue(kb.claim_task(conn, task))
+                        original(task)
+                    self.linear.set_delegate(ISSUE, OTHER)
+                    with patch.object(self.bridge.kanban, "archive", side_effect=claim_before_archive):
+                        self.bridge.recheck(force=True)
+                self.bridge = self.make_bridge(); self.bridge.recover()
+                self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+                event = self.linear.session_event("created", ISSUE, "late-registration")
+                with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.handle_webhook(event)
+                reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, Context("new-chat", "chat")))
+                self.assertFalse(reply["ok"]); self.assertIn("identity is unknown", reply["message"])
+                self.assertEqual(self.tasks(), [(old, "archived")])
+                process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
+                try:
+                    with self.bridge.kanban.conn() as conn: dispatch._set_worker_pid(conn, old, process.pid)
+                    with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+                    self.assertEqual(self.tasks(), [(old, "archived")])
+                    process.kill(); process.wait(timeout=10)
+                    self.bridge.await_retired(ISSUE)
+                    self.deliver(event)
+                    self.assertNotEqual(self.task_id(), old)
+                finally:
+                    if process.poll() is None: process.kill()
+                    process.wait(timeout=10)
+
     def test_restart_finishes_retirement_committed_before_core_archive(self):
         from unittest.mock import patch
         self.delegate()
