@@ -280,6 +280,12 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 2,700 lines, including this bounded
+The production implementation is capped at 2,900 lines, including this bounded
 authorization contract and durable recovery boundaries; the unit suite enforces
 that limit without compressing safety-critical branches.
+
+Ownership loss archives directly through core so a running worker retains its termination identity.
+A durable issue fence blocks native and chat replacements until every recorded predecessor exits.
+Unreadable identities, launch windows without a registered PID, and deleted tasks without worker
+receipts stay fenced for reconciliation. Archive/delete closeout queues a durable unfinished
+Blocked status and session error; current Linear ownership and human closure still win at send time.

@@ -142,6 +142,10 @@ class FakeKanban:
         self.tasks[task_id].status = "ready"
         return True
 
+    def retirement(self, task_id, prior=None):
+        return prior or {"workers": [], "pending": [], "missing": False}
+    def await_retirement(self, snapshot):
+        pass
     def archive(self, task_id):
         self.tasks[task_id].status = "archived"
 
