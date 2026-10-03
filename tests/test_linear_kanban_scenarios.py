@@ -2236,6 +2236,91 @@ class LinearKanbanScenarios(unittest.TestCase):
             with self.bridge.kanban.conn() as conn:
                 self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before + 1)
 
+    def test_newer_stop_fence_survives_core_failure_and_ingress_retries(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        from linear_ingress_fixture import IngressStore, Route
+        with self.stopped_worker() as (process, task, event):
+            with self.assertRaises(LinearError): self.deliver(event)
+            self.clock.now += 1
+            stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
+            stamp = self.clock() * 1000
+            inbox = self.dir / "stop-retry.db"
+            producer = IngressStore(inbox)
+            producer.enqueue(Route("alpha", "alpha", "/webhook/alpha", inbox, inbox), "new-stop", json.dumps(stop).encode())
+            with sqlite3.connect(inbox) as db:
+                db.execute("UPDATE deliveries SET received_at=?", (self.clock(),))
+            with patch.object(self.bridge.kanban, "block", side_effect=LinearError("Temporary core failure")):
+                self.bridge.drain_ingress(inbox)
+            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stamp)
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            process.terminate(); process.wait(timeout=10)
+            self.bridge = self.make_bridge()
+            with patch.object(self.bridge.kanban, "block", side_effect=RuntimeError("Interrupted core call")):
+                self.bridge.recover(inbox)
+            self.assertEqual(self.tasks(), [(task, "blocked")])
+            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stamp)
+            self.bridge.tick(inbox)
+            self.assertEqual(self.tasks(), [(task, "blocked")])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            with sqlite3.connect(inbox) as db:
+                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "imported")
+
+    def test_startup_processes_owned_stop_beyond_normal_inbox_batch_before_resume(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        from linear_ingress_fixture import IngressStore, Route
+        with self.stopped_worker() as (process, task, event):
+            with self.assertRaises(LinearError): self.deliver(event)
+            inbox = self.dir / "startup-stop.db"
+            producer = IngressStore(inbox)
+            route = Route("alpha", "alpha", "/webhook/alpha", inbox, inbox)
+            for i in range(101): producer.enqueue(route, f"older-{i:03}", b'{"type":"Unknown"}')
+            self.clock.now += 1
+            stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
+            producer.enqueue(route, "new-stop", json.dumps(stop).encode())
+            with sqlite3.connect(inbox) as db:
+                db.execute("UPDATE deliveries SET received_at=?", (self.clock()-1,))
+                db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='new-stop'", (self.clock(),))
+            process.terminate(); process.wait(timeout=10)
+            self.bridge = self.make_bridge()
+            with patch.object(self.bridge.kanban, "unblock", wraps=self.bridge.kanban.unblock) as unblock:
+                self.bridge.recover(inbox)
+                unblock.assert_not_called()
+            self.assertEqual(self.tasks(), [(task, "blocked")])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            with sqlite3.connect(inbox) as db:
+                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "imported")
+                self.assertEqual(db.execute("SELECT count(*) FROM deliveries WHERE status='pending'").fetchone()[0], 51)
+
+    def test_pending_resume_waits_for_stop_beyond_prioritized_batch(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        from linear_ingress_fixture import IngressStore, Route
+        with self.stopped_worker() as (process, task, event):
+            with self.assertRaises(LinearError): self.deliver(event)
+            inbox = self.dir / "batched-stops.db"
+            producer = IngressStore(inbox)
+            route = Route("alpha", "alpha", "/webhook/alpha", inbox, inbox)
+            self.clock.now -= 1
+            old_stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
+            self.clock.now += 1
+            for i in range(50): producer.enqueue(route, f"older-{i:03}", json.dumps(old_stop).encode())
+            self.clock.now += 1
+            producer.enqueue(route, "new-stop", json.dumps(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")).encode())
+            with sqlite3.connect(inbox) as db:
+                db.execute("UPDATE deliveries SET received_at=?", (self.clock()-1,))
+                db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='new-stop'", (self.clock(),))
+            process.terminate(); process.wait(timeout=10)
+            self.bridge = self.make_bridge()
+            self.bridge.tick(inbox)
+            self.assertEqual(self.tasks(), [(task, "blocked")])
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            with sqlite3.connect(inbox) as db:
+                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "pending")
+            self.bridge.tick(inbox)
+            self.assertEqual(self.tasks(), [(task, "blocked")])
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+
     def test_newer_stop_cancels_pending_resume_across_worker_exit_and_recovery(self):
         from hermes_fleet_linear_plugin.api import LinearError
         with self.stopped_worker() as (process, task, event):

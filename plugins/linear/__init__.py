@@ -276,7 +276,7 @@ def register(ctx: Any) -> None:
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge
         try:
-            await asyncio.to_thread(bridge.recover)
+            await asyncio.to_thread(bridge.recover, ingress)
             while not runtime.stop_event.is_set():
                 try:
                     await asyncio.to_thread(bridge.tick, ingress)

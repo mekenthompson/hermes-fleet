@@ -199,6 +199,9 @@ activity even if the response is lost. `outbox` has pending, sent and failed sta
   queued durably; the task becomes ready only after its fingerprinted worker has exited.
   Core's immutable spawn history preserves this guard even after terminal cleanup clears a run's PID.
   A newer Stop cancels that pending resume. Newer follow-ups are retained together while teardown waits.
+  Its fence commits before core is called, so a core failure cannot revive an older instruction.
+  Startup and normal ticks prioritize queued Stops for owned work; saved resumes also check for
+  newer Stops beyond the current inbox batch before making a task executable.
   Core comments and completion receipts retain each instruction's identity across recovery and ingress retries.
   Repeated Stop cycles can enter core triage. A newer human instruction reopens Stop-caused triage
   through core's specification API, preserving recurrence counters and parent gating. Other triage
