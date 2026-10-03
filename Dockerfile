@@ -26,13 +26,24 @@ RUN set -eux; \
     rm -rf "/tmp/${archive}" "/tmp/gh_${GH_VERSION}_linux_amd64"; \
     test "$(gh --version | awk 'NR==1{print $3}')" = "${GH_VERSION}"
 # Agent images stage uv under the pm runtime dir and do not put it on PATH.
+# Upstream removed the honcho extra. Install the SDK directly and bake the
+# catalog plugin the agent pin names, or memory.provider=honcho has no code.
 RUN cd /opt/hermes \
     && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
     && test -x "$UV" \
-    && "$UV" export --frozen --no-dev --no-emit-project --extra honcho --output-file /tmp/hermes-honcho-requirements.txt \
-    && "$UV" pip install --python /opt/hermes/.venv/bin/python --requirement /tmp/hermes-honcho-requirements.txt \
-    && rm -f /tmp/hermes-honcho-requirements.txt \
+    && "$UV" pip install --python /opt/hermes/.venv/bin/python 'honcho-ai==2.2.0' \
     && /opt/hermes/.venv/bin/python -c "from importlib.metadata import version; import honcho; assert version('honcho-ai') == '2.2.0'"
+RUN set -eux; \
+    sha=f014a64306bac21f233f51a8e5cddf94a704f62d; \
+    archive=/tmp/honcho-plugin.tar.gz; \
+    curl -fsSL --retry 3 "https://github.com/plastic-labs/honcho/archive/${sha}.tar.gz" -o "$archive"; \
+    printf '%s  %s\n' "8694fbf31c8a158eb85d10c12fb161059d787421ee644848d492aa11cf4b12c0" "$archive" | sha256sum -c -; \
+    mkdir -p /tmp/honcho-plugin /opt/hermes/plugins/memory/honcho; \
+    tar -xzf "$archive" -C /tmp/honcho-plugin; \
+    cp -a "/tmp/honcho-plugin/honcho-${sha}/hermes-plugin-honcho/." /opt/hermes/plugins/memory/honcho/; \
+    rm -rf "$archive" /tmp/honcho-plugin; \
+    test -f /opt/hermes/plugins/memory/honcho/__init__.py; \
+    /opt/hermes/.venv/bin/python -c "from pathlib import Path; text=Path('/opt/hermes/plugins/memory/honcho/__init__.py').read_text(); assert 'MemoryProvider' in text or 'register_memory_provider' in text"
 COPY package.json package-lock.json /opt/coding-clis/
 RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no-fund \
     && node /opt/coding-clis/node_modules/@anthropic-ai/claude-code/install.cjs \
