@@ -50,19 +50,6 @@
       ]
     },
     {
-      "id": "linear-agent",
-      "target": "standalone_public_plugin",
-      "default_enabled": false,
-      "conditions": [
-        "external_deployment_policy",
-        "runtime_read_only_policy",
-        "synthetic_examples_only",
-        "independent_tests",
-        "license_review",
-        "no_deployment_identity"
-      ]
-    },
-    {
       "id": "linear",
       "target": "standalone_public_plugin",
       "default_enabled": false,

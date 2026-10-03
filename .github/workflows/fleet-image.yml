@@ -272,7 +272,6 @@ jobs:
           assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
           assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
-          timeout 15s docker run --rm --network none --user root --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent,readonly" --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
@@ -546,7 +545,6 @@ jobs:
           assert acp_review.assert_reviewed_claude_code_version() == os.environ["EXPECTED_CLAUDE_CODE_VERSION"]
           assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
-          timeout 15s docker run --rm --network none --user root --mount "type=bind,src=${GITHUB_WORKSPACE}/plugins/linear-agent,dst=/opt/hermes/plugins/linear-agent,readonly" --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-linear-policy-trust.py
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 

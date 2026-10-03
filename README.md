@@ -53,15 +53,9 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 
 Optional, **disabled by default**. They exist so isolation does not mean a dumb agent.
 
-### Linear Agent
+### Linear
 
-Multi-agent work tracking without a shared inbox. Each profile is a Linear worker with its own identity. The image does not ship the worker. It does not ship routes, workspace names, or OAuth bindings. The overlay bind-mounts that same generic worker, read-only, over the image path, and mounts root-owned policy maps. The mount is attested code, not policy. Enable without the mount or without policy and the process fails closed before OAuth.
-
-The principal assigns work in Linear. Specialists pick up the cards they own. They do not read each other's queues. Stop containment stays durable across a bounce. Policy and plugin settings must agree on profile, workspace, vault item binding, and rollout scope. Details: [`docs/linear-agent.md`](docs/linear-agent.md).
-
-### Linear (replacement, staged and disabled)
-
-`plugins/linear/` is the smaller replacement for the Linear Agent worker. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Bound ordinary-chat work uses core's generation-fenced Stop API; a receipt does not prove external effects ended. It remains disabled until an operator enables it with a reviewed overlay settings block; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
+`plugins/linear/` provides native Linear tracking and execution through Kanban. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Bound ordinary-chat work uses core's generation-fenced Stop API; a receipt does not prove external effects ended. It remains disabled until an operator enables it with a reviewed overlay settings block; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
 
 ### Browser handoff
 
@@ -163,7 +157,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`reference/`](reference/) — vision, principles, invariants, product spec, jobs
 - [`docs/overlay-repository.md`](docs/overlay-repository.md) — overlay repo layout, config layers, sample files
 - [`docs/image-release.md`](docs/image-release.md) — image bake, scan, and publication
-- [`docs/linear-agent.md`](docs/linear-agent.md) — Linear worker plugin (policy stays external)
+- [`plugins/linear/README.md`](plugins/linear/README.md) — native Linear and Kanban integration
 - [`docs/perplexity.md`](docs/perplexity.md) — optional search provider
 - [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (staged, disabled)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
