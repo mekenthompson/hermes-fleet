@@ -2082,6 +2082,9 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.recover()
                 self.bridge.tick(inbox)
                 self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+                with self.bridge.kanban.conn() as conn:
+                    notes = "\n".join(c.body for c in kb.list_comments(conn, task))
+                    self.assertEqual(notes.count("Continue the same work"), 1 if action == "prompted" else 0)
                 self.assertEqual(self.linear.state(issue_id), "In Progress")
                 self.assertFalse(self.bridge.store.get(issue_id)["stop_requested_at"])
                 with sqlite3.connect(inbox) as db:
@@ -2176,6 +2179,60 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Now resume explicitly"))
             self.assertEqual(self.bridge.kanban.get(task).status, "ready")
             self.assertEqual(self.task_id(), task)
+
+    def test_recovery_deduplicates_completed_followups_before_pending_ingress_replay(self):
+        from linear_ingress_fixture import IngressStore, Route
+        self.bind_identity()
+        inbox = self.dir / "queued-followup-ingress.db"
+        producer = IngressStore(inbox)
+        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
+        with self.stopped_worker() as (process, task, first):
+            second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope", activity_id="act-2")
+            for delivery, event in (("first", first), ("second", second)):
+                producer.enqueue(route, delivery, json.dumps(event).encode())
+            with sqlite3.connect(inbox) as db:
+                db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
+            self.bridge.drain_ingress(inbox)
+            process.terminate(); process.wait(timeout=10)
+            self.bridge = self.make_bridge()
+            self.bind_identity()
+            self.bridge.recover()
+            self.bridge.tick(inbox)
+            self.bridge = self.make_bridge()
+            self.bind_identity()
+            self.bridge.recover()
+            self.bridge.tick(inbox)
+            with self.bridge.kanban.conn() as conn:
+                notes = "\n".join(c.body for c in kb.list_comments(conn, task))
+            self.assertEqual(notes.count("Resume this task"), 1)
+            self.assertEqual(notes.count("Use the updated scope"), 1)
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+            self.assertEqual(self.task_id(), task)
+            with sqlite3.connect(inbox) as db:
+                self.assertEqual(db.execute("SELECT status FROM deliveries ORDER BY delivery_id").fetchall(),
+                                 [("imported",), ("imported",)])
+
+    def test_newer_prompt_after_uncertain_comment_commit_preserves_each_instruction_once(self):
+        from unittest.mock import patch
+        with self.stopped_worker() as (process, task, first):
+            process.terminate(); process.wait(timeout=10)
+            add = kb.add_comment
+            def lose_reply(*args, **kwargs):
+                add(*args, **kwargs)
+                raise RuntimeError("reply lost after core comment commit")
+            with patch.object(kb, "add_comment", side_effect=lose_reply):
+                with self.assertRaises(RuntimeError): self.deliver(first)
+            self.clock.now += 1
+            second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope")
+            self.deliver(second)
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.deliver(second)
+            with self.bridge.kanban.conn() as conn:
+                notes = "\n".join(c.body for c in kb.list_comments(conn, task))
+            self.assertEqual(notes.count("Resume this task"), 1)
+            self.assertEqual(notes.count("Use the updated scope"), 1)
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
     def test_newer_pending_prompt_preserves_both_instructions_without_retry_duplicates(self):
         from hermes_fleet_linear_plugin.api import LinearError

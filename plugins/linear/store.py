@@ -303,7 +303,9 @@ class Store:
     def followup_captured(self, marker: str) -> bool:
         with self._tx() as db:
             return bool(db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND "
-                                   "json_extract(payload, '$.followup_marker')=? LIMIT 1", (marker,)).fetchone())
+                                   "(json_extract(payload, '$.followup_marker')=? OR EXISTS "
+                                   "(SELECT 1 FROM json_each(outbox.payload, '$.followup_markers') WHERE value=?)) "
+                                   "LIMIT 1", (marker, marker)).fetchone())
     def fence_scope(self, issue_id: str, reason: str, *, at: float) -> None:
         """Persist a permanent authorization denial without deleting work or its evidence."""
         with self._tx() as db:
