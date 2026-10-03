@@ -26,13 +26,15 @@ RUN set -eux; \
     rm -rf "/tmp/${archive}" "/tmp/gh_${GH_VERSION}_linux_amd64"; \
     test "$(gh --version | awk 'NR==1{print $3}')" = "${GH_VERSION}"
 # Honcho tooling is owned by Fleet, independent of optional Agent extras.
+# These hashed release locks use their reviewed cutoff instead of Agent
+# source's older exclude-newer date; no other Agent packages are resolved.
 COPY release/honcho-sdk-requirements.txt release/honcho-requirements.txt /tmp/honcho-locks/
 RUN cd /opt/hermes \
     && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
     && test -x "$UV" \
-    && "$UV" pip install --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-10-03T23:59:59Z --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
     && "$UV" venv --python /opt/hermes/.venv/bin/python /opt/honcho-cli \
-    && "$UV" pip install --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-10-03T23:59:59Z --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
     && ln -s /opt/honcho-cli/bin/honcho /usr/local/bin/honcho \
     && rm -rf /tmp/honcho-locks
 COPY --chmod=0755 scripts/verify-honcho-runtime.py /opt/hermes-fleet/bin/verify-honcho-runtime.py
