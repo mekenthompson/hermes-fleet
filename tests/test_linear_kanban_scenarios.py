@@ -198,6 +198,45 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.bridge.store.get(ISSUE)["run_generation"], 8)
 
+    def test_desktop_handler_without_local_service_uses_single_gateway_owner(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_fleet_linear_plugin import transport
+        home = self.dir / "profiles" / "alpha"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("{}\n")
+        class Registration:
+            def get_config(self, key, default=None):
+                return True if key == "enabled" else default
+            def register_tool(self, **kwargs): self.tool = kwargs["handler"]
+            def register_hook(self, *args): pass
+            def register_profile_service(self, *args): self.service = args
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.dir)}):
+            self.bridge.kanban = Kanban(profile="alpha", profile_home=home)
+            token = set_hermes_home_override(home)
+            server = None
+            try:
+                server = transport.Server(home, "alpha", lambda args, context: chat.handle(self.bridge, args, context),
+                                          lambda session: chat.on_turn_end(self.bridge, session))
+                client = Registration()
+                plugin.register(client)
+                context = SimpleNamespace(profile="alpha", platform="api_server", session_key="desktop-owner",
+                                          session_id="desktop-transcript", run_generation=12)
+                reply = json.loads(client.tool({"action": "start", "issue": "ABC-1"}, context))
+                self.assertTrue(reply["ok"], reply)
+                row = self.bridge.store.get(ISSUE)
+                self.assertEqual((row["owner_ref"], row["run_generation"], row["task_id"]), ("desktop-owner", 12, None))
+                with self.bridge.kanban.conn() as conn:
+                    self.assertEqual(kb.list_tasks(conn), [])
+                foreign = SimpleNamespace(**{**vars(context), "session_key": "other-chat"})
+                refusal = json.loads(client.tool({"action": "start", "issue": "ABC-1"}, foreign))
+                self.assertFalse(refusal["ok"])
+                self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "desktop-owner")
+            finally:
+                if server is not None: server.close()
+                reset_hermes_home_override(token)
+
     # -- helpers -------------------------------------------------------------
     def deliver(self, event: dict) -> None:
         self.bridge.handle_webhook(event)

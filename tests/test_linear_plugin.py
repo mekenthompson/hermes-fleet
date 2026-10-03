@@ -26,7 +26,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Actor/workspace binding and mutation-refusal regressions require explicit safety branches.
 # Durable recovery and exact credential binding retain explicit, readable safety branches.
 # Same-task triage recovery and durable blocker receipts use core's supported APIs.
-BUDGET = 2900
+# Desktop/API transport adds a bounded profile-private IPC surface; one gateway owns execution.
+BUDGET = 3100
 
 
 class FakeContext:
@@ -112,7 +113,7 @@ class LinearPluginUnitTests(unittest.TestCase):
         self.assertLessEqual(lines, BUDGET)
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
                          ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "oauth.py", "plugin.yaml",
-                          "store.py"])
+                          "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:
         cid = "0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b"
