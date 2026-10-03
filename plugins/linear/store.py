@@ -286,6 +286,9 @@ class Store:
         with self._tx() as db:
             work = db.execute("SELECT * FROM work WHERE issue_id=? AND pending_resume IS NOT NULL", (issue_id,)).fetchone()
             if not work or not self._effect_admitted(db, issue_id): return False
+            if json.loads(work["pending_resume"]).get("stamp") != stamp or (
+                    work["origin"] == "kanban" and work["stop_requested_at"] and
+                    stamp <= work["stop_requested_at"]): return False
             if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 body = json.dumps({**payload, "work_owner": work["ownership_id"], "enqueued_at": at})
