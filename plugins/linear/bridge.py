@@ -149,14 +149,16 @@ class Kanban:
             self._await_worker_exit(conn, task_id)
             return self.kb.unblock_task(conn, task_id)
     def _await_worker_exit(self, conn, task_id: str) -> None:
-        from hermes_cli.kanban_db_dispatch import _worker_alive, _process_fingerprint
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
         for pid, fingerprint in conn.execute(
                 "SELECT worker_pid, worker_started_at FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL",
                 (task_id,)):
             pid = int(pid)
-            if self.kb._pid_alive(pid) and _process_fingerprint(pid) is None:
+            if not self.kb._pid_alive(pid): continue
+            observed = _process_fingerprint(pid)
+            if not isinstance(observed, str) or "|" not in observed:
                 raise LinearError("Core worker identity is unavailable; retry the saved resume transition")
-            if _worker_alive(pid, fingerprint):
+            if not isinstance(fingerprint, str) or "|" not in fingerprint or observed == fingerprint:
                 raise LinearError("Prior core worker is still exiting; retry the saved resume transition")
     def comment(self, task_id: str, body: str) -> None:
         with self.conn() as conn:
