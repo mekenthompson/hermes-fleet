@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 import asyncio
+from contextlib import contextmanager
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2110,6 +2112,64 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge()
         self.bridge.recover()
         self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+
+    @contextmanager
+    def stopped_worker(self):
+        self.delegate()
+        task = self.task_id()
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.bridge.kanban.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, task, claimer=kb._claimer_id()))
+                dispatch._set_worker_pid(conn, task, process.pid)
+            self.clock.now += 1
+            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.clock.now += 1
+            yield process, task, self.linear.session_event("prompted", ISSUE, "s-1", body="Resume this task")
+        finally:
+            if process.poll() is None: process.terminate()
+            process.wait(timeout=10)
+
+    def test_pending_resume_waits_for_stopped_worker_exit_across_recovery(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            with self.bridge.kanban.conn() as conn:
+                before = len([e for e in kb.list_events(conn, task) if e.kind == "commented"])
+            with self.assertRaises(LinearError): self.deliver(event)
+            self.bridge = self.make_bridge()
+            self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            self.assertIsNone(process.poll())
+            with self.bridge.kanban.conn() as conn:
+                self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before)
+            process.terminate(); process.wait(timeout=10)
+            self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            self.bridge.recover()
+            with self.bridge.kanban.conn() as conn:
+                self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before + 1)
+
+    def test_recycled_stopped_worker_pid_does_not_hold_resume_or_signal_stranger(self):
+        from unittest.mock import patch
+        with self.stopped_worker() as (process, task, event):
+            with patch.object(dispatch, "_process_fingerprint", return_value="different-instance|0"):
+                self.deliver(event)
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+            self.assertIsNone(process.poll())
+
+    def test_unreadable_stopped_worker_identity_keeps_resume_pending(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            with patch.object(dispatch, "_process_fingerprint", return_value=None):
+                with self.assertRaises(LinearError): self.deliver(event)
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            self.assertIsNone(process.poll())
 
 
     def test_task_creation_crash_recovers_mapping_and_existing_terminal_evidence_once(self) -> None:

@@ -146,9 +146,22 @@ class Kanban:
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input")
     def unblock(self, task_id: str) -> bool:
         with self.conn() as conn:
+            self._await_worker_exit(conn, task_id)
             return self.kb.unblock_task(conn, task_id)
+    def _await_worker_exit(self, conn, task_id: str) -> None:
+        from hermes_cli.kanban_db_dispatch import _worker_alive, _process_fingerprint
+        for pid, fingerprint in conn.execute(
+                "SELECT worker_pid, worker_started_at FROM task_runs WHERE task_id=? AND worker_pid IS NOT NULL",
+                (task_id,)):
+            pid = int(pid)
+            if self.kb._pid_alive(pid) and _process_fingerprint(pid) is None:
+                raise LinearError("Core worker identity is unavailable; retry the saved resume transition")
+            if _worker_alive(pid, fingerprint):
+                raise LinearError("Prior core worker is still exiting; retry the saved resume transition")
     def comment(self, task_id: str, body: str) -> None:
         with self.conn() as conn:
+            task = self.kb.get_task(conn, task_id)
+            if task and task.status == "blocked": self._await_worker_exit(conn, task_id)
             self.kb.add_comment(conn, task_id, "linear", body)
     def archive(self, task_id: str) -> None:
         with self.conn() as conn:
