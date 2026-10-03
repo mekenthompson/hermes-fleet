@@ -84,6 +84,56 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(task.assignee, "default")
         self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
 
+    def test_standalone_chat_uses_default_context_and_retains_stop_generation(self):
+        from hermes_cli.profiles import get_profile_dir
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                       Context("chat-owner", "chat-transcript", 7, profile="default")))
+        self.assertTrue(reply["ok"], reply)
+        row = self.bridge.store.get(ISSUE)
+        self.assertEqual(row["origin"], "chat")
+        self.assertEqual(row["run_generation"], 7)
+        self.assertIsNone(row["task_id"])
+
+    def test_same_executor_name_from_foreign_home_cannot_claim_chat(self):
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        token = set_hermes_home_override(str(self.dir))
+        try:
+            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                           Context("foreign", "foreign-transcript", 7, profile="default")))
+        finally:
+            reset_hermes_home_override(token)
+        self.assertFalse(reply["ok"])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+
+    def test_standalone_chat_without_generation_explains_stop_limit(self):
+        from hermes_cli.profiles import get_profile_dir
+        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
+        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                       Context("chat-owner", "chat-transcript", profile="default")))
+        self.assertTrue(reply["ok"])
+        self.assertIn("Linear Stop cannot interrupt", reply["message"])
+        self.assertIsNone(self.bridge.store.get(ISSUE)["run_generation"])
+
+    def test_named_chat_matches_its_scoped_home_and_retains_generation(self):
+        from unittest.mock import patch
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        home = self.dir / "profiles" / "alpha"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("{}\n")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.dir)}):
+            self.bridge.kanban = Kanban(profile="alpha", profile_home=home)
+            token = set_hermes_home_override(home)
+            try:
+                reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                               Context("named-owner", "named-transcript", 8, profile="alpha")))
+            finally:
+                reset_hermes_home_override(token)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.bridge.store.get(ISSUE)["run_generation"], 8)
+
     # -- helpers -------------------------------------------------------------
     def deliver(self, event: dict) -> None:
         self.bridge.handle_webhook(event)

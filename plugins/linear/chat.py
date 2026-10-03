@@ -33,9 +33,10 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     session_key = str(getattr(invocation_context, "session_key", "") or "")
     session_id = str(getattr(invocation_context, "session_id", "") or session_key)
     profile = str(getattr(invocation_context, "profile", "") or "")
+    bound = bridge.chat_profile_matches(profile)
     generation = getattr(invocation_context, "run_generation", None)
-    generation = generation if profile == bridge.profile and type(generation) is int and generation > 0 else None
-    if profile != bridge.profile:
+    generation = generation if bound and type(generation) is int and generation > 0 else None
+    if not bound:
         return _reply(False, "linear needs a tool turn bound to this profile.")
     if not session_key:
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
@@ -151,7 +152,10 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
     if not bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id")) or not bridge.project_update(
             session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"]):
         return _reply(False, "Specialist authorization is fenced or unavailable; tracking was not fully captured.")
-    return _reply(True, f"Tracking {ident} from this chat: {url}")
+    message = f"Tracking {ident} from this chat: {url}"
+    if generation is None:
+        message += " Linear Stop cannot interrupt this chat adapter; use the chat's own Stop control."
+    return _reply(True, message)
 
 def on_turn_end(bridge: Bridge | None, session_id: str) -> None:
     """Every finished turn restarts the quiet period for that session's project updates."""

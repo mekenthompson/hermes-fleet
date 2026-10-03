@@ -16,6 +16,10 @@ Kanban uses the executor name that resolves to the service's own home. A standal
 container uses `default`; a named-profile gateway uses its matching named profile.
 Activation refuses an executor that resolves to a different home.
 
+Chat tools accept that same executor identity only from the service's exact home.
+Adapters without a core chat-run generation can track work, but cannot be interrupted
+by Linear Stop. Start makes that limitation explicit; use the chat's Stop control.
+
 ## Enable it
 
 Add one block to the profile's config, in the deployment overlay. The values below are synthetic.
