@@ -2171,6 +2171,26 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
             self.assertIsNone(process.poll())
 
+    def test_fluctuating_worker_identity_cannot_release_a_live_stopped_worker(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self.stopped_worker() as (process, task, event):
+            with self.bridge.kanban.conn() as conn:
+                fingerprint = conn.execute("SELECT worker_started_at FROM task_runs WHERE task_id=? AND worker_pid=?",
+                                           (task, process.pid)).fetchone()[0]
+            with patch.object(dispatch, "_process_fingerprint", side_effect=[fingerprint, None]) as probe:
+                with self.assertRaises(LinearError): self.deliver(event)
+                self.assertEqual(probe.call_count, 1)
+            with patch.object(dispatch, "_process_fingerprint", side_effect=[fingerprint, None]) as probe:
+                with self.assertRaises(LinearError): self.bridge.kanban.unblock(task)
+                self.assertEqual(probe.call_count, 1)
+            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
+            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
+            self.assertIsNone(process.poll())
+            process.terminate(); process.wait(timeout=10)
+            self.bridge.recover()
+            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
+
 
     def test_task_creation_crash_recovers_mapping_and_existing_terminal_evidence_once(self) -> None:
         from unittest.mock import patch
