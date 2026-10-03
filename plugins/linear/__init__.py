@@ -255,7 +255,8 @@ def register(ctx: Any) -> None:
         api.token = token_provider(settings, home)  # identity settings validated before credentials
         await asyncio.to_thread(api.viewer_id)  # refuse before state, recovery, or service admission
         bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
-                        await asyncio.to_thread(Kanban, settings.get("board")), profile=runtime.profile_name,
+                        await asyncio.to_thread(Kanban, settings.get("board"), profile=runtime.profile_name,
+                                                profile_home=home), profile=runtime.profile_name,
                         settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge

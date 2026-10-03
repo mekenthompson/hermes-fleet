@@ -75,6 +75,15 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.injected.append((key, text))
         return self.inject_ok
 
+    def test_standalone_delegation_is_eligible_for_real_core_dispatch(self):
+        from hermes_cli.profiles import get_profile_dir
+        self.bridge.kanban = Kanban(profile="container-label", profile_home=get_profile_dir("default"))
+        self.delegate()
+        row = self.bridge.store.get(ISSUE)
+        task = self.bridge.kanban.get(row["task_id"])
+        self.assertEqual(task.assignee, "default")
+        self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
+
     # -- helpers -------------------------------------------------------------
     def deliver(self, event: dict) -> None:
         self.bridge.handle_webhook(event)
