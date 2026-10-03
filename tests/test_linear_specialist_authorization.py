@@ -135,7 +135,7 @@ class FakeKanban:
     def subscribe(self, task_id, issue_id):
         self.subscriptions.append((task_id, issue_id))
 
-    def comment(self, task_id, body):
+    def comment(self, task_id, body, *, marker=""):
         self.comments.append((task_id, body))
 
     def unblock(self, task_id):

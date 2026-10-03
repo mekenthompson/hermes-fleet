@@ -3,6 +3,7 @@ The Linear delegate is rechecked before writes and while work is active."""
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import re
@@ -166,11 +167,17 @@ class Kanban:
                 raise LinearError("Core worker identity is unavailable; retry the saved resume transition")
             if not isinstance(fingerprint, str) or "|" not in fingerprint or observed == fingerprint:
                 raise LinearError("Prior core worker is still exiting; retry the saved resume transition")
-    def comment(self, task_id: str, body: str) -> None:
+    def comment(self, task_id: str, body: str, *, marker: str = "") -> None:
         with self.conn() as conn:
             task = self.kb.get_task(conn, task_id)
             if task and task.status == "blocked": self._await_worker_exit(conn, task_id)
-            self.kb.add_comment(conn, task_id, "linear", body)
+            author = "linear:" + hashlib.sha256(marker.encode()).hexdigest() if marker else "linear"
+            if marker:
+                for comment in self.kb.list_comments(conn, task_id):
+                    if comment.author != author: continue
+                    if comment.body != body.strip(): raise LinearError("Applied follow-up changed; reconcile the task", retryable=False)
+                    return
+            self.kb.add_comment(conn, task_id, author, body)
     def archive(self, task_id: str) -> None:
         with self.conn() as conn:
             self.kb.archive_task(conn, task_id)
@@ -587,13 +594,19 @@ class Bridge:
             intent = json.loads(current["pending_resume"]) if current.get("pending_resume") else None
             incoming = note
             key = f"{session_id}:{stamp}:{marker or incoming}"
+            if self.store.followup_captured(key): return True
             markers = []
+            messages = []
             if intent and intent.get("kind") == "kanban":
                 markers = intent.get("markers", [f"{intent['session_id']}:{intent['stamp']}:{intent['note']}"])
-                note = intent["note"] + ("\n\n" + note if key not in markers else "")
-            if key not in markers: markers.append(key)
+                messages = intent.get("messages", [{"key": markers[0], "note": intent["note"]}])
+            if key not in markers:
+                markers.append(key)
+                messages.append({"key": key, "note": incoming})
+            note = "\n\n".join(message["note"] for message in messages)
             saved = json.dumps({"kind": "kanban", "note": note, "last_note": incoming, "marker": marker,
-                                "markers": markers, "session_id": session_id, "stamp": stamp, "receipt": receipt})
+                                "markers": markers, "messages": messages, "session_id": session_id,
+                                "stamp": stamp, "receipt": receipt})
             if not self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp,
                                      pending_resume=saved): return False
         with self.store.guard_issue_work(row["issue_id"]) as admitted:
@@ -601,7 +614,8 @@ class Bridge:
             if not admitted or not current: return False
             if current["pending_resume"] != saved: return True  # A newer instruction or Stop superseded this attempt.
             def steer() -> bool:
-                self.kanban.comment(task.id, note)
+                for message in messages:
+                    self.kanban.comment(task.id, message["note"], marker=message["key"])
                 if task.status == "blocked" and not self.kanban.unblock(task.id):
                     latest = self.kanban.get(task.id)
                     if latest and latest.status == "blocked":
@@ -612,7 +626,7 @@ class Bridge:
             return self.store.complete_resume(row["issue_id"], stamp, [
                 ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
                             "source_ms": stamp, "seen": "self", **route}),
-                ("activity", {"issue_id": row["issue_id"], "session_id": session_id,
+                ("activity", {"issue_id": row["issue_id"], "session_id": session_id, "followup_markers": markers,
                               "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
