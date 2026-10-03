@@ -249,12 +249,33 @@ def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
         return
     running: dict[str, Bridge] = {}
+    from . import transport
+
+    def active_home():
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).resolve(strict=True)
 
     def tool(args: dict[str, Any] | None = None, invocation_context: Any = None, **_: Any) -> str:
-        return chat.handle(running.get("bridge"), args or {}, invocation_context)
+        bridge = running.get("bridge")
+        if bridge is not None:
+            return chat.handle(bridge, args or {}, invocation_context)
+        try:
+            return transport.chat_request(active_home(), args or {}, invocation_context)
+        except transport.Unavailable as exc:
+            return chat._reply(False, str(exc))
+        except transport.Uncertain as exc:
+            return chat._reply(False, str(exc))
 
     def on_session_end(session_id: str = "", **_: Any) -> None:
-        chat.on_turn_end(running.get("bridge"), session_id)
+        bridge = running.get("bridge")
+        if bridge is not None:
+            chat.on_turn_end(bridge, session_id)
+        elif session_id:
+            try:
+                home = active_home()
+                transport.request(home, {"op": "turn_end", "home": str(home), "session_id": session_id})
+            except (transport.Unavailable, transport.Uncertain):
+                log.warning("linear: chat turn-end capture unavailable; queued evidence needs reconciliation")
 
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
                       description=chat.SCHEMA["description"], inject_invocation_context=True)
@@ -275,8 +296,12 @@ def register(ctx: Any) -> None:
                         settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge
+        server = None
         try:
             await asyncio.to_thread(bridge.recover, ingress)
+            server = transport.Server(home, runtime.profile_name,
+                                      lambda args, context: chat.handle(bridge, args, context),
+                                      lambda session: chat.on_turn_end(bridge, session))
             while not runtime.stop_event.is_set():
                 try:
                     await asyncio.to_thread(bridge.tick, ingress)
@@ -290,5 +315,7 @@ def register(ctx: Any) -> None:
                     pass
         finally:
             running.pop("bridge", None)
+            if server is not None:
+                await asyncio.to_thread(server.close)
 
     ctx.register_profile_service("linear", service)

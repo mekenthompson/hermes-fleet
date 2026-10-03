@@ -289,3 +289,5 @@ A durable issue fence blocks native and chat replacements until every recorded p
 Unreadable identities, launch windows without a registered PID, and deleted tasks without worker
 receipts stay fenced for reconciliation. Archive/delete closeout queues a durable unfinished
 Blocked status and session error; current Linear ownership and human closure still win at send time.
+
+Desktop/API and gateway chats use the same gateway-owned bridge. A separate desktop/API process forwards its host-bound tool context through a profile-private Unix socket; it does not start another scheduler. If the gateway is unavailable before submission, the tool reports that explicitly. A lost response after submission requires ownership reconciliation before retrying. Restarting a chat cannot replace a missing gateway service.
