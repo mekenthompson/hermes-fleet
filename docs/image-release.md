@@ -46,6 +46,12 @@ release the ACP `opus[1m]` slot is Opus 5.5; the adapter does not offer
 `claude-opus-5-5`. Both preflight and publication verify the provider's exact
 executable and SDK declaration hashes, not only package version strings.
 
+The optional Claude ACP provider declares the `opus[1m]` context window as
+1,000,000 tokens through Agent's `ProviderProfile.get_model_context_length`
+hook. Other logical handles fall back to Agent metadata. Explicit user context
+overrides take precedence. CI discovers the actual plugin against the pinned
+Agent source and checks context resolution, aliases and override precedence.
+
 The native deny list includes `AppifactRepl`, `FetchInboxMessage`, and
 `SubagentHandback`, which are present in the reviewed executable but absent
 from the SDK tool-input union. Review actual executable tools on future bumps;
