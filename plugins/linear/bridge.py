@@ -903,6 +903,9 @@ class Bridge:
                     continue
     def recover(self) -> None:
         """After a restart: Kanban workers are respawned by core; chat work is asked to reconcile."""
+        self._recover_kanban()
+        self._recover_chats()
+    def _recover_kanban(self) -> None:
         for row in self.store.active("kanban"):
             if not row.get("pending_resume"): continue
             try:
@@ -913,6 +916,7 @@ class Bridge:
                                  intent["stamp"], intent["receipt"], intent.get("marker", ""))
             except (LinearError, ValueError, KeyError):
                 continue
+    def _recover_chats(self) -> None:
         for row in self.store.active("chat"):
             if self.store.issue_reconciliation_blocked(row["issue_id"]):
                 continue
@@ -1219,6 +1223,7 @@ class Bridge:
     def tick(self, ingress: Path | None = None) -> None:
         if ingress is not None:
             self.drain_ingress(ingress)
+        self._recover_kanban()
         self.pump_kanban()
         self.recheck()
         self.flush()

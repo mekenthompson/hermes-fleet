@@ -2159,7 +2159,6 @@ class LinearKanbanScenarios(unittest.TestCase):
         with self.bridge.kanban.conn() as conn:
             self.assertFalse(any(e.kind == "specified" for e in kb.list_events(conn, task)))
             self.assertTrue(kb.specify_triage_task(conn, task, author="operator"))
-        self.bridge.recover()
         self.bridge.tick()
         self.assertEqual(self.tasks(), [(task, "ready")])
         self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
