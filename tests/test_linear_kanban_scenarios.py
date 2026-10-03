@@ -358,6 +358,31 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.types(), ["response", "response"])
         self.assertTrue(all("Already in progress from Hermes chat" in a["content"]["body"] for a in self.linear.activities))
 
+    def test_chat_closeout_receipt_fences_late_native_echo_and_prompt_across_restart(self):
+        from unittest.mock import patch
+        for action in ("done", "release"):
+            with self.subTest(action=action):
+                self.setUp()
+                self.assertTrue(self.chat("start")["ok"])
+                old_echo = self.linear.session_event("created", ISSUE, "s-echo", creator=None)
+                old_prompt = self.linear.session_event("prompted", ISSUE, "s-echo", body="Older instruction")
+                self.clock.now += 1
+                with patch.object(self.bridge, "flush", return_value=0):
+                    self.assertTrue(self.chat(action, evidence="https://example.invalid/merged-result")["ok"])
+                self.assertIsNone(self.bridge.store.get(ISSUE))
+                self.bridge = self.make_bridge()
+                self.bridge.recover()
+                self.bridge.handle_webhook(old_echo)
+                self.bridge.handle_webhook(old_prompt)
+                self.assertEqual(self.tasks(), [])
+                self.assertIsNone(self.bridge.store.get(ISSUE))
+                self.bridge.flush()
+                self.bridge.handle_webhook(old_echo)
+                self.assertEqual(self.tasks(), [])
+                self.clock.now += 1
+                self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Explicit new work"))
+                self.assertEqual(len(self.tasks()), 1)
+
     def test_follow_up_is_forwarded_to_the_owner(self) -> None:
         self.delegate()
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Please also update the changelog"))

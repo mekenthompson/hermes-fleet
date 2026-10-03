@@ -177,6 +177,13 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT * FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
         return dict(row) if row else None
+    def chat_closeout_ms(self, issue_id: str) -> float:
+        """Existing terminal receipts fence pre-closeout chat delegation echoes and prompts."""
+        with self._tx() as db:
+            row = db.execute("SELECT MAX(json_extract(payload, '$.enqueued_at')) FROM outbox WHERE kind='status' "
+                             "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.terminal')=1 "
+                             "AND json_extract(payload, '$.session_key') IS NOT NULL", (issue_id,)).fetchone()
+            return float(row[0] or 0) * 1000
     def put(self, issue_id: str, origin: str, owner_ref: str, *, task_id: str | None = None,
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
