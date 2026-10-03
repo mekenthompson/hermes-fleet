@@ -33,7 +33,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     session_key = str(getattr(invocation_context, "session_key", "") or "")
     session_id = str(getattr(invocation_context, "session_id", "") or session_key)
     profile = str(getattr(invocation_context, "profile", "") or "")
-    bound = bridge.chat_profile_matches(profile)
+    platform = str(getattr(invocation_context, "platform", "") or "")
+    bound = bridge.chat_profile_matches(profile, platform=platform)
     generation = getattr(invocation_context, "run_generation", None)
     generation = generation if bound and type(generation) is int and generation > 0 else None
     if not bound:
