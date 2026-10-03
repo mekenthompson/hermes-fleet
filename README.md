@@ -109,7 +109,7 @@ The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pi
 - UID/GID 1000 for the `hermes` account so profile containers can start with no-new-privileges
 - GitHub CLI 2.98.0 from the official release tarball
 - 1Password CLI 2.40.0 from its digest-pinned official image (no vault config)
-- The Agent `honcho` extra, with no workspace identifiers
+- Honcho Python SDK 2.5.1 in the Agent runtime and Honcho CLI 0.2.0 in an isolated environment, installed from hashed dependency locks with no workspace identifiers
 - Codex, Grok, OpenCode, and Claude Code from the committed lockfile
 - The optional plugins listed above
 - Optional `tooling-policy-hook` binary for overlay install policy

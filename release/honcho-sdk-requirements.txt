@@ -1,0 +1,7 @@
+# SDK dependencies are supplied by the Agent runtime.
+honcho-ai==2.5.1 \
+    --hash=sha256:6169731c76f83298afcf080057ba6774eb679e5aab1de4b74bb3a271e1a9dde3 \
+    --hash=sha256:ef354c086b05d911b8f9db14cc552488ffd332e57947ee0378bbb3657f51cd7e
+    # via
+    #   -r release/honcho-requirements.in
+    #   honcho-cli

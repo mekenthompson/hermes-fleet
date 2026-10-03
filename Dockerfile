@@ -25,14 +25,18 @@ RUN set -eux; \
     install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
     rm -rf "/tmp/${archive}" "/tmp/gh_${GH_VERSION}_linux_amd64"; \
     test "$(gh --version | awk 'NR==1{print $3}')" = "${GH_VERSION}"
-# Agent images stage uv under the pm runtime dir and do not put it on PATH.
-# Upstream removed the honcho extra. Install the SDK directly and bake the
-# catalog plugin the agent pin names, or memory.provider=honcho has no code.
+# Honcho tooling is owned by Fleet, independent of optional Agent extras.
+COPY release/honcho-sdk-requirements.txt release/honcho-requirements.txt /tmp/honcho-locks/
 RUN cd /opt/hermes \
     && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
     && test -x "$UV" \
-    && "$UV" pip install --python /opt/hermes/.venv/bin/python 'honcho-ai==2.2.0' \
-    && /opt/hermes/.venv/bin/python -c "from importlib.metadata import version; import honcho; assert version('honcho-ai') == '2.2.0'"
+    && "$UV" pip install --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
+    && "$UV" venv --python /opt/hermes/.venv/bin/python /opt/honcho-cli \
+    && "$UV" pip install --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
+    && ln -s /opt/honcho-cli/bin/honcho /usr/local/bin/honcho \
+    && rm -rf /tmp/honcho-locks
+COPY --chmod=0755 scripts/verify-honcho-runtime.py /opt/hermes-fleet/bin/verify-honcho-runtime.py
+RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-runtime.py
 RUN set -eux; \
     sha=f014a64306bac21f233f51a8e5cddf94a704f62d; \
     archive=/tmp/honcho-plugin.tar.gz; \
