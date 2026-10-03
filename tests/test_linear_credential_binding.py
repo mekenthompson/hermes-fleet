@@ -304,7 +304,6 @@ class CredentialBindingTests(unittest.TestCase):
             with lock:
                 requests.setdefault(local.label, []).append((kind, credential))
             if kind == "identity":
-                barrier.wait(timeout=10)
                 return response({"viewer": {"id": "app-a"}, "organization": {"id": "org-a"}})
             return response({"issueUpdate": {"success": True}})
 
@@ -312,6 +311,7 @@ class CredentialBindingTests(unittest.TestCase):
 
         def run(label):
             local.label, local.calls = label, 0
+            barrier.wait(timeout=10)  # callers race admission; requests serialize for quota observation
             client.update_issue(label, {"stateId": "started"})
             with lock:
                 counts[label] = local.calls
@@ -329,7 +329,6 @@ class CredentialBindingTests(unittest.TestCase):
     def test_concurrent_401_refresh_does_not_change_another_verified_call(self):
         local = threading.local()
         barrier = threading.Barrier(2)
-        refreshed = threading.Event()
         requests, counts = {}, {}
         lock = threading.Lock()
 
@@ -348,12 +347,6 @@ class CredentialBindingTests(unittest.TestCase):
             with lock:
                 requests.setdefault(local.label, []).append((kind, credential))
             if kind == "identity":
-                if local.invalidations == 0:
-                    barrier.wait(timeout=10)
-                    if local.label == "right":
-                        self.assertTrue(refreshed.wait(timeout=10))
-                else:
-                    refreshed.set()
                 return response({"viewer": {"id": "app-a"}, "organization": {"id": "org-a"}})
             if local.label == "left" and local.invalidations == 0:
                 return 401, {}, b"{}"
@@ -363,6 +356,7 @@ class CredentialBindingTests(unittest.TestCase):
 
         def run(label):
             local.label, local.calls, local.invalidations = label, 0, 0
+            barrier.wait(timeout=10)  # refresh and its verified retry complete before the next caller
             client.update_issue(label, {"stateId": "started"})
             with lock:
                 counts[label] = (local.calls, local.invalidations)

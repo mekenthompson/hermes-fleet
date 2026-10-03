@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from . import chat
-from .api import ENDPOINT, LinearAPI, LinearError
+from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms
 from .oauth import token_provider
 from .store import Store
@@ -333,9 +333,19 @@ def register(ctx: Any) -> None:
         home = Path(runtime.profile_home)
         api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
                              specialist_scope=settings.get("specialist_scope"),
+                             rate_limit_path=Path(str(settings.get("state_database") or home / "linear" / "state.db") + ".rate-limit.json"),
                              endpoint=settings.get("api_url") or ENDPOINT)
         api.token = token_provider(settings, home)  # identity settings validated before credentials
-        await asyncio.to_thread(api.viewer_id)  # refuse before state, recovery, or service admission
+        while True:
+            try:
+                await asyncio.to_thread(api.viewer_id)  # refuse before state, recovery, or service admission
+                if api.clock() < api.paused_until: raise RateLimited(api.paused_until)
+                break
+            except RateLimited as exc:
+                try:
+                    await asyncio.wait_for(runtime.stop_event.wait(), timeout=max(0.01, exc.until - api.clock()))
+                    return
+                except asyncio.TimeoutError: pass
         bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
                         await asyncio.to_thread(Kanban, settings.get("board"), profile=runtime.profile_name,
                                                 profile_home=home), profile=runtime.profile_name,
