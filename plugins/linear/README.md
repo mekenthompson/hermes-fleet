@@ -232,6 +232,20 @@ specialist_scope:
   allowed_requester_ids: [user-id]
 ```
 
+To cover every team and project in the bound organization, including new teams,
+new projects, and issues without a project, use this explicit form instead:
+
+```yaml
+specialist_scope:
+  all_teams: true
+  all_projects: true
+  allowed_requester_ids: [user-id]
+```
+
+Both flags must be exactly `true`. Omitting a list, mixing forms, or leaving the
+requester list empty is refused. Organization-wide scope keeps app/workspace,
+issue creator, session requester, and prompt actor authorization checks.
+
 This is separate from the immutable app/workspace identity. The client resolves
 issues, Agent Sessions and prompt activities through Linear before admitting
 work, and rechecks the owning issue before every effect. A foreign requester,

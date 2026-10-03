@@ -383,17 +383,50 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             {**SCOPE, "extra": ["not-accepted"]},
             {**SCOPE, "allowed_team_ids": []},
             {**SCOPE, "allowed_requester_ids": [" "]},
+            {"all_teams": True, "all_projects": False, "allowed_requester_ids": [USER]},
+            {"all_teams": 1, "all_projects": True, "allowed_requester_ids": [USER]},
+            {"all_teams": True, "all_projects": True, "allowed_requester_ids": []},
+            {**SCOPE, "all_teams": True, "all_projects": True},
         ):
             with self.subTest(scope=scope), self.assertRaises(ValueError):
                 plugin.BoundLinearAPI(lambda: self.fail("credentials must not be read"),
                                       identity={"viewer_id": VIEWER, "organization_id": ORG},
                                       specialist_scope=scope)
 
+    def test_all_teams_and_projects_in_bound_organization_keep_requester_boundary(self):
+        api = self.authority.api(scope={"all_teams": True, "all_projects": True,
+                                       "allowed_requester_ids": [USER]})
+        for project in (None, {"id": "new-project"}):
+            self.authority.issues[ISSUE] = issue_record(team={"id": "new-team"}, project=project)
+            self.assertEqual(api.issue(ISSUE)["id"], ISSUE)
+        self.authority.issues[ISSUE] = issue_record(creator={"id": "foreign-user"}, project=None)
+        with self.assertRaises(LinearError):
+            api.update_issue(ISSUE, {"title": "must not write"})
+        self.assertEqual(self.authority.mutations, [])
+        with self.assertRaises(LinearError):
+            api.graphql("query Arbitrary { organization { id } }")
+        self.authority.organization = "foreign-org"
+        with self.assertRaises(LinearError):
+            api.issue(ISSUE)
+
     def test_arbitrary_graphql_is_refused_without_network_access_in_specialist_mode(self):
         before = len(self.authority.requests)
         with self.assertRaises(LinearError):
             self.api.graphql("query Exfiltrate { users { nodes { id } } }")
         self.assertEqual(len(self.authority.requests), before)
+
+    def test_automatic_session_without_creator_requires_own_app_and_authorized_issue(self):
+        self.authority.sessions[SESSION] = {"id": SESSION, "issue": {"id": ISSUE},
+                                           "creator": None, "appUser": {"id": VIEWER}}
+        self.assertEqual(self.api.agent_session(SESSION)["id"], SESSION)
+        self.authority.sessions[SESSION]["appUser"] = {"id": "foreign-app"}
+        with self.assertRaises(LinearError):
+            self.api.agent_session(SESSION)
+        self.authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        self.authority.issues[ISSUE] = issue_record(creator={"id": "foreign-user"})
+        with self.assertRaises(LinearError):
+            self.api.create_activity("client-id", SESSION, {"type": "thought", "body": "denied"}, issue_id=ISSUE)
+        self.assertEqual(self.authority.mutations, [])
 
     def test_general_mode_keeps_existing_arbitrary_graphql_semantics(self):
         general = self.authority.api(scope=None)
