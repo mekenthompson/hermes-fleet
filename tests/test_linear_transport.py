@@ -59,7 +59,7 @@ class LinearTransportTests(unittest.TestCase):
                 self.assertEqual(seen,[])
             finally:server.close()
 
-    def test_scoped_context_is_carried_into_rpc_handler(self):
+    def test_scoped_context_is_preserved_into_rpc_handler(self):
         scope=contextvars.ContextVar('profile-scope',default='foreign')
         with tempfile.TemporaryDirectory() as tmp:
             home=Path(tmp);token=scope.set('alpha')
