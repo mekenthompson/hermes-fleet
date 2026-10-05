@@ -206,6 +206,77 @@ class LinearAPI:
                               issue_ids: list[str] | None = None) -> None:
         self._create("projectUpdateCreate", "ProjectUpdateCreateInput",
                      {"id": client_id, "projectId": project_id, "body": body})
+    def create_issue(self, client_id: str, team_id: str, title: str, *, description: str | None = None,
+                     project_id: str | None = None, parent_id: str | None = None) -> dict[str, Any]:
+        """Create an issue as the authenticated app. Never assigns or delegates."""
+        fields = {"id": client_id, "teamId": team_id, "title": title, "assigneeId": None, "delegateId": None}
+        if description is not None:
+            fields["description"] = description
+        if project_id is not None:
+            fields["projectId"] = project_id
+        if parent_id is not None:
+            fields["parentId"] = parent_id
+        try:
+            data = self.graphql("mutation IssueCreate($input: IssueCreateInput!) "
+                                "{ issueCreate(input: $input) { success } }", {"input": fields})
+            _require_mutation_success(data, "issueCreate")
+        except LinearError as exc:
+            if not is_duplicate_create_error(exc.errors, client_id):
+                raise
+        issue = self.graphql(
+            "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title url "
+            "team { id key } project { id } parent { id } assignee { id } delegate { id } } }",
+            {"id": client_id}).get("issue")
+        team = (issue or {}).get("team") or {}
+        project = (issue or {}).get("project") or {}
+        parent = (issue or {}).get("parent") or {}
+        if (not isinstance(issue, dict) or issue.get("id") != client_id or issue.get("title") != title
+                or team_id not in {team.get("id"), team.get("key")}
+                or issue.get("assignee") is not None or issue.get("delegate") is not None
+                or (project_id is not None and project.get("id") != project_id)
+                or (parent_id is not None and parent.get("id") != parent_id)):
+            raise LinearError("Linear issue readback does not match the create", retryable=False)
+        return issue
+    def create_project(self, client_id: str, name: str, team_ids: list[str], *,
+                       description: str | None = None) -> dict[str, Any]:
+        """Create a project as the authenticated app. Never sets a lead."""
+        fields: dict[str, Any] = {"id": client_id, "name": name, "teamIds": list(team_ids), "leadId": None}
+        if description is not None:
+            fields["description"] = description
+        try:
+            data = self.graphql("mutation ProjectCreate($input: ProjectCreateInput!) "
+                                "{ projectCreate(input: $input) { success } }", {"input": fields})
+            _require_mutation_success(data, "projectCreate")
+        except LinearError as exc:
+            if not is_duplicate_create_error(exc.errors, client_id):
+                raise
+        project = self.graphql(
+            "query CreatedProject($id: String!) { project(id: $id) { id name url lead { id } teams { nodes { id key } } } }",
+            {"id": client_id}).get("project")
+        teams = {node.get("id") for node in ((project or {}).get("teams") or {}).get("nodes") or []}
+        if (not isinstance(project, dict) or project.get("id") != client_id or project.get("name") != name
+                or project.get("lead") is not None or not set(team_ids) <= teams):
+            raise LinearError("Linear project readback does not match the create", retryable=False)
+        return project
+    def link_issue(self, issue_id: str, related_issue_id: str, relation: str) -> dict[str, Any]:
+        """Link two issues. ``blocked_by`` records the related issue as the blocker."""
+        if relation not in {"blocks", "blocked_by", "related"}:
+            raise LinearError("issue link relation must be blocks, blocked_by, or related", retryable=False)
+        if relation == "blocked_by":
+            issue_id, related_issue_id, kind = related_issue_id, issue_id, "blocks"
+        else:
+            kind = relation
+        data = self.graphql(
+            "mutation IssueRelationCreate($input: IssueRelationCreateInput!) "
+            "{ issueRelationCreate(input: $input) { success issueRelation "
+            "{ id type issue { id } relatedIssue { id } } } }",
+            {"input": {"issueId": issue_id, "relatedIssueId": related_issue_id, "type": kind}})
+        _require_mutation_success(data, "issueRelationCreate")
+        relation_row = (data.get("issueRelationCreate") or {}).get("issueRelation") or {}
+        if (relation_row.get("type") != kind or (relation_row.get("issue") or {}).get("id") != issue_id
+                or (relation_row.get("relatedIssue") or {}).get("id") != related_issue_id):
+            raise LinearError("Linear issue link readback does not match the create", retryable=False)
+        return relation_row
 
 def state_id(issue: dict[str, Any], name: str) -> str:
     """Resolve a workflow state by name on the issue's team (case-insensitive)."""

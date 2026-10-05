@@ -27,7 +27,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Durable recovery and exact credential binding retain explicit, readable safety branches.
 # Same-task triage recovery and durable blocker receipts use core's supported APIs.
 # Desktop/API transport adds a bounded profile-private IPC surface; one gateway owns execution.
-BUDGET = 3100
+# Own-app create and link keep explicit team, parent, assignee, delegate, and lead guards.
+BUDGET = 3300
 
 
 class FakeContext:

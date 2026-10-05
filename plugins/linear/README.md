@@ -109,6 +109,11 @@ attempts)`. The plugin reads pending rows for its profile and marks them `import
 | Delegate moved to someone else (seen on re-read) | task blocked and archived; chat: told to stop | "Reassigned to ..." comment |
 | Human moves the issue to Done or Canceled | task blocked and archived | nothing; the human wins |
 
+Chat can also create an issue or project, or link two existing issues, as this profile's own app.
+Those actions do not assign, delegate, set a lead, or start tracking. The caller supplies a UUID
+and reuses it if the response is lost. Configured `identity.teams` and `identity.projects` are
+checked before the mutation, including a parent issue.
+
 **Done needs evidence.** A GitHub PR link is checked against the exact head and required checks
 before either a Kanban result or chat command marks Linear Done, including projects without a
 configured contract. Set `completion_contracts` to make core enforce that check before Kanban
