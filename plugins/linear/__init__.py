@@ -203,6 +203,41 @@ class BoundLinearAPI(LinearAPI):
         with self._permit_specialist_operation():
             return super().create_project_update(client_id, project_id, body)
 
+    def create_issue(self, client_id, team_id, title, *, description=None, project_id=None, parent_id=None):
+        if self.specialist_scope is not None:
+            raise LinearError("Issue creation is outside specialist scope", retryable=False)
+        self.viewer_id()
+        team = self.graphql("query Team($id: String!) { team(id: $id) { id key } }", {"id": team_id}).get("team")
+        if (not isinstance(team, dict) or not team.get("id") or
+                (self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]))):
+            raise LinearError("Linear team is outside configured scope", retryable=False)
+        if self.identity.get("projects") and project_id not in self.identity["projects"]:
+            raise LinearError("Linear project is outside configured scope", retryable=False)
+        if parent_id:
+            parent_id = self.issue(parent_id)["id"]
+        return super().create_issue(client_id, team["id"], title, description=description,
+                                    project_id=project_id, parent_id=parent_id)
+
+    def create_project(self, client_id, name, team_ids, *, description=None):
+        if self.specialist_scope is not None:
+            raise LinearError("Project creation is outside specialist scope", retryable=False)
+        self.viewer_id()
+        resolved = []
+        for team_id in team_ids:
+            team = self.graphql("query Team($id: String!) { team(id: $id) { id key } }", {"id": team_id}).get("team")
+            if (not isinstance(team, dict) or not team.get("id") or
+                    (self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]))):
+                raise LinearError("Linear team is outside configured scope", retryable=False)
+            resolved.append(team["id"])
+        return super().create_project(client_id, name, resolved, description=description)
+
+    def link_issue(self, issue_id, related_issue_id, relation):
+        if self.specialist_scope is not None:
+            raise LinearError("Issue linking is outside specialist scope", retryable=False)
+        self.viewer_id()
+        left, right = self.issue(issue_id), self.issue(related_issue_id)
+        return super().link_issue(left["id"], right["id"], relation)
+
 async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
     """Run core's ordinary-chat API on the profile service's gateway loop."""
     gateway = runtime.gateway

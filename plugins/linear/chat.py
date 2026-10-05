@@ -7,22 +7,65 @@ from .bridge import Bridge, PR_URL, evidence_links
 SCHEMA = {
     "name": "linear",
     "description": (
-        "Track work you are doing in this chat on a Linear issue. start: claim the issue (refused if another "
-        "agent is working it). done: finish it; needs an evidence link (PR, merge, deploy check or findings). "
-        "blocked: you need a human; say what. release: stop tracking it unfinished."),
+        "Track work on a Linear issue, or create issues and projects as this profile's own app. "
+        "start: claim an existing issue (refused if another agent is working it). "
+        "done: finish it; needs an evidence link. blocked: you need a human. "
+        "release: stop tracking unfinished work. "
+        "create_issue: create an undelegated issue; requires id, title, and team. "
+        "create_project: create a project; requires id, name, and team. "
+        "link_issue: relate two existing issues. Creates never assign, delegate, or start tracking."),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "done", "blocked", "release"]},
-            "issue": {"type": "string", "description": "Issue identifier, for example ABC-123"},
+            "action": {"type": "string", "enum": ["start", "done", "blocked", "release", "create_issue", "create_project", "link_issue"]},
+            "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking and link_issue."},
+            "id": {"type": "string", "description": "Caller UUID for create_issue or create_project. Reuse it to reconcile a lost response."},
+            "title": {"type": "string", "description": "create_issue title."},
+            "name": {"type": "string", "description": "create_project name."},
+            "team": {"type": "string", "description": "Team id or key. Required for create_issue and create_project."},
+            "description": {"type": "string"},
+            "project": {"type": "string", "description": "Optional project id for create_issue."},
+            "parent": {"type": "string", "description": "Optional parent issue id for create_issue."},
+            "related": {"type": "string", "description": "Other issue id for link_issue."},
+            "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"], "description": "link_issue relation."},
             "evidence": {"type": "string", "description": "done: link(s) proving the result reached its destination"},
             "note": {"type": "string", "description": "done: outcome summary; blocked/release: what is needed or why"},
         },
-        "required": ["action", "issue"],
+        "required": ["action"],
     },
 }
 def _reply(ok: bool, message: str) -> str:
     return json.dumps({"ok": ok, "message": message})
+
+def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
+    """Create or link as this app. Do not assign, delegate, or start tracking."""
+    client_id = str(args.get("id") or "").strip()
+    try:
+        if action == "create_issue":
+            title, team = str(args.get("title") or "").strip(), str(args.get("team") or "").strip()
+            if not client_id or not title or not team:
+                return _reply(False, "create_issue needs id, title, and team.")
+            created = bridge.api.create_issue(
+                client_id, team, title, description=args.get("description"),
+                project_id=args.get("project") or None, parent_id=args.get("parent") or None)
+            return _reply(True, f"Created {created.get('identifier')} {created.get('url')} undelegated.")
+        if action == "create_project":
+            name, team = str(args.get("name") or "").strip(), str(args.get("team") or "").strip()
+            if not client_id or not name or not team:
+                return _reply(False, "create_project needs id, name, and team.")
+            created = bridge.api.create_project(client_id, name, [team], description=args.get("description"))
+            return _reply(True, f"Created project {created.get('name')} {created.get('url')}.")
+        if action == "link_issue":
+            issue = str(args.get("issue") or "").strip()
+            related, relation = str(args.get("related") or "").strip(), str(args.get("relation") or "").strip()
+            if not issue or not related or not relation:
+                return _reply(False, "link_issue needs issue, related, and relation.")
+            linked = bridge.api.link_issue(issue, related, relation)
+            return _reply(True, f"Linked {linked.get('type')} {issue} -> {related}.")
+    except LinearError as exc:
+        return _reply(False, str(exc))
+    return _reply(False, f"Unknown planning action {action!r}.")
+
 def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any = None) -> str:
     if bridge is None:
         return _reply(False, "The Linear service is not running on this profile.")
@@ -37,7 +80,13 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         return _reply(False, "linear needs a tool turn bound to this profile.")
     if not session_key:
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
-    action, ref = str(args.get("action", "")), str(args.get("issue", "")).strip()
+    action = str(args.get("action", ""))
+    if action in {"create_issue", "create_project", "link_issue"}:
+        return _plan(bridge, args, action)
+    ref = str(args.get("issue", "")).strip()
+    if not ref:
+        return _reply(False, "tracking needs an issue identifier.")
+    action, ref = action, ref
     note = str(args.get("note") or "").strip()
     try:
         issue = bridge.api.issue(ref)
