@@ -92,6 +92,31 @@ class OwnIdentityCreateTests(unittest.TestCase):
             client.create_issue(CLIENT, "OTHER", "Reconcile")
         self.assertFalse(any("mutation" in query for query in calls))
 
+    def test_bound_create_refuses_project_outside_selected_team_before_mutation(self) -> None:
+        calls = []
+
+        def transport(url, body, headers):
+            payload = json.loads(body)
+            query, variables = payload["query"], payload["variables"]
+            calls.append(query)
+            if "IdentityBinding" in query:
+                return _ok({"viewer": {"id": "app-a"}, "organization": {"id": "org-a"}})
+            if query.lstrip().startswith("query Team"):
+                return _ok({"team": {"id": "team-1", "key": "OPS"}})
+            if query.lstrip().startswith("query Project"):
+                self.assertEqual(variables["id"], "project-foreign")
+                return _ok({"project": {"id": "project-foreign", "archivedAt": None,
+                                        "teams": {"nodes": [{"id": "team-other"}], "pageInfo": {"hasNextPage": False}}}})
+            raise AssertionError(query)
+
+        client = BoundLinearAPI(lambda: "synthetic", identity={
+            "viewer_id": "app-a", "organization_id": "org-a", "teams": ["OPS"], "projects": ["project-foreign"]},
+            transport=transport)
+        with self.assertRaises(LinearError):
+            client.create_issue(CLIENT, "OPS", "Reconcile", project_id="project-foreign")
+        self.assertTrue(any(query.lstrip().startswith("query Project") for query in calls))
+        self.assertFalse(any(query.lstrip().startswith("mutation") for query in calls))
+
     def test_bound_create_refuses_foreign_parent_before_mutation(self) -> None:
         calls = []
 

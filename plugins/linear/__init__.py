@@ -213,6 +213,17 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear team is outside configured scope", retryable=False)
         if self.identity.get("projects") and project_id not in self.identity["projects"]:
             raise LinearError("Linear project is outside configured scope", retryable=False)
+        if project_id:
+            project = self.graphql(
+                "query Project($id: String!) { project(id: $id) { id archivedAt teams { nodes { id } pageInfo { hasNextPage } } } }",
+                {"id": project_id}).get("project")
+            connection = (project or {}).get("teams") if isinstance(project, dict) else None
+            nodes = connection.get("nodes") if isinstance(connection, dict) else None
+            page = connection.get("pageInfo") if isinstance(connection, dict) else None
+            team_ids = {node.get("id") for node in nodes if isinstance(node, dict)} if isinstance(nodes, list) else set()
+            if (not isinstance(project, dict) or project.get("id") != project_id or project.get("archivedAt") is not None
+                    or not isinstance(page, dict) or page.get("hasNextPage") is not False or team["id"] not in team_ids):
+                raise LinearError("Linear project does not belong to the selected team", retryable=False)
         if parent_id:
             parent_id = self.issue(parent_id)["id"]
         return super().create_issue(client_id, team["id"], title, description=description,
