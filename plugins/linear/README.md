@@ -112,7 +112,7 @@ attempts)`. The plugin reads pending rows for its profile and marks them `import
 Chat can also create an issue or project, or link two existing issues, as this profile's own app.
 Those actions do not assign, delegate, set a lead, or start tracking. The caller supplies a UUID
 and reuses it if the response is lost. Configured `identity.teams` and `identity.projects` are
-checked before the mutation, including a parent issue.
+checked before the mutation, including that a project belongs to the selected team and that a parent issue is in scope.
 
 **Done needs evidence.** A GitHub PR link is checked against the exact head and required checks
 before either a Kanban result or chat command marks Linear Done, including projects without a
