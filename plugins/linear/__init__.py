@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -317,11 +318,17 @@ def register(ctx: Any) -> None:
         if bridge is not None:
             chat.on_turn_end(bridge, session_id)
         elif session_id:
+            captured_at = time.time()
+            home = active_home()
             try:
-                home = active_home()
                 transport.request(home, {"op": "turn_end", "home": str(home), "session_id": session_id})
             except (transport.Unavailable, transport.Uncertain):
-                log.warning("linear: chat turn-end capture unavailable; queued evidence needs reconciliation")
+                # The service may already be stopped during gateway replacement.
+                # Persist the deadline in the owning existing store, not at replay time.
+                path = Path(ctx.get_config("state_database") or home / "linear" / "state.db")
+                if path.is_file():
+                    Store(path).delay_session_updates(
+                        session_id, captured_at + float(ctx.get_config("quiet_minutes", 30)) * 60)
 
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
                       description=chat.SCHEMA["description"], inject_invocation_context=True)
