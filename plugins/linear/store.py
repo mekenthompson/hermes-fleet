@@ -136,7 +136,13 @@ class Store:
             if not payload.get("terminal") or payload.get("reconciliation") or not attempted: return False
             payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
             payload["reconcile_required"] = True
-            db.execute("UPDATE outbox SET payload=?, state='failed' WHERE id=?", (json.dumps(payload), row_id))
+            if payload.get("release"):
+                payload["applied"] = int(outcome == "applied")
+                sql = "DELETE FROM work" if payload["applied"] else "UPDATE work SET release_pending=0"
+                db.execute(sql + " WHERE issue_id=? AND ownership_id=? AND release_pending=1",
+                           (payload["issue_id"], payload["work_owner"]))
+            state = "sent" if payload.get("release") and payload.get("applied") else "failed"
+            db.execute("UPDATE outbox SET payload=?, state=? WHERE id=?", (json.dumps(payload), state, row_id))
             return True
     @staticmethod
     def _targets(payload: dict[str, Any]) -> set[str]:

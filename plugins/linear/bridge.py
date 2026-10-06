@@ -968,7 +968,7 @@ class Bridge:
                 continue
     def _recover_chats(self) -> None:
         for row in self.store.active("chat"):
-            if self.store.issue_reconciliation_blocked(row["issue_id"]):
+            if row.get("release_pending") or self.store.issue_reconciliation_blocked(row["issue_id"]):
                 continue
             if not self.authorize_specialist_effect(row["issue_id"]):
                 continue
@@ -981,7 +981,7 @@ class Bridge:
             if not self.may_execute_existing(row["issue_id"]):
                 continue
             with self.store.guard_issue_work(row["issue_id"]) as admitted:
-                if not admitted: continue
+                if not admitted or (self.store.get(row["issue_id"]) or {}).get("release_pending"): continue
                 injected = self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a "
                                        "Linear issue. Reconcile what already happened, then continue; finish "
                                        "with `linear done` or `linear blocked`.")
@@ -1050,6 +1050,8 @@ class Bridge:
             action()
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        release_status = self.store.outbox_row(payload.get("requires_status_id", ""))
+        if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return False
         if kind == "status" and payload.get("terminal"):
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])
@@ -1168,6 +1170,8 @@ class Bridge:
                     if self.store.status_pending(terminal_id):
                         waiting_lines.add(ident)
                     continue
+                release_status = self.store.outbox_row(terminal_id) if terminal_id else None
+                if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): continue
                 if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() and
                         self.store.pending_claim(issue["id"])):
                     raise LinearError(f"claim for {ident} is still pending")

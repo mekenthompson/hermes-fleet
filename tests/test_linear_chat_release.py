@@ -83,6 +83,74 @@ class ChatReleaseTests(unittest.TestCase):
         self.assertEqual(self.issue["state"]["name"], "Done")
         self.assertEqual(self.issue["delegate"], {"id": SELF})
 
+    def test_new_owner_suppresses_unsent_old_release_comment_and_response(self):
+        self.store.update("i", linear_session_id="ls")
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        status = next(r for r in self.store.pending("i") if r["kind"] == "status")
+        self.assertTrue(self.bridge._send(status))
+        self.store.mark_sent(status["id"], applied=True)
+        self.store.put("i", "chat", "new-chat", last_updated_at=self.clock() * 1000)
+        self.remote.set_delegate("i", {"id": SELF})
+        self.remote.set_state("i", "In Progress")
+        self.bridge.flush()
+        self.assertFalse(self.remote.comments)
+        self.assertFalse(self.remote.activities)
+
+    def test_new_local_owner_suppresses_old_release_project_update(self):
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        self.bridge.flush()
+        self.assertIsNone(self.store.get("i"))
+        self.store.put("i", "chat", "new-chat", last_updated_at=self.clock() * 1000)
+        self.remote.set_delegate("i", {"id": SELF})
+        self.remote.set_state("i", "In Progress")
+        self.clock.now += self.bridge.quiet
+        self.bridge.flush()
+        self.assertFalse(self.remote.project_updates)
+        self.assertEqual(self.store.get("i")["owner_ref"], "new-chat")
+
+    def test_verified_applied_reconciliation_finishes_release_without_replay(self):
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        row_id = next(r["id"] for r in self.store.pending("i") if r["kind"] == "status")
+        self.remote.lose_next_response = True
+        self.bridge.flush()
+        exact = self.api.issue("i")
+        self.assertIsNone(exact["delegate"])
+        self.assertEqual(exact["state"]["name"], "Blocked")
+        count = self.remote.requests.count("mutation IssueUpdate")
+        self.assertTrue(self.store.reconcile_terminal(row_id, outcome="applied",
+            evidence="Synthetic exact readback: Blocked and delegate null", at=self.clock()))
+        self.assertIsNone(self.store.get("i"))
+        self.bridge.flush()
+        self.clock.now += self.bridge.quiet
+        self.bridge.flush()
+        self.assertEqual(self.remote.requests.count("mutation IssueUpdate"), count)
+        self.assertEqual(len(self.remote.project_updates), 1)
+
+    def test_verified_not_applied_reconciliation_unfences_original_chat(self):
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        row_id = next(r["id"] for r in self.store.pending("i") if r["kind"] == "status")
+        original = self.remote._apply
+        def failed(query, variables):
+            if "mutation IssueUpdate" in query:
+                return 200, {"data": {"issueUpdate": {"success": False}}}
+            return original(query, variables)
+        with patch.object(self.remote, "_apply", side_effect=failed):
+            self.bridge.flush()
+        self.assertTrue(self.store.reconcile_terminal(row_id, outcome="not_applied",
+            evidence="Synthetic rejected mutation and exact original delegate/state", at=self.clock()))
+        self.assertEqual(self.store.get("i")["release_pending"], 0)
+        self.assertTrue(json.loads(handle(self.bridge, {"action": "start", "issue": "ABC-1"}, self.context))["ok"])
+        self.bridge.flush()
+        self.assertEqual(self.issue["delegate"]["id"], SELF)
+        self.assertFalse(self.remote.comments)
+
+    def test_restart_recovery_does_not_resume_pending_release(self):
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        with patch.object(self.bridge, "inject", return_value=True) as inject:
+            self.bridge._recover_chats()
+        inject.assert_not_called()
+        self.assertEqual(self.store.get("i")["release_pending"], 1)
+
     def test_native_response_is_sent_after_verified_release(self):
         self.store.update("i", linear_session_id="ls")
         handle(self.bridge, {"action": "release", "issue": "ABC-1", "note": "unfinished"}, self.context)
