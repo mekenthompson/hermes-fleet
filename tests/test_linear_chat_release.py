@@ -1,6 +1,7 @@
 """Explicit unfinished release is a durable relinquishment, not local deletion."""
 import json
 import tempfile
+import sqlite3
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -82,6 +83,28 @@ class ChatReleaseTests(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.issue["state"]["name"], "Done")
         self.assertEqual(self.issue["delegate"], {"id": SELF})
+
+    def test_release_finalization_delete_failure_rolls_back_receipt_and_keeps_fence(self):
+        handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
+        status = next(r for r in self.store.pending("i") if r["kind"] == "status")
+        self.assertTrue(self.bridge._send(status))
+        self.assertIsNone(self.issue["delegate"])
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON work BEGIN SELECT RAISE(FAIL, 'fault'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.mark_sent(status["id"], applied=True)
+        reopened = Store(self.store.path)
+        self.assertEqual(reopened.get("i")["release_pending"], 1)
+        self.assertEqual(reopened.outbox_row(status["id"])["state"], "pending")
+        self.assertTrue(reopened.issue_reconciliation_blocked("i"))
+        with sqlite3.connect(self.store.path) as db:
+            db.execute("DROP TRIGGER fail_delete")
+        count = self.remote.requests.count("mutation IssueUpdate")
+        self.bridge.store = reopened
+        self.clock.now += 120
+        self.bridge.flush()
+        self.assertEqual(self.remote.requests.count("mutation IssueUpdate"), count)
+        self.assertIsNotNone(reopened.get("i"))
 
     def test_new_owner_suppresses_unsent_old_release_comment_and_response(self):
         self.store.update("i", linear_session_id="ls")

@@ -469,17 +469,26 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.clock.now += 1
                 with patch.object(self.bridge, "flush", return_value=0):
                     self.assertTrue(self.chat(action, evidence="https://example.invalid/merged-result")["ok"])
-                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release":
+                    self.assertEqual(self.bridge.store.get(ISSUE)["release_pending"], 1)
+                else:
+                    self.assertIsNone(self.bridge.store.get(ISSUE))
                 self.bridge = self.make_bridge()
                 self.bridge.recover()
                 self.bridge.handle_webhook(old_echo)
                 self.bridge.handle_webhook(old_prompt)
                 self.assertEqual(self.tasks(), [])
-                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release":
+                    self.assertEqual(self.bridge.store.get(ISSUE)["release_pending"], 1)
+                else:
+                    self.assertIsNone(self.bridge.store.get(ISSUE))
                 self.bridge.flush()
+                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release": self.assertIsNone(self.linear.issues[ISSUE]["delegate"])
                 self.bridge.handle_webhook(old_echo)
                 self.assertEqual(self.tasks(), [])
                 self.clock.now += 1
+                if action == "release": self.linear.set_delegate(ISSUE, {"id": SELF})
                 self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Explicit new work"))
                 self.assertEqual(len(self.tasks()), 1)
 
@@ -939,7 +948,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_chat_terminal_capture_rolls_back_at_each_sql_boundary(self) -> None:
         from unittest.mock import patch
         for action in ("done", "release"):
-            for boundary in ("status", "comment", "project_update", "project_update_insert", "delete"):
+            for boundary in ("status", "comment", "project_update", "project_update_insert", "ownership_capture"):
                 with self.subTest(action=action, boundary=boundary):
                     self.setUp()
                     self.assertTrue(self.chat("start")["ok"])
@@ -948,8 +957,9 @@ class LinearKanbanScenarios(unittest.TestCase):
                             db.execute("DELETE FROM outbox WHERE kind = 'project_update'")
                     before = [(p["id"], p["payload"]) for p in self.bridge.store.pending()]
                     with sqlite3.connect(self.bridge.store.path) as db:
-                        if boundary == "delete":
-                            db.execute("CREATE TRIGGER fail_boundary BEFORE DELETE ON work BEGIN SELECT RAISE(FAIL, 'fault'); END")
+                        if boundary == "ownership_capture":
+                            operation = "UPDATE" if action == "release" else "DELETE"
+                            db.execute(f"CREATE TRIGGER fail_boundary BEFORE {operation} ON work BEGIN SELECT RAISE(FAIL, 'fault'); END")
                         elif boundary == "project_update":
                             db.execute("CREATE TRIGGER fail_boundary BEFORE UPDATE ON outbox WHEN NEW.kind = 'project_update' "
                                        "BEGIN SELECT RAISE(FAIL, 'fault'); END")
