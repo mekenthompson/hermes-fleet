@@ -722,12 +722,16 @@ class Store:
         with self._tx() as db:
             if not self._row_admitted(db, row_id) or not self._admitted(db, *self._targets(payload)): return
             db.execute("UPDATE outbox SET payload = ?, next_at = ? WHERE id = ?", (json.dumps(payload), next_at, row_id))
-    def delay_session_updates(self, session_id: str, next_at: float) -> None:
-        """Quiet period: every turn in the session pushes its pending project updates back."""
+    def delay_session_updates(self, session_id: str, next_at: float, *, turn_id: str = "") -> None:
+        """Quiet period: each identified turn retains its first captured deadline across replay."""
         with self._tx() as db:
             rows = db.execute("SELECT id, payload FROM outbox WHERE kind='project_update' AND state='pending' AND "
                               "COALESCE(json_extract(payload, '$.frozen'), 0)=0 AND "
                               "json_extract(payload, '$.session_id')=?", (session_id,)).fetchall()
+            if turn_id and rows:
+                key = json.dumps(["turn_end", session_id, turn_id])
+                db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)", (key, str(next_at)))
+                next_at = float(db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0])
             for row in rows:
                 if self._admitted(db, *self._targets(json.loads(row["payload"]))):
                     db.execute("UPDATE outbox SET next_at=MAX(next_at, ?) WHERE id=?", (next_at, row["id"]))

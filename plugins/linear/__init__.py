@@ -313,22 +313,16 @@ def register(ctx: Any) -> None:
         except transport.Uncertain as exc:
             return chat._reply(False, str(exc))
 
-    def on_session_end(session_id: str = "", **_: Any) -> None:
+    def on_session_end(session_id: str = "", turn_id: str = "", **_: Any) -> None:
+        if not session_id or not isinstance(turn_id, str) or not turn_id: return
         bridge = running.get("bridge")
-        if bridge is not None:
-            chat.on_turn_end(bridge, session_id)
-        elif session_id:
-            captured_at = time.time()
-            home = active_home()
-            try:
-                transport.request(home, {"op": "turn_end", "home": str(home), "session_id": session_id})
-            except (transport.Unavailable, transport.Uncertain):
-                # The service may already be stopped during gateway replacement.
-                # Persist the deadline in the owning existing store, not at replay time.
-                path = Path(ctx.get_config("state_database") or home / "linear" / "state.db")
-                if path.is_file():
-                    Store(path).delay_session_updates(
-                        session_id, captured_at + float(ctx.get_config("quiet_minutes", 30)) * 60)
+        home = active_home()
+        path = Path(ctx.get_config("state_database") or home / "linear" / "state.db")
+        if bridge is not None or path.is_file():
+            # Capture once under the original turn identity before any service replacement.
+            store = bridge.store if bridge is not None else Store(path)
+            quiet = bridge.quiet if bridge is not None else float(ctx.get_config("quiet_minutes", 30)) * 60
+            store.delay_session_updates(session_id, time.time() + quiet, turn_id=turn_id)
 
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
                       description=chat.SCHEMA["description"], inject_invocation_context=True)
