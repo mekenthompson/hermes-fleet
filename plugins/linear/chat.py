@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from .api import LinearError
-from .bridge import Bridge, PR_URL, evidence_links
+from .bridge import Bridge, PR_URL, evidence_links, iso_ms
 SCHEMA = {
     "name": "linear",
     "description": (
@@ -193,7 +193,11 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
                                        last_updated_at=fence, resume_fence_at=fence):
                 return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
     else:
-        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project, run_generation=generation):
+        watermark = iso_ms(issue.get("updatedAt"))
+        if not watermark or watermark <= 0:
+            return _reply(False, "Linear issue ordering timestamp is unavailable; no claim was captured.")
+        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project,
+                                run_generation=generation, last_updated_at=watermark):
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
     if not bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id")) or not bridge.project_update(
             session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"]):
