@@ -136,7 +136,8 @@ class FakeLinear:
             if "stateId" in fields:
                 issue["state"] = dict(next(s for s in issue["team"]["states"]["nodes"] if s["id"] == fields["stateId"]))
             if "delegateId" in fields:
-                issue["delegate"] = {"id": SELF, "name": "This Agent"} if fields["delegateId"] == SELF else OTHER
+                issue["delegate"] = (None if fields["delegateId"] is None else
+                                     {"id": SELF, "name": "This Agent"} if fields["delegateId"] == SELF else OTHER)
             issue["updatedAt"] = self.clock.iso()
             return 200, {"data": {"issueUpdate": {"success": True}}}
         for mutation, store, entity in (("commentCreate", self.comments, "Comment"),

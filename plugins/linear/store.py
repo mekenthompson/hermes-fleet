@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS work (
   task_id TEXT, project_id TEXT, last_updated_at REAL NOT NULL DEFAULT 0,
   linear_session_id TEXT, panel_note TEXT, stop_requested_at REAL NOT NULL DEFAULT 0,
   last_event_id INTEGER NOT NULL DEFAULT 0, resume_fence_at REAL NOT NULL DEFAULT 0,
-  run_generation INTEGER, ownership_id TEXT, pending_resume TEXT);
+  run_generation INTEGER, ownership_id TEXT, pending_resume TEXT, release_pending INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending');
@@ -52,6 +52,8 @@ class Store:
                 db.execute("ALTER TABLE work ADD COLUMN resume_fence_at REAL NOT NULL DEFAULT 0")
             if "run_generation" not in columns:
                 db.execute("ALTER TABLE work ADD COLUMN run_generation INTEGER")
+            if "release_pending" not in columns:
+                db.execute("ALTER TABLE work ADD COLUMN release_pending INTEGER NOT NULL DEFAULT 0")
             if "ownership_id" not in columns:
                 db.execute("ALTER TABLE work ADD COLUMN ownership_id TEXT")
     @contextmanager
@@ -326,7 +328,8 @@ class Store:
         with self._tx() as db:
             db.execute("INSERT OR IGNORE INTO specialist_scope_fence (issue_id, reason, fenced_at) "
                        "VALUES (?, ?, ?)", (issue_id, reason[:500], at))
-    def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
+    def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float,
+               release: bool = False) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             if not self._effect_admitted(db, issue_id): return False
@@ -371,7 +374,10 @@ class Store:
                 body = json.dumps({**payload, "enqueued_at": payload.get("enqueued_at", at)})
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (row_id, kind, body, at + float(payload.get("quiet", 0))))
-            db.execute("DELETE FROM work WHERE issue_id = ?", (issue_id,))
+            if release:
+                db.execute("UPDATE work SET release_pending=1 WHERE issue_id=?", (issue_id,))
+            else:
+                db.execute("DELETE FROM work WHERE issue_id = ?", (issue_id,))
             return True
     def capture_event(self, issue_id: str, event_id: int, writes: list[tuple[str, dict[str, Any]]],
                       *, at: float, forget: bool = False) -> bool:
@@ -499,7 +505,17 @@ class Store:
             if not self._row_admitted(db, row_id): return False
             db.execute("UPDATE outbox SET state = 'sent', payload = json_set(payload, '$.applied', ?) WHERE id = ?",
                        (int(applied), row_id))
+            if applied:
+                receipt = db.execute("SELECT payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+                payload = json.loads(receipt["payload"])
+                if payload.get("release"):
+                    db.execute("DELETE FROM work WHERE issue_id=? AND ownership_id=? AND release_pending=1",
+                               (payload["issue_id"], payload["work_owner"]))
             return True
+    def verified_release(self, row_id: str) -> bool:
+        row = self.outbox_row(row_id)
+        return bool(row and row["state"] == "sent" and row["kind"] == "status"
+                    and row["payload"].get("release") and row["payload"].get("applied"))
     def terminal_status_applied(self, row_id: str) -> bool:
         with self._tx() as db:
             row = db.execute("SELECT state, kind, json_extract(payload, '$.applied') FROM outbox WHERE id = ?",

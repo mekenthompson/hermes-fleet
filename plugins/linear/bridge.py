@@ -557,6 +557,7 @@ class Bridge:
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
         issue_id = row["issue_id"]
+        if (self.store.get(issue_id) or {}).get("release_pending"): return
         if self.store.issue_reconciliation_blocked(issue_id): return
         marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
         if self.store.followup_captured(marker): return
@@ -572,7 +573,7 @@ class Bridge:
         if not self.store.update(issue_id, pending_resume=json.dumps(intent)): return
         failure = None
         with self.store.guard_issue_work(issue_id) as admitted:
-            if not admitted or not self._require_effect(issue_id): return
+            if not admitted or (self.store.get(issue_id) or {}).get("release_pending") or not self._require_effect(issue_id): return
             try: ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
             except Exception as exc:
                 failure, ok = exc, False
@@ -1080,7 +1081,9 @@ class Bridge:
         if kind != "project_update" and payload.get("terminal"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
-            if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
+            delegate = (issue.get("delegate") or {}).get("id")
+            released = (delegate is None and self.store.verified_release(payload.get("requires_status_id", "")))
+            if ((delegate != self.api.viewer_id() and not released)
                     or (issue.get("state") or {}).get("type") == "canceled"):
                 return False  # no completion message or update after a human takeover/cancel
         elif kind in ("comment", "activity") and not payload.get("takeover") and \
@@ -1107,12 +1110,22 @@ class Bridge:
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
                     raise LinearError("PR acceptance on the recorded exact head failed at delivery", retryable=False)
             name = self.state_name(issue, payload["state"])
+            if payload.get("release") and not name:
+                raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
             fields = {"stateId": state_id(issue, name)} if name else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
+            if payload.get("release"):
+                fields["delegateId"] = None
             if fields:
                 self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields),
                                     terminal=bool(payload.get("terminal")))
+            if payload.get("release"):
+                verified = self._effect_issue(payload["issue_id"])
+                if (verified.get("id") != payload["issue_id"] or "delegate" not in verified or
+                        (verified.get("delegate") or {}).get("id") is not None or
+                        (verified.get("state") or {}).get("name") != name):
+                    raise LinearError("Release write was not verified; reconcile before further work")
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
@@ -1158,7 +1171,9 @@ class Bridge:
                 if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() and
                         self.store.pending_claim(issue["id"])):
                     raise LinearError(f"claim for {ident} is still pending")
-                if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                delegate = (issue.get("delegate") or {}).get("id")
+                released = delegate is None and terminal_id and self.store.verified_release(terminal_id)
+                if ((delegate != self.api.viewer_id() and not released) or
                         (issue.get("state") or {}).get("type") == "canceled" or
                         ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
                     continue
