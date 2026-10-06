@@ -70,7 +70,8 @@ with patch.dict("sys.modules", {"hermes_constants": SimpleNamespace(get_hermes_h
     hooks["on_session_end"]("s", turn_id="crash-turn")
 os._exit(0)
 '''
-            result = subprocess.run([sys.executable, "-c", script, str(home)], capture_output=True, text=True, timeout=20)
+            result = subprocess.run([sys.executable, "-c", script, str(home)], cwd=Path(__file__).parent,
+                                    capture_output=True, text=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stderr)
             reopened = Store(store.path)
             self.assertEqual(reopened.outbox_row(row_id)["next_at"], 260)
