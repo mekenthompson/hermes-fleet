@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Any
 from . import chat
 from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
-from .bridge import Bridge, Kanban, validate_activation_cutoff_ms
+from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import token_provider
 from .store import Store
 
 log = logging.getLogger("linear")
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
-            "api_url", "board", "ingress_database", "state_database", "tick_seconds", "activation_cutoff_ms",
+            "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
             "specialist_scope")
 class BoundLinearAPI(LinearAPI):
     """Bind credentials to an actor/workspace and, optionally, a bounded specialist scope."""
@@ -331,6 +331,7 @@ def register(ctx: Any) -> None:
     async def service(runtime: Any) -> None:
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
         validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
+        validate_ingress_profile(settings.get("ingress_profile"))
         home = Path(runtime.profile_home)
         api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
                              specialist_scope=settings.get("specialist_scope"),

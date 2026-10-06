@@ -87,6 +87,52 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(task.assignee, "default")
         self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
 
+    def test_standalone_inbox_binding_creates_one_real_default_executor(self):
+        from hermes_cli.profiles import get_profile_dir
+        from linear_ingress_fixture import IngressStore, Route
+        inbox = self.dir / "bound-ingress.db"
+        producer = IngressStore(inbox)
+        target = Route("worker-a", "worker-a", "/webhook/worker-a", self.dir / "unused", inbox)
+        foreign = Route("worker-b", "worker-b", "/webhook/worker-b", self.dir / "unused", inbox)
+        self.bridge = Bridge(self.bridge.store, self.bridge.api,
+                             Kanban(profile="default", profile_home=get_profile_dir("default")),
+                             profile="default", settings={"ingress_profile": "worker-a"}, clock=self.clock)
+        self.linear.set_delegate(ISSUE, {"id": SELF})
+        event = json.dumps(self.linear.session_event("created", ISSUE, "bound-session")).encode()
+        producer.enqueue(target, "target", event)
+        producer.enqueue(foreign, "foreign", event)
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.tasks()), 1)
+        task = self.bridge.kanban.get(self.bridge.store.get(ISSUE)["task_id"])
+        self.assertEqual(task.assignee, "default")
+        self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(dict(db.execute("SELECT delivery_id, status FROM deliveries")),
+                             {"target": "imported", "foreign": "pending"})
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.tasks()), 1)
+
+    def test_bound_inbox_echo_preserves_existing_default_chat_owner_without_worker(self):
+        from hermes_cli.profiles import get_profile_dir
+        from linear_ingress_fixture import IngressStore, Route
+        inbox = self.dir / "bound-chat-ingress.db"
+        producer = IngressStore(inbox)
+        route = Route("worker-a", "worker-a", "/webhook/worker-a", self.dir / "unused", inbox)
+        self.bridge = Bridge(self.bridge.store, self.bridge.api,
+                             Kanban(profile="default", profile_home=get_profile_dir("default")),
+                             profile="default", settings={"ingress_profile": "worker-a"}, clock=self.clock)
+        owner = Context("owner-key", "owner-transcript", 7, profile="default")
+        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, owner))["ok"])
+        self.bridge.flush()
+        producer.enqueue(route, "echo", json.dumps(self.linear.session_event("created", ISSUE, "echo-session")).encode())
+        self.bridge.tick(inbox)
+        row = self.bridge.store.get(ISSUE)
+        self.assertEqual((row["origin"], row["owner_ref"], row["run_generation"], row["task_id"]),
+                         ("chat", "owner-key", 7, None))
+        self.assertEqual(self.tasks(), [])
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("imported", 1))
+
     def test_standalone_chat_uses_default_context_and_retains_stop_generation(self):
         from hermes_cli.profiles import get_profile_dir
         self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))

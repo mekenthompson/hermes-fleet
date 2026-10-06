@@ -69,6 +69,11 @@ def validate_activation_cutoff_ms(value: Any) -> int | None:
     if type(value) is not int or value <= 0:
         raise ValueError("linear: activation_cutoff_ms must be a positive integer Unix epoch in milliseconds")
     return value
+def validate_ingress_profile(value: Any) -> str | None:
+    if value is None: return None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("linear: ingress_profile must be a nonempty profile identifier")
+    return value
 def evidence_links(text: str) -> list[str]:
     """Links that can prove a result; the tracker's own issue links cannot."""
     return [clean for url in URL.findall(text or "") if (clean := url.rstrip(".,;:!?"))
@@ -194,6 +199,7 @@ class Bridge:
                  clock: Callable[[], float] = time.time) -> None:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.inject, self.clock = store, api, kanban, profile, inject, clock
+        self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
         self._ingress = Path(settings["ingress_database"]) if settings.get("ingress_database") else None
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
@@ -1257,7 +1263,7 @@ class Bridge:
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
                           "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
                           "json_extract(payload, '$.agentActivity.signal') END='stop' ORDER BY received_at, delivery_id",
-                          (self.profile,)).fetchall()
+                          (self.ingress_profile,)).fetchall()
     def _queued_stop(self, issue_id: str, stamp: float) -> bool:
         if self._ingress is None or not self._ingress.exists(): return False
         try:
@@ -1276,7 +1282,7 @@ class Bridge:
             stops = [row[:4] for row in self._stop_deliveries(db) if not row[4] or row[4] in owned][:limit]
             rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at FROM deliveries WHERE profile = ? "
                               "AND status = 'pending' ORDER BY received_at, delivery_id LIMIT ?",
-                              (self.profile, limit)).fetchall()
+                              (self.ingress_profile, limit)).fetchall()
             selected = {(row[0], row[1]) for row in stops}
             rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
             for agent, delivery, payload, received in rows:

@@ -58,7 +58,15 @@ plugins:
 ```
 
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
-`api_url`, `tick_seconds` (default 2).
+`api_url`, `tick_seconds` (default 2). `ingress_profile` optionally selects the exact profile identifier
+written into this private inbox by its trusted ingress route. It defaults to the runtime profile;
+set it explicitly when a standalone `default` executor has a separately named inbox route. Only
+the inbox selector changes, including Stop priority and resume checks. Chat authorization, executor
+identity, board, app/workspace credentials and scope do not change. The override must contain only
+ASCII letters, digits, underscores or hyphens; malformed values refuse startup before credentials
+or state admission. This does not enable the plugin or replay imported deliveries. Changing an
+existing inbox's binding can expose previously pending deliveries: reconcile them and obtain
+scoped activation approval before deploying the binding.
 
 API requests share a serialized client within the profile. HTTP 400 GraphQL `RATELIMITED`
 and HTTP 429 pause requests until the exhausted request, complexity, or endpoint budget's
