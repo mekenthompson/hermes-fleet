@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -294,6 +295,10 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
 def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
         return
+    # Detached workers have task authority, not chat authority. The gateway
+    # bridge projects its own linked tasks; worker env never grants a chat claim.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return
     running: dict[str, Bridge] = {}
     from . import transport
 
@@ -302,6 +307,10 @@ def register(ctx: Any) -> None:
         return Path(get_hermes_home()).resolve(strict=True)
 
     def tool(args: dict[str, Any] | None = None, invocation_context: Any = None, **_: Any) -> str:
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return chat._reply(False, "The Linear chat tool is unavailable to detached Kanban workers. "
+                               "Use this task's Kanban lifecycle; only bridge-linked tasks project to Linear. "
+                               "A manual task requires owner reconciliation, not a worker chat claim.")
         bridge = running.get("bridge")
         if bridge is not None:
             return chat.handle(bridge, args or {}, invocation_context)

@@ -33,6 +33,36 @@ class LinearTransportTests(unittest.TestCase):
             self.assertEqual(worker.exitcode,0)
             self.assertFalse(transport.endpoint(home).exists())
 
+    def test_worker_registration_does_not_offer_chat_tracking(self):
+        class Context:
+            def __init__(self): self.tools = []
+            def get_config(self, key, default=None): return True if key == 'enabled' else default
+            def register_tool(self, **kwargs): self.tools.append(kwargs['name'])
+            def register_hook(self, *args): pass
+            def register_profile_service(self, *args): pass
+        context = Context()
+        with patch.dict(os.environ, {'HERMES_KANBAN_TASK': 'task-owned', 'HERMES_PROFILE': 'default'}):
+            plugin.register(context)
+        self.assertNotIn('linear', context.tools)
+
+    def test_registered_chat_handler_refuses_detached_worker_without_rpc(self):
+        class Context:
+            def get_config(self, key, default=None): return True if key == 'enabled' else default
+            def register_tool(self, **kwargs): self.tool = kwargs['handler']
+            def register_hook(self, *args): pass
+            def register_profile_service(self, *args): pass
+        context = Context()
+        with patch.dict(os.environ, {'HERMES_KANBAN_TASK': ''}):
+            plugin.register(context)
+        with patch.dict(os.environ, {'HERMES_KANBAN_TASK': 'task-owned'}), patch.dict(
+                'sys.modules', {'hermes_constants': SimpleNamespace(get_hermes_home=lambda: Path.cwd())}), patch.object(
+                transport, 'chat_request', side_effect=AssertionError('worker must not call chat RPC')):
+            result = json.loads(context.tool({'action': 'start', 'issue': 'ABC-1'}, SimpleNamespace(
+                profile='alpha', platform='telegram', session_key='forged', session_id='forged', run_generation=1)))
+        self.assertFalse(result['ok'])
+        self.assertIn('Kanban', result['message'])
+        self.assertIn('manual', result['message'])
+
     def test_tool_registration_without_local_service_uses_existing_gateway(self):
         class Context:
             def get_config(self,key,default=None):return True if key=='enabled' else default
