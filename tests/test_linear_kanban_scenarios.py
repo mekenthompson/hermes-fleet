@@ -383,6 +383,52 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(task.assignee, "default")
         self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
 
+    def test_standalone_inbox_binding_creates_one_real_default_executor(self):
+        from hermes_cli.profiles import get_profile_dir
+        from linear_ingress_fixture import IngressStore, Route
+        inbox = self.dir / "bound-ingress.db"
+        producer = IngressStore(inbox)
+        target = Route("worker-a", "worker-a", "/webhook/worker-a", self.dir / "unused", inbox)
+        foreign = Route("worker-b", "worker-b", "/webhook/worker-b", self.dir / "unused", inbox)
+        self.bridge = Bridge(self.bridge.store, self.bridge.api,
+                             Kanban(profile="default", profile_home=get_profile_dir("default")),
+                             profile="default", settings={"ingress_profile": "worker-a"}, clock=self.clock)
+        self.linear.set_delegate(ISSUE, {"id": SELF})
+        event = json.dumps(self.linear.session_event("created", ISSUE, "bound-session")).encode()
+        producer.enqueue(target, "target", event)
+        producer.enqueue(foreign, "foreign", event)
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.tasks()), 1)
+        task = self.bridge.kanban.get(self.bridge.store.get(ISSUE)["task_id"])
+        self.assertEqual(task.assignee, "default")
+        self.assertTrue(dispatch._profile_exists_fn()(task.assignee))
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(dict(db.execute("SELECT delivery_id, status FROM deliveries")),
+                             {"target": "imported", "foreign": "pending"})
+        self.bridge.tick(inbox)
+        self.assertEqual(len(self.tasks()), 1)
+
+    def test_bound_inbox_echo_preserves_existing_default_chat_owner_without_worker(self):
+        from hermes_cli.profiles import get_profile_dir
+        from linear_ingress_fixture import IngressStore, Route
+        inbox = self.dir / "bound-chat-ingress.db"
+        producer = IngressStore(inbox)
+        route = Route("worker-a", "worker-a", "/webhook/worker-a", self.dir / "unused", inbox)
+        self.bridge = Bridge(self.bridge.store, self.bridge.api,
+                             Kanban(profile="default", profile_home=get_profile_dir("default")),
+                             profile="default", settings={"ingress_profile": "worker-a"}, clock=self.clock)
+        owner = Context("owner-key", "owner-transcript", 7, profile="default")
+        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, owner))["ok"])
+        self.bridge.flush()
+        producer.enqueue(route, "echo", json.dumps(self.linear.session_event("created", ISSUE, "echo-session")).encode())
+        self.bridge.tick(inbox)
+        row = self.bridge.store.get(ISSUE)
+        self.assertEqual((row["origin"], row["owner_ref"], row["run_generation"], row["task_id"]),
+                         ("chat", "owner-key", 7, None))
+        self.assertEqual(self.tasks(), [])
+        with sqlite3.connect(inbox) as db:
+            self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("imported", 1))
+
     def test_standalone_chat_uses_default_context_and_retains_stop_generation(self):
         from hermes_cli.profiles import get_profile_dir
         self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
@@ -765,17 +811,26 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.clock.now += 1
                 with patch.object(self.bridge, "flush", return_value=0):
                     self.assertTrue(self.chat(action, evidence="https://example.invalid/merged-result")["ok"])
-                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release":
+                    self.assertEqual(self.bridge.store.get(ISSUE)["release_pending"], 1)
+                else:
+                    self.assertIsNone(self.bridge.store.get(ISSUE))
                 self.bridge = self.make_bridge()
                 self.bridge.recover()
                 self.bridge.handle_webhook(old_echo)
                 self.bridge.handle_webhook(old_prompt)
                 self.assertEqual(self.tasks(), [])
-                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release":
+                    self.assertEqual(self.bridge.store.get(ISSUE)["release_pending"], 1)
+                else:
+                    self.assertIsNone(self.bridge.store.get(ISSUE))
                 self.bridge.flush()
+                self.assertIsNone(self.bridge.store.get(ISSUE))
+                if action == "release": self.assertIsNone(self.linear.issues[ISSUE]["delegate"])
                 self.bridge.handle_webhook(old_echo)
                 self.assertEqual(self.tasks(), [])
                 self.clock.now += 1
+                if action == "release": self.linear.set_delegate(ISSUE, {"id": SELF})
                 self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Explicit new work"))
                 self.assertEqual(len(self.tasks()), 1)
 
@@ -1253,7 +1308,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_chat_terminal_capture_rolls_back_at_each_sql_boundary(self) -> None:
         from unittest.mock import patch
         for action in ("done", "release"):
-            for boundary in ("status", "comment", "project_update", "project_update_insert", "delete"):
+            for boundary in ("status", "comment", "project_update", "project_update_insert", "ownership_capture"):
                 with self.subTest(action=action, boundary=boundary):
                     self.setUp()
                     self.assertTrue(self.chat("start")["ok"])
@@ -1262,8 +1317,9 @@ class LinearKanbanScenarios(unittest.TestCase):
                             db.execute("DELETE FROM outbox WHERE kind = 'project_update'")
                     before = [(p["id"], p["payload"]) for p in self.bridge.store.pending()]
                     with sqlite3.connect(self.bridge.store.path) as db:
-                        if boundary == "delete":
-                            db.execute("CREATE TRIGGER fail_boundary BEFORE DELETE ON work BEGIN SELECT RAISE(FAIL, 'fault'); END")
+                        if boundary == "ownership_capture":
+                            operation = "UPDATE" if action == "release" else "DELETE"
+                            db.execute(f"CREATE TRIGGER fail_boundary BEFORE {operation} ON work BEGIN SELECT RAISE(FAIL, 'fault'); END")
                         elif boundary == "project_update":
                             db.execute("CREATE TRIGGER fail_boundary BEFORE UPDATE ON outbox WHEN NEW.kind = 'project_update' "
                                        "BEGIN SELECT RAISE(FAIL, 'fault'); END")

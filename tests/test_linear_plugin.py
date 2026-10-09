@@ -30,8 +30,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Own-app create and link keep explicit team, parent, assignee, delegate, and lead guards.
 # Profile-local durable cooldown and serialized rate-limit admission add bounded API state.
 # Approved session-free chat admission adds a live-turn validator and durable receipt schema.
-# Retain a fixed cap, including the new module; do not minify identity/recovery safety branches.
-BUDGET = 3650
+# Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
+# Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
+BUDGET = 3703
 
 
 class FakeContext:

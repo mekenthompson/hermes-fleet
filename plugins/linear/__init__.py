@@ -3,19 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from . import chat
 from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
-from .bridge import Bridge, Kanban, validate_activation_cutoff_ms
+from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import token_provider
 from .store import Store
 
 log = logging.getLogger("linear")
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
-            "api_url", "board", "ingress_database", "state_database", "tick_seconds", "activation_cutoff_ms",
+            "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
             "specialist_scope")
 class BoundLinearAPI(LinearAPI):
     """Bind credentials to an actor/workspace and, optionally, a bounded specialist scope."""
@@ -294,6 +296,10 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
 def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
         return
+    # Detached workers have task authority, not chat authority. The gateway
+    # bridge projects its own linked tasks; worker env never grants a chat claim.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return
     running: dict[str, Bridge] = {}
     from . import transport
 
@@ -302,6 +308,10 @@ def register(ctx: Any) -> None:
         return Path(get_hermes_home()).resolve(strict=True)
 
     def tool(args: dict[str, Any] | None = None, invocation_context: Any = None, **_: Any) -> str:
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return chat._reply(False, "The Linear chat tool is unavailable to detached Kanban workers. "
+                               "Use this task's Kanban lifecycle; only bridge-linked tasks project to Linear. "
+                               "A manual task requires owner reconciliation, not a worker chat claim.")
         bridge = running.get("bridge")
         if bridge is not None:
             return chat.handle(bridge, args or {}, invocation_context)
@@ -312,16 +322,16 @@ def register(ctx: Any) -> None:
         except transport.Uncertain as exc:
             return chat._reply(False, str(exc))
 
-    def on_session_end(session_id: str = "", **_: Any) -> None:
+    def on_session_end(session_id: str = "", turn_id: str = "", **_: Any) -> None:
+        if not session_id or not isinstance(turn_id, str) or not turn_id: return
         bridge = running.get("bridge")
-        if bridge is not None:
-            chat.on_turn_end(bridge, session_id)
-        elif session_id:
-            try:
-                home = active_home()
-                transport.request(home, {"op": "turn_end", "home": str(home), "session_id": session_id})
-            except (transport.Unavailable, transport.Uncertain):
-                log.warning("linear: chat turn-end capture unavailable; queued evidence needs reconciliation")
+        home = active_home()
+        path = Path(ctx.get_config("state_database") or home / "linear" / "state.db")
+        if bridge is not None or path.is_file():
+            # Capture once under the original turn identity before any service replacement.
+            store = bridge.store if bridge is not None else Store(path)
+            quiet = bridge.quiet if bridge is not None else float(ctx.get_config("quiet_minutes", 30)) * 60
+            store.delay_session_updates(session_id, time.time() + quiet, turn_id=turn_id)
 
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
                       description=chat.SCHEMA["description"], inject_invocation_context=True)
@@ -330,6 +340,7 @@ def register(ctx: Any) -> None:
     async def service(runtime: Any) -> None:
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
         validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
+        validate_ingress_profile(settings.get("ingress_profile"))
         home = Path(runtime.profile_home)
         api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
                              specialist_scope=settings.get("specialist_scope"),

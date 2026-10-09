@@ -58,7 +58,15 @@ plugins:
 ```
 
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
-`api_url`, `tick_seconds` (default 2).
+`api_url`, `tick_seconds` (default 2). `ingress_profile` optionally selects the exact profile identifier
+written into this private inbox by its trusted ingress route. It defaults to the runtime profile;
+set it explicitly when a standalone `default` executor has a separately named inbox route. Only
+the inbox selector changes, including Stop priority and resume checks. Chat authorization, executor
+identity, board, app/workspace credentials and scope do not change. The override must contain only
+ASCII letters, digits, underscores or hyphens; malformed values refuse startup before credentials
+or state admission. This does not enable the plugin or replay imported deliveries. Changing an
+existing inbox's binding can expose previously pending deliveries: reconcile them and obtain
+scoped activation approval before deploying the binding.
 
 API requests share a serialized client within the profile. HTTP 400 GraphQL `RATELIMITED`
 and HTTP 429 pause requests until the exhausted request, complexity, or endpoint budget's
@@ -101,6 +109,38 @@ window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Deliv
 `webhookId`, which is constant. It then writes each delivery to this profile's inbox table
 `deliveries(logical_agent, delivery_id, profile, payload, payload_sha256, received_at, status,
 attempts)`. The plugin reads pending rows for its profile and marks them `imported`.
+
+## Chat work and detached workers
+
+The native `linear` tool is chat-only. Detached Kanban workers intentionally receive
+no authenticated chat session or run generation. They must not call `linear start`,
+`done`, `blocked`, `release`, or `delegate`, copy the originating chat identity, or infer it from
+`HERMES_PROFILE=default`. The plugin does not offer this tool in worker processes.
+
+- A task created by the Linear bridge has a persisted issue/task ownership binding.
+  Its worker uses Kanban lifecycle tools and supplies evidence; the gateway bridge
+  projects those events to Linear through its durable outbox.
+- A manually created Kanban task, even with an issue URL in its body, has no native
+  Linear binding. Its Kanban completion does not update the issue. Do not invent an
+  adoption path for it. The only supported chat-to-worker handoff is the authenticated
+  in-process admission below, and only for a strictly unowned issue.
+- Do not release chat tracking and then require a manual worker to claim the issue.
+  Keep chat execution and bounded assistance under the owning chat, or arrange an
+  authorized native Linear session through the supported operator route after the
+  predecessor has stopped and its release is verified. Do not duplicate an existing
+  task merely to obtain tracking.
+- For an already stranded manual task, preserve its workspace, run history and
+  evidence, stop competing execution, and escalate exact owner/task reconciliation.
+  Do not edit the bridge database, spoof chat fields, redelegate blindly, or unblock
+  the task until a supported ownership path is established.
+
+Task acceptance must describe capabilities available to the executor. A detached
+worker cannot satisfy a chat-only Linear claim. Separate product evidence from the
+tracking integration blocker; never treat a rejected review as permission to skip
+product or destination acceptance. Goal-mode workers currently accept external
+blocks only as `dependency` or `needs_input`; do not mislabel a capability failure
+as a human product decision or claim completion to escape the judge. Preserve the
+precise failure and request supervisor reconciliation without repeated tool retries.
 
 ## Chat-to-worker admission
 
@@ -220,6 +260,13 @@ Every Linear write goes through a local outbox, oldest first per issue.
   The original receipt and dependent writes remain available; neither a remote Done nor a newer
   reopen proves the predecessor's outcome. A failed lookup before send (`write_started=False`)
   remains retryable and can yield to a successor. Other issues in a shared project update proceed.
+- **Unfinished chat release** retains the owning row and fences restart/followup admission until
+  the parked state and null native delegate are read back on the exact issue. The human assignee
+  is not changed. A verified `applied` reconciliation of this release finalizes matching local
+  ownership and permits its receipt-bound closeout; `not_applied` restores the original claim
+  without replaying the failed release. Record neither outcome from a failed lookup or a later
+  unrelated edit. A successor ownership generation suppresses old release comments, responses
+  and project-update lines. Read-before-write plus readback is best-effort, not remote CAS.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
   task), and one more try after the next successful write. A failed chat alert remains due until

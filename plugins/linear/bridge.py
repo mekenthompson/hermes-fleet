@@ -69,6 +69,11 @@ def validate_activation_cutoff_ms(value: Any) -> int | None:
     if type(value) is not int or value <= 0:
         raise ValueError("linear: activation_cutoff_ms must be a positive integer Unix epoch in milliseconds")
     return value
+def validate_ingress_profile(value: Any) -> str | None:
+    if value is None: return None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("linear: ingress_profile must be a nonempty profile identifier")
+    return value
 def evidence_links(text: str) -> list[str]:
     """Links that can prove a result; the tracker's own issue links cannot."""
     return [clean for url in URL.findall(text or "") if (clean := url.rstrip(".,;:!?"))
@@ -201,6 +206,7 @@ class Bridge:
                  clock: Callable[[], float] = time.time) -> None:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.inject, self.clock = store, api, kanban, profile, inject, clock
+        self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
         self._ingress = Path(settings["ingress_database"]) if settings.get("ingress_database") else None
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
@@ -572,6 +578,7 @@ class Bridge:
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
         issue_id = row["issue_id"]
+        if (self.store.get(issue_id) or {}).get("release_pending"): return
         if self.store.issue_reconciliation_blocked(issue_id): return
         marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
         if self.store.followup_captured(marker): return
@@ -587,7 +594,7 @@ class Bridge:
         if not self.store.update(issue_id, pending_resume=json.dumps(intent)): return
         failure = None
         with self.store.guard_issue_work(issue_id) as admitted:
-            if not admitted or not self._require_effect(issue_id): return
+            if not admitted or (self.store.get(issue_id) or {}).get("release_pending") or not self._require_effect(issue_id): return
             try: ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
             except Exception as exc:
                 failure, ok = exc, False
@@ -1001,7 +1008,7 @@ class Bridge:
                 continue
     def _recover_chats(self) -> None:
         for row in self.store.active("chat"):
-            if self.store.issue_reconciliation_blocked(row["issue_id"]):
+            if row.get("release_pending") or self.store.issue_reconciliation_blocked(row["issue_id"]):
                 continue
             if not self.authorize_specialist_effect(row["issue_id"]):
                 continue
@@ -1014,7 +1021,7 @@ class Bridge:
             if not self.may_execute_existing(row["issue_id"]):
                 continue
             with self.store.guard_issue_work(row["issue_id"]) as admitted:
-                if not admitted: continue
+                if not admitted or (self.store.get(row["issue_id"]) or {}).get("release_pending"): continue
                 injected = self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a "
                                        "Linear issue. Reconcile what already happened, then continue; finish "
                                        "with `linear done` or `linear blocked`.")
@@ -1089,6 +1096,8 @@ class Bridge:
             action()
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        release_status = self.store.outbox_row(payload.get("requires_status_id", ""))
+        if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return False
         if kind == "status" and payload.get("terminal"):
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])
@@ -1120,7 +1129,9 @@ class Bridge:
         if kind != "project_update" and payload.get("terminal") and not payload.get("admission_id"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
-            if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
+            delegate = (issue.get("delegate") or {}).get("id")
+            released = (delegate is None and self.store.verified_release(payload.get("requires_status_id", "")))
+            if ((delegate != self.api.viewer_id() and not released)
                     or (issue.get("state") or {}).get("type") == "canceled"):
                 return False  # no completion message or update after a human takeover/cancel
         elif kind in ("comment", "activity") and not payload.get("takeover") and \
@@ -1156,12 +1167,22 @@ class Bridge:
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
                     raise LinearError("PR acceptance on the recorded exact head failed at delivery", retryable=False)
             name = self.state_name(issue, payload["state"])
+            if payload.get("release") and not name:
+                raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
             fields = {"stateId": state_id(issue, name)} if name else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
+            if payload.get("release"):
+                fields["delegateId"] = None
             if fields:
                 self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields),
                                     terminal=bool(payload.get("terminal")))
+            if payload.get("release"):
+                verified = self._effect_issue(payload["issue_id"])
+                if (verified.get("id") != payload["issue_id"] or "delegate" not in verified or
+                        (verified.get("delegate") or {}).get("id") is not None or
+                        (verified.get("state") or {}).get("name") != name):
+                    raise LinearError("Release write was not verified; reconcile before further work")
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
@@ -1204,10 +1225,14 @@ class Bridge:
                     if self.store.status_pending(terminal_id):
                         waiting_lines.add(ident)
                     continue
+                release_status = self.store.outbox_row(terminal_id) if terminal_id else None
+                if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): continue
                 if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() and
                         self.store.pending_claim(issue["id"])):
                     raise LinearError(f"claim for {ident} is still pending")
-                if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                delegate = (issue.get("delegate") or {}).get("id")
+                released = delegate is None and terminal_id and self.store.verified_release(terminal_id)
+                if ((delegate != self.api.viewer_id() and not released) or
                         (issue.get("state") or {}).get("type") == "canceled" or
                         ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
                     continue
@@ -1287,7 +1312,7 @@ class Bridge:
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
                           "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
                           "json_extract(payload, '$.agentActivity.signal') END='stop' ORDER BY received_at, delivery_id",
-                          (self.profile,)).fetchall()
+                          (self.ingress_profile,)).fetchall()
     def _queued_stop(self, issue_id: str, stamp: float) -> bool:
         if self._ingress is None or not self._ingress.exists(): return False
         try:
@@ -1306,7 +1331,7 @@ class Bridge:
             stops = [row[:4] for row in self._stop_deliveries(db) if not row[4] or row[4] in owned][:limit]
             rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at FROM deliveries WHERE profile = ? "
                               "AND status = 'pending' ORDER BY received_at, delivery_id LIMIT ?",
-                              (self.profile, limit)).fetchall()
+                              (self.ingress_profile, limit)).fetchall()
             selected = {(row[0], row[1]) for row in stops}
             rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
             for agent, delivery, payload, received in rows:
