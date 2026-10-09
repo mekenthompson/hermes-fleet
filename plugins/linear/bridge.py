@@ -78,16 +78,20 @@ def evidence_links(text: str) -> list[str]:
     """Links that can prove a result; the tracker's own issue links cannot."""
     return [clean for url in URL.findall(text or "") if (clean := url.rstrip(".,;:!?"))
             and "linear.app/" not in clean]
+_SECRET = re.compile(r"(?i)(?:\b(?:ghp_|github_pat_|gho_|ghu_|ghs_|sk-)[A-Za-z0-9_]+|Bearer\s+\S+|(?:token|authorization)\s*[:=]\s*\S+)")
+def _public(text: str) -> str:
+    """Refusal text may quote a receipt detail, never a token that leaked into one."""
+    return _SECRET.sub("[redacted]", text)
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
     if isinstance(receipt, dict) and receipt:
-        cause = f"{receipt.get('classification') or 'unknown'}: {receipt.get('detail') or 'no detail'}"
+        cause = f"{receipt.get('classification') or 'unknown'}: {_public(str(receipt.get('detail') or 'no detail'))}"
         cause += f"; source {receipt['evidence_source']}" if receipt.get("evidence_source") else ""
     else:
         cause = "acceptance verifier returned no receipt"
     return (f"{url}: {cause}" if url else cause)[:500]
 def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
-    cause = "; ".join(failures) if failures else "no acceptance receipt"
+    cause = _public("; ".join(failures) if failures else "no acceptance receipt")
     if where == "delivery":
         return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
     tail = (". The result remains unfinished; reconcile the PR before marking Done." if where == "kanban" else

@@ -22,6 +22,18 @@ class AcceptanceDetailTests(unittest.TestCase):
         self.assertIn("acme/repo/pull/7", cause)
         self.assertNotIn("must-not-appear", cause)
 
+    def test_cause_redacts_a_credential_in_the_detail(self) -> None:
+        leaked = "ghp_EXAMPLETOKEN"
+        cause = bridge.acceptance_cause({
+            "classification": "auth", "evidence_source": "checks",
+            "detail": f"refused {leaked} and github_pat_EXAMPLETOKEN",
+        })
+        text = bridge.acceptance_refusal([cause])
+        self.assertNotIn(leaked, text)
+        self.assertNotIn("github_pat_", text)
+        self.assertIn("[redacted]", text)
+        self.assertIn("could not be verified", text)
+
     def test_refused_receipt_is_recorded_and_does_not_count_as_accepted(self) -> None:
         calls = []
 
