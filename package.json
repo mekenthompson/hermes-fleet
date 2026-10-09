@@ -8,5 +8,8 @@
     "@openai/codex": "0.160.0",
     "@xai-official/grok": "1.0.46",
     "opencode-ai": "1.18.29"
+  },
+  "overrides": {
+    "proxy-addr": "2.0.8"
   }
 }
