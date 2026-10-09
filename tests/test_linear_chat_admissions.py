@@ -3,7 +3,10 @@ import threading
 import unittest
 from pathlib import Path
 
-from store import Store
+from linear_fake_api import load_plugin
+
+load_plugin()
+from hermes_fleet_linear_plugin.store import Store
 
 
 class ChatAdmissionTests(unittest.TestCase):
