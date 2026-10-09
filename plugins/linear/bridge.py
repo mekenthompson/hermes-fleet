@@ -870,7 +870,7 @@ class Bridge:
         if row and row["origin"] == "kanban_chat":
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                     "body": payload["content"]["body"]}) if kind == "activity" else (kind, payload)
-                      for kind, payload in writes]
+                      for kind, payload in writes if kind != "project_update"]
         return self.store.finish(issue_id, writes, at=at)
     def _finished(self, row: dict[str, Any]) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):

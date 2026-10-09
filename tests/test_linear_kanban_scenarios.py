@@ -360,6 +360,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(self.linear.activities, [])
         self.assertTrue(any("Findings" in comment["body"] for comment in self.linear.comments))
+        self.assertEqual(self.linear.project_updates, [])
+        self.assertFalse(any(row["kind"] == "project_update" for row in self.bridge.store.pending()))
 
     def test_session_free_worker_block_projects_comment_without_agent_activity(self):
         task = self.bridge.kanban.create(title="ABC-1: session-free work", assignee="default")
