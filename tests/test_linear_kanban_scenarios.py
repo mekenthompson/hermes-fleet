@@ -78,6 +78,300 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.injected.append((key, text))
         return self.inject_ok
 
+    def test_chat_admission_identity_requires_live_host_turn_and_catalog(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import registry
+        from hermes_fleet_linear_plugin import admission
+        validator = getattr(admission, "bound_to_live_turn", None)
+        self.assertTrue(callable(validator), "production live-turn validator is missing")
+        context = registry.ToolInvocationContext(profile="alpha", platform="telegram", chat_id="chat", chat_type="dm",
+            session_key="parent-chat", session_id="parent-session", run_generation=7)
+        with sqlite3.connect(self.dir / "state.db") as db:
+            db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, ended_at REAL)")
+            db.execute("INSERT INTO sessions VALUES('parent-session', NULL)")
+        source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat", thread_id="",
+            chat_type="dm", user_id="", scope_id="")
+        turn_ctx = SimpleNamespace(session_key="parent-chat", session_id="parent-session", run_generation=7,
+                                   _run_still_current=lambda: True)
+        state = SimpleNamespace(persistent=SimpleNamespace(run_generation=7),
+             turn=SimpleNamespace(agent=object(), event=SimpleNamespace(source=source), ctx=turn_ctx))
+        gateway = SimpleNamespace(_peek_session_state=lambda key: state,
+            _chat_stop_profile_matches=lambda key, home: True,
+            _is_user_authorized_for_source=lambda source: True)
+        runtime = SimpleNamespace(gateway=gateway, profile_home=self.dir, profile_name="alpha")
+        with patch.object(registry, "_current_tool_invocation_context", return_value=context):
+            self.assertTrue(validator(runtime, context))
+            self.assertFalse(validator(runtime, SimpleNamespace(**{name: getattr(context, name) for name in
+                ("profile", "platform", "chat_id", "session_key", "session_id", "run_generation")})))
+            state.persistent.run_generation = 8
+            self.assertFalse(validator(runtime, context))
+            state.persistent.run_generation = 7
+            for target, field, value in ((runtime, "profile_name", "beta"),
+                    (source, "chat_id", "other-chat"), (turn_ctx, "session_id", "other-session"),
+                    (turn_ctx, "_run_still_current", lambda: False)):
+                with self.subTest(field=field):
+                    old = getattr(target, field)
+                    setattr(target, field, value)
+                    self.assertFalse(validator(runtime, context))
+                    setattr(target, field, old)
+            with sqlite3.connect(self.dir / "state.db") as db:
+                db.execute("UPDATE sessions SET ended_at=1")
+            self.assertFalse(validator(runtime, context))
+
+    def test_registered_service_delegate_accepts_host_turn_and_refuses_serialized_rpc(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import registry
+        from hermes_fleet_linear_plugin import transport
+        self.bridge.kanban.profile_home = self.dir
+        context = registry.ToolInvocationContext(profile="alpha", platform="telegram", chat_id="chat", chat_type="dm",
+            session_key="parent-chat", session_id="parent-session", run_generation=7)
+        source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat", thread_id="",
+            chat_type="dm", user_id="", scope_id="")
+        turn = SimpleNamespace(session_key=context.session_key, session_id=context.session_id, run_generation=7,
+                               _run_still_current=lambda: True)
+        state = SimpleNamespace(persistent=SimpleNamespace(run_generation=7),
+            turn=SimpleNamespace(agent=object(), ctx=turn, event=SimpleNamespace(source=source)))
+        gateway = SimpleNamespace(_peek_session_state=lambda key: state,
+            _chat_stop_profile_matches=lambda key, home: True, _is_user_authorized_for_source=lambda source: True)
+        with sqlite3.connect(self.dir / "state.db") as db:
+            db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, ended_at REAL)")
+            db.execute("INSERT INTO sessions VALUES('parent-session', NULL)")
+        class Registration:
+            def get_config(self, key, default=None): return True if key == "enabled" else default
+            def register_tool(self, **kwargs): self.tool = kwargs
+            def register_hook(self, *args): pass
+            def register_profile_service(self, name, factory): self.service = factory
+        registration = Registration()
+        plugin.register(registration)
+        self.assertTrue(registration.tool["inject_invocation_context"])
+        self.assertIn("delegate", registration.tool["schema"]["parameters"]["properties"]["action"]["enum"])
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        captured = []
+        def at_recover(*_):
+            captured.append(json.loads(registration.tool["handler"](args, context)))
+        async def run_service():
+            stop = asyncio.Event()
+            stop.set()
+            runtime = SimpleNamespace(gateway=gateway, profile_home=self.dir, profile_name="alpha", stop_event=stop)
+            await registration.service(runtime)
+        with patch.object(plugin, "BoundLinearAPI", return_value=self.bridge.api), \
+                patch.object(plugin, "token_provider", return_value=lambda: "synthetic-token"), \
+                patch.object(plugin, "Store", return_value=self.bridge.store), \
+                patch.object(plugin, "Kanban", return_value=self.bridge.kanban), \
+                patch.object(plugin, "Bridge", return_value=self.bridge), \
+                patch.object(self.bridge, "chat_profile_matches", return_value=True), \
+                patch.object(self.bridge, "recover", side_effect=at_recover), \
+                patch.object(registry, "_current_tool_invocation_context", return_value=context):
+            asyncio.run(run_service())
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0]["ok"], captured)
+        before = sum("mutation" in request for request in self.linear.requests)
+        server = transport.Server(self.dir, "alpha", lambda args, host: chat.handle(self.bridge, args, host), lambda _: None)
+        try:
+            with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+                result = json.loads(transport.chat_request(self.dir, args, context))
+            self.assertFalse(result["ok"], result)
+            self.assertIn("live gateway-owned", result["message"])
+        finally:
+            server.close()
+        self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
+        self.assertEqual(len(self.tasks()), 1)
+
+    def test_chat_delegate_admits_one_session_free_real_core_task(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.bridge.kanban.profile_home = self.dir
+        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
+                                  session_id="parent-session", run_generation=7, chat_id="chat", thread_id="",
+                                  chat_type="dm", user_id="user", scope_id="")
+        self.bridge.validate_chat_admission = lambda value: value is context
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        # Exercise the registered chat handler's action, not an invented native event.
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            result = json.loads(chat.handle(self.bridge, args, context))
+            self.assertTrue(result["ok"], result)
+            again = json.loads(chat.handle(self.bridge, args, context))
+            self.assertTrue(again["ok"], again)
+            before = sum("mutation" in request for request in self.linear.requests)
+            for field, value in (("run_generation", 8), ("chat_id", "other-chat")):
+                with self.subTest(field=field):
+                    old = getattr(context, field)
+                    setattr(context, field, value)
+                    rejected = json.loads(chat.handle(self.bridge, args, context))
+                    self.assertFalse(rejected["ok"], rejected)
+                    setattr(context, field, old)
+            self.linear.set_state(ISSUE, "Canceled")
+            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
+            self.linear.set_state(ISSUE, "In Progress")
+            self.linear.set_delegate(ISSUE, OTHER)
+            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
+            self.linear.set_delegate(ISSUE, {"id": SELF})
+            self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
+        row = self.bridge.store.get(ISSUE)
+        self.assertEqual(row["origin"], "kanban_chat")
+        self.assertEqual(row["owner_ref"], "parent-chat")
+        self.assertEqual(self.bridge.kanban.get(row["task_id"]).status, "ready")
+        self.assertEqual(self.bridge.kanban.get(row["task_id"]).max_retries, 0)
+        self.assertEqual(self.linear.activities, [])
+        self.assertEqual(len(self.tasks()), 1)
+        self.deliver(self.linear.session_event("created", ISSUE, "genuine-native-session"))
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "parent-chat")
+        self.assertEqual(self.bridge.store.get(ISSUE)["task_id"], row["task_id"])
+        self.assertEqual(len(self.tasks()), 1)
+        activity_count = len(self.linear.activities)
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, row["task_id"], reason="reconcile worker", kind="capability"))
+        self.clock.now += 1
+        self.deliver(self.linear.session_event("prompted", ISSUE, "genuine-native-session", body="continue"))
+        self.assertEqual(self.bridge.kanban.get(row["task_id"]).status, "blocked")
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "parent-chat")
+        self.assertEqual(len(self.linear.activities), activity_count)
+        self.complete(row["task_id"], "Findings: https://docs.example/findings/admitted")
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.assertEqual(len(self.linear.activities), activity_count)
+
+    def test_chat_delegate_task_create_response_loss_preserves_blocked_idempotent_task(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.bridge.kanban.profile_home = self.dir
+        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
+            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
+            user_id="user", scope_id="")
+        self.bridge.validate_chat_admission = lambda value: value is context
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        original = self.bridge.kanban.create
+        def lose_response(**fields):
+            original(**fields)
+            raise OSError("local create response lost")
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            with patch.object(self.bridge.kanban, "create", side_effect=lose_response):
+                self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
+            tasks = self.tasks()
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0][1], "blocked")
+            self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
+            self.assertTrue(json.loads(chat.handle(self.bridge, args, context))["ok"])
+            self.assertEqual(len(self.tasks()), 1)
+
+    def test_chat_admission_turn_invalidated_at_transport_boundary_sends_nothing(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.bridge.kanban.profile_home = self.dir
+        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
+            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
+            user_id="user", scope_id="")
+        live = [True]
+        self.bridge.validate_chat_admission = lambda value: live[0] and value is context
+        original = self.bridge._mutate_outbox
+        def invalidate(row_id, action, **kwargs):
+            live[0] = False
+            return original(row_id, action, **kwargs)
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True), \
+                patch.object(self.bridge, "_mutate_outbox", side_effect=invalidate):
+            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
+        self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
+        self.assertEqual(self.tasks()[0][1], "blocked")
+
+    def test_chat_delegate_binding_refusal_retains_fenced_task(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.bridge.kanban.profile_home = self.dir
+        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
+            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
+            user_id="user", scope_id="")
+        self.bridge.validate_chat_admission = lambda value: value is context
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True), \
+                patch.object(self.bridge.store, "bind_chat_admission", return_value=False), \
+                patch.object(self.bridge.kanban, "archive", side_effect=OSError("archive failed")):
+            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
+        admission = self.bridge.store.chat_admission(args["id"])
+        self.assertEqual(admission["state"], "ambiguous")
+        self.assertEqual(admission["task_id"], self.tasks()[0][0])
+        self.assertEqual(self.tasks()[0][1], "blocked")
+        self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
+
+    def test_chat_delegate_response_loss_keeps_task_blocked_across_restart(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        self.bridge.kanban.profile_home = self.dir
+        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
+            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
+            user_id="user", scope_id="")
+        self.bridge.validate_chat_admission = lambda value: value is context
+        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+        self.linear.lose_next_response = True
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            result = json.loads(chat.handle(self.bridge, args, context))
+        self.assertFalse(result["ok"])
+        admission = self.bridge.store.chat_admission(args["id"])
+        self.assertEqual(admission["state"], "ambiguous")
+        self.assertEqual(self.bridge.kanban.get(admission["task_id"]).status, "blocked")
+        before = sum("mutation" in request for request in self.linear.requests)
+        self.bridge = self.make_bridge()
+        self.bridge.recover()
+        self.bridge.flush()
+        self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(self.bridge.kanban.get(admission["task_id"]).status, "blocked")
+
+    def test_session_free_worker_archive_projects_unfinished_comment_not_activity(self):
+        task = self.bridge.kanban.create(title="Synthetic archive", assignee="alpha")
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
+        self.linear.set_delegate(ISSUE, {"id": SELF})
+        self.bridge.kanban.archive(task.id)
+        self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertEqual(self.linear.activities, [])
+        self.assertTrue(any("unfinished" in comment["body"].lower() for comment in self.linear.comments))
+
+    def test_session_free_worker_scope_fence_archives_worker(self):
+        task = self.bridge.kanban.create(title="Synthetic scope", assignee="alpha")
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
+        self.bridge.api.specialist_scope = object()
+        self.bridge.store.fence_scope(ISSUE, "fixture scope revoked", at=self.clock())
+        self.assertFalse(self.bridge.authorize_specialist_effect(ISSUE))
+        self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
+        self.assertEqual(self.linear.activities, [])
+        self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
+
+    def test_session_free_worker_cancellation_retires_worker_not_parent_chat(self):
+        task = self.bridge.kanban.create(title="Synthetic cancel", assignee="alpha")
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
+        self.linear.set_delegate(ISSUE, {"id": SELF})
+        self.linear.set_state(ISSUE, "Canceled")
+        self.bridge.recheck(force=True)
+        self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
+        self.assertTrue(self.bridge.store.retired(ISSUE))
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.linear.activities, [])
+
+    def test_session_free_worker_completion_projects_comment_not_native_activity(self):
+        task = self.bridge.kanban.create(title="ABC-1: session-free work", assignee="default")
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id)
+        self.bridge.api.update_issue(ISSUE, {"delegateId": SELF})
+        self.complete(task.id, "Findings: https://docs.example/findings/session-free")
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.assertEqual(self.linear.activities, [])
+        self.assertTrue(any("Findings" in comment["body"] for comment in self.linear.comments))
+
+    def test_session_free_worker_block_projects_comment_without_agent_activity(self):
+        task = self.bridge.kanban.create(title="ABC-1: session-free work", assignee="default")
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id)
+        self.bridge.api.update_issue(ISSUE, {"delegateId": SELF})
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task.id, kind="capability", reason="Missing runtime capability"))
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertEqual(self.linear.activities, [])
+        self.assertTrue(any("Missing runtime capability" in comment["body"] for comment in self.linear.comments))
+
     def test_standalone_delegation_is_eligible_for_real_core_dispatch(self):
         from hermes_cli.profiles import get_profile_dir
         self.bridge.kanban = Kanban(profile="container-label", profile_home=get_profile_dir("default"))
@@ -818,6 +1112,24 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge()
         self.bridge.tick()
         self.assertEqual(len(self.linear.activities), before)
+
+    def test_capability_block_is_not_a_request_for_human_input(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task_id, reason="Native tracking transport is unavailable",
+                                          kind="capability"))
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        activity = self.linear.activities[-1]["content"]
+        self.assertEqual(activity["type"], "error")
+        self.assertIn("capability", activity["body"])
+        self.assertNotIn("Reply here to unblock", activity["body"])
+        before = len(self.linear.activities)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(len(self.linear.activities), before)
+        self.assertEqual(self.bridge.kanban.get(task_id).block_kind, "capability")
 
     def test_upgraded_work_keeps_claimed_unprocessed_block(self) -> None:
         self.delegate()
@@ -2469,6 +2781,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
         self.assertIn("Kanban triage", self.linear.activities[-1]["content"]["body"])
+        self.assertEqual(self.linear.activities[-1]["content"]["type"], "error")
+        self.assertNotIn("Reply here to unblock", self.linear.activities[-1]["content"]["body"])
         self.clock.now += 1
         event = self.linear.session_event("prompted", ISSUE, "s-1", body="Keep this instruction")
         self.deliver(event)

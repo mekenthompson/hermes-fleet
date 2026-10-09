@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS retirement (
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS specialist_scope_fence (
   issue_id TEXT PRIMARY KEY, reason TEXT NOT NULL, fenced_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_admissions (
+  request_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL UNIQUE, profile TEXT NOT NULL,
+  home TEXT NOT NULL, parent_session_key TEXT NOT NULL, parent_session_id TEXT NOT NULL,
+  run_generation INTEGER NOT NULL, ownership_id TEXT NOT NULL, task_id TEXT,
+  state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
+  reason_code TEXT, route TEXT);
 """
 class Store:
     def __init__(self, path: Path | str) -> None:
@@ -175,6 +181,101 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT * FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
         return dict(row) if row else None
+    # -- session-free durable chat admission ------------------------------
+    @staticmethod
+    def _chat_admission_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["route"] = json.loads(result["route"]) if result["route"] is not None else None
+        return result
+    def chat_admission(self, request_id: str) -> dict[str, Any] | None:
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM chat_admissions WHERE request_id=?", (request_id,)).fetchone()
+        return self._chat_admission_row(row)
+    def chat_admissions(self, states: list[str] | tuple[str, ...] | set[str] | None = None) -> list[dict[str, Any]]:
+        with self._tx() as db:
+            if states is None:
+                rows = db.execute("SELECT * FROM chat_admissions ORDER BY rowid").fetchall()
+            else:
+                states = tuple(states)
+                if not states:
+                    return []
+                rows = db.execute("SELECT * FROM chat_admissions WHERE state IN (" +
+                                  ",".join("?" for _ in states) + ") ORDER BY rowid", states).fetchall()
+        return [self._chat_admission_row(row) for row in rows]
+    def prepare_chat_admission(self, request_id: str, issue_id: str, profile: str, home: str,
+                               parent_session_key: str, parent_session_id: str, run_generation: int,
+                               route: dict[str, Any] | None, at: float) -> dict[str, Any] | None:
+        del at  # retained in API for callers; admission itself is durable without wall-clock semantics.
+        identity = (issue_id, profile, home, parent_session_key, parent_session_id, run_generation,
+                    json.dumps(route, sort_keys=True, separators=(",", ":")) if route is not None else None)
+        with self._tx() as db:
+            prior = db.execute("SELECT * FROM chat_admissions WHERE request_id=?", (request_id,)).fetchone()
+            if prior:
+                saved = (prior["issue_id"], prior["profile"], prior["home"], prior["parent_session_key"],
+                         prior["parent_session_id"], prior["run_generation"], prior["route"])
+                if saved != identity:
+                    raise ValueError("chat admission request_id reused with conflicting identity")
+                return self._chat_admission_row(prior)
+            if db.execute("SELECT 1 FROM chat_admissions WHERE issue_id=?", (issue_id,)).fetchone():
+                return None
+            if (not self._effect_admitted(db, issue_id) or
+                    db.execute("SELECT 1 FROM work WHERE issue_id=?", (issue_id,)).fetchone() or
+                    db.execute("SELECT 1 FROM retirement WHERE issue_id=?", (issue_id,)).fetchone()):
+                return None
+            ownership_id = str(uuid.uuid4())
+            db.execute("INSERT INTO chat_admissions (request_id, issue_id, profile, home, parent_session_key, "
+                       "parent_session_id, run_generation, ownership_id, state, route) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?)",
+                       (request_id, issue_id, profile, home, parent_session_key, parent_session_id,
+                        run_generation, ownership_id, identity[-1]))
+            return self._chat_admission_row(db.execute("SELECT * FROM chat_admissions WHERE request_id=?",
+                                                       (request_id,)).fetchone())
+    def transition_chat_admission(self, request_id: str, expected_state: str, state: str,
+                                  task_id: str | None = None, reason_code: str | None = None) -> bool:
+        allowed = {"prepared": {"claiming", "rejected", "ambiguous"},
+                   "claiming": {"admitted", "rejected", "ambiguous"},
+                   "admitted": {"ambiguous"}, "rejected": set(), "ambiguous": set()}
+        if state not in allowed.get(expected_state, set()):
+            return False
+        with self._tx() as db:
+            row = db.execute("SELECT issue_id FROM chat_admissions WHERE request_id=? AND state=?",
+                             (request_id, expected_state)).fetchone()
+            if not row:
+                return False
+            cur = db.execute("UPDATE chat_admissions SET state=?, task_id=COALESCE(?, task_id), "
+                             "reason_code=? WHERE request_id=? AND state=?",
+                             (state, task_id, reason_code, request_id, expected_state))
+            return cur.rowcount == 1
+    def bind_chat_admission(self, request_id: str, task_id: str, project_id: str | None,
+                            last_updated_at: float) -> bool:
+        with self._tx() as db:
+            admission = db.execute("SELECT * FROM chat_admissions WHERE request_id=?", (request_id,)).fetchone()
+            if not admission or admission["state"] not in ("prepared", "claiming"):
+                return False
+            issue_id = admission["issue_id"]
+            if not self._effect_admitted(db, issue_id) or db.execute(
+                    "SELECT 1 FROM retirement WHERE issue_id=?", (issue_id,)).fetchone():
+                return False
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            if work:
+                if not (work["origin"] == "kanban_chat" and work["ownership_id"] == admission["ownership_id"] and
+                        work["task_id"] == task_id):
+                    return False
+            else:
+                db.execute("INSERT INTO work (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, "
+                           "run_generation, ownership_id) VALUES (?, 'kanban_chat', ?, ?, ?, ?, ?, ?)",
+                           (issue_id, admission["parent_session_key"], task_id, project_id, last_updated_at,
+                            admission["run_generation"], admission["ownership_id"]))
+            if admission["state"] == "prepared":
+                db.execute("UPDATE chat_admissions SET state='claiming', task_id=? WHERE request_id=? AND state='prepared'",
+                           (task_id, request_id))
+            elif admission["task_id"] not in (None, task_id):
+                return False
+            else:
+                db.execute("UPDATE chat_admissions SET task_id=? WHERE request_id=?", (task_id, request_id))
+            return True
     def retired(self, issue_id: str | None = None) -> list[dict]:
         with self._tx() as db:
             return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
@@ -411,7 +512,8 @@ class Store:
         with self._tx() as db:
             return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
                                    "json_extract(payload, '$.task_id')=? AND "
-                                   "json_extract(payload, '$.terminal')=1 LIMIT 1", (task_id,)).fetchone())
+                                   "json_extract(payload, '$.terminal')=1 AND "
+                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id,)).fetchone())
     def superseded(self, row: dict[str, Any]) -> bool:
         payload, owner = row["payload"], row["payload"].get("work_owner")
         with self._tx() as db:

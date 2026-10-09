@@ -350,6 +350,8 @@ def register(ctx: Any) -> None:
                         await asyncio.to_thread(Kanban, settings.get("board"), profile=runtime.profile_name,
                                                 profile_home=home), profile=runtime.profile_name,
                         settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
+        from . import admission
+        bridge.validate_chat_admission = lambda context: admission.bound_to_live_turn(runtime, context)
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge
         server = None
