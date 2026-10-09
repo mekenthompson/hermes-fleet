@@ -186,7 +186,14 @@ class FleetImageReleaseTests(unittest.TestCase):
             },
         )
         self.assertTrue(package["private"])
+        self.assertEqual(package["overrides"], {"proxy-addr": "2.0.8"})
         self.assertEqual(lock["packages"][""]["dependencies"], package["dependencies"])
+        proxy_addr = lock["packages"]["node_modules/proxy-addr"]
+        self.assertEqual(proxy_addr["version"], "2.0.8")
+        self.assertEqual(
+            proxy_addr["resolved"],
+            "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.8.tgz",
+        )
         entry = lock["packages"]["node_modules/@anthropic-ai/claude-code"]
         self.assertEqual(entry["version"], CLAUDE_CODE_VERSION)
         self.assertEqual(entry["integrity"], CLAUDE_CODE_INTEGRITY)
