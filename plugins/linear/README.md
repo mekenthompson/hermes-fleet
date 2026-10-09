@@ -110,6 +110,37 @@ window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Deliv
 `deliveries(logical_agent, delivery_id, profile, payload, payload_sha256, received_at, status,
 attempts)`. The plugin reads pending rows for its profile and marks them `imported`.
 
+## Chat work and detached workers
+
+The native `linear` tool is chat-only. Detached Kanban workers intentionally receive
+no authenticated chat session or run generation. They must not call `linear start`,
+`done`, `blocked`, or `release`, copy the originating chat identity, or infer it from
+`HERMES_PROFILE=default`. The plugin does not offer this tool in worker processes.
+
+- A task created by the Linear bridge has a persisted issue/task ownership binding.
+  Its worker uses Kanban lifecycle tools and supplies evidence; the gateway bridge
+  projects those events to Linear through its durable outbox.
+- A manually created Kanban task, even with an issue URL in its body, has no native
+  Linear binding. Its Kanban completion does not update the issue. There is no
+  supported automatic adoption or chat-to-task transfer action.
+- Do not release chat tracking and then require a manual worker to claim the issue.
+  Keep chat execution and bounded assistance under the owning chat, or arrange an
+  authorized native Linear session through the supported operator route after the
+  predecessor has stopped and its release is verified. Do not duplicate an existing
+  task merely to obtain tracking.
+- For an already stranded manual task, preserve its workspace, run history and
+  evidence, stop competing execution, and escalate exact owner/task reconciliation.
+  Do not edit the bridge database, spoof chat fields, redelegate blindly, or unblock
+  the task until a supported ownership path is established.
+
+Task acceptance must describe capabilities available to the executor. A detached
+worker cannot satisfy a chat-only Linear claim. Separate product evidence from the
+tracking integration blocker; never treat a rejected review as permission to skip
+product or destination acceptance. Goal-mode workers currently accept external
+blocks only as `dependency` or `needs_input`; do not mislabel a capability failure
+as a human product decision or claim completion to escape the judge. Preserve the
+precise failure and request supervisor reconciliation without repeated tool retries.
+
 ## What happens
 
 | Event | Kanban | Linear |

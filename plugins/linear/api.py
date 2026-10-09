@@ -47,6 +47,25 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
         raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
     raise LinearError(f"Linear {mutation} response did not confirm success")
 
+def _graphql_rejection(errors: Any) -> str:
+    """Log each GraphQL message and code, then keep them on the stable prefix."""
+    parts: list[str] = []
+    log = logging.getLogger("linear")
+    for error in errors if isinstance(errors, list) else []:
+        if not isinstance(error, dict):
+            continue
+        message = error.get("message")
+        raw_extensions = error.get("extensions")
+        extensions = raw_extensions if isinstance(raw_extensions, dict) else {}
+        code = extensions.get("code")
+        log.error("linear: GraphQL error message=%s code=%s", message, code)
+        text = message.strip() if isinstance(message, str) else ""
+        if text and code:
+            parts.append(f"{text} ({code})")
+        elif text or code:
+            parts.append(text or str(code))
+    return "Linear GraphQL error" + (f": {'; '.join(parts)}" if parts else "")
+
 def is_duplicate_create_error(errors: Any, client_id: str) -> bool:
     """True when Linear rejected a create because an entity with our client ``id`` exists.
 
@@ -206,7 +225,7 @@ class LinearAPI:
         if status == 403:
             raise LinearError("Linear refused this app (HTTP 403); check its scopes", retryable=False)
         if errors:
-            raise LinearError("Linear GraphQL error", errors=errors, retryable=False)
+            raise LinearError(_graphql_rejection(errors), errors=errors, retryable=False)
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
         return payload["data"]
