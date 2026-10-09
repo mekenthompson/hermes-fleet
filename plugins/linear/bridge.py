@@ -1034,22 +1034,38 @@ class Bridge:
                 continue
             if row.get("stop_requested_at"):
                 with self.store.guard_issue(row["issue_id"]) as admitted:
-                    if admitted:
-                        self.inject(row["owner_ref"], "[Linear] Stop was requested before the restart. Do not resume this "
-                                                       "issue until a newer instruction explicitly reopens it.")
+                    if admitted and not self.store.recovery_delivered(
+                            row["issue_id"], row.get("ownership_id"), row.get("run_generation"), "stop"):
+                        if self.inject(row["owner_ref"], "[Linear] Stop was requested before the restart. Do not resume this "
+                                                       "issue until a newer instruction explicitly reopens it."):
+                            self.store.mark_recovery_delivered(
+                                row["issue_id"], row.get("ownership_id"), row.get("run_generation"), "stop")
                 continue
             if not self.may_execute_existing(row["issue_id"]):
                 continue
             with self.store.guard_issue_work(row["issue_id"]) as admitted:
                 if not admitted or (self.store.get(row["issue_id"]) or {}).get("release_pending"): continue
+                if self._restart_notice_settled(row): continue
                 injected = self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a "
                                        "Linear issue. Reconcile what already happened, then continue; finish "
                                        "with `linear done` or `linear blocked`.")
+                if injected:
+                    latest = self.store.latest_status(row["issue_id"])
+                    self.store.mark_recovery_delivered(
+                        row["issue_id"], row.get("ownership_id"), row.get("run_generation"),
+                        None if latest is None else latest.get("id"))
             if not injected:
                 self.store.delete(row["issue_id"])
                 self.status(row["issue_id"], "blocked")
                 self.comment(row["issue_id"], "Interrupted by a restart, and the chat session did not survive. "
                                               "Re-delegate or start it again from chat.", row=row)
+    def _restart_notice_settled(self, row: dict) -> bool:
+        """A blocked closeout, or a notice already delivered for this execution, is not a new restart."""
+        latest = self.store.latest_status(row["issue_id"])
+        if latest and latest.get("state") == "blocked": return True
+        return self.store.recovery_delivered(
+            row["issue_id"], row.get("ownership_id"), row.get("run_generation"),
+            None if latest is None else latest.get("id"))
     def flush(self) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
         sent, progress = 0, True

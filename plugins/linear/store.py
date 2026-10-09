@@ -620,6 +620,33 @@ class Store:
                     db.execute("DELETE FROM work WHERE issue_id=? AND ownership_id=? AND release_pending=1",
                                (payload["issue_id"], payload["work_owner"]))
             return True
+    def latest_status(self, issue_id: str) -> dict[str, Any] | None:
+        """Newest status intent, including a pending or failed closeout."""
+        with self._tx() as db:
+            row = db.execute("SELECT id, json_extract(payload, '$.state') AS intent FROM outbox "
+                             "WHERE kind='status' AND json_extract(payload, '$.issue_id')=? "
+                             "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
+                             (issue_id,)).fetchone()
+        if not row or not row["intent"]: return None
+        return {"id": row["id"], "state": row["intent"]}
+    def recovery_delivered(self, issue_id: str, ownership_id: str | None,
+                           generation: int | None, status_id: str | None) -> bool:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                             (f"recovery-notice:{issue_id}",)).fetchone()
+        if not row: return False
+        try: saved = json.loads(row["value"])
+        except (ValueError, TypeError): return False
+        return saved == {"ownership_id": ownership_id, "run_generation": generation,
+                         "status_id": status_id or ""}
+    def mark_recovery_delivered(self, issue_id: str, ownership_id: str | None,
+                                generation: int | None, status_id: str | None) -> None:
+        body = json.dumps({"ownership_id": ownership_id, "run_generation": generation,
+                           "status_id": status_id or ""})
+        with self._tx() as db:
+            db.execute("INSERT INTO metadata(key, value) VALUES (?, ?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (f"recovery-notice:{issue_id}", body))
     def verified_release(self, row_id: str) -> bool:
         row = self.outbox_row(row_id)
         return bool(row and row["state"] == "sent" and row["kind"] == "status"
