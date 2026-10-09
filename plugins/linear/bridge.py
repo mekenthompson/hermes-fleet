@@ -80,24 +80,19 @@ def evidence_links(text: str) -> list[str]:
             and "linear.app/" not in clean]
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
-    if not isinstance(receipt, dict) or not receipt:
-        cause = "acceptance verifier returned no receipt"
-    else:
+    if isinstance(receipt, dict) and receipt:
         cause = f"{receipt.get('classification') or 'unknown'}: {receipt.get('detail') or 'no detail'}"
-        if receipt.get("evidence_source"):
-            cause += f"; source {receipt['evidence_source']}"
-    if url:
-        cause = f"{url}: {cause}"
-    return cause[:500]
+        cause += f"; source {receipt['evidence_source']}" if receipt.get("evidence_source") else ""
+    else:
+        cause = "acceptance verifier returned no receipt"
+    return (f"{url}: {cause}" if url else cause)[:500]
 def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
     cause = "; ".join(failures) if failures else "no acceptance receipt"
     if where == "delivery":
         return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
-    if where == "kanban":
-        return ("PR acceptance on the exact head and required checks could not be verified "
-                f"({cause}). The result remains unfinished; reconcile the PR before marking Done.")
-    return ("PR acceptance on the exact head and required checks could not be verified "
-            f"({cause}); leave this issue open and reconcile the PR.")
+    tail = (". The result remains unfinished; reconcile the PR before marking Done." if where == "kanban" else
+            "; leave this issue open and reconcile the PR.")
+    return f"PR acceptance on the exact head and required checks could not be verified ({cause}){tail}"
 def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
     """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
     try:
@@ -313,8 +308,7 @@ class Bridge:
                           heads: dict[str, str] | None = None, failures: list[str] | None = None) -> bool:
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
-            if failures is not None:
-                failures.append("evidence link is not a pull request")
+            failures is not None and failures.append("evidence link is not a pull request")
             return False
         if not prs:
             return True
@@ -323,8 +317,7 @@ class Bridge:
             receipt = pr_acceptance(url) if contract in ("local-only", url) else pr_acceptance(url, contract)
             if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
                     r"[0-9a-f]{40}", str(receipt.get("head_sha") or "")):
-                if failures is not None:
-                    failures.append(acceptance_cause(receipt if isinstance(receipt, dict) else {}, url))
+                failures is not None and failures.append(acceptance_cause(receipt if isinstance(receipt, dict) else {}, url))
                 return False
             if heads is not None: heads[url] = receipt["head_sha"]
         return True
@@ -917,8 +910,7 @@ class Bridge:
         issue_id = row["issue_id"]
         heads: dict[str, str] = {}
         failures: list[str] = []
-        accepted = (self.accepted_evidence(evidence, contract, heads=heads, failures=failures) if any(
-                    PR_URL.fullmatch(link) for link in evidence) else self.accepted_evidence(evidence, contract, failures=failures))
+        accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
         if not evidence or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
                     "unfinished. Reply or re-delegate to continue." if not evidence else
