@@ -58,7 +58,15 @@ plugins:
 ```
 
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
-`api_url`, `tick_seconds` (default 2).
+`api_url`, `tick_seconds` (default 2). `ingress_profile` optionally selects the exact profile identifier
+written into this private inbox by its trusted ingress route. It defaults to the runtime profile;
+set it explicitly when a standalone `default` executor has a separately named inbox route. Only
+the inbox selector changes, including Stop priority and resume checks. Chat authorization, executor
+identity, board, app/workspace credentials and scope do not change. The override must contain only
+ASCII letters, digits, underscores or hyphens; malformed values refuse startup before credentials
+or state admission. This does not enable the plugin or replay imported deliveries. Changing an
+existing inbox's binding can expose previously pending deliveries: reconcile them and obtain
+scoped activation approval before deploying the binding.
 
 API requests share a serialized client within the profile. HTTP 400 GraphQL `RATELIMITED`
 and HTTP 429 pause requests until the exhausted request, complexity, or endpoint budget's
@@ -211,6 +219,13 @@ Every Linear write goes through a local outbox, oldest first per issue.
   The original receipt and dependent writes remain available; neither a remote Done nor a newer
   reopen proves the predecessor's outcome. A failed lookup before send (`write_started=False`)
   remains retryable and can yield to a successor. Other issues in a shared project update proceed.
+- **Unfinished chat release** retains the owning row and fences restart/followup admission until
+  the parked state and null native delegate are read back on the exact issue. The human assignee
+  is not changed. A verified `applied` reconciliation of this release finalizes matching local
+  ownership and permits its receipt-bound closeout; `not_applied` restores the original claim
+  without replaying the failed release. Record neither outcome from a failed lookup or a later
+  unrelated edit. A successor ownership generation suppresses old release comments, responses
+  and project-update lines. Read-before-write plus readback is best-effort, not remote CAS.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
   task), and one more try after the next successful write. A failed chat alert remains due until

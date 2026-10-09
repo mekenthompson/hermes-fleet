@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from .api import LinearError
-from .bridge import Bridge, PR_URL, evidence_links
+from .bridge import Bridge, PR_URL, evidence_links, iso_ms
 SCHEMA = {
     "name": "linear",
     "description": (
@@ -103,6 +103,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if not bridge.authorize_specialist_effect(issue_id):
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         row = bridge.store.get(issue_id)
+        if row and row.get("release_pending"):
+            return _reply(False, "Release is pending verified relinquishment; reconcile it before further work.")
         if action == "start":
             try: bridge.await_retired(issue_id)
             except LinearError as exc: return _reply(False, str(exc))
@@ -148,26 +150,30 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(True, f"{ident} Blocked update queued; it stays yours. Delivery is not yet confirmed.")
         if action == "release":
             if not _finish(bridge, row, session_key, session_id, project, ident, "blocked",
-                           f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished"):
+                           f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished",
+                           release=True):
                 return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
-            return _reply(True, f"Stopped chat tracking {ident}; Blocked closeout queued, not yet confirmed in Linear.")
+            return _reply(True, f"{ident} unfinished release queued durably; relinquishment is not yet verified.")
     return _reply(False, f"Unknown action {action!r}.")
 def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
             ident: str, state: str, message: str, update: str, evidence: list[str] | None = None,
-            heads: dict[str, str] | None = None) -> bool:
+            heads: dict[str, str] | None = None, *, release: bool = False) -> bool:
     issue_id = row["issue_id"]
     if not bridge.authorize_specialist_effect(issue_id):
         return False
     route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
     return bridge.store.finish(issue_id, [
         ("status", {"issue_id": issue_id, "state": state, "evidence": evidence or [],
-                    "evidence_contract": "local-only", "pr_heads": heads or {}, **route}),
+                    "evidence_contract": "local-only", "pr_heads": heads or {}, "release": release, **route}),
         ("comment", {"issue_id": issue_id, "body": message, **route}),
+        *([("activity", {"issue_id": issue_id, "session_id": row["linear_session_id"],
+                         "content": {"type": "response", "body": message}, **route})]
+          if release and row.get("linear_session_id") else []),
         ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
                             "session_id": session_id, "project_id": project, "resolve": issue_id,
                             "lines": {ident: update}, "line_issues": {ident: issue_id},
                             "quiet": bridge.quiet, **route}),
-    ], at=bridge.clock())
+    ], at=bridge.clock(), release=release)
 def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
            session_id: str, generation: int | None) -> str:
     ident, url = issue.get("identifier"), issue.get("url", "")
@@ -193,7 +199,11 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
                                        last_updated_at=fence, resume_fence_at=fence):
                 return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
     else:
-        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project, run_generation=generation):
+        watermark = iso_ms(issue.get("updatedAt"))
+        if not watermark or watermark <= 0:
+            return _reply(False, "Linear issue ordering timestamp is unavailable; no claim was captured.")
+        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project,
+                                run_generation=generation, last_updated_at=watermark):
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
     if not bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id")) or not bridge.project_update(
             session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"]):
