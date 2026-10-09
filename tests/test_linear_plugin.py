@@ -13,11 +13,12 @@ import time
 import unittest
 from pathlib import Path
 
-from linear_fake_api import ROOT, Clock, load_plugin
+from linear_fake_api import ROOT, SELF, Clock, FakeLinear, load_plugin
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import api as linear_api  # noqa: E402
 from hermes_fleet_linear_plugin import oauth  # noqa: E402
+from hermes_fleet_linear_plugin.bridge import Bridge  # noqa: E402
 from hermes_fleet_linear_plugin.store import Store  # noqa: E402
 
 PLUGIN = ROOT / "plugins" / "linear"
@@ -33,7 +34,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
 # Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
 # Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
-BUDGET = 3731
+# Blocked chat recovery is acknowledged once per execution, including a queued or failed Blocked closeout.
+# Measured 3766, allowance 8.
+BUDGET = 3774
 
 
 class FakeContext:
@@ -397,6 +400,103 @@ class ConnectOAuthTests(unittest.TestCase):
         with self.assertRaises(linear_api.LinearError) as caught:
             linear_api.LinearAPI(broken, transport=lambda *a: (200, {}, b"{}")).viewer_id()
         self.assertTrue(caught.exception.retryable)
+
+RESTART = "[Linear] The gateway restarted while you were working on a Linear issue."
+
+
+class ChatRestartRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.clock = Clock()
+        self.linear = FakeLinear(self.clock)
+        self.addCleanup(self.linear.close)
+        self.linear.add_issue("iss-1", "ABC-1")
+        self.linear.set_delegate("iss-1", {"id": SELF, "name": "This Agent"})
+        self.linear.set_state("iss-1", "Blocked")
+        self.store = Store(Path(tmp.name) / "state.db")
+        self.injected: list[str] = []
+        self.inject_ok = True
+        api = linear_api.LinearAPI(lambda: "synthetic-token", endpoint=self.linear.url, clock=self.clock)
+        self.bridge = Bridge(self.store, api, None, profile="alpha", inject=self._inject, clock=self.clock)
+
+    def _inject(self, _key: str, text: str) -> bool:
+        self.injected.append(text)
+        return self.inject_ok
+
+    def _own(self) -> None:
+        self.assertTrue(self.store.put("iss-1", "chat", "chat-key", run_generation=4))
+
+    def _status(self, state: str, at: float, *, sent: bool = True, failed: bool = False) -> str:
+        row_id = self.store.enqueue("status", {"issue_id": "iss-1", "state": state, "session_key": "chat-key"}, at=at)
+        self.assertTrue(row_id)
+        if failed:
+            self.store.mark(row_id, "failed")
+        elif sent:
+            self.store.mark_sent(row_id, True)
+        return row_id
+
+    def _restarts(self) -> list[str]:
+        return [text for text in self.injected if text.startswith(RESTART)]
+
+    def test_blocked_closeout_is_not_reinjected_across_restarts(self) -> None:
+        self._own()
+        self._status("in_progress", 10)
+        for at, sent, failed in ((20, False, False), (30, True, False), (40, False, True)):
+            self.injected.clear()
+            self._status("blocked", at, sent=sent, failed=failed)
+            self.bridge._recover_chats()
+            self.bridge._recover_chats()
+            with self.subTest(at=at, sent=sent, failed=failed):
+                self.assertEqual(self._restarts(), [])
+                self.assertIsNotNone(self.store.get("iss-1"))
+                self.assertEqual(self.store.get("iss-1")["owner_ref"], "chat-key")
+
+    def test_successful_restart_notice_is_delivered_once_per_execution(self) -> None:
+        self.linear.set_state("iss-1", "In Progress")
+        self._own()
+        self._status("in_progress", 10)
+        self.bridge._recover_chats()
+        self.bridge._recover_chats()
+        self.assertEqual(len(self._restarts()), 1)
+        self._status("in_progress", 20)
+        self.bridge._recover_chats()
+        self.assertEqual(len(self._restarts()), 2)
+        self.bridge._recover_chats()
+        self.assertEqual(len(self._restarts()), 2)
+
+    def test_lost_session_is_not_retried_after_the_row_is_released(self) -> None:
+        self.linear.set_state("iss-1", "In Progress")
+        self._own()
+        self._status("in_progress", 10)
+        self.inject_ok = False
+        self.bridge._recover_chats()
+        self.assertIsNone(self.store.get("iss-1"))
+        delivered = len(self.injected)
+        self.inject_ok = True
+        self.bridge._recover_chats()
+        self.assertEqual(len(self.injected), delivered)
+
+    def test_new_execution_after_blocked_closeout_notifies_once(self) -> None:
+        self._own()
+        self._status("blocked", 10)
+        self.bridge._recover_chats()
+        self.assertEqual(self._restarts(), [])
+        self.linear.set_state("iss-1", "In Progress")
+        self._status("in_progress", 20)
+        self.bridge._recover_chats()
+        self.bridge._recover_chats()
+        self.assertEqual(len(self._restarts()), 1)
+
+    def test_paused_stop_notice_is_delivered_once(self) -> None:
+        self._own()
+        self.assertTrue(self.store.update("iss-1", stop_requested_at=5))
+        self.bridge._recover_chats()
+        self.bridge._recover_chats()
+        stops = [text for text in self.injected if text.startswith("[Linear] Stop was requested")]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(self._restarts(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

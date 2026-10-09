@@ -222,8 +222,9 @@ The bridge records each Kanban event and its queued Linear writes in one local t
 after a crash it replays events beyond that local cursor even if core's notification claim advanced.
 Rows upgraded from the older work schema reconcile historical transitions against the current
 task state, so an old breaker event cannot block a task that has since resumed.
-Chat work is asked to reconcile. If its session cannot be reached, it becomes Blocked with
-"interrupted by restart".
+Chat work is asked to reconcile once for that execution. A Blocked closeout, including one
+still queued or failed, is not asked again. A paused Stop notice is delivered once. If its
+session cannot be reached, it becomes Blocked with "interrupted by restart".
 
 **Ownership.** Before every status write, and every `recheck_minutes` for active work, the plugin
 re-reads the issue. An Issue webhook that changes the delegate triggers an immediate re-read.
