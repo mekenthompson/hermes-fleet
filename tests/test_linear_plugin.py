@@ -32,7 +32,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Approved session-free chat admission adds a live-turn validator and durable receipt schema.
 # Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
 # Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
-BUDGET = 3703
+# Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
+BUDGET = 3731
 
 
 class FakeContext:
