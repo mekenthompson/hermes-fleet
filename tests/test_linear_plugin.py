@@ -29,7 +29,7 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Desktop/API transport adds a bounded profile-private IPC surface; one gateway owns execution.
 # Own-app create and link keep explicit team, parent, assignee, delegate, and lead guards.
 # Profile-local durable cooldown and serialized rate-limit admission add bounded API state.
-BUDGET = 3380  # Bounded allowance for durable release reconciliation and generation fences.
+BUDGET = 3393  # Measured after main landed the detached-worker gate and GraphQL error detail.
 
 
 class FakeContext:
