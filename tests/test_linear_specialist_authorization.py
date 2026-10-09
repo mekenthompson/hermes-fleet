@@ -1077,7 +1077,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         from hermes_fleet_linear_plugin import chat
         self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
         before = self.store.get(ISSUE)
-        def evidence_checked(_links):
+        def evidence_checked(_links, **_ignored):
             self.authority.issues[ISSUE] = issue_record(project={"id": "project-foreign"})
             return True
         self.bridge.accepted_evidence = evidence_checked
@@ -1098,7 +1098,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 self.kanban.tasks["task"] = SimpleNamespace(id="task", status="done", completion_contract="https://docs.example/findings/1", result="Done", title="OPS-1: task")
                 self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT)
                 before = self.store.get(issue_id)
-                def evidence_checked(_links, _contract):
+                def evidence_checked(_links, _contract, **_ignored):
                     self.authority.issues[issue_id] = issue_record(id=issue_id, project={"id": "project-foreign"})
                     return accepted
                 self.bridge.accepted_evidence = evidence_checked

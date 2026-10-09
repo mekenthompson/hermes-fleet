@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from .api import LinearError
-from .bridge import Bridge, PR_URL, evidence_links, iso_ms
+from .bridge import Bridge, PR_URL, acceptance_refusal, evidence_links, iso_ms
 SCHEMA = {
     "name": "linear",
     "description": (
@@ -128,11 +128,11 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
                                      "Without one, use `linear blocked` or `linear release`.")
             heads: dict[str, str] = {}
-            accepted = (bridge.accepted_evidence(links, heads=heads) if any(PR_URL.fullmatch(link) for link in links)
-                        else bridge.accepted_evidence(links))
+            failures: list[str] = []
+            accepted = (bridge.accepted_evidence(links, heads=heads, failures=failures) if any(PR_URL.fullmatch(link) for link in links)
+                        else bridge.accepted_evidence(links, failures=failures))
             if not accepted:
-                return _reply(False, "PR acceptance on the exact head and required checks could not be verified; "
-                                     "leave this issue open and reconcile the PR.")
+                return _reply(False, acceptance_refusal(failures))
             if not _finish(bridge, row, session_key, session_id, project, ident, "done",
                            f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
                            f"Done: {' '.join(links)}", links, heads):

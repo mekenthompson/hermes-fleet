@@ -78,6 +78,26 @@ def evidence_links(text: str) -> list[str]:
     """Links that can prove a result; the tracker's own issue links cannot."""
     return [clean for url in URL.findall(text or "") if (clean := url.rstrip(".,;:!?"))
             and "linear.app/" not in clean]
+def acceptance_cause(receipt, url: str = "") -> str:
+    """Bounded refusal cause. Never include the check dump or gh stderr."""
+    if not isinstance(receipt, dict) or not receipt:
+        cause = "acceptance verifier returned no receipt"
+    else:
+        cause = f"{receipt.get('classification') or 'unknown'}: {receipt.get('detail') or 'no detail'}"
+        if receipt.get("evidence_source"):
+            cause += f"; source {receipt['evidence_source']}"
+    if url:
+        cause = f"{url}: {cause}"
+    return cause[:500]
+def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
+    cause = "; ".join(failures) if failures else "no acceptance receipt"
+    if where == "delivery":
+        return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
+    if where == "kanban":
+        return ("PR acceptance on the exact head and required checks could not be verified "
+                f"({cause}). The result remains unfinished; reconcile the PR before marking Done.")
+    return ("PR acceptance on the exact head and required checks could not be verified "
+            f"({cause}); leave this issue open and reconcile the PR.")
 def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
     """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
     try:
@@ -290,9 +310,11 @@ class Bridge:
                 continue
             self._reauth_alerted.add((kind, target))
     def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
-                          heads: dict[str, str] | None = None) -> bool:
+                          heads: dict[str, str] | None = None, failures: list[str] | None = None) -> bool:
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
+            if failures is not None:
+                failures.append("evidence link is not a pull request")
             return False
         if not prs:
             return True
@@ -301,6 +323,8 @@ class Bridge:
             receipt = pr_acceptance(url) if contract in ("local-only", url) else pr_acceptance(url, contract)
             if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
                     r"[0-9a-f]{40}", str(receipt.get("head_sha") or "")):
+                if failures is not None:
+                    failures.append(acceptance_cause(receipt if isinstance(receipt, dict) else {}, url))
                 return False
             if heads is not None: heads[url] = receipt["head_sha"]
         return True
@@ -892,13 +916,13 @@ class Bridge:
         evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
         issue_id = row["issue_id"]
         heads: dict[str, str] = {}
-        accepted = (self.accepted_evidence(evidence, contract, heads=heads) if any(
-                    PR_URL.fullmatch(link) for link in evidence) else self.accepted_evidence(evidence, contract))
+        failures: list[str] = []
+        accepted = (self.accepted_evidence(evidence, contract, heads=heads, failures=failures) if any(
+                    PR_URL.fullmatch(link) for link in evidence) else self.accepted_evidence(evidence, contract, failures=failures))
         if not evidence or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
                     "unfinished. Reply or re-delegate to continue." if not evidence else
-                    "PR acceptance on the exact head and required checks could not be verified. "
-                    "The result remains unfinished; reconcile the PR before marking Done.")
+                    acceptance_refusal(failures, where="kanban"))
             if not self.authorize_specialist_effect(issue_id):
                 return
             self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
@@ -1161,11 +1185,13 @@ class Bridge:
                 return False
             if payload.get("terminal") and payload.get("state") == "done" and payload.get("pr_heads"):
                 current: dict[str, str] = {}
-                if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current)
+                delivery_failures: list[str] = []
+                if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current,
+                                               failures=delivery_failures)
                         or current != payload["pr_heads"]):
                     if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
-                    raise LinearError("PR acceptance on the recorded exact head failed at delivery", retryable=False)
+                    raise LinearError(acceptance_refusal(delivery_failures, where="delivery"), retryable=False)
             name = self.state_name(issue, payload["state"])
             if payload.get("release") and not name:
                 raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
