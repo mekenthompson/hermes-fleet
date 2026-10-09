@@ -123,6 +123,13 @@ class Kanban:
     def subscribe(self, task_id: str, issue_id: str) -> None:
         with self.conn() as conn:
             self.kn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=issue_id)
+    def subscribe_parent(self, task_id: str, profile: str, route: dict) -> None:
+        with self.conn() as conn:
+            self.kn.add_notify_sub(conn, task_id=task_id, platform=route["platform"], chat_id=route["chat_id"],
+                thread_id=route.get("thread_id") or "", notifier_profile=profile,
+                delivery_mode="notify+wake", chat_type=route.get("chat_type") or "dm",
+                user_id=route.get("user_id") or None,
+                delivery_metadata={"scope_id": route.get("scope_id") or ""})
     def events(self, task_id: str, issue_id: str) -> list:
         with self.conn() as conn:
             return self.kn.claim_unseen_events_for_sub(
@@ -366,7 +373,7 @@ class Bridge:
             log.warning("linear: specialist scope permanently fenced issue %s: %s", issue_id, exc)
     def _park_fenced(self, issue_id: str) -> None:
         row = self.store.get(issue_id)
-        if row and row["origin"] == "kanban" and row.get("task_id"):
+        if row and row["origin"] in ("kanban", "kanban_chat") and row.get("task_id"):
             task = self.kanban.get(row["task_id"])
             if task and task.status != "archived": self.kanban.archive(task.id)
     def authorize_specialist_effect(self, issue_id: str) -> bool:
@@ -509,6 +516,10 @@ class Bridge:
             return False
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
+        if row and row["origin"] == "kanban_chat":
+            self.activity(issue_id, session_id, "response",
+                          "Already delegated from Hermes chat to the existing Kanban task; no second executor was created.")
+            return
         incomplete = bool(row and row["origin"] == "kanban" and
                           not self.store.has_start_ack(issue_id, row["task_id"]))
         if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(
@@ -548,6 +559,10 @@ class Bridge:
             return
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
+        if row and row["origin"] == "kanban_chat":
+            self.comment(issue["id"], "Native Linear follow-up did not resume this chat-admitted worker. "
+                         "Reconcile the retained task in the owning chat; no new executor was created.", row=row)
+            return
         if row and row["origin"] == "chat":
             self._chat_followup(row, session_id, str(activity.get("id") or ""), event_ms(event), ident, body)
             return
@@ -684,7 +699,7 @@ class Bridge:
         issue_id = row["issue_id"]
         body = "Kanban task archived or deleted without accepted completion evidence. Work remains unfinished."
         route = {"task_id": row["task_id"], "terminal": True, "owner_issue_id": issue_id}
-        self.store.finish(issue_id, [
+        self._finish_work(issue_id, [
             ("status", {"issue_id": issue_id, "state": "blocked", **route}),
             ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                           "content": {"type": "error", "body": body}, **route})], at=self.clock())
@@ -782,7 +797,7 @@ class Bridge:
         self.say(row, f"Stopped by {who}. Re-delegate or reply here to resume.")
     # -- Kanban -> Linear -------------------------------------------------
     def pump_kanban(self) -> None:
-        for row in self.store.active("kanban"):
+        for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
                 if not self.authorize_specialist_effect(row["issue_id"]):
                     continue
@@ -820,11 +835,19 @@ class Bridge:
         writes: list[tuple[str, dict[str, Any]]] = []
         route = self._alert_route(row)
         if event.kind in ("blocked", "block_loop_detected") and not str(payload.get("reason") or "").startswith(OWN):
-            instruction = "Resolve Kanban triage on the board." if task_status == "triage" else "Reply here to unblock."
+            internal_block = payload.get("kind") in {"capability", "transient"}
+            if task_status == "triage":
+                instruction = "Resolve Kanban triage on the board."
+            elif internal_block:
+                instruction = "Reconcile the runtime failure before resuming the existing task; no user input is requested."
+            else:
+                instruction = "Reply here to unblock."
+            block_type = "error" if internal_block else "elicitation"
+            block_label = f"Blocked ({payload['kind']})" if internal_block else "Blocked"
             writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
                       ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                                    "content": {"type": "elicitation", "body":
-                                                f"Blocked: {payload.get('reason') or 'needs input'}. {instruction}"},
+                                    "content": {"type": block_type, "body":
+                                                f"{block_label}: {payload.get('reason') or 'needs input'}. {instruction}"},
                                     **route})]
         elif event.kind == "gave_up":
             writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
@@ -844,7 +867,18 @@ class Bridge:
                 (event.kind == "block_loop_detected" and task_status != "triage") or
                 (event.kind == "unblocked" and task_status in ("blocked", "triage"))):
             writes = []
+        if row["origin"] == "kanban_chat":
+            writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
+                                    "body": payload["content"]["body"]}) if kind == "activity" else (kind, payload)
+                      for kind, payload in writes]
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
+    def _finish_work(self, issue_id: str, writes: list, *, at: float) -> bool:
+        row = self.store.get(issue_id)
+        if row and row["origin"] == "kanban_chat":
+            writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
+                                    "body": payload["content"]["body"]}) if kind == "activity" else (kind, payload)
+                      for kind, payload in writes if kind != "project_update"]
+        return self.store.finish(issue_id, writes, at=at)
     def _finished(self, row: dict[str, Any]) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
@@ -867,7 +901,7 @@ class Bridge:
                     "The result remains unfinished; reconcile the PR before marking Done.")
             if not self.authorize_specialist_effect(issue_id):
                 return
-            self.store.finish(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
+            self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
                                                     "owner_issue_id": issue_id}),
                                          ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
@@ -889,7 +923,7 @@ class Bridge:
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
         if not self.authorize_specialist_effect(issue_id):
             return
-        self.store.finish(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
+        self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock())
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
                   source_ms: float | None = None) -> bool:
@@ -919,7 +953,7 @@ class Bridge:
         self.comment(row["issue_id"], f"Reassigned to {name}; local retirement requested. "
                      "New work here waits for the prior worker to exit.", takeover=True)
     def release(self, row: dict[str, Any], reason: str) -> None:
-        if row["origin"] == "kanban":
+        if row["origin"] in ("kanban", "kanban_chat"):
             self._retire_task(row)
             self.kanban.archive(row["task_id"])
         else:
@@ -1050,6 +1084,12 @@ class Bridge:
     def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False) -> None:
         @contextmanager
         def guard():
+            row = self.store.outbox_row(row_id)
+            admission_id = (row or {}).get("payload", {}).get("admission_id")
+            if admission_id:
+                validate = getattr(self, "_active_admission_claims", {}).get(admission_id)
+                if not callable(validate) or not validate():
+                    raise ProjectUpdateDeferred
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
             yield
         with self.api.guarded_mutation(guard):
@@ -1086,7 +1126,7 @@ class Bridge:
             content = payload["content"] if kind == "activity" else payload
             content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
                                content["body"].replace("Done.", "Finished locally.", 1))
-        if kind != "project_update" and payload.get("terminal"):
+        if kind != "project_update" and payload.get("terminal") and not payload.get("admission_id"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
             delegate = (issue.get("delegate") or {}).get("id")
@@ -1102,6 +1142,15 @@ class Bridge:
                 return False
         if kind == "status":
             issue = self._effect_issue(payload["issue_id"])  # exact target on every re-read
+            if payload.get("admission_id"):
+                admission = self.store.chat_admission(payload["admission_id"])
+                validate = getattr(self, "_active_admission_claims", {}).get(payload["admission_id"])
+                if not callable(validate) or not validate():
+                    raise ProjectUpdateDeferred
+                if (not admission or admission["state"] != "claiming" or
+                        admission["issue_id"] != issue["id"] or admission["task_id"] != payload.get("task_id") or
+                        (issue.get("delegate") or {}).get("id") or (issue.get("state") or {}).get("type") in CLOSED):
+                    return False
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                   payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"

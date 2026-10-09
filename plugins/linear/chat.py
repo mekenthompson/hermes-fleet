@@ -8,7 +8,8 @@ SCHEMA = {
     "name": "linear",
     "description": (
         "Track work on a Linear issue, or create issues and projects as this profile's own app. "
-        "start: claim an existing issue (refused if another agent is working it). "
+        "start: claim an existing issue for this chat (refused if another agent is working it). "
+        "delegate: session-free gateway-chat handoff of a fresh unowned issue to one durable Kanban task; requires id. "
         "done: finish it; needs an evidence link. blocked: you need a human. "
         "release: stop tracking unfinished work. "
         "create_issue: create an undelegated issue; requires id, title, and team. "
@@ -17,7 +18,7 @@ SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "done", "blocked", "release", "create_issue", "create_project", "link_issue"]},
+            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "create_issue", "create_project", "link_issue"]},
             "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking and link_issue."},
             "id": {"type": "string", "description": "Caller UUID for create_issue or create_project. Reuse it to reconcile a lost response."},
             "title": {"type": "string", "description": "create_issue title."},
@@ -81,6 +82,9 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     if not session_key:
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
     action = str(args.get("action", ""))
+    if action == "delegate":
+        from . import admission
+        return admission.handle(bridge, args, invocation_context)
     if action in {"create_issue", "create_project", "link_issue"}:
         return _plan(bridge, args, action)
     ref = str(args.get("issue", "")).strip()

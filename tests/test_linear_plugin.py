@@ -29,7 +29,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Desktop/API transport adds a bounded profile-private IPC surface; one gateway owns execution.
 # Own-app create and link keep explicit team, parent, assignee, delegate, and lead guards.
 # Profile-local durable cooldown and serialized rate-limit admission add bounded API state.
-BUDGET = 3393  # Measured after main landed the detached-worker gate and GraphQL error detail.
+# Approved session-free chat admission adds a live-turn validator and durable receipt schema.
+# Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
+# Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
+BUDGET = 3703
 
 
 class FakeContext:
@@ -114,7 +117,7 @@ class LinearPluginUnitTests(unittest.TestCase):
                     for p in PLUGIN.iterdir() if p.suffix in {".py", ".yaml"})
         self.assertLessEqual(lines, BUDGET)
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "oauth.py", "plugin.yaml",
+                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "oauth.py", "plugin.yaml",
                           "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:

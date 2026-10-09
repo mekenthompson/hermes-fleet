@@ -1,7 +1,7 @@
 # Linear plugin
 
 Linear is the human record of work. This profile's Kanban board runs the work. The plugin translates
-between them and holds no execution state of its own.
+between them. Core owns execution; the plugin retains admission and effect receipts, not a second worker runtime.
 
 - **Linear** owns status, the delegate (which agent owns an issue, visible to every agent), comments,
   agent-session activity and project updates.
@@ -114,15 +114,16 @@ attempts)`. The plugin reads pending rows for its profile and marks them `import
 
 The native `linear` tool is chat-only. Detached Kanban workers intentionally receive
 no authenticated chat session or run generation. They must not call `linear start`,
-`done`, `blocked`, or `release`, copy the originating chat identity, or infer it from
+`done`, `blocked`, `release`, or `delegate`, copy the originating chat identity, or infer it from
 `HERMES_PROFILE=default`. The plugin does not offer this tool in worker processes.
 
 - A task created by the Linear bridge has a persisted issue/task ownership binding.
   Its worker uses Kanban lifecycle tools and supplies evidence; the gateway bridge
   projects those events to Linear through its durable outbox.
 - A manually created Kanban task, even with an issue URL in its body, has no native
-  Linear binding. Its Kanban completion does not update the issue. There is no
-  supported automatic adoption or chat-to-task transfer action.
+  Linear binding. Its Kanban completion does not update the issue. Do not invent an
+  adoption path for it. The only supported chat-to-worker handoff is the authenticated
+  in-process admission below, and only for a strictly unowned issue.
 - Do not release chat tracking and then require a manual worker to claim the issue.
   Keep chat execution and bounded assistance under the owning chat, or arrange an
   authorized native Linear session through the supported operator route after the
@@ -140,6 +141,46 @@ product or destination acceptance. Goal-mode workers currently accept external
 blocks only as `dependency` or `needs_input`; do not mislabel a capability failure
 as a human product decision or claim completion to escape the judge. Preserve the
 precise failure and request supervisor reconciliation without repeated tool retries.
+
+## Chat-to-worker admission
+
+`linear start` tracks work performed by the current chat. It is not a detached-worker
+identity grant. Detached Kanban workers must not call chat `start` or inherit a previous
+chat's routing/environment to manufacture authority.
+
+For a new, strictly unowned issue, an in-process live gateway chat turn may call:
+
+```json
+{"action":"delegate","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
+```
+
+Use a new canonical UUID for the request, and reuse that exact request only within its
+original live turn. The saved profile/home, session, generation and subscriber route
+must match. Existing delegates or chat/native work are refused, including this app's
+own delegate. The issue and parent-session admission are retained rather than reopened.
+The gateway retains a blocked idempotent Kanban task, subscribes the originating chat
+with `notify+wake`, and captures a guarded one-shot ownership claim before activation.
+The worker executes; the chat remains the subscriber. No native Linear Agent Session
+is fabricated. Worker progress, internal capability/transient blockers and completion
+use guarded status/comment projection rather than AgentActivities or credential requests.
+
+Serialized Desktop/API RPC callers cannot acquire this live in-process admission grant.
+Use the gateway chat or keep the chat itself as executor; do not bypass the refusal.
+The validator checks the host-injected context against the live gateway turn and session
+catalog, including exact profile, route, session and generation. It checks again at the
+transport boundary and before activation. This is not a sandbox against arbitrary
+same-UID code, nor a remote CAS against concurrent human Linear writes.
+
+This route requires the companion core no-auto-replay policy for explicit
+`max_retries=0` tasks. A fresh task may start once; a recorded or ambiguous attempt
+must remain capability-blocked for operator reconciliation across reclaim/restart.
+Known-unsent local creation retries reuse the blocked task. Uncertain ownership writes
+retain an ambiguous admission and are not automatically resent. Reconcile worker identity,
+retained runs and remote effects before authorizing new execution; blocked/archived status
+alone does not prove a process physically stopped. Native follow-up prompts do not unblock
+these chat-admitted tasks. Cancellation and takeover retire the worker, not its parent chat.
+Source tests are not authorization to activate this route, replay old tasks or repair
+existing product ownership. Acceptance uses a fresh disposable issue after separate live approval.
 
 ## What happens
 
