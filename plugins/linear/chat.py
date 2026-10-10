@@ -121,6 +121,11 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if not ref or not client_id or not isinstance(body, str) or not body.strip():
             return _reply(False, f"{action} needs issue, caller UUID id, and nonempty content.")
         try:
+            import uuid
+            if str(uuid.UUID(client_id)) != client_id.lower(): raise ValueError
+        except (ValueError, AttributeError):
+            return _reply(False, f"{action} id must be a UUID caller id.")
+        try:
             issue = bridge.api.issue(ref)
             issue_id = issue.get("id")
             if ref not in (issue_id, issue.get("identifier")):
@@ -134,7 +139,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 if owner.get("release_pending") or owner.get("stop_requested_at"):
                     return _reply(False, "Content changes are blocked during Stop or release reconciliation.")
                 payload = {"issue_id": issue_id, "body": body, "session_key": session_key,
-                           "work_owner": owner.get("ownership_id")}
+                           "work_owner": owner.get("ownership_id"), "id": client_id, "content_action": True}
                 if action == "update_description":
                     expected = args.get("expected_description")
                     if not isinstance(expected, str):
@@ -150,7 +155,10 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                     payload["id"] = client_id
                     payload["content_action"] = True
                     kind = "comment"
-                row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
+                try:
+                    row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
+                except ValueError as exc:
+                    return _reply(False, f"Caller id conflicts with an earlier {action}; no change was made.")
                 if not row_id:
                     return _reply(False, "Content change was not admitted; no change was made.")
                 warning = (" Formatting tip: split this long single paragraph with headings and bullets/checklists."

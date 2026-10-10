@@ -127,7 +127,7 @@ class Store:
                 return False
             if row["kind"] == "status" and not terminal and payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                 return False
-            if terminal:
+            if terminal or row["kind"] == "description":
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
@@ -552,7 +552,8 @@ class Store:
             existing = db.execute("SELECT kind, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if existing:
                 saved = json.loads(existing["payload"])
-                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in ("issue_id", "body", "expected_description", "id")):
+                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in
+                        ("issue_id", "body", "expected_description", "id", "session_key", "work_owner")):
                     return row_id
                 raise ValueError("outbox id reused with conflicting content")
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()

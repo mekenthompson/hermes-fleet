@@ -250,7 +250,11 @@ class LinearAPI:
         _require_mutation_success(data, "issueUpdate")
     def replace_description(self, issue_id: str, expected: str, body: str) -> None:
         current = self.issue(issue_id)
-        if current.get("id") != issue_id or current.get("description") != expected:
+        if current.get("id") != issue_id:
+            raise LinearError("Description target could not be verified", retryable=False)
+        if current.get("description") == body:
+            return  # same-id readback reconciliation; never overwrite a concurrent change
+        if current.get("description") != expected:
             raise LinearError("Description changed or could not be verified; no replacement made", retryable=False)
         # This is an optimistic preflight, not a server-side CAS: a concurrent
         # edit between this read and mutation can still be overwritten.
