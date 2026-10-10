@@ -248,6 +248,23 @@ class LinearAPI:
                             "{ issueUpdate(id: $id, input: $input) { success } }",
                             {"id": issue_id, "input": fields})
         _require_mutation_success(data, "issueUpdate")
+    def replace_description(self, issue_id: str, expected: str, body: str) -> None:
+        current = self.issue(issue_id)
+        if current.get("id") != issue_id or current.get("description") != expected:
+            raise LinearError("Description changed or could not be verified; no replacement made", retryable=False)
+        # This is an optimistic preflight, not a server-side CAS: a concurrent
+        # edit between this read and mutation can still be overwritten.
+        self.update_issue(issue_id, {"description": body})
+        verified = self.issue(issue_id)
+        if verified.get("id") != issue_id or verified.get("description") != body:
+            raise LinearError("Description replacement could not be verified; reconcile before retrying")
+    def verify_comment(self, comment_id: str, issue_id: str, body: str) -> bool:
+        data = self.graphql("query CommentReadback($id: String!) { comment(id: $id) { id body issue { id } } }",
+                            {"id": comment_id})
+        comment = data.get("comment")
+        return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
+                    comment.get("body") == body and isinstance(comment.get("issue"), dict) and
+                    comment["issue"].get("id") == issue_id)
     def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
         try:
             data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",

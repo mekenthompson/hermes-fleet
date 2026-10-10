@@ -13,24 +13,28 @@ SCHEMA = {
         "done: finish it; needs an evidence link. blocked: you need a human. "
         "release: stop tracking unfinished work. "
         "create_issue: create an undelegated issue; requires id, title, and team. "
+        "update_description: replace an issue description with an expected_description preflight; readable headings and bullets/checklists required. "
+        "add_comment: add a concise progress note with headings; requires a caller UUID id. "
         "create_project: create a project; requires id, name, and team. "
         "link_issue: relate two existing issues. Creates never assign, delegate, or start tracking."),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "create_issue", "create_project", "link_issue"]},
+            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
             "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking and link_issue."},
             "id": {"type": "string", "description": "Caller UUID for create_issue or create_project. Reuse it to reconcile a lost response."},
             "title": {"type": "string", "description": "create_issue title."},
             "name": {"type": "string", "description": "create_project name."},
             "team": {"type": "string", "description": "Team id or key. Required for create_issue and create_project."},
-            "description": {"type": "string"},
+            "description": {"type": "string", "description": "Markdown description. Use readable headings and bullets/checklists, not one long paragraph. Short prose is valid."},
+            "expected_description": {"type": "string", "description": "Required current description for update_description's optimistic preflight. This is not server-side compare-and-swap; concurrent edits can race."},
             "project": {"type": "string", "description": "Optional project id for create_issue."},
             "parent": {"type": "string", "description": "Optional parent issue id for create_issue."},
             "related": {"type": "string", "description": "Other issue id for link_issue."},
             "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"], "description": "link_issue relation."},
             "evidence": {"type": "string", "description": "done: link(s) proving the result reached its destination"},
             "note": {"type": "string", "description": "done: outcome summary; blocked/release: what is needed or why"},
+            "body": {"type": "string", "description": "add_comment: concise progress note; use short headings and bullets/checklists rather than one long paragraph. Short prose is valid."},
         },
         "required": ["action"],
     },
@@ -72,7 +76,9 @@ def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
             created = bridge.api.create_issue(
                 client_id, team, title, description=args.get("description"),
                 project_id=args.get("project") or None, parent_id=args.get("parent") or None)
-            return _reply(True, f"Created {created.get('identifier')} {created.get('url')} undelegated.")
+            return _reply(True, f"Created {created.get('identifier')} {created.get('url')} undelegated." +
+                          (" Formatting tip: split this long single paragraph with headings and bullets/checklists." if
+                           isinstance(args.get("description"), str) and len(args["description"]) > 500 and "\n" not in args["description"] else ""))
         if action == "create_project":
             name, team = str(args.get("name") or "").strip(), str(args.get("team") or "").strip()
             if not client_id or not name or not team:
@@ -108,6 +114,54 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     if action == "delegate":
         from . import admission
         return admission.handle(bridge, args, invocation_context)
+    if action in {"update_description", "add_comment"}:
+        ref = str(args.get("issue") or "").strip()
+        client_id = str(args.get("id") or "").strip()
+        body = args.get("description") if action == "update_description" else args.get("body")
+        if not ref or not client_id or not isinstance(body, str) or not body.strip():
+            return _reply(False, f"{action} needs issue, caller UUID id, and nonempty content.")
+        try:
+            issue = bridge.api.issue(ref)
+            issue_id = issue.get("id")
+            if ref not in (issue_id, issue.get("identifier")):
+                return _reply(False, "Linear issue resolution did not match the requested issue.")
+            if not bridge.authorize_specialist_effect(issue_id):
+                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
+            with bridge.lock(issue_id):
+                owner = bridge.store.get(issue_id)
+                if not owner or owner.get("origin") != "chat" or owner.get("owner_ref") != session_key:
+                    return _reply(False, "Content changes require the owning chat's active Linear claim.")
+                if owner.get("release_pending") or owner.get("stop_requested_at"):
+                    return _reply(False, "Content changes are blocked during Stop or release reconciliation.")
+                payload = {"issue_id": issue_id, "body": body, "session_key": session_key,
+                           "work_owner": owner.get("ownership_id")}
+                if action == "update_description":
+                    expected = args.get("expected_description")
+                    if not isinstance(expected, str):
+                        return _reply(False, "update_description requires expected_description (the exact current text).")
+                    payload.update({"expected_description": expected, "body": body})
+                    kind = "description"
+                if action == "add_comment":
+                    try:
+                        import uuid
+                        if str(uuid.UUID(client_id)) != client_id.lower(): raise ValueError
+                    except (ValueError, AttributeError):
+                        return _reply(False, "add_comment id must be a UUID caller id.")
+                    payload["id"] = client_id
+                    payload["content_action"] = True
+                    kind = "comment"
+                row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
+                if not row_id:
+                    return _reply(False, "Content change was not admitted; no change was made.")
+                warning = (" Formatting tip: split this long single paragraph with headings and bullets/checklists."
+                           if len(body) > 500 and "\n" not in body else "")
+                bridge.flush()
+                return _reply(True, f"{action} queued durably for {issue.get('identifier')}; delivery is not yet confirmed.{warning}", outbox_id=row_id)
+        except LinearError as exc:
+            if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:
+                bridge._fence_scope_denial(getattr(exc, "authoritative_issue_id", "") or "", exc)
+                return _reply(False, "This issue is outside the configured Linear specialist scope.")
+            return _reply(False, f"Linear is unavailable ({exc}); no content change was confirmed.")
     if action in {"create_issue", "create_project", "link_issue"}:
         return _plan(bridge, args, action)
     ref = str(args.get("issue", "")).strip()

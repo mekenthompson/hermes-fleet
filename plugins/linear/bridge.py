@@ -1121,7 +1121,14 @@ class Bridge:
         @contextmanager
         def guard():
             row = self.store.outbox_row(row_id)
-            admission_id = (row or {}).get("payload", {}).get("admission_id")
+            payload = (row or {}).get("payload", {})
+            admission_id = payload.get("admission_id")
+            if payload.get("content_action") or row and row.get("kind") == "description":
+                work = self.store.get(payload.get("issue_id", ""))
+                if (not work or work.get("ownership_id") != payload.get("work_owner") or
+                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
+                        work.get("stop_requested_at")):
+                    raise ProjectUpdateDeferred
             if admission_id:
                 validate = getattr(self, "_active_admission_claims", {}).get(admission_id)
                 if not callable(validate) or not validate():
@@ -1225,8 +1232,30 @@ class Bridge:
                     raise LinearError("Release write was not verified; reconcile before further work")
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
+            if payload.get("content_action") and payload.get("work_owner"):
+                work = self.store.get(payload["issue_id"])
+                if (not work or work.get("ownership_id") != payload.get("work_owner") or
+                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
+                        work.get("stop_requested_at")):
+                    return False
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
+            verify = getattr(self.api, "verify_comment", None)
+            if payload.get("content_action") and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
+                raise LinearError("Comment target/body readback did not match; reconcile before retrying")
+            return True
+        elif kind == "description":
+            if row["attempts"]:
+                raise LinearError("Prior description write has uncertain outcome; reconcile before retrying", retryable=False)
+            current = self._effect_issue(payload["issue_id"])
+            work = self.store.get(payload["issue_id"])
+            if (current.get("id") != payload["issue_id"] or not work or
+                    work.get("ownership_id") != payload.get("work_owner") or
+                    work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
+                    work.get("stop_requested_at")):
+                return False
+            self._mutate_outbox(row["id"], lambda: self.api.replace_description(
+                payload["issue_id"], payload["expected_description"], payload["body"]))
             return True
         elif kind == "activity":
             self._mutate_outbox(row["id"], lambda: self.api.create_activity(
