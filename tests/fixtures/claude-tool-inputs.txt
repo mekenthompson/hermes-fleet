@@ -1,5 +1,5 @@
 // ToolInputSchemas copied verbatim from the reviewed SDK declaration.
-// Full declaration SHA256: 91ab2df2cb687cd3692f74a149867a847e3a4c88478c55a255e6a33df7fc5fca
+// Full declaration SHA256: 63e378f4585427786c6cd0e876f094c8ade8d284d86554ef44f83a5cdf396cfb
 export type ToolInputSchemas =
   | AgentInput
   | BashInput
@@ -36,6 +36,7 @@ export type ToolInputSchemas =
   | ScheduleWakeupInput
   | RemoteTriggerInput
   | ShowOnboardingRolePickerInput
+  | OfferChromeSetupInput
   | ReadNotificationsInput
   | MonitorInput
   | ProposeSkillsInput

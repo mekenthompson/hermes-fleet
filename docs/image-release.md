@@ -4,7 +4,7 @@ The public Fleet image is an opinionated child of the **exact Agent digest** rec
 
 ## Transaction
 
-Pull requests build one `linux/amd64` candidate from the exact Fleet source revision without registry-write credentials. The trusted publication job independently builds its candidate only after the exact-main CI gate, then verifies the pinned Agent handoff, inherited Agent provenance marker and installed Hermes version, Fleet revision and image identity, UID 1000 runtime user plus inherited Agent entrypoint/command, non-root `hermes` workload execution, 1Password CLI 2.40.0 from its exact official image digest, Claude Code 2.1.285, Codex 0.162.1, Grok 1.0.50, the Claude ACP adapter 0.78.0, the attributed subscription-only Claude provider plugin, absence of a Docker socket, full SPDX evidence, bounded package-level SPDX, official SPDX 2.3 schema validity through a fully hashed validator lock, and the critical-vulnerability gate.
+Pull requests build one `linux/amd64` candidate from the exact Fleet source revision without registry-write credentials. The trusted publication job independently builds its candidate only after the exact-main CI gate, then verifies the pinned Agent handoff, inherited Agent provenance marker and installed Hermes version, Fleet revision and image identity, UID 1000 runtime user plus inherited Agent entrypoint/command, non-root `hermes` workload execution, 1Password CLI 2.40.0 from its exact official image digest, Claude Code 2.1.296, Codex 0.162.1, Grok 1.0.50, the Claude ACP adapter 0.89.0, the attributed subscription-only Claude provider plugin, absence of a Docker socket, full SPDX evidence, bounded package-level SPDX, official SPDX 2.3 schema validity through a fully hashed validator lock, and the critical-vulnerability gate.
 
 Publication runs automatically on **every push to `main`** that touches the image input set (see "Change scoping" below). The publish job builds and scans its candidate while the `CI` push run for the same commit is still in flight, then waits (up to 30 minutes, polling every 20 seconds) for that run to complete. This is the **exact-SHA CI** gate: the newest `CI` push run for this exact commit (not a green run from another commit) must have succeeded, and absence, timeout, or any other conclusion fails closed. That gate is the last step before the first registry write; the earlier GHCR login exists only to pull the pinned Agent parent. Runs are grouped per commit and are never cancelled by a later push.
 
@@ -36,14 +36,16 @@ From the private checkout the job runs the private repository's release conducto
 
 The public Fleet source repository is `https://github.com/mekenthompson/hermes-fleet`. The existing image package remains `ghcr.io/mekenthompson/hermes-fleet-public`; repository renaming must not invalidate published immutable image references.
 
-This workflow performs **no production deployment**. It does not modify profile state, Docker Compose inputs, networks, secrets, or running containers. The public image inherits the Agent image's entrypoint and command. It rebinds the `hermes` account to UID/GID 1000 and ends as `USER 1000:1000`. The image also installs GitHub CLI 2.102.0 from the official release tarball, the Agent `honcho` extra without workspace identifiers, and the extra coding CLIs Codex, Grok, and OpenCode from the committed lockfile. Fleet also copies the `op` executable from the immutable official image `docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a`, verifies version `2.40.0` during build and release, and records that source in the image provenance marker. Claude Code is installed from the committed lockfile at exact version `2.1.285`; Codex and Grok are pinned to `0.162.1` and `1.0.50` respectively, and the Docker build plus both release gates assert their installed version banners. `npm ci` disables lifecycle scripts, then the Dockerfile explicitly invokes only the three locked CLI postinstall selectors needed to expose their native executables. The same lock pins `@agentclientprotocol/claude-agent-acp` to `0.78.0` with integrity `sha512-ivWFMmadPFRbc0vn+80B04qomeLdvVieWFu2WK0JFXvHt12Uqdn3Ujjm7rERvM8w4hjxUb1u5vRotu1C/cquCA==`. Hermes launches that adapter through the supported external-process provider seam using the image-owned `hermes-claude-acp-subscription` wrapper; the `claude` executable alone is not the ACP adapter. The provider plugin is adapted from `mvdbastos/hermes-acp-agents` revision `0526610a3945cc376ac517b63ca358a5b838a2fc`, records the exact upstream file hashes, retains the upstream MIT copyright and permission notice in `UPSTREAM_LICENSE`, and removes API-key, proxy, cloud-provider, and model-override environment variables before launch so the external Claude subscription login remains authoritative. Auto-update is disabled so runtime bytes cannot drift from the scanned image. The image contains no credentials, Claude OAuth state, account data, vault references, or 1Password configuration; those remain external runtime inputs.
+This workflow performs **no production deployment**. It does not modify profile state, Docker Compose inputs, networks, secrets, or running containers. The public image inherits the Agent image's entrypoint and command. It rebinds the `hermes` account to UID/GID 1000 and ends as `USER 1000:1000`. The image also installs GitHub CLI 2.102.0 from the official release tarball, the Agent `honcho` extra without workspace identifiers, and the extra coding CLIs Codex, Grok, and OpenCode from the committed lockfile. Fleet also copies the `op` executable from the immutable official image `docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a`, verifies version `2.40.0` during build and release, and records that source in the image provenance marker. Claude Code is installed from the committed lockfile at exact version `2.1.296`; Codex and Grok are pinned to `0.162.1` and `1.0.50` respectively, and the Docker build plus both release gates assert their installed version banners. `npm ci` disables lifecycle scripts, then the Dockerfile explicitly invokes only the three locked CLI postinstall selectors needed to expose their native executables. The same lock pins `@agentclientprotocol/claude-agent-acp` to `0.89.0` with integrity `sha512-MZr7aWNb9HijspcYpfDx2N91vIeaEmGB6TaCBXVvYwFymYfLDfUChlBvnwNWxj48VL16hc6WVhyB33Ie8OLxGw==`. Hermes launches that adapter through the supported external-process provider seam using the image-owned `hermes-claude-acp-subscription` wrapper; the `claude` executable alone is not the ACP adapter. The provider plugin is adapted from `mvdbastos/hermes-acp-agents` revision `0526610a3945cc376ac517b63ca358a5b838a2fc`, records the exact upstream file hashes, retains the upstream MIT copyright and permission notice in `UPSTREAM_LICENSE`, and removes API-key, proxy, cloud-provider, and model-override environment variables before launch so the external Claude subscription login remains authoritative. Auto-update is disabled so runtime bytes cannot drift from the scanned image. The image contains no credentials, Claude OAuth state, account data, vault references, or 1Password configuration; those remain external runtime inputs.
 
 ## Claude ACP compatibility
 
-ACP `0.78.0` uses Claude Agent SDK `0.3.270`; the launcher continues to
-select the separately pinned Claude Code `2.1.285` executable. On that
-release the ACP `opus[1m]` slot is Opus 5.5; the adapter does not offer
-`claude-opus-5-5`. Both preflight and publication verify the provider's exact
+ACP `0.89.0` uses Claude Agent SDK `0.3.293`; the launcher continues to
+select the separately pinned Claude Code `2.1.296` executable. On that
+release the ACP `opus[1m]` slot remains the existing Opus slot; the adapter
+does not offer `claude-opus-5-5`. `allowDangerouslySkipPermissions` stays
+false, and ACP 0.89 still clamps `bypassPermissions` to `default` when that
+opt-out is set. Both preflight and publication verify the provider's exact
 executable and SDK declaration hashes, not only package version strings.
 
 The optional Claude ACP provider declares the `opus[1m]` context window as
@@ -52,10 +54,14 @@ hook. Other logical handles fall back to Agent metadata. Explicit user context
 overrides take precedence. CI discovers the actual plugin against the pinned
 Agent source and checks context resolution, aliases and override precedence.
 
-The native deny list includes `AppifactRepl`, `FetchInboxMessage`, and
-`SubagentHandback`, which are present in the reviewed executable but absent
-from the SDK tool-input union. Review actual executable tools on future bumps;
-the SDK declaration alone is not an exhaustive native-tool inventory.
+The native deny list keeps every previously denied name, including
+`AppifactRepl`, `FetchInboxMessage`, and `SubagentHandback`, which remain in
+the reviewed executable. It also denies new 2.1.296 native tools, including
+`OfferChromeSetup`, `ListConnectors`, `PublishPlugin`, `PowerShell`, and
+`WaitForMcpServers`. Those tools are denied, not approved. `ToolSearch` stays
+available only to discover profile-authorized connectors. Review actual
+executable tools on future bumps; the SDK declaration alone is not an
+exhaustive native-tool inventory.
 `allowDangerouslySkipPermissions: false` explicitly disables the adapter's
 bypass mode without weakening connector allow/deny rules. Managed connector
 restrictions remain authoritative. No credential migration is required by these

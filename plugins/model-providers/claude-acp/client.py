@@ -51,11 +51,11 @@ _BRIDGE_PREFIX = "mcp__hermes_bridge__"
 _CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
 _CLAUDE_CODE_PACKAGE = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/package.json")
 _CLAUDE_SDK_TOOLS = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/sdk-tools.d.ts")
-# 2.1.285 offers Opus 5.5 as the existing opus / opus[1m] slot. The adapter
-# does not offer claude-opus-5-5. Do not add that API id as an alias.
-_REVIEWED_CLAUDE_CODE_VERSION = "2.1.285"
-_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "33dad1ec615a2e08cc78b494f05c110e49916de2c79d78ec8799ebf46b233d29"
-_REVIEWED_SDK_TOOLS_SHA256 = "91ab2df2cb687cd3692f74a149867a847e3a4c88478c55a255e6a33df7fc5fca"
+# Reviewed 2.1.296. Opus 5.5 remains the existing opus / opus[1m] slot.
+# The adapter does not offer claude-opus-5-5. Do not add that API id as an alias.
+_REVIEWED_CLAUDE_CODE_VERSION = "2.1.296"
+_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de"
+_REVIEWED_SDK_TOOLS_SHA256 = "63e378f4585427786c6cd0e876f094c8ade8d284d86554ef44f83a5cdf396cfb"
 _DISCOVERY_TOOLS = ("ToolSearch",)
 # Claude.ai cloud connectors only hydrate when the full Claude Code preset is
 # selected. Deny every native tool in the reviewed, pinned Claude Code release;
@@ -64,7 +64,7 @@ _DISCOVERY_TOOLS = ("ToolSearch",)
 # Claude Code release can add an unreviewed native tool.
 _NATIVE_TOOL_DENY = (
     "Agent",
-    # Native tools added in 2.1.273 but not yet declared by SDK 0.3.270.
+    # Native tools added in 2.1.273 and still absent from the SDK tool-input union.
     "AppifactRepl",
     "FetchInboxMessage",
     "SubagentHandback",
@@ -121,6 +121,24 @@ _NATIVE_TOOL_DENY = (
     "WebSearch",
     "Workflow",
     "Write",
+    # Present in the 2.1.296 executable. Denied, not approved.
+    "AgentOutput",
+    "ArtifactCheck",
+    "ArtifactComments",
+    "ArtifactData",
+    "BashOutput",
+    "Design",
+    "EndConversation",
+    "ExitPlanModeV2",
+    "ListConnectors",
+    "OfferChromeSetup",
+    "PowerShell",
+    "PublishPlugin",
+    "SearchMcpRegistry",
+    "SendFile",
+    "SendUserFile",
+    "SuggestConnectors",
+    "WaitForMcpServers",
 )
 _CONNECTOR_PREFIX = "mcp__claude_ai_"
 _CONNECTOR_WILDCARD = "mcp__claude_ai_*"
