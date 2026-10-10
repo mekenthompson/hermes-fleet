@@ -1246,7 +1246,10 @@ class Bridge:
             return True
         elif kind == "description":
             if row["attempts"]:
-                raise LinearError("Prior description write has uncertain outcome; reconcile before retrying", retryable=False)
+                current = self._effect_issue(payload["issue_id"])
+                if current.get("id") != payload["issue_id"] or current.get("description") != payload["body"]:
+                    raise LinearError("Prior description write is uncertain; remote description differs, reconcile manually", retryable=False)
+                return True
             current = self._effect_issue(payload["issue_id"])
             work = self.store.get(payload["issue_id"])
             if (current.get("id") != payload["issue_id"] or not work or
