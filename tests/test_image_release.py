@@ -32,10 +32,10 @@ ONEPASSWORD_CLI_IMAGE = (
 CLAUDE_CODE_VERSION = "2.1.285"
 CLAUDE_CODE_INTEGRITY = "sha512-frr0DLmVHSDNjw+hC6ZmXMVQ8yH4nNmVcI4lVFzWt0bdPNZP7clOKsuLcqSdwQabIpe6A3NEc3TJfiBVD8B2Bg=="
 CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-6qNST8qKemr+rD9zvUEwEq0UtWt0E5Js8bkbjh13/LM62FiGWcN6IqiJPxybJ2FNd+I3liXq6JYNv/vrGnmAow=="
-CODEX_VERSION = "0.160.0"
-CODEX_INTEGRITY = "sha512-kEtVGzjRAYAMOwJxN39bGcna7LT3IDQgq64NNJ/dDTfu4OzZaocJcyNb5/gGJ/IVF/Vj7oK7E2m3nmTan7lpjg=="
-GROK_VERSION = "1.0.46"
-GROK_INTEGRITY = "sha512-qXO4myJFAQCIZNjMJWAaJ0TTUgi2WrQpnYYtrdd9hQ8TYezPH0slSHBYgxqedlwgcHVdqBiiDXULHkIdBDzkyQ=="
+CODEX_VERSION = "0.162.1"
+CODEX_INTEGRITY = "sha512-NWZdi/kxyjv/8EUGFupziGU38YyleugZRM4JXgY5XFH7FUmaFA33NZS2Bmq0HPazf7S3jJQQWsZ/jAK9jsrV3Q=="
+GROK_VERSION = "1.0.50"
+GROK_INTEGRITY = "sha512-eXY/+nWHgRn8ti4DYoW+ICBRwfmTzP68HNiaC+Q+DkybD51/of13Yp7Taef5oeZUZB1D0jP3B5njnsn8tDkveA=="
 CLAUDE_AGENT_ACP_VERSION = "0.78.0"
 CLAUDE_AGENT_ACP_INTEGRITY = "sha512-ivWFMmadPFRbc0vn+80B04qomeLdvVieWFu2WK0JFXvHt12Uqdn3Ujjm7rERvM8w4hjxUb1u5vRotu1C/cquCA=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
@@ -182,7 +182,7 @@ class FleetImageReleaseTests(unittest.TestCase):
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
                 "@openai/codex": CODEX_VERSION,
                 "@xai-official/grok": GROK_VERSION,
-                "opencode-ai": "1.18.29",
+                "opencode-ai": "1.18.35",
             },
         )
         self.assertTrue(package["private"])

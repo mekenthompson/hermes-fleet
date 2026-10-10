@@ -5,9 +5,9 @@
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.78.0",
     "@anthropic-ai/claude-code": "2.1.285",
-    "@openai/codex": "0.160.0",
-    "@xai-official/grok": "1.0.46",
-    "opencode-ai": "1.18.29"
+    "@openai/codex": "0.162.1",
+    "@xai-official/grok": "1.0.50",
+    "opencode-ai": "1.18.35"
   },
   "overrides": {
     "proxy-addr": "2.0.8"
