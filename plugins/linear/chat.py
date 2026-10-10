@@ -35,8 +35,31 @@ SCHEMA = {
         "required": ["action"],
     },
 }
-def _reply(ok: bool, message: str) -> str:
-    return json.dumps({"ok": ok, "message": message})
+def _reply(ok: bool, message: str, **details: Any) -> str:
+    return json.dumps({"ok": ok, "message": message, **details})
+
+def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
+    """Durable ownership is not a liveness observation. Do not invent one."""
+    owner = row.get("owner_ref") or ""
+    state = (issue.get("state") or {}).get("name") or "unknown"
+    ownership = {"origin": row["origin"], "owner_session_key": owner if row["origin"] == "chat" else None,
+                 "task_id": row.get("task_id"), "execution_state": "unknown",
+                 "release_pending": bool(row.get("release_pending")),
+                 "stop_requested": bool(row.get("stop_requested_at")), "linear_state": state}
+    if code == "release_pending":
+        message = "Release is pending verified relinquishment; reconcile it before further work."
+    elif row["origin"] == "chat":
+        message = (f"{issue.get('identifier')} has a retained ownership claim from chat {owner!r}. "
+                   "This is not proof of active work; execution state is unknown. "
+                   f"Linear state is {state!r}, not a liveness signal. "
+                   "Continue in the owning chat to reconcile current evidence and use done or release. "
+                   "If that chat cannot be resumed, request guarded ownership recovery; "
+                   "do not clear the claim based on inactivity or an old blocker comment.")
+    else:
+        message = (f"{issue.get('identifier')} is bound to Kanban task {row.get('task_id')!r}; "
+                   "the binding alone does not prove the task is running. "
+                   "Continue its existing task/Linear session rather than creating another executor.")
+    return _reply(False, f"{message} {issue.get('url', '')}", code=code, ownership=ownership)
 
 def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
     """Create or link as this app. Do not assign, delegate, or start tracking."""
@@ -108,7 +131,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
         row = bridge.store.get(issue_id)
         if row and row.get("release_pending"):
-            return _reply(False, "Release is pending verified relinquishment; reconcile it before further work.")
+            return _ownership_refusal(issue, row, "release_pending")
         if action == "start":
             try: bridge.await_retired(issue_id)
             except LinearError as exc: return _reply(False, str(exc))
@@ -118,7 +141,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
-            return _reply(False, f"{ident} is not owned by this chat session; no change was made.")
+            return _ownership_refusal(issue, row, "chat_ownership_conflict")
         if action == "done":
             if row.get("stop_requested_at"):
                 return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "
@@ -180,10 +203,9 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
            session_id: str, generation: int | None) -> str:
     ident, url = issue.get("identifier"), issue.get("url", "")
     if row and row["origin"] == "kanban":
-        return _reply(False, f"{ident} is already running here as Kanban task {row['task_id']}; "
-                             f"reply in its Linear session to steer it: {url}")
+        return _ownership_refusal(issue, row, "task_ownership_conflict")
     if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
-        return _reply(False, f"{ident} is already tracked in another chat session: {url}")
+        return _ownership_refusal(issue, row, "chat_ownership_conflict")
     delegate = issue.get("delegate") or {}
     if delegate.get("id") not in (None, me) and (issue.get("state") or {}).get("type") == "started":
         return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")

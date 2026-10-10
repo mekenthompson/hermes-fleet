@@ -35,8 +35,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
 # Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
 # Blocked chat recovery is acknowledged once per execution, including a queued or failed Blocked closeout.
-# Measured 3766, allowance 8.
-BUDGET = 3774
+# Ownership refusals add structured diagnostics, not inferred worker liveness.
+# Measured 3788, allowance 8; keep the same bounded headroom.
+BUDGET = 3796
 
 
 class FakeContext:

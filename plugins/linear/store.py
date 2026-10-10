@@ -125,6 +125,8 @@ class Store:
             payload = json.loads(row["payload"])
             if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
                 return False
+            if row["kind"] == "status" and not terminal and payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
+                return False
             if terminal:
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)

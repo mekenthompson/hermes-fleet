@@ -23,6 +23,21 @@ from other adapters or named profiles remain refused.
 Adapters without a core chat-run generation can track work, but cannot be interrupted
 by Linear Stop. Start makes that limitation explicit; use the chat's Stop control.
 
+## Ownership refusals are not execution observations
+
+A retained chat claim or a task binding does not prove that work is running.
+Tracking refusals include a stable `code` (`chat_ownership_conflict`,
+`task_ownership_conflict`, or `release_pending`) and an `ownership` object with
+its chat owner or task, Linear workflow name, Stop and release flags, and
+`execution_state: unknown`. An idle chat, an open session-catalog row, or a
+workflow named Blocked must not be reported as a competing active executor.
+
+Reconcile current evidence in the recorded owning chat, then finish or release
+through the supported lifecycle. Old comments describe earlier failures, not
+current verifier results. There is no automatic idle-time takeover; an
+unreachable owner needs guarded recovery, not direct database edits, duplicate
+issues, or a raw delegate change.
+
 ## Enable it
 
 Add one block to the profile's config, in the deployment overlay. The values below are synthetic.
