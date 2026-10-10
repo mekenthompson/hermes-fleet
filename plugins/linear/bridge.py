@@ -1151,6 +1151,8 @@ class Bridge:
             links = payload.get("evidence") or evidence_links(self.store.terminal_text(row["id"]))
             if any(PR_URL.fullmatch(url) for url in links):
                 self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile before retrying")
+        if kind == "status" and not payload.get("terminal") and payload.get("work_owner") and self.store.superseded(row):
+            return False  # an old chat's queued blocker/progress cannot overwrite its successor
         if kind == "status" and payload.get("terminal") and self.store.superseded(row):
             self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
             return False
