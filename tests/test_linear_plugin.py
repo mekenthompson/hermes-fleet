@@ -34,10 +34,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
 # Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
 # Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
-# Blocked chat recovery is acknowledged once per execution, including a queued or failed Blocked closeout.
-# Ownership refusals add structured diagnostics, not inferred worker liveness.
-# Measured 3788, allowance 8; keep the same bounded headroom.
-BUDGET = 3796
+# Content actions add a bounded durable outbox path; keep headroom explicit.
+BUDGET = 3900
 
 
 class FakeContext:
@@ -113,6 +111,10 @@ class LinearPluginUnitTests(unittest.TestCase):
         plugin.register(on)
         self.assertEqual([t["name"] for t in on.tools], ["linear"])
         self.assertTrue(on.tools[0]["inject_invocation_context"])
+        self.assertIn("update_description", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])
+        self.assertIn("add_comment", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])
+        self.assertIn("expected_description", on.tools[0]["schema"]["parameters"]["properties"])
+        self.assertIn("headings", on.tools[0]["schema"]["parameters"]["properties"]["body"]["description"])
         self.assertEqual((on.hooks, on.services), (["on_session_end"], ["linear"]))
         contract = json.loads((ROOT / "contracts" / "plugins.json").read_text(encoding="utf-8"))
         self.assertFalse(next(c for c in contract["components"] if c["id"] == "linear")["default_enabled"])

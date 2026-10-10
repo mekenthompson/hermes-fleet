@@ -545,10 +545,16 @@ class Store:
                        "payload=json_set(payload, '$.reconcile_required', 1) WHERE id=?", (row_id,))
     # -- outbox -----------------------------------------------------------
     def enqueue(self, kind: str, payload: dict[str, Any], *, at: float | None = None) -> str:
-        row_id = str(uuid.uuid4())
+        row_id = str(payload.get("id") or uuid.uuid4())
         now = time.time() if at is None else at
         with self._tx() as db:
             if not self._effect_admitted(db, *self._targets(payload)): return ""
+            existing = db.execute("SELECT kind, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if existing:
+                saved = json.loads(existing["payload"])
+                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in ("issue_id", "body", "expected_description", "id")):
+                    return row_id
+                raise ValueError("outbox id reused with conflicting content")
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
             body = json.dumps({**payload, "work_owner": work["ownership_id"] if work else None,
                                "enqueued_at": payload.get("enqueued_at", now)})
