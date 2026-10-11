@@ -165,7 +165,7 @@ class BoundLinearAPI(LinearAPI):
     def update_issue(self, issue_id, fields):
         if self.specialist_scope is not None:
             issue = self._mutation_issue(issue_id)
-            if (not isinstance(fields, dict) or set(fields) - {"stateId", "delegateId"} or
+            if (not isinstance(fields, dict) or set(fields) - {"stateId", "delegateId", "description"} or
                     ("delegateId" in fields and fields["delegateId"] != self.identity["viewer_id"]) or
                     ("stateId" in fields and fields["stateId"] not in {
                         item.get("id") for item in ((issue.get("team") or {}).get("states") or {}).get("nodes") or []
@@ -180,6 +180,10 @@ class BoundLinearAPI(LinearAPI):
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().create_comment(client_id, issue_id, body)
+    def verify_comment(self, comment_id, issue_id, body):
+        self._mutation_issue(issue_id)
+        with self._permit_specialist_operation():
+            return super().verify_comment(comment_id, issue_id, body)
     def create_activity(self, client_id, session_id, content, *, issue_id=None):
         if self.specialist_scope is not None:
             if not isinstance(issue_id, str) or not issue_id:
