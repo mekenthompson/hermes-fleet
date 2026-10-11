@@ -21,8 +21,8 @@ SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
-            "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking and link_issue."},
-            "id": {"type": "string", "description": "Caller UUID for create_issue or create_project. Reuse it to reconcile a lost response."},
+            "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking, link_issue, update_description and add_comment."},
+            "id": {"type": "string", "description": "Canonical caller UUID for create_issue, create_project, update_description and add_comment. Reuse the exact id/payload to reconcile a lost response."},
             "title": {"type": "string", "description": "create_issue title."},
             "name": {"type": "string", "description": "create_project name."},
             "team": {"type": "string", "description": "Team id or key. Required for create_issue and create_project."},
@@ -122,7 +122,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(False, f"{action} needs issue, caller UUID id, and nonempty content.")
         try:
             import uuid
-            if str(uuid.UUID(client_id)) != client_id.lower(): raise ValueError
+            if str(uuid.UUID(client_id)) != client_id: raise ValueError
         except (ValueError, AttributeError):
             return _reply(False, f"{action} id must be a UUID caller id.")
         try:
@@ -139,7 +139,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 if owner.get("release_pending") or owner.get("stop_requested_at"):
                     return _reply(False, "Content changes are blocked during Stop or release reconciliation.")
                 payload = {"issue_id": issue_id, "body": body, "session_key": session_key,
-                           "work_owner": owner.get("ownership_id"), "id": client_id, "content_action": True}
+                           "work_owner": owner.get("ownership_id"), "id": client_id, "content_action": True, "write_started": False}
                 if action == "update_description":
                     expected = args.get("expected_description")
                     if not isinstance(expected, str):
@@ -147,23 +147,15 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                     payload.update({"expected_description": expected, "body": body})
                     kind = "description"
                 if action == "add_comment":
-                    try:
-                        import uuid
-                        if str(uuid.UUID(client_id)) != client_id.lower(): raise ValueError
-                    except (ValueError, AttributeError):
-                        return _reply(False, "add_comment id must be a UUID caller id.")
-                    payload["id"] = client_id
-                    payload["content_action"] = True
                     kind = "comment"
                 try:
                     row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
-                except ValueError as exc:
+                except ValueError:
                     return _reply(False, f"Caller id conflicts with an earlier {action}; no change was made.")
                 if not row_id:
                     return _reply(False, "Content change was not admitted; no change was made.")
                 warning = (" Formatting tip: split this long single paragraph with headings and bullets/checklists."
                            if len(body) > 500 and "\n" not in body else "")
-                bridge.flush()
                 return _reply(True, f"{action} queued durably for {issue.get('identifier')}; delivery is not yet confirmed.{warning}", outbox_id=row_id)
         except LinearError as exc:
             if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:

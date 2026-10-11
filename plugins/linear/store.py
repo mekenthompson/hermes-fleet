@@ -89,13 +89,13 @@ class Store:
         """An attempted terminal write has an unknown effect until an explicit durable resolution."""
         if not issue_id or issue_id.startswith("update:"):
             return False
-        rows = db.execute("SELECT id, state, attempts, payload FROM outbox WHERE kind='status' AND "
+        rows = db.execute("SELECT id, state, attempts, payload FROM outbox WHERE kind IN ('status','description') AND "
                           "json_extract(payload, '$.issue_id')=?", (issue_id,)).fetchall()
         for row in rows:
             if row["id"] == except_id:
                 continue
             payload = json.loads(row["payload"])
-            if not payload.get("terminal") or payload.get("reconciliation"):
+            if not (payload.get("terminal") or payload.get("content_action")) or payload.get("reconciliation"):
                 continue
             if (payload.get("reconcile_required") or
                     (row["state"] in ("pending", "failed") and
@@ -125,6 +125,12 @@ class Store:
             payload = json.loads(row["payload"])
             if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
                 return False
+            if payload.get("content_action"):
+                work = db.execute("SELECT origin, owner_ref, ownership_id, stop_requested_at, release_pending FROM work WHERE issue_id=?",
+                                  (payload["issue_id"],)).fetchone()
+                if (not work or work["origin"] != "chat" or work["owner_ref"] != payload.get("session_key") or
+                        work["ownership_id"] != payload.get("work_owner") or work["stop_requested_at"] or work["release_pending"]):
+                    return False
             if row["kind"] == "status" and not terminal and payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                 return False
             if terminal or row["kind"] == "description":
@@ -548,7 +554,6 @@ class Store:
         row_id = str(payload.get("id") or uuid.uuid4())
         now = time.time() if at is None else at
         with self._tx() as db:
-            if not self._effect_admitted(db, *self._targets(payload)): return ""
             existing = db.execute("SELECT kind, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if existing:
                 saved = json.loads(existing["payload"])
@@ -556,6 +561,7 @@ class Store:
                         ("issue_id", "body", "expected_description", "id", "session_key", "work_owner")):
                     return row_id
                 raise ValueError("outbox id reused with conflicting content")
+            if not self._effect_admitted(db, *self._targets(payload)): return ""
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
             body = json.dumps({**payload, "work_owner": work["ownership_id"] if work else None,
                                "enqueued_at": payload.get("enqueued_at", now)})

@@ -14,7 +14,7 @@ from contextlib import closing, contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from .api import LinearAPI, LinearError, RateLimited, state_id
+from .api import markdown_matches, LinearAPI, LinearError, RateLimited, state_id
 from .oauth import ReauthorizationRequired
 from .store import Store
 log = logging.getLogger("linear")
@@ -1129,6 +1129,12 @@ class Bridge:
                         work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
                         work.get("stop_requested_at")):
                     raise ProjectUpdateDeferred
+                current = self._effect_issue(payload["issue_id"])
+                if ((current.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                        (current.get("state") or {}).get("type") in CLOSED):
+                    raise ProjectUpdateDeferred
+                if row["kind"] == "description" and current.get("description") != payload["expected_description"]:
+                    raise ProjectUpdateDeferred
             if admission_id:
                 validate = getattr(self, "_active_admission_claims", {}).get(admission_id)
                 if not callable(validate) or not validate():
@@ -1139,6 +1145,12 @@ class Bridge:
             action()
     def _send(self, row: dict[str, Any]) -> bool:
         payload, kind = row["payload"], row["kind"]
+        if kind == "description" and (payload.get("write_started") or
+                (row["attempts"] and "write_started" not in payload)):
+            current = self._effect_issue(payload["issue_id"])
+            if not markdown_matches(current.get("description"), payload["body"]):
+                raise LinearError("Prior description write is uncertain; remote description differs, reconcile manually", retryable=False)
+            return True  # read-only settlement, even if the human changed ownership since send
         release_status = self.store.outbox_row(payload.get("requires_status_id", ""))
         if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return False
         if kind == "status" and payload.get("terminal"):
@@ -1179,7 +1191,7 @@ class Bridge:
             if ((delegate != self.api.viewer_id() and not released)
                     or (issue.get("state") or {}).get("type") == "canceled"):
                 return False  # no completion message or update after a human takeover/cancel
-        elif kind in ("comment", "activity") and not payload.get("takeover") and \
+        elif kind in ("comment", "activity", "description") and not payload.get("takeover") and \
                 (payload.get("session_key") or payload.get("task_id")):
             issue = self._effect_issue(payload["issue_id"])
             if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id()
@@ -1245,11 +1257,6 @@ class Bridge:
                 raise LinearError("Comment target/body readback did not match; reconcile before retrying")
             return True
         elif kind == "description":
-            if row["attempts"]:
-                current = self._effect_issue(payload["issue_id"])
-                if current.get("id") != payload["issue_id"] or current.get("description") != payload["body"]:
-                    raise LinearError("Prior description write is uncertain; remote description differs, reconcile manually", retryable=False)
-                return True
             current = self._effect_issue(payload["issue_id"])
             work = self.store.get(payload["issue_id"])
             if (current.get("id") != payload["issue_id"] or not work or

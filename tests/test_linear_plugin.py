@@ -34,8 +34,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Retain the measured cap, including the new module; do not minify identity/recovery safety branches.
 # Combined with landed ownership, ingress, and detached-worker lines, production sources are 3703 lines.
 # Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
-# Content actions add a bounded durable outbox path; keep headroom explicit.
-BUDGET = 3900
+# Content actions include guarded transport, persisted uncertainty and Markdown readback.
+# Measured 3944, allowance 8; retain bounded headroom without compressing safety branches.
+BUDGET = 3952
 
 
 class FakeContext:

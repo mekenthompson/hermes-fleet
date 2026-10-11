@@ -157,6 +157,43 @@ blocks only as `dependency` or `needs_input`; do not mislabel a capability failu
 as a human product decision or claim completion to escape the judge. Preserve the
 precise failure and request supervisor reconciliation without repeated tool retries.
 
+## Human-readable descriptions and progress
+
+Write for the person reviewing the outcome. Use short headings, bullets and
+acceptance checklists in issue descriptions, concise progress comments and project
+updates. A long single paragraph gets a formatting warning, not an automatic
+rewrite. The submitted Markdown, code and URLs are preserved.
+
+Creation is planning, not tracking. Use `start` for work the current chat executes,
+then verify the exact issue's delegate and workflow status. Installing automation
+is a milestone, not completion while replies or decisions remain.
+
+The chat tool exposes two nonterminal content actions for its existing owning chat:
+
+```json
+{"action":"add_comment","issue":"ABC-1","id":"10b73a80-4dda-4994-a46d-6a30f4c2e654","body":"### Progress\n- Setup verified.\n\n### Remaining\n- [ ] Await written replies."}
+{"action":"update_description","issue":"ABC-1","id":"7f5a19f7-10da-4c49-9ca6-97c485c24cdd","expected_description":"Exact current description","description":"### Outcome\nCompare written offers.\n\n### Remaining\n- [ ] Resolve the decision."}
+```
+
+Use a canonical UUID and reuse the exact issue/content/expected-text request when
+reconciling a lost response. A conflicting ID reuse is refused. Both actions use
+the existing outbox, profile identity, specialist scope, local owning claim and
+remote delegate/closed-state checks. Stop, pending release or replaced ownership
+suppress content mutations. They never start another executor or change status.
+
+`update_description` replaces the description, so preserve human-authored scope
+and acceptance. Its expected-text preflight is **not atomic compare-and-swap**:
+a concurrent human edit can still race the external write. A durable send marker
+survives restart; an uncertain replacement is only reconciled by matching desired
+remote content, never blindly resent. A different remote value retains an
+unresolved receipt and fences new writes for operator reconciliation.
+
+Successful delivery verifies the exact issue/comment ID and Markdown content.
+Readback tolerates only top-level bullet-marker canonicalization and blank lines
+after Markdown headings, preserving code, links and checklist state. A queued
+receipt is not remote delivery, source tests are not live activation, and the
+bridge's automatic closeout must not be duplicated with manual comments.
+
 ## Chat-to-worker admission
 
 `linear start` tracks work performed by the current chat. It is not a detached-worker

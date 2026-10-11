@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import math
+import re
 import threading
 import time
 import urllib.error
@@ -103,6 +104,32 @@ def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read() or b""
+
+def markdown_matches(actual: object, expected: str) -> bool:
+    """Accept only editor heading spacing/bullet canonicalization; preserve code/text."""
+    if not isinstance(actual, str):
+        return False
+    def canonical(text: str) -> list[str]:
+        lines, result, fence = text.splitlines(), [], None
+        after_heading = False
+        for line in lines:
+            marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+            if marker:
+                run = marker.group(1)
+                if fence is None: fence = (run[0], len(run))
+                elif run[0] == fence[0] and len(run) >= fence[1]: fence = None
+                result.append(line)
+                after_heading = False
+                continue
+            if fence is not None:
+                result.append(line)
+                continue
+            if not line and after_heading:
+                continue
+            after_heading = bool(re.match(r'^#{1,6} +', line))
+            result.append(re.sub(r'^[*+] ', '- ', line))
+        return result
+    return canonical(actual) == canonical(expected)
 
 class LinearAPI:
     """``token`` is the provider interface: a callable returning an access token, with an
@@ -252,7 +279,7 @@ class LinearAPI:
         current = self.issue(issue_id)
         if current.get("id") != issue_id:
             raise LinearError("Description target could not be verified", retryable=False)
-        if current.get("description") == body:
+        if markdown_matches(current.get("description"), body):
             return  # same-id readback reconciliation; never overwrite a concurrent change
         if current.get("description") != expected:
             raise LinearError("Description changed or could not be verified; no replacement made", retryable=False)
@@ -260,14 +287,14 @@ class LinearAPI:
         # edit between this read and mutation can still be overwritten.
         self.update_issue(issue_id, {"description": body})
         verified = self.issue(issue_id)
-        if verified.get("id") != issue_id or verified.get("description") != body:
+        if verified.get("id") != issue_id or not markdown_matches(verified.get("description"), body):
             raise LinearError("Description replacement could not be verified; reconcile before retrying")
     def verify_comment(self, comment_id: str, issue_id: str, body: str) -> bool:
         data = self.graphql("query CommentReadback($id: String!) { comment(id: $id) { id body issue { id } } }",
                             {"id": comment_id})
         comment = data.get("comment")
         return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
-                    comment.get("body") == body and isinstance(comment.get("issue"), dict) and
+                    markdown_matches(comment.get("body"), body) and isinstance(comment.get("issue"), dict) and
                     comment["issue"].get("id") == issue_id)
     def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
         try:
@@ -309,7 +336,7 @@ class LinearAPI:
             if not is_duplicate_create_error(exc.errors, client_id):
                 raise
         issue = self.graphql(
-            "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title url "
+            "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
             "team { id key } project { id } parent { id } assignee { id } delegate { id } } }",
             {"id": client_id}).get("issue")
         team = (issue or {}).get("team") or {}
@@ -317,6 +344,7 @@ class LinearAPI:
         parent = (issue or {}).get("parent") or {}
         if (not isinstance(issue, dict) or issue.get("id") != client_id or issue.get("title") != title
                 or team_id not in {team.get("id"), team.get("key")}
+                or (description is not None and not markdown_matches(issue.get("description"), description))
                 or issue.get("assignee") is not None or issue.get("delegate") is not None
                 or (project_id is not None and project.get("id") != project_id)
                 or (parent_id is not None and parent.get("id") != parent_id)):
