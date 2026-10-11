@@ -57,12 +57,14 @@ for line in sys.stdin:
         assert options["allowDangerouslySkipPermissions"] is False
         if mode in {"bridge", "forged", "permission_bash"}:
             servers = message["params"].get("mcpServers")
-            assert isinstance(servers, list) and servers, "top-level mcpServers must advertise hermes_bridge"
-            server = servers[0]
-            assert server.get("name") == "hermes_bridge"
-            assert "type" not in server
-            assert server.get("command")
-            assert server.get("args")
+            assert servers == [], (
+                "top-level mcpServers must stay empty; an untyped stdio entry "
+                "fails ACP SDK 1.8 session/new"
+            )
+            bridge = options["mcpServers"]["hermes_bridge"]
+            assert bridge.get("type") == "stdio"
+            assert bridge.get("command")
+            assert bridge.get("args")
         result = {"sessionId": session_id}
         if mode in {"wrong_model", "model_ok", "missing_model"}:
             result["configOptions"] = [dict(MODEL_OPTION)]

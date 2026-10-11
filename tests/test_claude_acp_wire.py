@@ -50,7 +50,7 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertFalse(any(getattr(chunk.choices[0].delta, "tool_calls", None) for chunk in chunks if chunk.choices))
         self.assertTrue(client.is_closed)
 
-    def test_session_new_advertises_hermes_bridge_on_the_acp_mcp_servers_list(self):
+    def test_session_new_registers_hermes_bridge_via_claude_code_options(self):
         client = self.client("bridge")
         response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
         self.assertEqual(response.choices[0].message.tool_calls[0].function.name, "probe")

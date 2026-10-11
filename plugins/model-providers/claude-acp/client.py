@@ -1475,20 +1475,16 @@ class ClaudeACPClient:
                 if not isinstance(prompt_capabilities, dict) or prompt_capabilities.get("image") is not True:
                     raise RuntimeError("Claude ACP adapter does not advertise image prompt support")
             bridge_config: dict[str, Any] = {}
-            acp_mcp_servers: list[dict[str, Any]] = []
             if bridge_tools:
                 proxy_args = [
                     str(Path(__file__).with_name("tool_bridge_mcp.py")),
                     "--proxy",
                     bridge_socket,
                 ]
-                # ACP session/new consumes a top-level array. Do not set type=stdio:
-                # the adapter only hydrates unnamed-type entries as stdio servers.
-                acp_mcp_servers = [{
-                    "name": "hermes_bridge",
-                    "command": sys.executable,
-                    "args": proxy_args,
-                }]
+                # ACP SDK 1.8 rejects an untyped stdio entry, and claude-agent-acp
+                # 0.89 does not hydrate type=stdio on the top-level list. An
+                # entry there fails session/new before the bridge can start.
+                # Claude Code options.mcpServers is the path that registers it.
                 bridge_config = {
                     "hermes_bridge": {
                         "type": "stdio",
@@ -1500,7 +1496,7 @@ class ClaudeACPClient:
             options["mcpServers"] = bridge_config
             session = request("session/new", {
                 "cwd": self._cwd,
-                "mcpServers": acp_mcp_servers,
+                "mcpServers": [],
                 "_meta": {
                     "systemPrompt": {"type": "preset", "preset": "claude_code", "append": system},
                     "claudeCode": {
