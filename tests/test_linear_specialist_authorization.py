@@ -1251,6 +1251,15 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
 
+    def test_session_claim_survives_a_later_issue_timestamp_without_a_delegate(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["updatedAt"] = "2026-01-01T00:00:02Z"
+        self.authority.issues[ISSUE]["delegate"] = None
+        self.bridge.flush()
+        self.assertNotEqual(self.kanban.tasks["task-1"].status, "archived")
+        self.assertEqual(self.store.get(ISSUE)["owner_ref"], SESSION)
+        self.assertTrue(any("issueUpdate" in query for query in self.authority.mutations))
+
     def test_foreign_requester_cannot_use_allowed_author_or_poison_issue(self):
         self.authority.issues[ISSUE] = issue_record()
         self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
