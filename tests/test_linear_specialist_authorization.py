@@ -1260,6 +1260,25 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(self.store.get(ISSUE)["owner_ref"], SESSION)
         self.assertTrue(any("issueUpdate" in query for query in self.authority.mutations))
 
+    def test_worker_progress_becomes_agent_action_activity(self):
+        from types import SimpleNamespace
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        row = self.store.get(ISSUE)
+        setattr(self.kanban, "comment_text", lambda task_id, author, length: "Checked the Sydney stock file" if length == 29 else "")
+        self.bridge._task_event(row, SimpleNamespace(id=9, kind="heartbeat", payload={"note": "Reading the stock report"}), "running", {})
+        self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(id=10, kind="heartbeat", payload={}), "running", {})
+        self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(
+            id=11, kind="commented", payload={"author": "worker", "len": 29}), "running", {})
+        actions = [item["payload"] for item in self.store.pending()
+                   if item["kind"] == "activity" and item["payload"]["content"].get("type") == "action"]
+        thoughts = [item["payload"]["content"].get("body") for item in self.store.pending()
+                    if item["kind"] == "activity" and item["payload"]["content"].get("type") == "thought"]
+        self.assertEqual(actions[-1]["content"], {"type": "action", "action": "Working", "parameter": "Reading the stock report"})
+        self.assertTrue(actions[-1]["ephemeral"])
+        self.assertEqual(len(actions), 1)
+        self.assertIn("Checked the Sydney stock file", thoughts)
+
     def test_foreign_requester_cannot_use_allowed_author_or_poison_issue(self):
         self.authority.issues[ISSUE] = issue_record()
         self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
