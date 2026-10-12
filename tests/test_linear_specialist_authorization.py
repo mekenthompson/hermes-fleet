@@ -1230,5 +1230,137 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.pending(), [])
 
 
+class SessionRequesterTests(unittest.TestCase):
+    session_event = LinearSpecialistAuthorizationTests.session_event
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.authority = Authority()
+        self.authority.issues[ISSUE] = issue_record(creator={"id": "third-party"})
+        self.authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        self.kanban = FakeKanban()
+        self.store = Store(Path(self.tmp.name) / "state.db")
+        self.api = self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"})
+        self.bridge = Bridge(self.store, self.api, self.kanban, profile="synthetic")
+
+    def test_allowed_delegation_of_third_party_issue(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(len(self.kanban.creates), 1)
+        self.assertEqual(self.store.get(ISSUE)["owner_ref"], SESSION)
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
+
+    def test_foreign_requester_cannot_use_allowed_author_or_poison_issue(self):
+        self.authority.issues[ISSUE] = issue_record()
+        self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+        self.bridge.handle_webhook(self.session_event(creator="foreign"))
+        self.assertEqual(self.kanban.creates, [])
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.authority.sessions[SESSION]["creator"] = {"id": USER}
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_spoofed_creator_and_wrong_app_are_refused(self):
+        for changes in ({"creator": {"id": "foreign"}}, {"appUser": {"id": "foreign-app"}},
+                        {"creator": None}, {"creator": {"id": VIEWER}}, {"appUser": None}):
+            with self.subTest(changes=changes):
+                self.authority.sessions[SESSION] = {"id": SESSION, "issue": {"id": ISSUE},
+                                                    "creator": {"id": USER}, "appUser": {"id": VIEWER}, **changes}
+                self.bridge.handle_webhook(self.session_event())
+                self.assertEqual(self.kanban.creates, [])
+                self.assertEqual(self.authority.mutations, [])
+                self.assertFalse(self.store.scope_fenced(ISSUE))
+
+    def test_foreign_reply_does_not_revoke_allowed_work(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.activities[ACTIVITY]["user"] = {"id": "foreign"}
+        before = self.store.get(ISSUE)
+        self.bridge.handle_webhook(self.session_event("prompted", user="foreign"))
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertTrue(self.bridge.authorize_specialist_effect(ISSUE))
+
+    def test_restart_rechecks_session_and_refuses_changed_requester(self):
+        self.bridge.handle_webhook(self.session_event())
+        reopened = Store(Path(self.tmp.name) / "state.db")
+        api = self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"})
+        bridge = Bridge(reopened, api, self.kanban, profile="synthetic")
+        self.assertTrue(bridge.authorize_specialist_effect(ISSUE))
+        self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+        self.assertFalse(bridge.authorize_specialist_effect(ISSUE))
+        with self.assertRaises(LinearError):
+            api.create_comment("client", ISSUE, "must not send")
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_allowed_mention_and_reply(self):
+        # A mention-created session follows the same created event path, with no delegate.
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.bridge.handle_webhook(self.session_event("prompted"))
+        self.assertEqual(len(self.kanban.creates), 1)
+        self.assertTrue(self.kanban.comments)
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+
+    def test_queued_effects_send_and_then_refuse_requester_revocation(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.assertGreater(self.bridge.flush(), 0)
+        self.assertTrue(self.authority.mutations)
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.bridge.comment(ISSUE, "Synthetic result")
+        self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+        before = list(self.authority.mutations)
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, before)
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+
+    def test_transient_session_lookup_failure_is_not_permanent_denial(self):
+        self.authority.fail_session = True
+        with self.assertRaises(LinearError) as caught:
+            self.bridge.handle_webhook(self.session_event())
+        self.assertTrue(caught.exception.retryable)
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+        self.authority.fail_session = False
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_payload_issue_and_prompt_actor_spoofing_are_refused(self):
+        self.bridge.handle_webhook(self.session_event(event_issue="foreign-issue"))
+        self.assertEqual(self.kanban.creates, [])
+        self.bridge.handle_webhook(self.session_event())
+        before = list(self.kanban.comments)
+        self.bridge.handle_webhook(self.session_event("prompted", user="foreign"))
+        self.assertEqual(self.kanban.comments, before)
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+
+    def test_all_teams_policy_keeps_requester_guard(self):
+        self.api = self.authority.api(scope={"all_teams": True, "all_projects": True,
+                                           "allowed_requester_ids": [USER], "requester_basis": "agent_session"})
+        self.bridge = Bridge(self.store, self.api, self.kanban, profile="synthetic")
+        self.authority.issues[ISSUE] = issue_record(team={"id": "new-team"}, project=None, creator=None)
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_requester_mode_validation_and_default_preservation(self):
+        self.assertEqual(self.authority.api().specialist_scope, SCOPE)
+        self.assertEqual(self.authority.api(scope={**SCOPE, "requester_basis": "issue_creator"}).specialist_scope, SCOPE)
+        for value in (None, False, "user", [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.authority.api(scope={**SCOPE, "requester_basis": value})
+
+    def test_unbound_issue_does_not_gain_authority_from_author(self):
+        self.authority.issues[ISSUE] = issue_record()
+        with self.assertRaises(LinearError):
+            self.api.issue(ISSUE)
+        self.assertFalse(self.store.scope_fenced(ISSUE))
+
+    def test_stored_session_cannot_redirect_issue(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.sessions[SESSION]["issue"] = {"id": "other-issue"}
+        with self.assertRaises(LinearError):
+            self.api.update_issue(ISSUE, {"stateId": "state-done"})
+        self.assertEqual(self.authority.mutations, [])
+
+
 if __name__ == "__main__":
     unittest.main()

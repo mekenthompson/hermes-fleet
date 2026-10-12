@@ -237,7 +237,12 @@ class Bridge:
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
+        if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            api.requester_session_for_issue = self._requester_session_for_issue
         self._reauth_alerted: set[tuple[str, str]] = set()
+    def _requester_session_for_issue(self, issue_id: str):
+        row = self.store.get(issue_id) or {}
+        return row.get("owner_ref") if row.get("origin") == "kanban" else row.get("linear_session_id")
     def chat_profile_matches(self, profile: str, *, platform: str = "") -> bool:
         executor = getattr(self.kanban, "executor_profile", None)
         home = getattr(self.kanban, "profile_home", None)
@@ -454,7 +459,8 @@ class Bridge:
             try:
                 verified = self.api.agent_activity(activity_id, session_id)
             except LinearError as exc:
-                if not exc.retryable and exc.authoritative_session_id == session_id:
+                if (not exc.retryable and exc.authoritative_session_id == session_id and
+                        (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") != "agent_session"):
                     self._fence_scope_denial(authoritative_issue_id, LinearError(str(exc), retryable=False, authoritative_issue_id=authoritative_issue_id))
                 raise
             user_id = verified["user"]["id"]
@@ -467,6 +473,14 @@ class Bridge:
         if exc.retryable: raise exc
         log.warning("linear: specialist authorization refused: %s", exc)
     def handle_webhook(self, event: dict[str, Any]) -> None:
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            if event.get("type") == "AgentSessionEvent":
+                with self.api.requester_session((event.get("agentSession") or {}).get("id")):
+                    return self._handle_webhook(event)
+            if event.get("type") == "Issue" and not self.store.get((event.get("data") or {}).get("id")):
+                return
+        self._handle_webhook(event)
+    def _handle_webhook(self, event: dict[str, Any]) -> None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
