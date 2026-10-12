@@ -1198,8 +1198,9 @@ class Bridge:
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
             yield
-        guard.rejected = lambda: self.store.project_not_applied(
-            row_id, known_rejection=True, started_before=prior_started.get("value"))
+        if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
+            guard.rejected = lambda: self.store.project_not_applied(
+                row_id, known_rejection=True, started_before=prior_started.get("value"))
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:

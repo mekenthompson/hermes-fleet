@@ -244,8 +244,9 @@ class LinearAPI:
             self._pause(response_headers, limited=False)
             rejected = getattr(guard, "rejected", None) if guard is not None else None
             if status == 401 and callable(rejected):
-                # False means the marker was already started or is legacy. Do not
-                # retry that create; a 401 does not prove an earlier attempt missed.
+                # False means this project-update create was already started or is a
+                # prepared legacy create. Other guarded mutations do not install this
+                # callback, so their 401 still refreshes credentials and retries once.
                 if rejected() is False:
                     break
             refresh_provider = provider if token_provider is not None or verify_credential is not None else self.token

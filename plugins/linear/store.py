@@ -803,12 +803,13 @@ class Store:
             payload = json.loads(row["payload"])
             if known_rejection:
                 prior = payload.get("write_started") if started_before is None else started_before
-                # True or a missing legacy marker was not proven unsent. A 401 of this
-                # request must not clear that marker or thaw the frozen body.
-                if prior is not False:
+                legacy_create = prior is None and payload.get("send_body") is not None
+                # Already started, or a prepared legacy create: do not thaw and do not retry.
+                # A missing marker with no send body has not started, even if attempts > 0.
+                if prior is True or legacy_create:
                     return False
                 if payload.get("send_body") is None:
-                    return False
+                    return True
                 payload["frozen"] = True
                 payload["write_started"] = False
                 db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), row_id))
@@ -832,10 +833,10 @@ class Store:
                 return None
             if not self._admitted(db, *self._targets(payload)): return False
             if not payload.get("frozen"):
-                # A write already started, or a legacy row that was attempted without a
-                # marker, must not be reprojected. A fresh unsent row may still freeze.
+                # write_started true, or a prepared body with no marker, must not be
+                # reprojected. Attempts alone are pre-send retries and may still freeze.
                 if payload.get("write_started") is True or (
-                        "write_started" not in payload and row["attempts"]):
+                        "write_started" not in payload and payload.get("send_body")):
                     return False
                 payload["frozen"] = True
                 payload["write_started"] = False
