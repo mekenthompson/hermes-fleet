@@ -64,13 +64,16 @@ class BoundLinearAPI(LinearAPI):
             result["requester_basis"] = basis
         return result
     @contextmanager
-    def _permit_specialist_operation(self):
+    def _permit_specialist_operation(self, issue_ids=None):
+        prior = getattr(self._graphql_permit, "issue_targets", ())
+        if issue_ids is not None: self._graphql_permit.issue_targets = tuple(issue_ids)
         depth = getattr(self._graphql_permit, "depth", 0)
         self._graphql_permit.depth = depth + 1
         try:
             yield
         finally:
             self._graphql_permit.depth = depth
+            self._graphql_permit.issue_targets = prior
     @contextmanager
     def requester_session(self, session_id):
         prior = getattr(self._graphql_permit, "requester_session_id", None)
@@ -102,7 +105,15 @@ class BoundLinearAPI(LinearAPI):
     def graphql(self, query, variables=None):
         if self.specialist_scope is not None and not getattr(self._graphql_permit, "depth", 0):
             raise LinearError("Arbitrary Linear GraphQL is disabled by specialist_scope", retryable=False)
-        return super()._graphql(query, variables, verify_credential=self._verified_credential)
+        def verify(provider):
+            result = self._verified_credential(provider)
+            if (query.lstrip().startswith("mutation") and self.specialist_scope is not None and
+                    self.specialist_scope.get("requester_basis") == "agent_session"):
+                targets = getattr(self._graphql_permit, "issue_targets", ())
+                if not targets: raise LinearError("Specialist mutation has no issue authority", retryable=False)
+                for issue_id in targets: self._mutation_issue(issue_id)
+            return result
+        return super()._graphql(query, variables, verify_credential=verify)
     def viewer_id(self) -> str:
         self.verify_identity()
         return str(self.identity["viewer_id"])
@@ -115,7 +126,9 @@ class BoundLinearAPI(LinearAPI):
         requester_ok = isinstance(creator, dict) and creator.get("id") in self.specialist_scope["allowed_requester_ids"]
         if self.specialist_scope.get("requester_basis") == "agent_session":
             session_id = getattr(self._graphql_permit, "requester_session_id", None)
-            if not session_id:
+            bound_effect = isinstance(session_id, dict)
+            if bound_effect: session_id = session_id.get(issue["id"])
+            if not session_id and not bound_effect:
                 resolver = getattr(self, "requester_session_for_issue", None)
                 session_id = resolver(issue["id"]) if callable(resolver) else None
             if not isinstance(session_id, str) or not session_id:
@@ -210,12 +223,12 @@ class BoundLinearAPI(LinearAPI):
                 raise LinearError("Linear issue update exceeds specialist scope", retryable=False)
         elif self.identity.get("teams") or self.identity.get("projects"):
             self._mutation_issue(issue_id)
-        with self._permit_specialist_operation():
+        with self._permit_specialist_operation([issue_id]):
             return super().update_issue(issue_id, fields)
     def create_comment(self, client_id, issue_id, body):
         if self.specialist_scope is not None or self.identity.get("teams") or self.identity.get("projects"):
             self._mutation_issue(issue_id)
-        with self._permit_specialist_operation():
+        with self._permit_specialist_operation([issue_id]):
             return super().create_comment(client_id, issue_id, body)
     def verify_comment(self, comment_id, issue_id, body):
         self._mutation_issue(issue_id)
@@ -229,7 +242,7 @@ class BoundLinearAPI(LinearAPI):
             if session["issue"]["id"] != issue_id:
                 raise LinearError("Agent Activity session does not belong to the authorized issue", retryable=False)
             self._mutation_issue(issue_id)
-        with self._permit_specialist_operation():
+        with self._permit_specialist_operation([issue_id]):
             return super().create_activity(client_id, session_id, content)
 
     def create_project_update(self, client_id, project_id, body, *, issue_ids=None):
@@ -243,7 +256,7 @@ class BoundLinearAPI(LinearAPI):
                     raise LinearError("Project update issue is outside configured specialist scope", retryable=False)
         elif self.identity.get("projects") and project_id not in self.identity["projects"]:
             raise LinearError("Linear project is outside configured scope", retryable=False)
-        with self._permit_specialist_operation():
+        with self._permit_specialist_operation(issue_ids):
             return super().create_project_update(client_id, project_id, body)
 
     def create_issue(self, client_id, team_id, title, *, description=None, project_id=None, parent_id=None):

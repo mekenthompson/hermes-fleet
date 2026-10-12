@@ -1348,6 +1348,111 @@ class SessionRequesterTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.authority.api(scope={**SCOPE, "requester_basis": value})
 
+    def test_terminal_effect_authority_survives_finish_and_restart(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.bridge.flush()
+        task = self.kanban.tasks["task-1"]
+        task.status, task.result = "done", "Synthetic result"
+        self.kanban.evidence_text = lambda task: "https://example.test/findings"
+        self.bridge.pump_kanban()
+        self.assertIsNone(self.store.get(ISSUE))
+        self.authority.mutations.clear()
+        bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
+                        self.kanban, profile="synthetic")
+        self.assertGreater(bridge.flush(), 0)
+        self.assertEqual(len(self.authority.mutations), 3)
+        self.assertEqual(bridge.store.pending(), [])
+
+    def test_401_retry_rechecks_requester(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.bridge.flush()
+        self.authority.mutations.clear()
+        original = self.api.transport
+        attempts = []
+        def provider(): return "synthetic"
+        provider.invalidate = lambda: None
+        self.api.token = provider
+        def transport(url, body, headers):
+            if json.loads(body)["query"].lstrip().startswith("mutation"):
+                attempts.append(True)
+                if len(attempts) == 1:
+                    self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+                    return 401, {}, b"{}"
+            return original(url, body, headers)
+        self.api.transport = transport
+        self.bridge.comment(ISSUE, "must not send after revocation")
+        self.bridge.flush()
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_pending_reply_actor_rechecked_after_restart(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        original = self.kanban.comment
+        def crash(*args, **kwargs): raise RuntimeError("interrupted before delivery")
+        self.kanban.comment = crash
+        with self.assertRaises(RuntimeError):
+            self.bridge.handle_webhook(self.session_event("prompted"))
+        self.assertTrue(self.store.get(ISSUE)["pending_resume"])
+        self.kanban.comment = original
+        self.authority.activities[ACTIVITY]["user"] = {"id": "foreign"}
+        bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
+                        self.kanban, profile="synthetic")
+        bridge._recover_kanban()
+        self.assertEqual(self.kanban.comments, [])
+        self.assertTrue(bridge.store.get(ISSUE)["pending_resume"])
+        self.assertFalse(bridge.store.scope_fenced(ISSUE))
+        self.authority.activities[ACTIVITY]["user"] = {"id": USER}
+        bridge._recover_kanban()
+        self.assertTrue(self.kanban.comments)
+
+    def test_direct_mutation_retry_rechecks_requester(self):
+        self.bridge.handle_webhook(self.session_event())
+        original = self.api.transport
+        attempts = []
+        def provider(): return "synthetic"
+        provider.invalidate = lambda: None
+        self.api.token = provider
+        def transport(url, body, headers):
+            if json.loads(body)["query"].lstrip().startswith("mutation"):
+                attempts.append(True)
+                self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+                return 401, {}, b"{}"
+            return original(url, body, headers)
+        self.api.transport = transport
+        with self.assertRaises(LinearError):
+            self.api.create_comment("direct", ISSUE, "must not send")
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_legacy_effect_cannot_borrow_current_session_authority(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.bridge.flush()
+        self.authority.mutations.clear()
+        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "unbound legacy write"}, at=0)
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(self.store.outbox_row(row_id)["state"], "pending")
+
+    def test_terminal_effect_does_not_borrow_successor_session_authority(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.bridge.flush()
+        task = self.kanban.tasks["task-1"]
+        task.status = "done"
+        self.kanban.evidence_text = lambda task: "https://example.test/findings"
+        self.bridge.pump_kanban()
+        self.authority.mutations.clear()
+        other = "successor-session"
+        self.authority.sessions[other] = {"id": other, "issue": {"id": ISSUE},
+                                          "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+        self.api.requester_session_for_issue = lambda issue_id: other
+        self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, [])
+
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()
         with self.assertRaises(LinearError):

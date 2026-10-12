@@ -426,7 +426,14 @@ For work delegated by an allowed requester regardless of the issue author, add
 `requester_basis: agent_session` to either form. The bridge resolves the exact
 Agent Session from Linear, requires its human creator to be allowlisted and its
 app user to match this client, then binds subsequent issue effects to the session
-in the existing durable work row. Every effect resolves that session again;
+in the existing durable work row. Queued effects retain their exact issue/session
+bindings in the outbox payload, so closeout remains authorized after that work
+row is deleted and cannot borrow a successor's authority. Every transport attempt,
+including a credential-refresh retry, rechecks authority after credential resolution.
+Saved reply messages retain their activity and session IDs for actor verification
+before restart delivery. Legacy effects or reply intents lacking those bindings
+fail closed and require reconciliation instead of borrowing current work authority.
+Every effect resolves that session again;
 issue authorship alone never grants authority in this mode. Mentions use the same
 session-created path. Replies require an authoritative activity from an allowed
 human on that exact session. Foreign prompts are refused without poisoning an
@@ -453,7 +460,7 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 4,010 lines. This includes the bounded
+The production implementation is capped at 4,050 lines. This includes the bounded
 session-requester authorization path and existing recovery/transport safeguards.
 The unit suite enforces measured headroom without compressing safety-critical branches.
 

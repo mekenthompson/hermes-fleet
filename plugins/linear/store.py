@@ -478,10 +478,10 @@ class Store:
                         prior = json.loads(existing["payload"])
                         if existing["state"] in ("pending", "failed") and not prior.get("frozen"):
                             prior["lines"].update(payload["lines"])
-                            for key in ("line_issues", "terminal_lines"):
+                            for key in ("line_issues", "terminal_lines", "requester_sessions"):
                                 prior.setdefault(key, {}).update(payload.get(key, {}))
                             prior.update({key: value for key, value in payload.items()
-                                          if key not in ("lines", "line_issues", "terminal_lines")})
+                                          if key not in ("lines", "line_issues", "terminal_lines", "requester_sessions")})
                             prior["enqueued_at"] = at
                             db.execute("UPDATE outbox SET payload = ?, next_at = MAX(next_at, ?) WHERE id = ?",
                                        (json.dumps(prior), at + float(payload.get("quiet", 0)), existing["id"]))
@@ -744,6 +744,8 @@ class Store:
                 if not self._admitted(db, *self._targets(prior)): return False
                 prior["lines"].update(payload["lines"])
                 prior.setdefault("line_issues", {}).update(payload.get("line_issues", {}))
+                if payload.get("requester_sessions"):
+                    prior.setdefault("requester_sessions", {}).update(payload["requester_sessions"])
                 if payload.get("terminal"):
                     prior["terminal"] = True
                     prior["owner_issue_id"] = payload.get("owner_issue_id")

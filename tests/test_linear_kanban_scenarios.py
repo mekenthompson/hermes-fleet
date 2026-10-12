@@ -78,6 +78,33 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.injected.append((key, text))
         return self.inject_ok
 
+    def test_session_requester_real_kanban_closeout_survives_restart(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        api = authority.api(scope=policy)
+        store = Store(self.dir / "requester.db")
+        board = Kanban()
+        bridge = Bridge(store, api, board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        task_id = store.get(scoped_issue)["task_id"]
+        self.assertEqual(board.get(task_id).status, "ready")
+        bridge.flush()
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, task_id, result="Findings: https://example.test/findings"))
+        bridge.pump_kanban()
+        self.assertIsNone(store.get(scoped_issue))
+        authority.mutations.clear()
+        reopened = Bridge(Store(store.path), authority.api(scope=policy), Kanban(), profile="alpha")
+        self.assertEqual(reopened.flush(), 3)
+        self.assertEqual(len(authority.mutations), 3)
+        self.assertEqual(reopened.store.pending(), [])
+
     def test_chat_admission_identity_requires_live_host_turn_and_catalog(self):
         from types import SimpleNamespace
         from unittest.mock import patch

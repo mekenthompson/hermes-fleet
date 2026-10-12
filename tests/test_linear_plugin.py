@@ -37,8 +37,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Content actions include guarded transport, persisted uncertainty and Markdown readback.
 # Measured 3944, allowance 8; retain bounded headroom without compressing safety branches.
 # Session-requester authorization adds explicit fresh-session and durable binding guards.
-# Measured 4002, allowance 8; do not minify those authorization branches.
-BUDGET = 4010
+# Measured 4042, allowance 8; do not minify those authorization branches.
+BUDGET = 4050
 
 
 class FakeContext:
