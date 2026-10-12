@@ -333,19 +333,9 @@ class LinearAPI:
                      project_id: str | None = None, parent_id: str | None = None) -> dict[str, Any]:
         """Create an issue as the authenticated app. Never assigns or delegates."""
         fields = {"id": client_id, "teamId": team_id, "title": title, "assigneeId": None, "delegateId": None}
-        if description is not None:
-            fields["description"] = description
-        if project_id is not None:
-            fields["projectId"] = project_id
-        if parent_id is not None:
-            fields["parentId"] = parent_id
-        try:
-            data = self.graphql("mutation IssueCreate($input: IssueCreateInput!) "
-                                "{ issueCreate(input: $input) { success } }", {"input": fields})
-            _require_mutation_success(data, "issueCreate")
-        except LinearError as exc:
-            if not is_duplicate_create_error(exc.errors, client_id):
-                raise
+        fields.update({key: value for key, value in (
+            ("description", description), ("projectId", project_id), ("parentId", parent_id)) if value is not None})
+        self._create("issueCreate", "IssueCreateInput", fields)
         issue = self.graphql(
             "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
             "team { id key } project { id } parent { id } assignee { id } delegate { id } } }",
@@ -367,13 +357,7 @@ class LinearAPI:
         fields: dict[str, Any] = {"id": client_id, "name": name, "teamIds": list(team_ids), "leadId": None}
         if description is not None:
             fields["description"] = description
-        try:
-            data = self.graphql("mutation ProjectCreate($input: ProjectCreateInput!) "
-                                "{ projectCreate(input: $input) { success } }", {"input": fields})
-            _require_mutation_success(data, "projectCreate")
-        except LinearError as exc:
-            if not is_duplicate_create_error(exc.errors, client_id):
-                raise
+        self._create("projectCreate", "ProjectCreateInput", fields)
         project = self.graphql(
             "query CreatedProject($id: String!) { project(id: $id) { id name url lead { id } teams { nodes { id key } } } }",
             {"id": client_id}).get("project")
