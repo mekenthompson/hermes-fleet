@@ -1166,10 +1166,17 @@ class Bridge:
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row): raise ProjectUpdateDeferred
-            if payload.get("superseded_receipt"):
-                issue = self._effect_issue(payload["issue_id"])
-                if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
-                        (issue.get("state") or {}).get("type") == "canceled"): raise ProjectUpdateDeferred
+            if row and (payload.get("terminal") or payload.get("superseded_receipt")):
+                receipt_ids = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()}
+                for issue_id in self._outbox_scope_issue_ids(row):
+                    issue = self._effect_issue(issue_id)
+                    delegate = (issue.get("delegate") or {}).get("id")
+                    receipts = [self.store.outbox_row(r) for r in receipt_ids if r]
+                    released = delegate is None and any(r and r["payload"].get("issue_id") == issue_id and
+                        self.store.verified_release(r["id"]) for r in receipts)
+                    state = (issue.get("state") or {}).get("type")
+                    if ((delegate != self.api.viewer_id() and not released) or state == "canceled" or
+                            (row["kind"] == "status" and state in CLOSED)): raise ProjectUpdateDeferred
             if payload.get("content_action") or row and row.get("kind") == "description":
                 work = self.store.get(payload.get("issue_id", ""))
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or

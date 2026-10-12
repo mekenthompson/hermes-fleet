@@ -1590,6 +1590,45 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertTrue(self.kanban.comments)
         self.assertIsNone(self.store.get(ISSUE)["pending_resume"])
 
+    def test_terminal_takeover_and_cancellation_rechecked_after_credentials_and_401(self):
+        for boundary in ("credentials", "401"):
+            for change in ("takeover", "cancel"):
+                with self.subTest(boundary=boundary, change=change):
+                    self.setUp()
+                    self.bridge.handle_webhook(self.session_event())
+                    self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+                    self.bridge.flush()
+                    task = self.kanban.tasks["task-1"]
+                    task.status = "done"
+                    self.kanban.evidence_text = lambda task: "https://example.test/findings"
+                    self.bridge.pump_kanban()
+                    self.bridge.await_retired(ISSUE)
+                    self.authority.mutations.clear()
+                    changed, attempts = [], []
+                    def revoke():
+                        changed.append(True)
+                        if change == "takeover": self.authority.issues[ISSUE]["delegate"] = {"id": "foreign-human"}
+                        else: self.authority.issues[ISSUE]["state"] = {"id": "canceled", "type": "canceled"}
+                    def provider():
+                        if boundary == "credentials" and getattr(self.api._graphql_permit, "issue_targets", ()) and not changed:
+                            revoke()
+                        return "synthetic"
+                    provider.invalidate = lambda: None
+                    original = self.api.transport
+                    def transport(url, body, headers):
+                        if json.loads(body)["query"].lstrip().startswith("mutation"):
+                            attempts.append(True)
+                            if boundary == "401" and not changed:
+                                revoke()
+                                return 401, {}, b"{}"
+                        return original(url, body, headers)
+                    self.api.token, self.api.transport = provider, transport
+                    self.bridge.flush()
+                    self.assertEqual(changed, [True])
+                    self.assertEqual(len(attempts), int(boundary == "401"))
+                    self.assertEqual(self.authority.mutations, [])
+                    self.assertTrue(self.store.pending())
+
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()
         with self.assertRaises(LinearError):
