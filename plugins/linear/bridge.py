@@ -30,6 +30,37 @@ OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull
 OWN = "linear:"  # reason prefix on blocks this plugin makes, so their events are not echoed back
 def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
+def _bridge_comment_author(author: str) -> bool:
+    return author == "linear" or author.startswith("linear:")
+def resolve_comment_body(comments, author: str, length: int) -> str:
+    """Match the comment core stored for a commented event.
+
+    add_comment stores author.strip() and body.strip(), but the event records
+    the raw author and len(raw body). A trailing newline must still resolve.
+    Ambiguous same-length comments are refused rather than guessed. Bridge
+    authors are never published back to Linear.
+    """
+    raw_author = str(author or "")
+    stored_author = raw_author.strip()
+    if (not stored_author or _bridge_comment_author(raw_author)
+            or _bridge_comment_author(stored_author)):
+        return ""
+    try:
+        raw_len = int(length)
+    except (TypeError, ValueError):
+        return ""
+    owned = [item for item in comments if getattr(item, "author", None) == stored_author]
+    exact = [item for item in owned if len(item.body) == raw_len]
+    if len(exact) == 1:
+        return item_body(exact[0])
+    if exact:
+        return ""
+    padded = [item for item in owned if item.body == item.body.strip() and 0 < raw_len - len(item.body)]
+    if len(padded) == 1:
+        return item_body(padded[0])
+    return ""
+def item_body(item) -> str:
+    return str(getattr(item, "body", "") or "")
 def _visible_activity(content: dict[str, Any]) -> str:
     if content.get("body"):
         return str(content["body"])
@@ -169,9 +200,7 @@ class Kanban:
     def comment_text(self, task_id: str, author: str, length: int) -> str:
         with self.conn() as conn:
             comments = self.kb.list_comments(conn, task_id)
-        matches = [item.body for item in comments
-                   if item.author == author and len(item.body) == int(length)]
-        return matches[-1] if matches else ""
+        return resolve_comment_body(comments, author, length)
     def evidence_text(self, task) -> str:
         with self.conn() as conn:
             run = self.kb.latest_run(conn, task.id)
