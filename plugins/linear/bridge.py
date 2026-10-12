@@ -1005,6 +1005,9 @@ class Bridge:
             return False  # a human move to Done or Canceled always wins
         if delegate.get("id") == me:
             return True
+        if (claim and not delegate.get("id") and started not in CLOSED
+                and (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
+            return True  # a session claim sets the delegate; an empty field is not a takeover
         row = self.store.get(issue["id"])
         if row:
             self.takeover(row, issue)
