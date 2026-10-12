@@ -1692,7 +1692,36 @@ class SessionRequesterTests(unittest.TestCase):
                 self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], False)
             else:
                 self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
+        self.assertFalse(self.store.project_not_applied(row_id, known_rejection=True))
+        self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
+
+    def test_definite_401_refreezes_unsent_body_and_does_not_clear_started_marker(self):
+        unsent = {"issue_id": "update:synthetic", "session_id": "batch", "project_id": PROJECT,
+                  "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE},
+                  "frozen": True, "write_started": False, "send_body": "Agent update\n\n- OPS-1: result",
+                  "send_project_id": PROJECT}
+        row_id = self.store.enqueue("project_update", unsent, at=0)
         self.assertTrue(self.store.project_not_applied(row_id, known_rejection=True))
+        kept = self.store.outbox_row(row_id)["payload"]
+        self.assertIs(kept["frozen"], True)
+        self.assertIs(kept["write_started"], False)
+        self.assertEqual(kept["send_body"], unsent["send_body"])
+        started = {**unsent, "write_started": True}
+        started_id = self.store.enqueue("project_update", started, at=0)
+        self.assertFalse(self.store.project_not_applied(started_id, known_rejection=True))
+        still = self.store.outbox_row(started_id)["payload"]
+        self.assertIs(still["write_started"], True)
+        self.assertIs(still["frozen"], True)
+        self.assertEqual(still["send_body"], started["send_body"])
+        unfrozen = {**started, "frozen": False}
+        open_id = self.store.enqueue("project_update", unfrozen, at=0)
+        stored = self.store.outbox_row(open_id)
+        self.assertIs(
+            self.store.freeze_project_update(open_id, stored["payload"], stored["next_at"], "new body", PROJECT),
+            False,
+        )
+        self.assertIs(self.store.outbox_row(open_id)["payload"]["write_started"], True)
+        self.assertNotIn("new body", json.dumps(self.store.outbox_row(open_id)["payload"]))
 
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()

@@ -795,10 +795,26 @@ class Store:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
                            (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
             return True
-    def project_not_applied(self, row_id: str, *, known_rejection: bool = False) -> bool:
+    def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None) -> bool:
         with self._tx() as db:
             row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending'", (row_id,)).fetchone()
-            if not row or (not known_rejection and json.loads(row["payload"]).get("write_started") is not False): return False
+            if not row:
+                return False
+            payload = json.loads(row["payload"])
+            if known_rejection:
+                prior = payload.get("write_started") if started_before is None else started_before
+                # True or a missing legacy marker was not proven unsent. A 401 of this
+                # request must not clear that marker or thaw the frozen body.
+                if prior is not False:
+                    return False
+                if payload.get("send_body") is None:
+                    return False
+                payload["frozen"] = True
+                payload["write_started"] = False
+                db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), row_id))
+                return True
+            if payload.get("write_started") is not False:
+                return False
             db.execute("UPDATE outbox SET payload=json_set(payload, '$.frozen', json('false'), '$.write_started', json('false')) WHERE id=?", (row_id,))
             return True
     def freeze_project_update(self, row_id: str, expected: dict[str, Any], now: float,
@@ -816,6 +832,11 @@ class Store:
                 return None
             if not self._admitted(db, *self._targets(payload)): return False
             if not payload.get("frozen"):
+                # A write already started, or a legacy row that was attempted without a
+                # marker, must not be reprojected. A fresh unsent row may still freeze.
+                if payload.get("write_started") is True or (
+                        "write_started" not in payload and row["attempts"]):
+                    return False
                 payload["frozen"] = True
                 payload["write_started"] = False
                 payload["send_body"] = body

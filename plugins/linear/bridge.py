@@ -1160,6 +1160,7 @@ class Bridge:
                 self.store.revive_failed(self.clock())
         return sent
     def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False, issue_ids=None) -> None:
+        prior_started = {}
         @contextmanager
         def guard():
             row = self.store.outbox_row(row_id)
@@ -1194,9 +1195,11 @@ class Bridge:
                 validate = getattr(self, "_active_admission_claims", {}).get(admission_id)
                 if not callable(validate) or not validate():
                     raise ProjectUpdateDeferred
+            prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
             yield
-        guard.rejected = lambda: self.store.project_not_applied(row_id, known_rejection=True)
+        guard.rejected = lambda: self.store.project_not_applied(
+            row_id, known_rejection=True, started_before=prior_started.get("value"))
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:
