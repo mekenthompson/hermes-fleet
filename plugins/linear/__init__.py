@@ -40,8 +40,13 @@ class BoundLinearAPI(LinearAPI):
     @classmethod
     def _validate_specialist_scope(cls, scope):
         if scope is None: return None
-        if not isinstance(scope, dict) or set(scope) not in (cls.SCOPE_KEYS, cls.ALL_SCOPE_KEYS):
+        if not isinstance(scope, dict) or not (set(scope) in (cls.SCOPE_KEYS, cls.ALL_SCOPE_KEYS) or
+                ("requester_basis" in scope and set(scope) - {"requester_basis"} in (cls.SCOPE_KEYS, cls.ALL_SCOPE_KEYS))):
             raise ValueError("linear: specialist_scope requires exact team/project/requester lists or explicit all_teams/all_projects with a requester list")
+        basis = scope.get("requester_basis", "issue_creator")
+        if basis not in ("issue_creator", "agent_session"):
+            raise ValueError("linear: specialist_scope.requester_basis must be issue_creator or agent_session")
+        scope = {key: value for key, value in scope.items() if key != "requester_basis"}
         result = {}
         if set(scope) == cls.ALL_SCOPE_KEYS:
             if scope["all_teams"] is not True or scope["all_projects"] is not True:
@@ -55,6 +60,8 @@ class BoundLinearAPI(LinearAPI):
                     len(set(values)) != len(values)):
                 raise ValueError(f"linear: specialist_scope.{key} must be a nonempty list of unique exact IDs")
             result[key] = list(values)
+        if basis == "agent_session":
+            result["requester_basis"] = basis
         return result
     @contextmanager
     def _permit_specialist_operation(self):
@@ -64,6 +71,14 @@ class BoundLinearAPI(LinearAPI):
             yield
         finally:
             self._graphql_permit.depth = depth
+    @contextmanager
+    def requester_session(self, session_id):
+        prior = getattr(self._graphql_permit, "requester_session_id", None)
+        self._graphql_permit.requester_session_id = session_id
+        try:
+            yield
+        finally:
+            self._graphql_permit.requester_session_id = prior
     def verify_identity(self):
         self._verified_credential(self.token)
     def _verified_credential(self, provider):
@@ -97,13 +112,28 @@ class BoundLinearAPI(LinearAPI):
         if (not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip()):
             raise LinearError("Linear issue authorization response is malformed", retryable=False)
         team, project, creator = issue.get("team"), issue.get("project"), issue.get("creator")
+        requester_ok = isinstance(creator, dict) and creator.get("id") in self.specialist_scope["allowed_requester_ids"]
+        if self.specialist_scope.get("requester_basis") == "agent_session":
+            session_id = getattr(self._graphql_permit, "requester_session_id", None)
+            if not session_id:
+                resolver = getattr(self, "requester_session_for_issue", None)
+                session_id = resolver(issue["id"]) if callable(resolver) else None
+            if not isinstance(session_id, str) or not session_id:
+                raise LinearError("Linear specialist authorization needs a bound requester session")
+            try:
+                session = self.agent_session(session_id)
+            except LinearError as exc:
+                raise LinearError(str(exc), retryable=exc.retryable, authoritative_issue_id=issue["id"]) from exc
+            requester = (session or {}).get("creator")
+            requester_ok = (isinstance(session, dict) and (session.get("issue") or {}).get("id") == issue.get("id") and
+                            isinstance(requester, dict) and requester.get("id") in self.specialist_scope["allowed_requester_ids"])
         if (not isinstance(team, dict) or not isinstance(team.get("id"), str) or not team["id"] or
                 (not self.specialist_scope.get("all_teams") and team["id"] not in self.specialist_scope["allowed_team_ids"]) or
                 (not self.specialist_scope.get("all_projects") and
                  (not isinstance(project, dict) or project.get("id") not in self.specialist_scope["allowed_project_ids"])) or
                 (self.specialist_scope.get("all_projects") and project is not None and
                  (not isinstance(project, dict) or not isinstance(project.get("id"), str) or not project["id"])) or
-                not isinstance(creator, dict) or creator.get("id") not in self.specialist_scope["allowed_requester_ids"]):
+                not requester_ok):
             raise LinearError("Linear issue is outside configured specialist scope", retryable=False, authoritative_issue_id=issue.get("id"))
     def issue(self, ref):
         with self._permit_specialist_operation():
@@ -136,10 +166,17 @@ class BoundLinearAPI(LinearAPI):
         creator_id = creator.get("id") if isinstance(creator, dict) else None
         if not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip():
             raise LinearError("Linear Agent Session requester or issue is outside specialist scope", retryable=False)
-        if creator is None and isinstance(session.get("appUser"), dict) and session["appUser"].get("id") == self.identity["viewer_id"]:
+        if (self.specialist_scope.get("requester_basis") != "agent_session" and creator is None and
+                isinstance(session.get("appUser"), dict) and session["appUser"].get("id") == self.identity["viewer_id"]):
             # Automatic delegation sessions have no creator. Admit only this
             # app's authoritative session on an authorized creator's issue.
             self.issue(issue["id"])
+            return session
+        if self.specialist_scope.get("requester_basis") == "agent_session":
+            if (creator_id not in self.specialist_scope["allowed_requester_ids"] or
+                    not isinstance(session.get("appUser"), dict) or
+                    session["appUser"].get("id") != self.identity["viewer_id"]):
+                raise LinearError("Linear Agent Session requester is outside specialist scope", retryable=False)
             return session
         if not isinstance(creator_id, str) or creator_id not in (
                 self.identity["viewer_id"], *self.specialist_scope["allowed_requester_ids"]):

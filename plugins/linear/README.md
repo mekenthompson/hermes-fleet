@@ -420,7 +420,24 @@ specialist_scope:
 
 Both flags must be exactly `true`. Omitting a list, mixing forms, or leaving the
 requester list empty is refused. Organization-wide scope keeps app/workspace,
-issue creator, session requester, and prompt actor authorization checks.
+issue creator, session requester, and prompt actor authorization checks by default.
+
+For work delegated by an allowed requester regardless of the issue author, add
+`requester_basis: agent_session` to either form. The bridge resolves the exact
+Agent Session from Linear, requires its human creator to be allowlisted and its
+app user to match this client, then binds subsequent issue effects to the session
+in the existing durable work row. Every effect resolves that session again;
+issue authorship alone never grants authority in this mode. Mentions use the same
+session-created path. Replies require an authoritative activity from an allowed
+human on that exact session. Foreign prompts are refused without poisoning an
+otherwise authorized issue. Missing human creator, wrong app, or unavailable
+session authority fails closed; automatic app-created sessions are not evidence
+of human delegation. An unbound chat claim cannot bootstrap this policy.
+
+Omitting `requester_basis` (or using `issue_creator`) preserves the original
+creator-based policy. This opt-in does not clear existing scope fences or replay
+historical deliveries. Deploy the reviewed source and policy separately, then
+reconcile retained denials through an explicitly approved recovery procedure.
 
 This is separate from the immutable app/workspace identity. The client resolves
 issues, Agent Sessions and prompt activities through Linear before admitting
