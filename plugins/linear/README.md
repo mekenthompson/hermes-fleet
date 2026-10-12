@@ -238,12 +238,12 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 
 | Event | Kanban | Linear |
 |---|---|---|
-| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | Thought within seconds, then delegate = self and In Progress |
+| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A durable receipt thought is sent before task creation, then task progress and In Progress are sent |
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
 | Follow-up prompt | Task comment, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
-| Worker completes with evidence | task done | Done state, one response with the links, one project update |
-| Worker completes without evidence | task done | Blocked state, one error: unfinished |
+| Worker completes with a saved local summary or accepted external evidence | task done | Done state, one response with the saved summary and any links, one project update |
+| Worker completes without an accepted result | task done | Blocked state, one error: unfinished |
 | Worker blocks (`needs_input`) | task blocked | Blocked state, one elicitation |
 | Retry breaker trips | task blocked (`gave_up`) | Blocked state, one error |
 | Stop (a prompt with `signal: stop`) | `block_task(needs_input)`, which survives restarts; bound chat: generation-fenced core chat Stop | Kanban: Blocked and "Stopped by ...". Chat: Blocked with a Stop receipt activity; the delegate is kept |
@@ -257,11 +257,16 @@ Those actions do not assign, delegate, set a lead, or start tracking. The caller
 and reuses it if the response is lost. Configured `identity.teams` and `identity.projects` are
 checked before the mutation, including that a project belongs to the selected team and that a parent issue is in scope.
 
-**Done needs evidence.** A GitHub PR link is checked against the exact head and required checks
-before either a Kanban result or chat command marks Linear Done, including projects without a
-configured contract. Set `completion_contracts` to make core enforce that check before Kanban
-completion too. A non-GitHub pull-request link is not accepted as completion evidence. Other
-work needs a destination link such as a merged commit, deploy check, or findings.
+**Done needs an accepted result.** A saved local review summary can satisfy local-only work without
+an external URL when safe text remains after redaction. The minimum-content guard rejects empty
+or redaction-only text, ASCII single-character placeholders, and bare `Done`, `Complete`,
+`Completed`, or `OK` (ignoring case and punctuation). It does not prove a report's truth or
+substance; short findings and non-English text remain eligible. A GitHub PR link is checked
+against the exact head and required checks before either a Kanban result or chat command marks
+Linear Done, including projects without a configured contract. Set `completion_contracts` to
+make core enforce that check before Kanban completion too. A non-GitHub pull-request link is
+not accepted as completion evidence. Other work may use a destination link such as a merged
+commit, deploy check, or findings.
 
 Chat closeout receipts acknowledge durable local queuing, not remote acceptance.
 Named mutations require literal `success: true`; refusals retain failed recovery rows and
@@ -324,6 +329,10 @@ Every Linear write goes through a local outbox, oldest first per issue.
   failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
   task), and one more try after the next successful write. A failed chat alert remains due until
   injection succeeds. A superseded status write never replays.
+- **Historical requester gaps** quarantine the original outbox row as failed with a durable authorization reason.
+  They require reconciliation with the original session; a newer session never supplies authority
+  for the old write. A fresh session receipt can pass an unrelated unsent predecessor, while an
+  uncertain terminal mutation still fences later effects.
 - **Rate limits**: when Linear answers `RATELIMITED`, all calls pause until the
   `X-RateLimit-*-Reset` time (epoch milliseconds).
 - **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
@@ -337,8 +346,9 @@ generation for earlier chat work. `chat_stop` retains the original profile, issu
 activity, session key and generation across crashes. Its Stop receipt and worker observation may
 be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
 core accepted an interrupt request; worker completion never proves external effects stopped.
-The outbox keeps the same UUID v4 for each acknowledgement across retries, so Linear sees one
-activity even if the response is lost. `outbox` has pending, sent and failed states.
+The outbox keeps each activity ID stable across retries; the initial session receipt uses a
+deterministic issue/session ID, so duplicate deliveries do not create another receipt.
+`outbox` has pending, sent and failed states.
 
 ## Known limits
 

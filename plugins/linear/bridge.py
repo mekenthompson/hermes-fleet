@@ -1,5 +1,4 @@
-"""Translate Linear events and Kanban work for one profile through a durable outbox.
-The Linear delegate is rechecked before writes and while work is active."""
+"""Translate Linear and Kanban through a durable outbox, rechecking ownership before work and writes."""
 from __future__ import annotations
 import json
 import hashlib
@@ -8,6 +7,7 @@ import math
 import re
 import sqlite3
 import threading
+import uuid
 import time
 from collections import defaultdict
 from contextlib import closing, contextmanager, suppress
@@ -133,6 +133,8 @@ _SECRET = re.compile(r"(?i)(?:\b(?:ghp_|github_pat_|gho_|ghu_|ghs_|sk-)[A-Za-z0-
 def _public(text: str) -> str:
     """Refusal text may quote a receipt detail, never a token that leaked into one."""
     return _SECRET.sub("[redacted]", text)
+def _project_summary(text: str, limit: int = 300) -> str:
+    return " ".join(re.sub(r"(?<![\w:/])(?:(?:file://)?/|[A-Za-z]:\\|[A-Za-z0-9_.-]+[/\\])[^\s,;]+", "[local artifact]", _public(text)).split())[:limit].strip()
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
     if isinstance(receipt, dict) and receipt:
@@ -220,6 +222,10 @@ class Kanban:
         with self.conn() as conn:
             run = self.kb.latest_run(conn, task.id)
         return " ".join(str(x) for x in (task.result, run and run.summary, run and json.dumps(run.metadata)) if x)
+    def completion_summary(self, task) -> str:
+        with self.conn() as conn:
+            run = self.kb.latest_run(conn, task.id)
+        return ((run.summary if run else None) or task.result or "").strip()
     def block(self, task_id: str, reason: str) -> bool:
         with self.conn() as conn:
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input")
@@ -293,7 +299,7 @@ class Bridge:
         self.contracts = settings.get("completion_contracts") or {}
         self.quiet = float(settings.get("quiet_minutes", 30)) * 60
         self.recheck_every = float(settings.get("recheck_minutes", 5)) * 60
-        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
@@ -341,32 +347,23 @@ class Bridge:
     def me(self) -> str | None:
         try: return self.api.viewer_id()
         except LinearError: return None
-    @staticmethod
-    def _needs_reauthorization(exc: Exception) -> bool:
-        return isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired)
     def _alert_reauthorization(self) -> None:
         note = "[Linear] This profile's Linear authorization was revoked. Reauthorize its app; queued updates are waiting."
         destinations: set[tuple[str, str]] = set()
-        for row in self.store.active():
-            if row["origin"] == "chat":
-                destinations.add(("chat", row["owner_ref"]))
+        for row in [*self.store.active(), *(pending["payload"] for pending in self.store.pending())]:
+            chat = row["owner_ref"] if row.get("origin") == "chat" else row.get("session_key")
+            if chat:
+                destinations.add(("chat", chat))
             elif row.get("task_id"):
                 destinations.add(("kanban", row["task_id"]))
-        for pending in self.store.pending():
-            payload = pending["payload"]
-            if payload.get("session_key"):
-                destinations.add(("chat", payload["session_key"]))
-            elif payload.get("task_id"):
-                destinations.add(("kanban", payload["task_id"]))
         for kind, target in destinations:
             if (kind, target) in self._reauth_alerted:
                 continue
             log.error("linear: reauthorization required for profile %s", self.profile)
             try:
-                if kind == "chat":
-                    if not self.inject(target, note):
-                        continue
-                else:
+                if kind == "chat" and not self.inject(target, note):
+                    continue
+                if kind != "chat":
                     self.kanban.comment(target, note)
             except Exception:  # noqa: BLE001 - keep other alert routes available
                 log.exception("linear: reauthorization alert delivery failed")
@@ -380,7 +377,6 @@ class Bridge:
             return False
         if not prs:
             return True
-        # Verify the current PR head even after core accepted completion.
         for url in prs:
             receipt = pr_acceptance(url) if contract in ("local-only", url) else pr_acceptance(url, contract)
             if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
@@ -504,9 +500,6 @@ class Bridge:
         targets = issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row)
         with self._outbox_requester_scope(row):
             return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
-    @staticmethod
-    def _is_specialist_scope_denial(exc: LinearError) -> bool:
-        return not exc.retryable and any(text in str(exc).lower() for text in ("specialist scope", "specialist authorization"))
     def _effect_issue(self, issue_id: str) -> dict[str, Any]:
         try:
             issue = self.api.issue(issue_id)
@@ -841,6 +834,16 @@ class Bridge:
             return True
         if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
             return True
+        ack_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-session-received:{issue_id}:{session_id}"))
+        self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
+                           "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
+                           "content": {"type": "thought", "body": "Received. Checking durable work admission."}}, at=self.clock())
+        self.flush(only_id=ack_id)
+        receipt = self.store.outbox_row(ack_id)
+        if not (receipt and (payload := receipt["payload"]) and receipt["state"] == "sent" and payload.get("applied") == 1 and
+                payload.get("issue_id") == issue_id and payload.get("session_id") == session_id and
+                (payload.get("requester_sessions") or {}).get(issue_id) == session_id and payload.get("initial_ack")):
+            raise LinearError("Initial Linear acknowledgement is not accepted; retry durable ingress delivery")
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
@@ -848,6 +851,9 @@ class Bridge:
         with self.store.guard_issue_work(issue_id) as admitted:
             if not admitted: return False
             if stamp <= self.store.chat_closeout_ms(issue_id): return True
+            current = self._effect_issue(issue_id)
+            if (current.get("delegate") or {}).get("id") not in (None, me): return True
+            if (current.get("state") or {}).get("type") in CLOSED and ((fresh.get("state") or {}).get("type") not in CLOSED or stamp < self.closure_ms(current)): return True
             task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
                 title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
                 body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),
@@ -921,7 +927,6 @@ class Bridge:
             return
         self.status(row["issue_id"], "blocked")
         self.say(row, f"Stopped by {who}. Re-delegate or reply here to resume.")
-    # -- Kanban -> Linear -------------------------------------------------
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
@@ -1033,18 +1038,16 @@ class Bridge:
         if task is None: return
         self._retire_task(row)
         contract = task.completion_contract or "local-only"
-        # PR work: core's completion_contract already verified the exact PR head before 'done'.
         evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
         issue_id = row["issue_id"]
-        heads: dict[str, str] = {}
-        failures: list[str] = []
+        heads, failures = {}, []
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
-        if not evidence or not accepted:
+        summary = _project_summary(self.kanban.completion_summary(task), 1500)
+        residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", summary, flags=re.IGNORECASE)).casefold()
+        if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
-                    "unfinished. Reply or re-delegate to continue." if not evidence else
-                    acceptance_refusal(failures, where="kanban"))
-            if not self.authorize_specialist_effect(issue_id):
-                return
+                    "unfinished. Reply or re-delegate to continue.") if not evidence else acceptance_refusal(failures, where="kanban")
+            if not self.authorize_specialist_effect(issue_id): return
             self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
                                                     "owner_issue_id": issue_id}),
@@ -1053,20 +1056,16 @@ class Bridge:
                                                        "terminal": True, "owner_issue_id": issue_id,
                                                        "content": {"type": "error", "body": body}})], at=self.clock())
             return
-        summary = (task.result or "").strip()[:1500]
         links = " ".join(dict.fromkeys(evidence))
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
-                  ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                                "task_id": row["task_id"],
-                                "content": {"type": "response", "body": f"Done. {summary}\n\nEvidence: {links}"}}),
+                  ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
+                                "content": {"type": "response", "body": f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
                   ("project_update", {"issue_id": issue_id, "session_id": task.id, "session_key": "",
-                                      "task_id": row["task_id"],
-                                      "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: f"Done: {links}"},
+                                      "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
+                                      "lines": {task.title.split(":")[0]: f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
-        if not self.authorize_specialist_effect(issue_id):
-            return
+        if not self.authorize_specialist_effect(issue_id): return
         self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock())
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
@@ -1098,7 +1097,7 @@ class Bridge:
         name = (issue.get("delegate") or {}).get("name") or "nobody"
         self.release(row, f"Reassigned to {name} in Linear")
         self.comment(row["issue_id"], f"Reassigned to {name}; local retirement requested. "
-                     "New work here waits for the prior worker to exit.", takeover=True)
+                     "New work here waits for the prior worker to exit.", row=row, takeover=True)
     def release(self, row: dict[str, Any], reason: str) -> None:
         if row["origin"] in ("kanban", "kanban_chat"):
             self._retire_task(row)
@@ -1129,7 +1128,7 @@ class Bridge:
                         continue
                     self.may_write(issue, claim=False)
                 except LinearError as exc:
-                    if self._needs_reauthorization(exc):
+                    if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
                         self._alert_reauthorization()
                     if not exc.retryable:
                         self._fence_scope_denial(row["issue_id"], exc)
@@ -1193,14 +1192,30 @@ class Bridge:
         return self.store.recovery_delivered(
             row["issue_id"], row.get("ownership_id"), row.get("run_generation"),
             None if latest is None else latest.get("id"))
-    def flush(self) -> int:
+    def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
         sent, progress = 0, True
         while progress:
             progress = False
             for row in self.store.due(self.clock()):
+                if only_id is not None and row["id"] != only_id: continue
                 with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row):
                     if not self._authorize_outbox_effect(row):
+                        payload = row["payload"]
+                        missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
+                                   and any(not (payload.get("requester_sessions") or {}).get(issue_id)
+                                           for issue_id in self._outbox_scope_issue_ids(row)))
+                        reason = ("Missing persisted requester-session authority; operator reconciliation required"
+                                  if missing else "Specialist authorization unavailable or revoked; no write attempted")
+                        checks = int(payload.get("authorization_checks", 0)) + 1
+                        self.store.rewrite(row["id"], {**payload, "authorization_error": reason,
+                                           "authorization_checks": checks, "authorization_failed_at": self.clock(),
+                                           "reported": int(missing)},
+                                           self.clock() + min(60 * 2 ** min(checks - 1, 6), 3600))
+                        if missing:
+                            self.store.mark(row["id"], "failed")
+                            progress = ((self.store.outbox_row(row["id"]) or {}).get("state") == "failed") or progress
+                        log.warning("linear: outbox %s held: %s", row["id"], reason)
                         continue
                     if row["kind"] != "project_update" and any(
                             self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
@@ -1215,9 +1230,10 @@ class Bridge:
                         self.store.defer(row["id"], exc.until)
                         return sent
                     except LinearError as exc:
-                        if self._needs_reauthorization(exc):
+                        if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
                             self._alert_reauthorization()
-                        if self._specialist_scope_active() and self._is_specialist_scope_denial(exc):
+                        if self._specialist_scope_active() and not exc.retryable and any(
+                                text in str(exc).lower() for text in ("specialist scope", "specialist authorization")):
                             targets = self._outbox_scope_issue_ids(row)
                             denied = [issue_id for issue_id in targets
                                       if not self.authorize_specialist_effect(issue_id)]
@@ -1233,6 +1249,7 @@ class Bridge:
                     if self.store.mark_sent(row["id"], applied):
                         sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
+                if only_id is not None and row["id"] != only_id: continue
                 if not self._authorize_outbox_effect(row): continue
                 with self.store.guard_outbox(row["id"], "failed") as admitted:
                     if not admitted: continue
@@ -1252,6 +1269,15 @@ class Bridge:
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row, issue_ids): raise ProjectUpdateDeferred
+            if payload.get("initial_ack"):
+                issue = self._effect_issue(payload["issue_id"])
+                if (self._specialist_scope_active() and
+                        self.api.agent_session(payload["session_id"])["issue"]["id"] != issue["id"]):
+                    raise ProjectUpdateDeferred
+                if ((issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()) or
+                        ((issue.get("state") or {}).get("type") in CLOSED and
+                         float(payload.get("source_ms") or 0) < self.closure_ms(issue))):
+                    raise ProjectUpdateDeferred
             if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
                         payload.get("superseded_receipt")):
                 receipt_ids = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()}
@@ -1519,15 +1545,12 @@ class Bridge:
         if payload.get("reconcile_required"):
             note = "Earlier terminal write held after an uncertain send; reconcile its remote outcome. " + str(exc)
             work = None
-        if work and work["origin"] == "chat":
-            return bool(self.inject(work["owner_ref"], "[Linear] " + note))
-        elif work and work["task_id"]:
-            self.kanban.comment(work["task_id"], note)
-            return True
-        elif payload.get("session_key"):
-            return bool(self.inject(payload["session_key"], "[Linear] " + note))
-        elif payload.get("task_id"):
-            self.kanban.comment(payload["task_id"], note)
+        chat = work["owner_ref"] if work and work["origin"] == "chat" else payload.get("session_key")
+        task = work["task_id"] if work and work["origin"] != "chat" else payload.get("task_id")
+        if chat:
+            return bool(self.inject(chat, "[Linear] " + note))
+        if task:
+            self.kanban.comment(task, note)
             return True
         return False
     def _alert_uncertain_terminal(self, row: dict[str, Any]) -> None:

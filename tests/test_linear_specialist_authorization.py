@@ -129,6 +129,9 @@ class FakeKanban:
     def history(self, task_id, after_id):
         return [event for event in self.histories.get(task_id, []) if event.id > after_id]
 
+    def completion_summary(self, task):
+        return task.result or ""
+
     def evidence_text(self, _task):
         return ""
 
@@ -1324,6 +1327,7 @@ class SessionRequesterTests(unittest.TestCase):
 
     def test_restart_rechecks_session_and_refuses_changed_requester(self):
         self.bridge.handle_webhook(self.session_event())
+        self.authority.mutations.clear()
         reopened = Store(Path(self.tmp.name) / "state.db")
         api = self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"})
         bridge = Bridge(reopened, api, self.kanban, profile="synthetic")
@@ -1451,6 +1455,7 @@ class SessionRequesterTests(unittest.TestCase):
 
     def test_direct_mutation_retry_rechecks_requester(self):
         self.bridge.handle_webhook(self.session_event())
+        self.authority.mutations.clear()
         original = self.api.transport
         attempts = []
         def provider(): return "synthetic"
@@ -1475,7 +1480,9 @@ class SessionRequesterTests(unittest.TestCase):
         row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "unbound legacy write"}, at=0)
         self.bridge.flush()
         self.assertEqual(self.authority.mutations, [])
-        self.assertEqual(self.store.outbox_row(row_id)["state"], "pending")
+        held = self.store.outbox_row(row_id)
+        self.assertEqual((held["state"], held["attempts"]), ("failed", 0))
+        self.assertIn("requester-session", held["payload"]["authorization_error"])
 
     def test_terminal_effect_does_not_borrow_successor_session_authority(self):
         self.bridge.handle_webhook(self.session_event())
@@ -1529,6 +1536,7 @@ class SessionRequesterTests(unittest.TestCase):
 
     def test_direct_activity_target_retry(self):
         self.bridge.handle_webhook(self.session_event())
+        self.authority.mutations.clear()
         other = 'other-session'
         self.authority.sessions[other] = {'id': other, 'issue': {'id': ISSUE}, 'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
         original = self.api.transport
@@ -1554,6 +1562,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.api = self.authority.api(scope={'all_teams': True, 'all_projects': True, 'allowed_requester_ids': [USER], 'requester_basis': 'agent_session'})
         self.bridge = Bridge(self.store, self.api, self.kanban, profile='synthetic')
         self.bridge.handle_webhook(self.session_event())
+        self.authority.mutations.clear()
         original = self.api.transport
         attempts = []
         def provider(): return 'synthetic'
@@ -1780,6 +1789,7 @@ class SessionRequesterTests(unittest.TestCase):
 
     def test_stored_session_cannot_redirect_issue(self):
         self.bridge.handle_webhook(self.session_event())
+        self.authority.mutations.clear()
         self.authority.sessions[SESSION]["issue"] = {"id": "other-issue"}
         with self.assertRaises(LinearError):
             self.api.update_issue(ISSUE, {"stateId": "state-done"})

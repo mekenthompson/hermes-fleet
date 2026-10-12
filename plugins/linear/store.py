@@ -622,10 +622,11 @@ class Store:
                     "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id'))))))))")
         with self._tx() as db:
             rows = db.execute(
-                "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") + " AND o.rowid = ("
+                "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
+                " AND ((o.kind = 'activity' AND json_extract(o.payload, '$.initial_ack')=1) OR o.rowid = ("
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
                 " AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
-                ") AND o.next_at <= ? ORDER BY o.rowid", (now,)).fetchall()
+                ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
     def pending(self, issue_id: str | None = None) -> list[dict[str, Any]]:
         with self._tx() as db:

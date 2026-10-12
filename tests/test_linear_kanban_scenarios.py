@@ -782,12 +782,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(status, "ready")
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.linear.issues[ISSUE]["delegate"]["id"], SELF)
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
+        self.assertIn("Received", self.linear.activities[0]["content"]["body"])
         with self.bridge.kanban.conn() as conn:
             self.assertIn("Reconcile first", kb.build_worker_context(conn, task_id))
         self.complete(task_id, "Shipped the fix: https://docs.example/fix/7")
         self.assertEqual(self.linear.state(ISSUE), "Done")
-        self.assertEqual(self.types(), ["thought", "response"])
+        self.assertEqual(self.types(), ["thought", "thought", "response"])
         self.assertIn("https://docs.example/fix/7", self.linear.activities[-1]["content"]["body"])
         self.assertEqual(len(self.linear.project_updates), 1)
         self.assertIsNone(self.bridge.store.get(ISSUE))
@@ -805,7 +806,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         store.enqueue(route, "d-2", created)  # same event, new delivery id
         self.bridge.tick(inbox)
         self.assertEqual(len(self.tasks()), 1)
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
         # An older session arriving late must not take the row back or start more work.
         store.enqueue(route, "d-3", json.dumps(self.linear.session_event("created", ISSUE, "s-old", at=-600)).encode())
         self.bridge.tick(inbox)
@@ -1582,13 +1583,14 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertTrue(tripped)
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
-        self.assertEqual(self.types(), ["thought", "error"])
+        self.assertEqual(self.types(), ["thought", "thought", "error"])
         self.assertIn("repeated failed attempts", self.linear.activities[-1]["content"]["body"])
 
     def test_queued_claim_never_overrides_a_later_human_close(self) -> None:
         from unittest.mock import patch
-        with patch.object(self.bridge, "flush", return_value=0):
-            self.delegate()  # verified issue read, but claim remains durably queued
+        flush = self.bridge.flush
+        with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
+            self.delegate()  # receipt accepted, claim remains durably queued
         self.linear.down = True
         self.clock.now += 600
         self.linear.set_state(ISSUE, "Canceled")  # a human cancels while our claim is still queued
@@ -1601,8 +1603,9 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_queued_claim_never_undoes_a_later_delegate_removal(self) -> None:
         from unittest.mock import patch
-        with patch.object(self.bridge, "flush", return_value=0):
-            self.delegate()  # verified issue read, but claim remains durably queued
+        flush = self.bridge.flush
+        with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
+            self.delegate()  # receipt accepted, claim remains durably queued
         self.linear.down = True
         self.clock.now += 600
         self.linear.set_delegate(ISSUE, None)  # a human takes the agent off while our claim is queued
@@ -1812,7 +1815,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         for _ in range(23):
             self.clock.now += 3600
             self.bridge.tick()
-        self.assertEqual(self.types(), ["thought"])  # no new effects during outage
+        self.assertEqual(self.types(), ["thought", "thought"])  # no new effects during outage
         self.linear.down = False
         original_apply = self.linear._apply
         lose_comment = True
@@ -1826,7 +1829,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         for _ in range(6):
             self.clock.now += 3600
             self.bridge.tick()
-        self.assertEqual(self.types(), ["thought", "response"])
+        self.assertEqual(self.types(), ["thought", "thought", "response"])
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(len(self.linear.project_updates), 1)
         self.assertEqual(self.bridge.store.pending(), [])
@@ -1920,12 +1923,109 @@ class LinearKanbanScenarios(unittest.TestCase):
             comments = [c.body for c in kb.list_comments(conn, task_id)]
         self.assertTrue(any("has not accepted" in body for body in comments))
 
-    def test_done_without_evidence_is_unfinished(self) -> None:
+    def test_local_summary_without_url_is_delivered(self) -> None:
         self.delegate()
-        self.complete(self.task_id(), "All good, trust me")
+        task_id = self.task_id()
+        self.complete(task_id, "Saved review findings without an external URL")
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        self.assertEqual(self.types(), ["thought", "thought", "response"])
+        self.assertIn("Saved review findings", self.linear.activities[-1]["content"]["body"])
+        saved = self.bridge.store.project_update(task_id, "proj-1")
+        self.assertIn("Saved review findings", json.dumps(saved["payload"]["lines"]))
+        self.assertIn("Saved review findings", self.linear.project_updates[-1]["body"])
+
+    def test_done_with_empty_result_and_latest_run_is_unfinished(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, task_id, summary="Temporary findings", metadata={}))
+            conn.execute("UPDATE tasks SET result='' WHERE id=?", (task_id,))
+            conn.execute("UPDATE task_runs SET summary='' WHERE task_id=?", (task_id,))
+        self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
-        self.assertEqual(self.types(), ["thought", "error"])
-        self.assertIn("unfinished", self.linear.activities[-1]["content"]["body"])
+        self.assertEqual(self.linear.project_updates, [])
+        self.assertIn("without evidence", self.linear.activities[-1]["content"]["body"])
+
+    def test_ack_transport_failure_replays_after_restart_before_worker_creation(self) -> None:
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin.api import LinearError
+        event = self.linear.session_event("created", ISSUE, "receipt-retry")
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        original = self.linear.handle
+        attempts = []
+        def fail_receipt(query, variables):
+            if "agentActivityCreate" in query:
+                attempts.append(variables)
+                return 503, {}, {"errors": [{"message": "service unavailable"}]}
+            return original(query, variables)
+        with patch.object(self.linear, "handle", side_effect=fail_receipt):
+            with self.assertRaises(LinearError):
+                self.bridge.handle_webhook(event)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.tasks(), [])
+        self.assertEqual(self.linear.activities, [])
+        self.bridge = self.make_bridge()
+        self.clock.now += 61
+        self.bridge.handle_webhook(event)
+        self.bridge.tick()
+        self.assertEqual(len(self.tasks()), 1)
+        receipts = [a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
+                    and "Received" in a["content"]["body"]]
+        self.assertEqual(len(receipts), 1)
+        self.bridge = self.make_bridge()
+        self.bridge.handle_webhook(event)
+        self.bridge.tick()
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(len([a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
+                              and "Received" in a["content"]["body"]]), 1)
+
+    def test_failed_ack_keeps_ingress_pending_until_replayed(self) -> None:
+        from unittest.mock import patch
+        from linear_ingress_fixture import IngressStore, Route
+        inbox = self.dir / "ingress.db"
+        route = Route("alpha", "alpha", "/synthetic", self.dir / "unused", inbox)
+        event = self.linear.session_event("created", ISSUE, "inbox-retry")
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
+        IngressStore(inbox).enqueue(route, "delivery-1", json.dumps(event).encode())
+        with sqlite3.connect(inbox) as conn:
+            conn.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
+        original = self.linear.handle
+        def fail_receipt(query, variables):
+            if "agentActivityCreate" in query:
+                return 503, {}, {"errors": [{"message": "service unavailable"}]}
+            return original(query, variables)
+        with patch.object(self.linear, "handle", side_effect=fail_receipt):
+            self.bridge.drain_ingress(inbox)
+        with sqlite3.connect(inbox) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "pending")
+        self.assertEqual(self.tasks(), [])
+        self.clock.now += 61
+        self.bridge = self.make_bridge()
+        self.bridge.drain_ingress(inbox)
+        self.bridge.tick()
+        with sqlite3.connect(inbox) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(len([a for a in self.linear.activities if a["agentSessionId"] == "inbox-retry"
+                              and "Received" in a["content"]["body"]]), 1)
+
+    def test_local_project_finding_is_bounded_and_hides_local_artifacts(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        result = "Reconciled all rows. /private/report.md reports/output.md Bearer synthetic-secret " + "Details " * 70
+        self.complete(task_id, result)
+        saved = self.bridge.store.project_update(task_id, "proj-1")
+        line = saved["payload"]["lines"]["ABC-1"]
+        self.assertIn("Reconciled all rows", line)
+        self.assertLessEqual(len(line), 306)
+        self.assertNotIn("/private/", line)
+        self.assertNotIn("reports/output.md", line)
+        self.assertNotIn("synthetic-secret", line)
+        self.assertIn(line, self.linear.project_updates[-1]["body"])
+        response = self.linear.activities[-1]["content"]["body"]
+        self.assertNotIn("/private/", response)
+        self.assertNotIn("reports/output.md", response)
+        self.assertNotIn("synthetic-secret", response)
 
     def test_unconfigured_kanban_pr_requires_exact_head_acceptance(self) -> None:
         from unittest.mock import patch
@@ -2047,7 +2147,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.linear.set_delegate(ISSUE, OTHER)
         self.bridge.flush()
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
         self.assertEqual(self.linear.project_updates, [])
 
     def test_terminal_messages_are_suppressed_after_human_done(self) -> None:
@@ -2058,7 +2158,7 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.complete(task_id, "Findings: https://docs.example/findings/7")
         self.linear.set_state(ISSUE, "Done")
         self.bridge.flush()
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
         self.assertEqual(self.linear.project_updates, [])
 
     def test_terminal_project_update_keeps_kanban_alert_route(self) -> None:
@@ -2076,8 +2176,9 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_rate_limit_reset_header_is_honoured(self) -> None:
         from unittest.mock import patch
-        with patch.object(self.bridge, "flush", return_value=0):
-            self.delegate()  # pause applies to queued writes, not unverified execution admission
+        flush = self.bridge.flush
+        with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
+            self.delegate()  # receipt accepted, claim remains queued
         self.linear.rate_limited_until = self.clock() + 120
         self.bridge.tick()
         calls = len(self.linear.requests)
@@ -2087,11 +2188,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 61
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
 
     def test_restart_preserves_quota_pause_and_delivers_the_same_outbox_rows(self) -> None:
         from unittest.mock import patch
-        with patch.object(self.bridge, "flush", return_value=0): self.delegate()
+        flush = self.bridge.flush
+        with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
+            self.delegate()
         path = self.dir / "rate-limit.json"
         self.bridge.api.rate_limit_path = path
         pending_ids = {row["id"] for row in self.bridge.store.pending()}
@@ -2106,7 +2209,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 121
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
-        self.assertEqual(self.types(), ["thought"])
+        self.assertEqual(self.types(), ["thought", "thought"])
 
     def test_chat_start_refused_when_another_agent_holds_it(self) -> None:
         self.linear.set_delegate(ISSUE, OTHER)
@@ -3245,7 +3348,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_task_creation_crash_recovers_mapping_and_existing_terminal_evidence_once(self) -> None:
         from unittest.mock import patch
-        for outcome in ("evidence", "missing", "active"):
+        for outcome in ("evidence", "summary", "missing", "active"):
             with self.subTest(outcome=outcome):
                 issue_id = f"creation-crash-{outcome}"
                 self.linear.add_issue(issue_id, f"CRASH-{outcome}")
@@ -3259,20 +3362,32 @@ class LinearKanbanScenarios(unittest.TestCase):
                     task = conn.execute("SELECT id FROM tasks WHERE idempotency_key=?",
                                         (f"linear:{issue_id}:creation-{outcome}",)).fetchone()[0]
                     if outcome != "active":
-                        summary = "Persisted result https://docs.example/durable-evidence" if outcome == "evidence" else "No evidence"
+                        summary = ("Persisted result https://docs.example/durable-evidence" if outcome == "evidence"
+                                   else "Saved local review findings" if outcome == "summary" else "Temporary findings")
                         self.assertTrue(kb.complete_task(conn, task, summary=summary, metadata={}))
+                        if outcome == "missing":
+                            conn.execute("UPDATE tasks SET result='' WHERE id=?", (task,))
+                            conn.execute("UPDATE task_runs SET summary='' WHERE task_id=?", (task,))
                 self.bridge = self.make_bridge()
                 self.bridge.recover()
                 self.bridge.handle_webhook(event)
                 self.bridge.tick()
-                expected = {"evidence": "Done", "missing": "Blocked", "active": "In Progress"}[outcome]
+                expected = {"evidence": "Done", "summary": "Done", "missing": "Blocked",
+                            "active": "In Progress"}[outcome]
                 self.assertEqual(self.linear.state(issue_id), expected)
                 receipts = [a for a in self.linear.activities if a["agentSessionId"] == f"creation-{outcome}"]
-                self.assertEqual(len(receipts), 1)
-                self.assertEqual(receipts[0]["content"]["type"], {"evidence": "response", "missing": "error", "active": "thought"}[outcome])
+                self.assertEqual(len(receipts), 2)
+                self.assertIn("Received", receipts[0]["content"]["body"])
+                self.assertEqual(receipts[1]["content"]["type"], {"evidence": "response", "summary": "response",
+                                                                "missing": "error", "active": "thought"}[outcome])
                 if outcome == "evidence":
-                    self.assertIn("https://docs.example/durable-evidence", receipts[0]["content"]["body"])
+                    self.assertIn("https://docs.example/durable-evidence", receipts[1]["content"]["body"])
                     self.assertTrue(any("https://docs.example/durable-evidence" in u["body"] for u in self.linear.project_updates))
+                if outcome == "summary":
+                    self.assertIn("Saved local review findings", receipts[1]["content"]["body"])
+                if outcome == "missing":
+                    self.assertIn("without evidence", receipts[1]["content"]["body"])
+                    self.assertFalse(any("CRASH-missing: Done" in u["body"] for u in self.linear.project_updates))
                 if outcome == "active":
                     self.assertEqual(self.bridge.store.get(issue_id)["task_id"], task)
                 else:
