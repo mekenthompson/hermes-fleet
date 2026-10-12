@@ -620,6 +620,7 @@ class Bridge:
             return False
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
+        self._admit_legacy_initial_ack(issue_id, session_id)
         if row and row["origin"] == "kanban_chat":
             self.activity(issue_id, session_id, "response",
                           "Already delegated from Hermes chat to the existing Kanban task; no second executor was created.")
@@ -656,6 +657,7 @@ class Bridge:
         else:
             self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
     def _prompted(self, event, issue, session_id, row, activity) -> None:
+        self._admit_legacy_initial_ack(issue["id"], session_id)
         if row and event_ms(event) < float(row["last_updated_at"]):
             return
         if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active(),
@@ -682,6 +684,7 @@ class Bridge:
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
         issue_id = row["issue_id"]
+        self._admit_legacy_initial_ack(issue_id, session_id)
         if (self.store.get(issue_id) or {}).get("release_pending"): return
         if self.store.issue_reconciliation_blocked(issue_id): return
         marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
@@ -719,6 +722,7 @@ class Bridge:
     def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
                 stamp: float | None = None, receipt: str = "Resuming the existing task.", marker: str = "") -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
+        self._admit_legacy_initial_ack(row["issue_id"], session_id or row["owner_ref"])
         if self.store.issue_reconciliation_blocked(row["issue_id"]): return False
         if not self._require_effect(row["issue_id"]): return False
         session_id = session_id or row["owner_ref"]
@@ -802,6 +806,9 @@ class Bridge:
         prior = next((json.loads(r["snapshot"]) for r in self.store.retired(row["issue_id"])
                       if r["task_id"] == row["task_id"]), None)
         self.store.retire(row["issue_id"], row["task_id"], self.kanban.retirement(row["task_id"], prior))
+    def _admit_legacy_initial_ack(self, issue_id: str, session_id: str) -> None:
+        if not self.store.legacy_initial_ack_admitted(issue_id, session_id):
+            raise LinearError("Legacy initial Linear acknowledgement requires operator reconciliation")
     def await_retired(self, issue_id: str) -> None:
         for retired in self.store.retired(issue_id):
             task_id = retired["task_id"]
@@ -822,7 +829,6 @@ class Bridge:
                           "content": {"type": "error", "body": body}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
-        self.await_retired(issue_id)
         if self.store.issue_reconciliation_blocked(issue_id) or not self._require_effect(issue_id): return False
         fresh = self._effect_issue(issue_id)  # refuse new execution until current ownership is known
         me = self.me()
@@ -834,7 +840,9 @@ class Bridge:
             return True
         if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
             return True
-        ack_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-session-received:{issue_id}:{session_id}"))
+        self._admit_legacy_initial_ack(issue_id, session_id)
+        self.await_retired(issue_id)
+        ack_id = str(uuid.UUID(bytes=hashlib.sha256(f"linear-session-received-v4:{json.dumps([issue_id, session_id], separators=(',', ':'))}".encode()).digest()[:16], version=4))
         self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
                            "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
                            "content": {"type": "thought", "body": "Received. Checking durable work admission."}}, at=self.clock())
@@ -1199,6 +1207,7 @@ class Bridge:
             progress = False
             for row in self.store.due(self.clock()):
                 if only_id is not None and row["id"] != only_id: continue
+                if self.store.legacy_initial_ack(row): continue
                 with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row):
                     if not self._authorize_outbox_effect(row):
                         payload = row["payload"]
@@ -1250,6 +1259,7 @@ class Bridge:
                         sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 if only_id is not None and row["id"] != only_id: continue
+                if self.store.legacy_initial_ack(row): continue
                 if not self._authorize_outbox_effect(row): continue
                 with self.store.guard_outbox(row["id"], "failed") as admitted:
                     if not admitted: continue

@@ -187,6 +187,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if row and row.get("release_pending"):
             return _ownership_refusal(issue, row, "release_pending")
         if action == "start":
+            if not bridge.store.legacy_initial_ack_admitted(issue_id, session_id):
+                return _reply(False, "Legacy initial Linear acknowledgement requires operator reconciliation")
             try: bridge.await_retired(issue_id)
             except LinearError as exc: return _reply(False, str(exc))
             if bridge.store.issue_reconciliation_blocked(issue_id):
@@ -255,6 +257,8 @@ def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, projec
     ], at=bridge.clock(), release=release)
 def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
            session_id: str, generation: int | None) -> str:
+    if not bridge.store.legacy_initial_ack_admitted(issue["id"], session_id):
+        return _reply(False, "Legacy initial Linear acknowledgement requires operator reconciliation")
     ident, url = issue.get("identifier"), issue.get("url", "")
     if row and row["origin"] == "kanban":
         return _ownership_refusal(issue, row, "task_ownership_conflict")

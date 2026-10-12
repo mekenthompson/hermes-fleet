@@ -2,6 +2,7 @@
 import tempfile
 import uuid
 import json
+import hashlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,11 +14,203 @@ import unittest
 from pathlib import Path
 
 from test_linear_specialist_authorization import (
-    Authority, FakeKanban, Bridge, Store, ISSUE, SESSION, USER, VIEWER,
+    Authority, FakeKanban, Bridge, Store, ISSUE, SESSION, USER, VIEWER, SCOPE,
 )
 
 
 class DurableCloseoutTests(unittest.TestCase):
+    def test_legacy_receipt_fences_existing_work_webhook_and_chat_followup(self):
+        for origin, action in (('kanban', 'created'), ('kanban', 'prompted'),
+                               ('chat', 'prompted')):
+            with self.subTest(origin=origin, action=action), tempfile.TemporaryDirectory() as directory:
+                authority = Authority()
+                authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                successor = 'successor-session'
+                authority.sessions[successor] = {'id': successor, 'issue': {'id': ISSUE},
+                    'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+                authority.activities['successor-prompt'] = {'id': 'successor-prompt',
+                    'user': {'id': USER}, 'agentSession': {'id': successor}}
+                store = Store(Path(directory) / 'state.db')
+                kanban = FakeKanban()
+                if origin == 'kanban':
+                    task = kanban.create(initial_status='blocked')
+                    store.put(ISSUE, 'kanban', 'settled-session', task_id=task.id)
+                    store.enqueue('status', {'issue_id': ISSUE, 'task_id': task.id,
+                        'claim': True, 'state': 'in_progress'}, at=1)
+                else:
+                    store.put(ISSUE, 'chat', 'owning-chat')
+                    store.update(ISSUE, linear_session_id='settled-session')
+                legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                    f'linear-session-received:{ISSUE}:{SESSION}'))
+                store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE,
+                    'session_id': SESSION, 'initial_ack': True,
+                    'requester_sessions': {ISSUE: SESSION},
+                    'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+                before = store.get(ISSUE)
+                pending = store.pending(ISSUE)
+                bridge = Bridge(store, authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'}),
+                                kanban, profile='synthetic', inject=lambda *_: self.fail('injected'))
+                event = {'type': 'AgentSessionEvent', 'action': action,
+                    'createdAt': '2026-01-02T00:00:00Z', 'agentSession': {'id': successor,
+                        'creatorId': USER, 'issue': {'id': ISSUE}}}
+                if action == 'prompted':
+                    event['agentActivity'] = {'id': 'successor-prompt',
+                        'user': {'id': USER}, 'content': {'body': 'continue'}}
+                with self.assertRaisesRegex(Exception, 'Legacy initial Linear acknowledgement'):
+                    bridge.handle_webhook(event)
+                self.assertEqual(store.get(ISSUE), before)
+                self.assertEqual(store.pending(ISSUE), pending)
+                self.assertEqual(authority.mutations, [])
+                self.assertEqual(kanban.comments, [])
+                self.assertEqual(len(kanban.creates), 1 if origin == 'kanban' else 0)
+                if origin == 'kanban': self.assertEqual(task.status, 'blocked')
+
+    def test_foreign_settled_legacy_binding_fences_third_session(self):
+        for mismatch in ('id', 'session', 'requester', 'target', 'outcome', 'truthy_outcome'):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                authority = Authority()
+                authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                store = Store(Path(directory) / 'state.db')
+                old = SESSION
+                legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                    f'linear-session-received:{ISSUE}:{old if mismatch != "id" else "foreign"}'))
+                payload = {'id': legacy, 'issue_id': ISSUE,
+                    'session_id': 'foreign' if mismatch == 'session' else old,
+                    'initial_ack': True, 'requester_sessions': {ISSUE: old},
+                    'content': {'type': 'thought', 'body': 'Received.'}}
+                if mismatch == 'requester': payload['requester_sessions'] = {ISSUE: 'foreign'}
+                if mismatch == 'target': payload['owner_issue_id'] = 'foreign-issue'
+                store.enqueue('activity', payload, at=1)
+                store.mark_sent(legacy, mismatch != 'outcome')
+                if mismatch == 'truthy_outcome':
+                    row = store.outbox_row(legacy)
+                    store.rewrite(legacy, {**row['payload'], 'applied': 2}, 1)
+                successor = 'third-session'
+                authority.sessions[successor] = {'id': successor, 'issue': {'id': ISSUE},
+                    'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+                bridge = Bridge(store, authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'}),
+                                FakeKanban(), profile='synthetic')
+                event = {'type': 'AgentSessionEvent', 'action': 'created',
+                    'createdAt': '2026-01-02T00:00:00Z', 'agentSession': {'id': successor,
+                        'creatorId': USER, 'issue': {'id': ISSUE}}}
+                with self.assertRaisesRegex(Exception, 'Legacy initial Linear acknowledgement'):
+                    bridge.handle_webhook(event)
+                self.assertIsNone(store.get(ISSUE))
+                self.assertEqual(authority.mutations, [])
+
+    def test_valid_settled_legacy_predecessor_admits_distinct_webhook_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            successor = 'successor-session'
+            authority.sessions[successor] = {'id': successor, 'issue': {'id': ISSUE},
+                'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+            store = Store(Path(directory) / 'state.db')
+            legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                f'linear-session-received:{ISSUE}:{SESSION}'))
+            store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE,
+                'session_id': SESSION, 'initial_ack': True,
+                'requester_sessions': {ISSUE: SESSION},
+                'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+            store.mark_sent(legacy, True)
+            kanban = FakeKanban()
+            bridge = Bridge(store, authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'}),
+                            kanban, profile='synthetic', clock=lambda: 10)
+            bridge.handle_webhook({'type': 'AgentSessionEvent', 'action': 'created',
+                'createdAt': '2026-01-02T00:00:00Z', 'agentSession': {'id': successor,
+                    'creatorId': USER, 'issue': {'id': ISSUE}}})
+            self.assertEqual(len(kanban.creates), 1)
+            self.assertEqual(store.get(ISSUE)['owner_ref'], successor)
+            self.assertEqual(store.outbox_row(legacy)['state'], 'sent')
+    @staticmethod
+    def ack_id(session_id=SESSION):
+        key = json.dumps([ISSUE, session_id], separators=(',', ':'))
+        return str(uuid.UUID(bytes=hashlib.sha256(f'linear-session-received-v4:{key}'.encode()).digest()[:16],
+                             version=4))
+
+    def test_initial_ack_requires_canonical_uuid4_before_worker_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            accepted = []
+            original = authority.transport
+            def transport(url, body, headers):
+                request = json.loads(body)
+                if 'agentActivityCreate' in request['query']:
+                    activity_id = request['variables']['input']['id']
+                    try:
+                        parsed = uuid.UUID(activity_id)
+                        canonical_v4 = parsed.version == 4 and str(parsed) == activity_id
+                    except (TypeError, ValueError, AttributeError):
+                        canonical_v4 = False
+                    if not canonical_v4:
+                        return 200, {}, json.dumps({
+                            'data': None,
+                            'errors': [{'message': 'id must be UUIDv4',
+                                        'extensions': {'code': 'INVALID_INPUT'}}],
+                        }).encode()
+                    accepted.append(activity_id)
+                return original(url, body, headers)
+            api = authority.api()
+            api.transport = transport
+            store = Store(Path(directory) / 'state.db')
+            kanban = FakeKanban()
+            create = kanban.create
+            def checked_create(**fields):
+                self.assertGreaterEqual(len(accepted), len(kanban.creates) + 1,
+                                        'worker admitted before accepted acknowledgement')
+                return create(**fields)
+            kanban.create = checked_create
+            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            self.assertEqual(len(kanban.creates), 1)
+            self.assertEqual(len(accepted), 1)
+            receipt = store.outbox_row(accepted[0])
+            self.assertEqual(receipt['state'], 'sent')
+            self.assertEqual(receipt['payload']['applied'], 1)
+
+            reopened = Bridge(Store(store.path), api, kanban, profile='synthetic', clock=lambda: 11)
+            self.assertTrue(reopened._start({}, authority.issues[ISSUE], SESSION, 1,
+                                            'synthetic-start', existing=store.get(ISSUE)))
+            self.assertEqual(accepted, [self.ack_id()])
+
+            other_session = 'session-other'
+            authority.sessions[other_session] = {'id': other_session, 'issue': {'id': ISSUE},
+                                                 'creator': {'id': USER}}
+            reopened._start({}, authority.issues[ISSUE], other_session, 2, 'synthetic-other')
+            self.assertEqual(accepted, [self.ack_id(), self.ack_id(other_session)])
+            self.assertEqual(len(set(accepted)), 2)
+
+    def test_initial_ack_reuses_pending_uuid4_after_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            original = authority.transport
+            attempted = []
+            def transport(url, body, headers):
+                request = json.loads(body)
+                if 'agentActivityCreate' in request['query']:
+                    attempted.append(request['variables']['input']['id'])
+                    if len(attempted) == 1:
+                        return 503, {}, json.dumps({'errors': [{'message': 'synthetic outage'}]}).encode()
+                return original(url, body, headers)
+            api = authority.api()
+            api.transport = transport
+            path = Path(directory) / 'state.db'
+            kanban = FakeKanban()
+            bridge = Bridge(Store(path), api, kanban, profile='synthetic', clock=lambda: 10)
+            with self.assertRaisesRegex(Exception, 'acknowledgement'):
+                bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start')
+            self.assertEqual(kanban.creates, [])
+            self.assertEqual(attempted, [self.ack_id()])
+            pending = Store(path).outbox_row(self.ack_id())
+            self.assertEqual(pending['state'], 'pending')
+            reopened = Bridge(Store(path), api, kanban, profile='synthetic', clock=lambda: 71)
+            self.assertTrue(reopened._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            self.assertEqual(attempted, [self.ack_id(), self.ack_id()])
+            self.assertEqual(len(kanban.creates), 1)
+            self.assertEqual(reopened.store.outbox_row(self.ack_id())['payload']['applied'], 1)
+
     def test_post_ack_human_edit_prevents_worker_provisioning(self):
         for change in ('reassigned', 'completed', 'canceled'):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
@@ -44,28 +237,137 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertEqual(len(authority.mutations), 1)
 
     def test_unapplied_or_foreign_receipt_never_provisions_worker(self):
-        for mode in ("unapplied", "foreign_session", "uncertain"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
-                authority = Authority()
-                authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
-                api = authority.api()
-                store = Store(Path(directory) / 'state.db')
-                ack_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
-                    f'linear-session-received:{ISSUE}:{SESSION}'))
-                store.enqueue('activity', {'id': ack_id, 'issue_id': ISSUE,
-                    'session_id': 'other-session' if mode == 'foreign_session' else SESSION,
-                    'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
-                    'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
-                if mode != 'uncertain':
-                    store.mark_sent(ack_id, mode == 'foreign_session')
-                else:
-                    row = store.outbox_row(ack_id)
-                    store.rewrite(ack_id, {**row['payload'], 'write_started': True}, 9999999999)
-                kanban = FakeKanban()
-                bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
-                with self.assertRaisesRegex(Exception, 'acknowledgement'):
-                    bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start')
-                self.assertEqual(kanban.creates, [])
+        for version in ('legacy_v5', 'v4'):
+            modes = ("unapplied", "foreign_session", "uncertain")
+            for mode in modes + (("applied_legacy", "failed_legacy") if version == 'legacy_v5' else ()):
+                with self.subTest(version=version, mode=mode), tempfile.TemporaryDirectory() as directory:
+                    authority = Authority()
+                    authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                    api = authority.api()
+                    store = Store(Path(directory) / 'state.db')
+                    ack_id = (str(uuid.uuid5(uuid.NAMESPACE_URL,
+                        f'linear-session-received:{ISSUE}:{SESSION}')) if version == 'legacy_v5'
+                        else self.ack_id())
+                    store.enqueue('activity', {'id': ack_id, 'issue_id': ISSUE,
+                        'session_id': 'other-session' if mode == 'foreign_session' else SESSION,
+                        'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
+                        'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+                    if mode != 'uncertain':
+                        store.mark_sent(ack_id, mode in ('foreign_session', 'applied_legacy'))
+                        if mode == 'failed_legacy':
+                            store.mark(ack_id, 'failed')
+                    else:
+                        row = store.outbox_row(ack_id)
+                        store.rewrite(ack_id, {**row['payload'], 'write_started': True}, 9999999999)
+                    kanban = FakeKanban()
+                    bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
+                    before = store.outbox_row(ack_id)
+                    with self.assertRaisesRegex(Exception, 'acknowledgement'):
+                        bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start')
+                    self.assertEqual(kanban.creates, [])
+                    self.assertEqual(store.outbox_row(ack_id), before)
+                    self.assertEqual(authority.mutations, [])
+
+    def test_reopened_legacy_initial_ack_is_never_flushed_or_ticked(self):
+        for state in ('pending', 'failed', 'sent'):
+            for started in (False, True):
+                with self.subTest(state=state, started=started), tempfile.TemporaryDirectory() as directory:
+                    authority = Authority()
+                    authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                    path = Path(directory) / 'state.db'
+                    store = Store(path)
+                    legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                           f'linear-session-received:{ISSUE}:{SESSION}'))
+                    store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'session_id': SESSION,
+                        'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
+                        'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+                    if started:
+                        row = store.outbox_row(legacy)
+                        store.rewrite(legacy, {**row['payload'], 'write_started': True}, 1)
+                    if state == 'failed':
+                        store.mark(legacy, 'failed')
+                    elif state == 'sent':
+                        store.mark_sent(legacy, True)
+                    reopened = Store(path)
+                    before = reopened.outbox_row(legacy)
+                    bridge = Bridge(reopened, authority.api(), FakeKanban(), profile='synthetic', clock=lambda: 10)
+                    self.assertEqual(bridge.flush(), 0)
+                    bridge.tick()
+                    self.assertEqual(authority.mutations, [])
+                    self.assertEqual(Store(path).outbox_row(legacy), before)
+
+    def test_old_uncertain_legacy_ack_fences_new_session_on_same_issue(self):
+        for state in ('pending', 'failed'):
+            for started in (False, True):
+                with self.subTest(state=state, started=started), tempfile.TemporaryDirectory() as directory:
+                    authority = Authority()
+                    authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                    other = 'other-session'
+                    authority.sessions[other] = {'id': other, 'issue': {'id': ISSUE},
+                                                 'creator': {'id': USER}}
+                    path = Path(directory) / 'state.db'
+                    store = Store(path)
+                    legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                           f'linear-session-received:{ISSUE}:{SESSION}'))
+                    store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'session_id': SESSION,
+                        'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
+                        'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+                    if started:
+                        row = store.outbox_row(legacy)
+                        store.rewrite(legacy, {**row['payload'], 'write_started': True}, 9999999999)
+                    if state == 'failed':
+                        store.mark(legacy, 'failed')
+                    before = store.outbox_row(legacy)
+                    kanban = FakeKanban()
+                    bridge = Bridge(Store(path), authority.api(), kanban, profile='synthetic', clock=lambda: 10)
+                    with self.assertRaisesRegex(Exception, 'Legacy initial Linear acknowledgement'):
+                        bridge._start({}, authority.issues[ISSUE], other, 2, 'other-start')
+                    self.assertEqual(authority.mutations, [])
+                    self.assertEqual(kanban.creates, [])
+                    self.assertIsNone(Store(path).outbox_row(self.ack_id(other)))
+                    self.assertEqual(Store(path).outbox_row(legacy), before)
+
+    def test_settled_legacy_ack_does_not_fence_other_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            other = 'other-session'
+            authority.sessions[other] = {'id': other, 'issue': {'id': ISSUE}, 'creator': {'id': USER}}
+            path = Path(directory) / 'state.db'
+            store = Store(path)
+            legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                   f'linear-session-received:{ISSUE}:{SESSION}'))
+            store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'session_id': SESSION,
+                'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
+                'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+            store.mark_sent(legacy, True)
+            before = store.outbox_row(legacy)
+            kanban = FakeKanban()
+            bridge = Bridge(Store(path), authority.api(), kanban, profile='synthetic', clock=lambda: 10)
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], other, 2, 'other-start'))
+            self.assertEqual(len(kanban.creates), 1)
+            self.assertEqual(Store(path).outbox_row(legacy), before)
+
+    def test_failed_legacy_ack_is_not_revived_by_another_successful_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            path = Path(directory) / 'state.db'
+            store = Store(path)
+            legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                   f'linear-session-received:{ISSUE}:{SESSION}'))
+            store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'session_id': SESSION,
+                'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
+                'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+            store.retry(store.outbox_row(legacy), 86402)
+            other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
+                'requester_sessions': {ISSUE: SESSION},
+                'content': {'type': 'thought', 'body': 'Separate update.'}}, at=1)
+            before = store.outbox_row(legacy)
+            bridge = Bridge(Store(path), authority.api(), FakeKanban(), profile='synthetic', clock=lambda: 86402)
+            self.assertEqual(bridge.flush(), 1)
+            self.assertEqual(bridge.store.outbox_row(other)['state'], 'sent')
+            self.assertEqual(Store(path).outbox_row(legacy), before)
 
     def test_applied_receipt_cannot_revive_stale_closed_issue(self):
         with tempfile.TemporaryDirectory() as directory:

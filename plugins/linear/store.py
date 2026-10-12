@@ -39,7 +39,17 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
+PROJECT_UPDATE_LOOKUP = (
+    "SELECT * FROM outbox WHERE kind = 'project_update' AND "
+    "json_extract(payload, '$.session_id') = ? AND "
+    "json_extract(payload, '$.project_id') IS ? "
+    "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
+    "rowid DESC LIMIT 1")
 class Store:
+    @staticmethod
+    def legacy_initial_ack(row: dict[str, Any]) -> bool:
+        payload = row["payload"]
+        return bool(payload.get("initial_ack") and uuid.UUID(row["id"]).version == 5)
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self._local = threading.local()
@@ -633,6 +643,30 @@ class Store:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'pending' AND (? IS NULL OR "
                               "json_extract(payload, '$.issue_id') = ?) ORDER BY rowid", (issue_id, issue_id)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+    def initial_acks(self, issue_id: str) -> list[dict[str, Any]]:
+        with self._tx() as db:
+            rows = db.execute("SELECT * FROM outbox WHERE kind='activity' AND "
+                              "json_extract(payload, '$.initial_ack')=1 AND "
+                              "json_extract(payload, '$.issue_id')=? ORDER BY rowid", (issue_id,)).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+    def legacy_initial_ack_admitted(self, issue_id: str, session_id: str) -> bool:
+        """Only a coherent, applied predecessor permits another session; its own retry stays fenced."""
+        for row in self.initial_acks(issue_id):
+            if not self.legacy_initial_ack(row):
+                continue
+            payload = row["payload"]
+            stored_issue, stored_session = payload.get("issue_id"), payload.get("session_id")
+            if (not isinstance(stored_issue, str) or not isinstance(stored_session, str) or
+                    not stored_issue or not stored_session or
+                    row["id"] != str(uuid.uuid5(uuid.NAMESPACE_URL,
+                        f"linear-session-received:{stored_issue}:{stored_session}")) or
+                    payload.get("id") != row["id"] or
+                    self._targets(payload) != {issue_id} or
+                    payload.get("requester_sessions") != {issue_id: stored_session} or
+                    stored_session == session_id or row["state"] != "sent" or
+                    type(payload.get("applied")) is not int or payload["applied"] != 1):
+                return False
+        return True
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND "
@@ -729,18 +763,15 @@ class Store:
                 ).fetchall()
             revived = 0
             for row in rows:
+                if self.legacy_initial_ack({"id": row["id"], "payload": json.loads(row["payload"])}):
+                    continue
                 if self._admitted(db, *self._targets(json.loads(row["payload"]))):
                     db.execute("UPDATE outbox SET state='pending', next_at=? WHERE id=?", (now, row["id"]))
                     revived += 1
             return revived
     def project_update(self, session_id: str, project_id: str) -> dict[str, Any] | None:
         with self._tx() as db:
-            row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
-                             "json_extract(payload, '$.session_id') = ? AND "
-                             "json_extract(payload, '$.project_id') IS ? "
-                             "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
-                             "rowid DESC LIMIT 1",
-                             (session_id, project_id)).fetchone()
+            row = db.execute(PROJECT_UPDATE_LOOKUP, (session_id, project_id)).fetchone()
         return {**dict(row), "payload": json.loads(row["payload"])} if row else None
     def outbox_row(self, row_id: str) -> dict[str, Any] | None:
         with self._tx() as db:
@@ -754,11 +785,7 @@ class Store:
         """Merge a session's update atomically with terminal capture in finish()."""
         with self._tx() as db:
             if not self._effect_admitted(db, *self._targets(payload)): return False
-            row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
-                             "json_extract(payload, '$.session_id') = ? AND "
-                             "json_extract(payload, '$.project_id') IS ? "
-                             "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
-                             "rowid DESC LIMIT 1",
+            row = db.execute(PROJECT_UPDATE_LOOKUP,
                              (payload["session_id"], payload["project_id"])).fetchone()
             if row and self._requester_conflict(json.loads(row["payload"]), payload): row = None
             if row:

@@ -1934,6 +1934,21 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("Saved review findings", json.dumps(saved["payload"]["lines"]))
         self.assertIn("Saved review findings", self.linear.project_updates[-1]["body"])
 
+    def test_saved_run_summary_with_local_artifact_completes_without_task_result(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, task_id,
+                summary="Reconciled the synthetic rows; two values are missing.",
+                metadata={"artifacts": ["/synthetic/review.md"]}))
+            conn.execute("UPDATE tasks SET result='' WHERE id=?", (task_id,))
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Done")
+        response = self.linear.activities[-1]["content"]["body"]
+        self.assertIn("two values are missing", response)
+        self.assertNotIn("/synthetic/", response)
+        self.assertIn("two values are missing", self.linear.project_updates[-1]["body"])
+
     def test_done_with_empty_result_and_latest_run_is_unfinished(self) -> None:
         self.delegate()
         task_id = self.task_id()

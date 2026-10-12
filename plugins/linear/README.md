@@ -347,7 +347,11 @@ activity, session key and generation across crashes. Its Stop receipt and worker
 be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
 core accepted an interrupt request; worker completion never proves external effects stopped.
 The outbox keeps each activity ID stable across retries; the initial session receipt uses a
-deterministic issue/session ID, so duplicate deliveries do not create another receipt.
+deterministic UUIDv4-shaped issue/session ID, so duplicate deliveries do not create another receipt.
+An existing legacy UUIDv5 initial receipt holds its own session's admission; an unresolved one
+also holds new sessions on the same issue. A sent, applied receipt does not hold another session.
+The plugin retains legacy receipts and does not replay them automatically; a rejected receipt
+still needs outcome-aware recovery before that session can proceed.
 `outbox` has pending, sent and failed states.
 
 ## Known limits

@@ -78,6 +78,7 @@ def handle(bridge, args, context):
             raise LinearError("Issue resolution mismatch", retryable=False)
         issue_id = issue["id"]
         with bridge.lock(issue_id):
+            bridge._admit_legacy_initial_ack(issue_id, context.session_id)
             prior = bridge.store.chat_admission(request)
             if prior:
                 if any(prior[key] != value for key, value in (
