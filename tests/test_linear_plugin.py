@@ -36,7 +36,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Acceptance refusal quotes the verifier detail and redacts token shapes. Measured 3723, allowance 8.
 # Content actions include guarded transport, persisted uncertainty and Markdown readback.
 # Measured 3944, allowance 8; retain bounded headroom without compressing safety branches.
-BUDGET = 3952
+# Session-requester authorization adds explicit fresh-session and durable binding guards.
+# Measured 4002, allowance 8; do not minify those authorization branches.
+BUDGET = 4010
 
 
 class FakeContext:
