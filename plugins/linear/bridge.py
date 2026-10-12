@@ -852,7 +852,7 @@ class Bridge:
             if not admitted: return False
             if stamp <= self.store.chat_closeout_ms(issue_id): return True
             current = self._effect_issue(issue_id)
-            if (current.get("delegate") or {}).get("id") not in (None, me): return True
+            if (now := (current.get("delegate") or {}).get("id")) not in (None, me) or (delegate == me and now is None): return True
             if (current.get("state") or {}).get("type") in CLOSED and ((fresh.get("state") or {}).get("type") not in CLOSED or stamp < self.closure_ms(current)): return True
             task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
                 title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
@@ -1095,9 +1095,9 @@ class Bridge:
         return False
     def takeover(self, row: dict[str, Any], issue: dict[str, Any]) -> None:
         name = (issue.get("delegate") or {}).get("name") or "nobody"
+        with self._outbox_requester_scope({"payload": self._alert_route(row)}):
+            self.comment(row["issue_id"], f"Reassigned to {name}; local retirement requested. New work here waits for the prior worker to exit.", row=row, takeover=True)
         self.release(row, f"Reassigned to {name} in Linear")
-        self.comment(row["issue_id"], f"Reassigned to {name}; local retirement requested. "
-                     "New work here waits for the prior worker to exit.", row=row, takeover=True)
     def release(self, row: dict[str, Any], reason: str) -> None:
         if row["origin"] in ("kanban", "kanban_chat"):
             self._retire_task(row)
