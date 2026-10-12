@@ -39,7 +39,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Session-requester authorization adds explicit fresh-session and durable binding guards.
 # Measured 4100; do not minify those authorization branches.
 # Definite 401 refreeze keeps an already-started project create frozen. Measured 4132, allowance 8.
-BUDGET = 4140
+# Agent progress activities add action content, ephemeral current-step replacement, and comment text.
+# Measured 4179, allowance 8.
+BUDGET = 4187
 
 
 class FakeContext:
