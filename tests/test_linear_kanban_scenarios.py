@@ -2890,6 +2890,19 @@ class LinearKanbanScenarios(unittest.TestCase):
         with self.bridge.kanban.conn() as conn:
             self.assertEqual(sum(c.body.count("Keep this instruction") for c in kb.list_comments(conn, task)), 1)
 
+    def test_named_board_init_registers_a_database_stub_without_dropping_work(self):
+        slug = "specialist-linear"
+        from hermes_cli import kanban_db_connect
+        from hermes_cli.kanban_db_boards import create_board, list_boards
+        create_board(slug)
+        with kanban_db_connect.connect(board=slug) as conn:
+            task_id = kb.create_task(conn, title="keep me", assignee="default", board=slug)
+        (kb.board_dir(slug) / "board.json").unlink()
+        self.assertNotIn(slug, [item.get("slug") for item in list_boards(include_archived=False)])
+        opened = Kanban(slug)
+        self.assertIn(slug, [item.get("slug") for item in list_boards(include_archived=False)])
+        self.assertEqual(opened.get(task_id).title, "keep me")
+
     def test_trailing_newline_comment_resolves_its_own_row_not_an_earlier_one(self):
         self.delegate()
         task = self.task_id()
