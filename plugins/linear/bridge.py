@@ -433,9 +433,9 @@ class Bridge:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             with self.api.requester_session(row["payload"].get("requester_sessions") or {}): yield
         else: yield
-    def _authorize_outbox_effect(self, row: dict[str, Any]) -> bool:
+    def _authorize_outbox_effect(self, row: dict[str, Any], issue_ids=None) -> bool:
         if not self._specialist_scope_active(): return True
-        targets = self._outbox_scope_issue_ids(row)
+        targets = issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row)
         with self._outbox_requester_scope(row):
             return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
     @staticmethod
@@ -1159,17 +1159,17 @@ class Bridge:
             if progress:
                 self.store.revive_failed(self.clock())
         return sent
-    def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False) -> None:
+    def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False, issue_ids=None) -> None:
         @contextmanager
         def guard():
             row = self.store.outbox_row(row_id)
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
-            if row and not self._authorize_outbox_effect(row): raise ProjectUpdateDeferred
+            if row and not self._authorize_outbox_effect(row, issue_ids): raise ProjectUpdateDeferred
             if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
                         payload.get("superseded_receipt")):
                 receipt_ids = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()}
-                for issue_id in self._outbox_scope_issue_ids(row):
+                for issue_id in issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row):
                     issue = self._effect_issue(issue_id)
                     delegate = (issue.get("delegate") or {}).get("id")
                     receipts = [self.store.outbox_row(r) for r in receipt_ids if r]
@@ -1196,6 +1196,7 @@ class Bridge:
                     raise ProjectUpdateDeferred
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
             yield
+        guard.rejected = lambda: self.store.project_not_applied(row_id, known_rejection=True)
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:
@@ -1376,7 +1377,9 @@ class Bridge:
                 lines_to_send.append(f"- {ident}: {line}")
                 issue_ids_to_send.append(issue["id"])
             if waiting_lines:
-                if payload.get("frozen"): raise ProjectUpdateDeferred
+                if payload.get("frozen"):
+                    if self.store.project_not_applied(row_id): continue
+                    raise ProjectUpdateDeferred
                 if payload.get("followup") or not lines_to_send:
                     raise ProjectUpdateDeferred
                 split = self.store.split_project_update(row_id, payload, self.clock(), waiting_lines)
@@ -1388,24 +1391,27 @@ class Bridge:
             body = "Agent update\n\n" + "\n".join(lines_to_send) if lines_to_send else ""
             if payload.get("frozen"):
                 if body != payload.get("send_body") or project_id != payload.get("send_project_id"):
+                    if self.store.project_not_applied(row_id): continue
                     raise LinearError("project update changed after an uncertain create; reconcile the remote update")
                 if not project_id or not body:
                     return False
+            else:
+                if not project_id or not body:
+                    dropped = self.store.drop_unpublished_update(row_id, payload, self.clock())
+                    if dropped is None:
+                        continue
+                    raise ProjectUpdateDeferred  # no create occurred; later work may queue a new batch
+                frozen = self.store.freeze_project_update(row_id, payload, self.clock(), body, project_id)
+                if frozen is None:
+                    continue  # a terminal capture committed during preflight; read it again
+                if not frozen:
+                    raise ProjectUpdateDeferred
+            try:
                 self._mutate_outbox(row_id, lambda: self.api.create_project_update(
-                    row_id, project_id, body, issue_ids=issue_ids_to_send))
-                return True
-            if not project_id or not body:
-                dropped = self.store.drop_unpublished_update(row_id, payload, self.clock())
-                if dropped is None:
-                    continue
-                raise ProjectUpdateDeferred  # no create occurred; later work may queue a new batch
-            frozen = self.store.freeze_project_update(row_id, payload, self.clock(), body, project_id)
-            if frozen is None:
-                continue  # a terminal capture committed during preflight; read it again
-            if not frozen:
-                raise ProjectUpdateDeferred
-            self._mutate_outbox(row_id, lambda: self.api.create_project_update(
-                row_id, project_id, body, issue_ids=issue_ids_to_send))
+                    row_id, project_id, body, issue_ids=issue_ids_to_send), issue_ids=issue_ids_to_send)
+            except ProjectUpdateDeferred:
+                if self.store.project_not_applied(row_id): continue
+                raise
             return True
         raise LinearError("project update changed repeatedly during send preflight")
     def _loud(self, row: dict[str, Any], exc: Exception) -> bool:

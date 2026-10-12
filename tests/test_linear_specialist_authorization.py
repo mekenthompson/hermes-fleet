@@ -1629,6 +1629,71 @@ class SessionRequesterTests(unittest.TestCase):
                     self.assertEqual(self.authority.mutations, [])
                     self.assertTrue(self.store.pending())
 
+    def test_filtered_terminal_project_batch_at_takeover_and_cancel_boundaries(self):
+        for boundary in ("before", "credentials", "401"):
+            for change in ("takeover", "cancel"):
+                with self.subTest(boundary=boundary, change=change):
+                    self.setUp()
+                    self.bridge.handle_webhook(self.session_event())
+                    self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+                    self.bridge.flush()
+                    other, session = "issue-second", "session-second"
+                    self.authority.issues[other] = issue_record(id=other, identifier="OPS-2", delegate={"id": VIEWER})
+                    self.authority.sessions[session] = {"id": session, "issue": {"id": other},
+                                                       "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+                    self.store.put(other, "kanban", session, task_id="second-task", project_id=PROJECT)
+                    self.kanban.tasks["second-task"] = SimpleNamespace(id="second-task", status="ready",
+                        completion_contract=None, result="", title="OPS-2: second")
+                    task = self.kanban.tasks["task-1"]
+                    task.status = "done"
+                    self.kanban.evidence_text = lambda task: "https://example.test/findings"
+                    self.bridge.pump_kanban()
+                    self.bridge.project_update("task-1", PROJECT, "OPS-2", "Progress", quiet=False, issue_id=other)
+                    self.bridge.await_retired(ISSUE)
+                    changed, accepted, attempts = [], [], []
+                    def revoke():
+                        changed.append(True)
+                        if change == "takeover": self.authority.issues[other]["delegate"] = {"id": "foreign-human"}
+                        else: self.authority.issues[other]["state"] = {"id": "canceled", "type": "canceled"}
+                    def provider():
+                        if boundary == "credentials" and getattr(self.api._graphql_permit, "target_project", None) and not changed:
+                            revoke()
+                        return "synthetic"
+                    provider.invalidate = lambda: None
+                    original = self.api.transport
+                    def transport(url, body, headers):
+                        request = json.loads(body)
+                        if "projectUpdateCreate" in request["query"]:
+                            attempts.append(request["variables"]["input"]["body"])
+                            if boundary == "401" and not changed:
+                                revoke()
+                                return 401, {}, b"{}"
+                            accepted.append(attempts[-1])
+                        return original(url, body, headers)
+                    self.api.token, self.api.transport = provider, transport
+                    if boundary == "before": revoke()
+                    self.bridge.flush()
+                    self.assertEqual(changed, [True])
+                    self.assertEqual(len(accepted), 1)
+                    self.assertIn("OPS-1", accepted[0])
+                    self.assertNotIn("OPS-2", accepted[0])
+                    self.assertEqual(len(attempts), 2 if boundary == "401" else 1)
+                    self.assertEqual(self.store.pending(), [])
+
+    def test_project_thaw_requires_explicit_unsent_or_definite_rejection(self):
+        for marker, allowed in ((False, True), (True, False), (None, False)):
+            payload = {"issue_id": "update:synthetic", "session_id": "batch", "project_id": PROJECT,
+                       "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE},
+                       "frozen": True}
+            if marker is not None: payload["write_started"] = marker
+            row_id = self.store.enqueue("project_update", payload, at=0)
+            self.assertEqual(self.store.project_not_applied(row_id), allowed)
+            if allowed:
+                self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], False)
+            else:
+                self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
+        self.assertTrue(self.store.project_not_applied(row_id, known_rejection=True))
+
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()
         with self.assertRaises(LinearError):

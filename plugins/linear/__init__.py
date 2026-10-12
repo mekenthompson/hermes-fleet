@@ -64,30 +64,21 @@ class BoundLinearAPI(LinearAPI):
             result["requester_basis"] = basis
         return result
     @contextmanager
+    def _scope(self, **values):
+        prior = {key: getattr(self._graphql_permit, key, 0 if key == "depth" else None) for key in values}
+        try:
+            for key, value in values.items(): setattr(self._graphql_permit, key, value)
+            yield
+        finally:
+            for key, value in prior.items(): setattr(self._graphql_permit, key, value)
     def _permit_specialist_operation(self, issue_ids=None, *, session_id=None, project_id=None):
-        prior_session = getattr(self._graphql_permit, "target_session", None)
-        prior_project = getattr(self._graphql_permit, "target_project", None)
-        if session_id is not None: self._graphql_permit.target_session = session_id
-        if project_id is not None: self._graphql_permit.target_project = project_id
-        prior = getattr(self._graphql_permit, "issue_targets", ())
-        if issue_ids is not None: self._graphql_permit.issue_targets = tuple(issue_ids)
-        depth = getattr(self._graphql_permit, "depth", 0)
-        self._graphql_permit.depth = depth + 1
-        try:
-            yield
-        finally:
-            self._graphql_permit.depth = depth
-            self._graphql_permit.issue_targets = prior
-            self._graphql_permit.target_session = prior_session
-            self._graphql_permit.target_project = prior_project
-    @contextmanager
+        values = {"depth": getattr(self._graphql_permit, "depth", 0) + 1}
+        for key, value in (("issue_targets", tuple(issue_ids) if issue_ids is not None else None),
+                           ("target_session", session_id), ("target_project", project_id)):
+            if value is not None: values[key] = value
+        return self._scope(**values)
     def requester_session(self, session_id):
-        prior = getattr(self._graphql_permit, "requester_session_id", None)
-        self._graphql_permit.requester_session_id = session_id
-        try:
-            yield
-        finally:
-            self._graphql_permit.requester_session_id = prior
+        return self._scope(requester_session_id=session_id)
     def verify_identity(self):
         self._verified_credential(self.token)
     def _verified_credential(self, provider):
@@ -150,9 +141,7 @@ class BoundLinearAPI(LinearAPI):
                 session = self.agent_session(session_id)
             except LinearError as exc:
                 raise LinearError(str(exc), retryable=exc.retryable, authoritative_issue_id=issue["id"]) from exc
-            requester = (session or {}).get("creator")
-            requester_ok = (isinstance(session, dict) and (session.get("issue") or {}).get("id") == issue.get("id") and
-                            isinstance(requester, dict) and requester.get("id") in self.specialist_scope["allowed_requester_ids"])
+            requester_ok = session["issue"]["id"] == issue["id"]
         if (not isinstance(team, dict) or not isinstance(team.get("id"), str) or not team["id"] or
                 (not self.specialist_scope.get("all_teams") and team["id"] not in self.specialist_scope["allowed_team_ids"]) or
                 (not self.specialist_scope.get("all_projects") and

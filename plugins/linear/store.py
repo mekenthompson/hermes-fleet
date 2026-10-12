@@ -149,7 +149,7 @@ class Store:
             for receipt_id in receipts - {None, ""}:
                 receipt = db.execute("SELECT payload FROM outbox WHERE id=?", (receipt_id,)).fetchone()
                 if receipt and not superseded_receipt and self.superseded({"id": receipt_id, "payload": json.loads(receipt["payload"])}): return False
-            if terminal or row["kind"] == "description":
+            if terminal or row["kind"] in ("description", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
@@ -759,12 +759,9 @@ class Store:
                              "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
                              "rowid DESC LIMIT 1",
                              (payload["session_id"], payload["project_id"])).fetchone()
+            if row and self._requester_conflict(json.loads(row["payload"]), payload): row = None
             if row:
                 prior = json.loads(row["payload"])
-                if self._requester_conflict(prior, payload):
-                    db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
-                               (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
-                    return True
                 if row["state"] not in ("pending", "failed") or prior.get("frozen"):
                     return True
                 if not self._admitted(db, *self._targets(prior)): return False
@@ -798,6 +795,12 @@ class Store:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
                            (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
             return True
+    def project_not_applied(self, row_id: str, *, known_rejection: bool = False) -> bool:
+        with self._tx() as db:
+            row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending'", (row_id,)).fetchone()
+            if not row or (not known_rejection and json.loads(row["payload"]).get("write_started") is not False): return False
+            db.execute("UPDATE outbox SET payload=json_set(payload, '$.frozen', json('false'), '$.write_started', json('false')) WHERE id=?", (row_id,))
+            return True
     def freeze_project_update(self, row_id: str, expected: dict[str, Any], now: float,
                               body: str, project_id: str | None) -> bool | None:
         """Freeze the preflighted body only if it is still unchanged and due."""
@@ -814,6 +817,7 @@ class Store:
             if not self._admitted(db, *self._targets(payload)): return False
             if not payload.get("frozen"):
                 payload["frozen"] = True
+                payload["write_started"] = False
                 payload["send_body"] = body
                 payload["send_project_id"] = project_id
                 db.execute("UPDATE outbox SET payload = ? WHERE id = ?", (json.dumps(payload), row_id))
