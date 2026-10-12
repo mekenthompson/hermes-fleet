@@ -1279,6 +1279,17 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertIn("Checked the Sydney stock file", thoughts)
 
+    def test_comment_resolver_uses_core_strip_contract_and_skips_bridge_authors(self):
+        from types import SimpleNamespace
+        from hermes_fleet_linear_plugin.bridge import resolve_comment_body
+        stored = SimpleNamespace(author="worker", body="hello")
+        self.assertEqual(resolve_comment_body([stored], "worker\n", len("hello\n")), "hello")
+        other = SimpleNamespace(author="worker", body="hello")
+        self.assertEqual(resolve_comment_body([stored, other], "worker", len("hello")), "")
+        self.assertEqual(resolve_comment_body([stored], "linear", len("hello")), "")
+        marked = SimpleNamespace(author="linear:abc", body="Keep this instruction")
+        self.assertEqual(resolve_comment_body([marked], "linear:abc", len("Keep this instruction")), "")
+
     def test_foreign_requester_cannot_use_allowed_author_or_poison_issue(self):
         self.authority.issues[ISSUE] = issue_record()
         self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
