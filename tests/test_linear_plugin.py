@@ -38,7 +38,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Measured 3944, allowance 8; retain bounded headroom without compressing safety branches.
 # Session-requester authorization adds explicit fresh-session and durable binding guards.
 # Measured 4100; do not minify those authorization branches.
-BUDGET = 4100
+# Definite 401 refreeze keeps an already-started project create frozen. Measured 4129, allowance 8.
+BUDGET = 4137
 
 
 class FakeContext:

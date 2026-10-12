@@ -242,7 +242,12 @@ class LinearAPI:
             if status == 429 or "RATELIMITED" in codes:
                 raise RateLimited(self._pause(response_headers))
             self._pause(response_headers, limited=False)
-            if status == 401 and callable(getattr(guard, "rejected", None)): guard.rejected()
+            rejected = getattr(guard, "rejected", None) if guard is not None else None
+            if status == 401 and callable(rejected):
+                # False means the marker was already started or is legacy. Do not
+                # retry that create; a 401 does not prove an earlier attempt missed.
+                if rejected() is False:
+                    break
             refresh_provider = provider if token_provider is not None or verify_credential is not None else self.token
             if status == 401 and attempt == 1 and callable(getattr(refresh_provider, "invalidate", None)):
                 refresh_provider.invalidate()
