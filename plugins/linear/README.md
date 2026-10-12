@@ -453,10 +453,9 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 3,000 lines. The additional 100-line
-allowance covers restart-safe quota admission and serialized identity/request handling,
-alongside the bounded authorization contract and durable recovery boundaries. The unit
-suite enforces the limit without compressing safety-critical branches.
+The production implementation is capped at 4,010 lines. This includes the bounded
+session-requester authorization path and existing recovery/transport safeguards.
+The unit suite enforces measured headroom without compressing safety-critical branches.
 
 Ownership loss archives directly through core so a running worker retains its termination identity.
 A durable issue fence blocks native and chat replacements until every recorded predecessor exits.
