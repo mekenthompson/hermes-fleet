@@ -242,6 +242,7 @@ class LinearAPI:
             if status == 429 or "RATELIMITED" in codes:
                 raise RateLimited(self._pause(response_headers))
             self._pause(response_headers, limited=False)
+            if status == 401 and callable(getattr(guard, "rejected", None)): guard.rejected()
             refresh_provider = provider if token_provider is not None or verify_credential is not None else self.token
             if status == 401 and attempt == 1 and callable(getattr(refresh_provider, "invalidate", None)):
                 refresh_provider.invalidate()
