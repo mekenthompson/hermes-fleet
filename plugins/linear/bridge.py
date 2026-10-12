@@ -1166,7 +1166,8 @@ class Bridge:
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row): raise ProjectUpdateDeferred
-            if row and (payload.get("terminal") or payload.get("superseded_receipt")):
+            if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
+                        payload.get("superseded_receipt")):
                 receipt_ids = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()}
                 for issue_id in self._outbox_scope_issue_ids(row):
                     issue = self._effect_issue(issue_id)

@@ -37,7 +37,7 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Content actions include guarded transport, persisted uncertainty and Markdown readback.
 # Measured 3944, allowance 8; retain bounded headroom without compressing safety branches.
 # Session-requester authorization adds explicit fresh-session and durable binding guards.
-# Measured 4099, allowance 1; do not minify those authorization branches.
+# Measured 4100; do not minify those authorization branches.
 BUDGET = 4100
 
 
