@@ -339,13 +339,16 @@ class Bridge:
         route = self._alert_route(row or self.store.get(issue_id))
         return self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen,
                                              "terminal": terminal, "source_ms": source_ms, **route}, at=self.clock())
-    @staticmethod
-    def _alert_route(row: dict[str, Any] | None) -> dict[str, str]:
+    def _alert_route(self, row: dict[str, Any] | None) -> dict[str, Any]:
         if not row:
             return {}
+        binding = {}
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            session = row.get("owner_ref") if row["origin"] == "kanban" else row.get("linear_session_id")
+            binding = {"requester_sessions": {row["issue_id"]: session}}
         if row["origin"] == "chat":
-            return {"session_key": row["owner_ref"]}
-        return {"task_id": row["task_id"]} if row.get("task_id") else {}
+            return {"session_key": row["owner_ref"], **binding}
+        return {**({"task_id": row["task_id"]} if row.get("task_id") else {}), **binding}
     def comment(self, issue_id: str, body: str, *, row: dict[str, Any] | None = None,
                 terminal: bool = False, requires_status_id: str = "", takeover: bool = False) -> str:
         if not self.authorize_specialist_effect(issue_id):
@@ -384,6 +387,7 @@ class Bridge:
                       terminal, requires_status_id) -> bool:
         return self.store.queue_project_update({"issue_id": f"update:{session_id}:{project_id or issue_id}",
                                          "session_id": session_id, "session_key": session_key,
+                                         **self._alert_route(self.store.get(issue_id)),
                                          "project_id": project_id, "resolve": issue_id,
                                          "terminal": terminal, "owner_issue_id": issue_id if terminal else "",
                                          "requires_status_id": requires_status_id,
@@ -424,10 +428,16 @@ class Bridge:
         candidates = [payload.get("owner_issue_id"), payload.get("resolve")]
         candidates.extend((payload.get("line_issues") or {}).values())
         return list(dict.fromkeys(issue_id for issue_id in candidates if issue_id))
+    @contextmanager
+    def _outbox_requester_scope(self, row):
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            with self.api.requester_session(row["payload"].get("requester_sessions") or {}): yield
+        else: yield
     def _authorize_outbox_effect(self, row: dict[str, Any]) -> bool:
         if not self._specialist_scope_active(): return True
         targets = self._outbox_scope_issue_ids(row)
-        return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
+        with self._outbox_requester_scope(row):
+            return bool(targets) and all(self.authorize_specialist_effect(issue_id) for issue_id in targets)
     @staticmethod
     def _is_specialist_scope_denial(exc: LinearError) -> bool:
         return not exc.retryable and any(text in str(exc).lower() for text in ("specialist scope", "specialist authorization"))
@@ -678,7 +688,10 @@ class Bridge:
                 messages = intent.get("messages", [{"key": markers[0], "note": intent["note"]}])
             if key not in markers:
                 markers.append(key)
-                messages.append({"key": key, "note": incoming})
+                message = {"key": key, "note": incoming}
+                if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+                    message.update(activity_id=marker, session_id=session_id)
+                messages.append(message)
             note = "\n\n".join(message["note"] for message in messages)
             saved = json.dumps({"kind": "kanban", "note": note, "last_note": incoming, "marker": marker,
                                 "markers": markers, "messages": messages, "session_id": session_id,
@@ -690,6 +703,12 @@ class Bridge:
             if not admitted or not current: return False
             if current["pending_resume"] != saved: return True  # A newer instruction or Stop superseded this attempt.
             def steer() -> bool:
+                if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+                    for message in messages:
+                        if "activity_id" not in message:
+                            raise LinearError("Saved specialist reply lacks actor provenance", retryable=False)
+                        if message["activity_id"]:
+                            self.api.agent_activity(message["activity_id"], message["session_id"])
                 for message in messages:
                     self.kanban.comment(task.id, message["note"], marker=message["key"])
                 waiting = self.kanban.get(task.id)
@@ -777,6 +796,8 @@ class Bridge:
             self.kanban.subscribe(task.id, issue_id)
             return not staged or self.kanban.unblock(task.id)
         route = {"task_id": task.id}
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            route["requester_sessions"] = {issue_id: session_id}
         writes = [("activity", {"issue_id": issue_id, "session_id": session_id,
                                 "content": {"type": "thought", "body": f"On it. Queued as Kanban task {task.id}."},
                                 **route}),
@@ -906,6 +927,7 @@ class Bridge:
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                     "body": payload["content"]["body"]}) if kind == "activity" else (kind, payload)
                       for kind, payload in writes]
+        writes = [(kind, {**payload, **self._alert_route(row)}) for kind, payload in writes]
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     def _finish_work(self, issue_id: str, writes: list, *, at: float) -> bool:
         row = self.store.get(issue_id)
@@ -913,6 +935,8 @@ class Bridge:
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                     "body": payload["content"]["body"]}) if kind == "activity" else (kind, payload)
                       for kind, payload in writes if kind != "project_update"]
+        if row:
+            writes = [(kind, {**payload, **self._alert_route(row)}) for kind, payload in writes]
         return self.store.finish(issue_id, writes, at=at)
     def _finished(self, row: dict[str, Any]) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):
@@ -1086,7 +1110,7 @@ class Bridge:
         while progress:
             progress = False
             for row in self.store.due(self.clock()):
-                with self.lock(row["payload"]["issue_id"]):
+                with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row):
                     if not self._authorize_outbox_effect(row):
                         continue
                     if row["kind"] != "project_update" and any(
@@ -1137,6 +1161,7 @@ class Bridge:
             row = self.store.outbox_row(row_id)
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
+            if row and not self._authorize_outbox_effect(row): raise ProjectUpdateDeferred
             if payload.get("content_action") or row and row.get("kind") == "description":
                 work = self.store.get(payload.get("issue_id", ""))
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or
