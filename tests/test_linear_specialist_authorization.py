@@ -1254,6 +1254,66 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
 
+    def test_recheck_takeover_keeps_original_requester_after_successor_reopens(self):
+        task_id = LinearSpecialistAuthorizationTests.seed_kanban_work(self)
+        self.authority.issues[ISSUE]["delegate"] = {"id": "foreign", "name": "Other Agent"}
+        self.bridge.recheck(force=True)
+        self.assertIsNone(self.store.get(ISSUE))
+        self.assertEqual(self.kanban.tasks[task_id].status, "archived")
+        [notice] = [row for row in self.store.pending(ISSUE) if row["kind"] == "comment"]
+        self.assertEqual(notice["payload"]["requester_sessions"], {ISSUE: SESSION})
+        self.bridge.await_retired(ISSUE)
+        successor = "successor-session"
+        self.authority.sessions[successor] = {"id": successor, "issue": {"id": ISSUE},
+                                             "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+        self.assertTrue(self.store.put(ISSUE, "kanban", successor, task_id="successor-task", project_id=PROJECT))
+        self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
+        reopened = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
+                          self.kanban, profile="synthetic")
+        self.assertEqual(reopened.store.outbox_row(notice["id"])["payload"]["requester_sessions"], {ISSUE: SESSION})
+        self.authority.mutations.clear()
+        reopened.flush()
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(reopened.store.outbox_row(notice["id"])["state"], "pending")
+        self.assertTrue(reopened.store.scope_fenced(ISSUE))
+
+    def test_post_ack_delegate_change_gates_worker_provisioning(self):
+        cases = ((VIEWER, None, False, False), (None, None, False, True),
+                 (VIEWER, "foreign", False, False), (VIEWER, VIEWER, True, False))
+        for before, after, closed, allowed in cases:
+            with self.subTest(before=before, after=after, closed=closed):
+                self.setUp()
+                self.authority.issues[ISSUE]["delegate"] = {"id": before} if before else None
+                original_flush = self.bridge.flush
+                def after_receipt(*args, **kwargs):
+                    result = original_flush(*args, **kwargs)
+                    self.authority.issues[ISSUE]["delegate"] = {"id": after} if after else None
+                    self.authority.issues[ISSUE]["updatedAt"] = "2026-01-01T00:00:02Z"
+                    if closed:
+                        self.authority.issues[ISSUE]["state"] = {"id": "state-done", "name": "Done", "type": "completed"}
+                        self.authority.issues[ISSUE]["completedAt"] = "2026-01-01T00:00:02Z"
+                    return result
+                self.bridge.flush = after_receipt
+                self.bridge.handle_webhook(self.session_event())
+                self.assertTrue(any("agentActivityCreate" in query for query in self.authority.mutations))
+                self.assertEqual(len(self.kanban.creates), int(allowed))
+                self.assertEqual(self.store.get(ISSUE) is not None, allowed)
+
+    def test_recheck_retirement_continues_when_notice_authorization_refuses(self):
+        task_id = LinearSpecialistAuthorizationTests.seed_kanban_work(self)
+        self.authority.issues[ISSUE]["delegate"] = {"id": "foreign"}
+        original_issue, reads = self.api.issue, []
+        def deny_notice(ref):
+            reads.append(ref)
+            if len(reads) > 1:
+                raise LinearError("synthetic authorization outage")
+            return original_issue(ref)
+        self.api.issue = deny_notice
+        self.bridge.recheck(force=True)
+        self.assertIsNone(self.store.get(ISSUE))
+        self.assertEqual(self.kanban.tasks[task_id].status, "archived")
+        self.assertEqual(self.store.pending(ISSUE), [])
+
     def test_session_claim_survives_a_later_issue_timestamp_without_a_delegate(self):
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["updatedAt"] = "2026-01-01T00:00:02Z"
