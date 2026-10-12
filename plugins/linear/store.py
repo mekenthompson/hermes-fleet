@@ -131,8 +131,24 @@ class Store:
                 if (not work or work["origin"] != "chat" or work["owner_ref"] != payload.get("session_key") or
                         work["ownership_id"] != payload.get("work_owner") or work["stop_requested_at"] or work["release_pending"]):
                     return False
-            if row["kind"] == "status" and not terminal and payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
+            superseded_receipt = False
+            if payload.get("superseded_receipt") and row["kind"] in ("activity", "comment"):
+                status = db.execute("SELECT state,payload FROM outbox WHERE id=?", (payload.get("requires_status_id"),)).fetchone()
+                status_payload = json.loads(status["payload"]) if status else {}
+                body = (payload.get("content") or payload).get("body", "")
+                superseded_receipt = bool(status and status["state"] == "sent" and
+                    status_payload.get("superseded") and status_payload.get("applied") == 0 and
+                    status_payload.get("work_owner") == payload.get("work_owner") and
+                    status_payload.get("issue_id") == payload["issue_id"] and
+                    body.startswith("Earlier work closeout superseded; Linear status was not changed."))
+            owner_payload = {**payload, "issue_id": payload.get("owner_issue_id") or payload["issue_id"]}
+            if (payload.get("work_owner") and (row["kind"] == "status" or payload.get("terminal")) and
+                    not superseded_receipt and self.superseded({"id": row_id, "payload": owner_payload})):
                 return False
+            receipts = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()}
+            for receipt_id in receipts - {None, ""}:
+                receipt = db.execute("SELECT payload FROM outbox WHERE id=?", (receipt_id,)).fetchone()
+                if receipt and not superseded_receipt and self.superseded({"id": receipt_id, "payload": json.loads(receipt["payload"])}): return False
             if terminal or row["kind"] == "description":
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
@@ -474,6 +490,8 @@ class Store:
                                           "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
                                           "rowid DESC LIMIT 1",
                                           (payload["session_id"], payload["project_id"])).fetchone()
+                    if existing and self._requester_conflict(json.loads(existing["payload"]), payload):
+                        existing = None
                     if existing:
                         prior = json.loads(existing["payload"])
                         if existing["state"] in ("pending", "failed") and not prior.get("frozen"):
@@ -727,6 +745,10 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT * FROM outbox WHERE id = ?", (row_id,)).fetchone()
         return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+    @staticmethod
+    def _requester_conflict(prior, payload):
+        old, new = prior.get("requester_sessions") or {}, payload.get("requester_sessions") or {}
+        return bool(old) != bool(new) or any(key in old and old[key] != value for key, value in new.items())
     def queue_project_update(self, payload: dict[str, Any], *, due: float, quiet: bool) -> bool:
         """Merge a session's update atomically with terminal capture in finish()."""
         with self._tx() as db:
@@ -739,6 +761,10 @@ class Store:
                              (payload["session_id"], payload["project_id"])).fetchone()
             if row:
                 prior = json.loads(row["payload"])
+                if self._requester_conflict(prior, payload):
+                    db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
+                               (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
+                    return True
                 if row["state"] not in ("pending", "failed") or prior.get("frozen"):
                     return True
                 if not self._admitted(db, *self._targets(prior)): return False

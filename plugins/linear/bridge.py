@@ -690,7 +690,8 @@ class Bridge:
                 markers.append(key)
                 message = {"key": key, "note": incoming}
                 if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
-                    message.update(activity_id=marker, session_id=session_id)
+                    message.update(activity_id=marker, session_id=session_id,
+                                   provenance="activity" if marker else "delegation")
                 messages.append(message)
             note = "\n\n".join(message["note"] for message in messages)
             saved = json.dumps({"kind": "kanban", "note": note, "last_note": incoming, "marker": marker,
@@ -705,10 +706,13 @@ class Bridge:
             def steer() -> bool:
                 if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
                     for message in messages:
-                        if "activity_id" not in message:
-                            raise LinearError("Saved specialist reply lacks actor provenance", retryable=False)
-                        if message["activity_id"]:
+                        session = self.api.agent_session(message.get("session_id"))
+                        if session["issue"]["id"] != row["issue_id"]:
+                            raise LinearError("Saved specialist reply session changed issue", retryable=False)
+                        if message.get("provenance") == "activity" and message.get("activity_id"):
                             self.api.agent_activity(message["activity_id"], message["session_id"])
+                        elif message.get("provenance") != "delegation" or message.get("activity_id"):
+                            raise LinearError("Saved specialist reply lacks actor provenance", retryable=False)
                 for message in messages:
                     self.kanban.comment(task.id, message["note"], marker=message["key"])
                 waiting = self.kanban.get(task.id)
@@ -1162,6 +1166,10 @@ class Bridge:
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row): raise ProjectUpdateDeferred
+            if payload.get("superseded_receipt"):
+                issue = self._effect_issue(payload["issue_id"])
+                if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                        (issue.get("state") or {}).get("type") == "canceled"): raise ProjectUpdateDeferred
             if payload.get("content_action") or row and row.get("kind") == "description":
                 work = self.store.get(payload.get("issue_id", ""))
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or
@@ -1220,8 +1228,11 @@ class Bridge:
             if not status or not status["payload"].get("superseded") or kind not in ("activity", "comment"):
                 return False
             content = payload["content"] if kind == "activity" else payload
-            content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
-                               content["body"].replace("Done.", "Finished locally.", 1))
+            if not payload.get("superseded_receipt"):
+                content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
+                                   content["body"].replace("Done.", "Finished locally.", 1))
+            payload["superseded_receipt"] = True
+            self.store.rewrite(row["id"], payload, row["next_at"])
         if kind != "project_update" and payload.get("terminal") and not payload.get("admission_id"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
