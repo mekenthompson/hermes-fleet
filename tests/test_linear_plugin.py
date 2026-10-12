@@ -40,9 +40,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Measured 4100; do not minify those authorization branches.
 # Definite 401 refreeze keeps an already-started project create frozen. Measured 4132, allowance 8.
 # Agent progress activities add action content, ephemeral current-step replacement, and comment text.
-# Comment rows are identified by the event timestamp, not by length.
-# Measured 4222, allowance 8.
-BUDGET = 4230
+# Named board init registers board.json so the dispatcher can discover a database stub.
+# Measured 4226, allowance 8.
+BUDGET = 4234
 
 
 class FakeContext:

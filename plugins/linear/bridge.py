@@ -168,7 +168,11 @@ class Kanban:
         self.kb, self.kc, self.kn, self.board = kanban_db, kanban_db_connect, kanban_db_notify, board
         self.executor_profile = self.resolve_executor_profile(profile, profile_home) if profile is not None else None
         self.profile_home = Path(profile_home).resolve(strict=True) if profile is not None else None
-        kanban_db_connect.init_db(board=board)
+        if board and board != "default":
+            from hermes_cli.kanban_db_boards import create_board
+            create_board(board)
+        else:
+            kanban_db_connect.init_db(board=board)
     @staticmethod
     def resolve_executor_profile(profile: str, profile_home: Any) -> str:
         from hermes_cli.profiles import get_profile_dir, profile_exists
