@@ -1692,7 +1692,7 @@ class SessionRequesterTests(unittest.TestCase):
                 self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], False)
             else:
                 self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
-        self.assertFalse(self.store.project_not_applied(row_id, known_rejection=True))
+        self.assertTrue(self.store.project_not_applied(row_id, known_rejection=True))
         self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
 
     def test_definite_401_refreezes_unsent_body_and_does_not_clear_started_marker(self):
@@ -1722,6 +1722,14 @@ class SessionRequesterTests(unittest.TestCase):
         )
         self.assertIs(self.store.outbox_row(open_id)["payload"]["write_started"], True)
         self.assertNotIn("new body", json.dumps(self.store.outbox_row(open_id)["payload"]))
+        retried = {"issue_id": "update:synthetic", "session_id": "retry", "project_id": PROJECT,
+                   "resolve": ISSUE, "lines": {"OPS-1": "later"}, "line_issues": {"OPS-1": ISSUE}}
+        retry_id = self.store.enqueue("project_update", retried, at=0)
+        self.store.retry(self.store.outbox_row(retry_id), 0)
+        due = self.store.outbox_row(retry_id)
+        self.assertGreater(due["attempts"], 0)
+        self.assertNotIn("write_started", due["payload"])
+        self.assertTrue(self.store.freeze_project_update(retry_id, due["payload"], due["next_at"], "Agent update", PROJECT))
 
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()
