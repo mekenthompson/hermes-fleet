@@ -431,7 +431,11 @@ bindings in the outbox payload, so closeout remains authorized after that work
 row is deleted and cannot borrow a successor's authority. Every transport attempt,
 including a credential-refresh retry, rechecks authority after credential resolution.
 Saved reply messages retain their activity and session IDs for actor verification
-before restart delivery. Legacy effects or reply intents lacking those bindings
+before restart delivery. Each saved session is independently resolved and each
+reply requires nonempty activity provenance; delegation resumes carry an explicit
+delegation provenance type. Incompatible requester bindings remain separate project
+update batches, and transport admission independently checks superseded ownership.
+Legacy effects or reply intents lacking those bindings
 fail closed and require reconciliation instead of borrowing current work authority.
 Every effect resolves that session again;
 issue authorship alone never grants authority in this mode. Mentions use the same
@@ -460,7 +464,7 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 4,050 lines. This includes the bounded
+The production implementation is capped at 4,100 lines. This includes the bounded
 session-requester authorization path and existing recovery/transport safeguards.
 The unit suite enforces measured headroom without compressing safety-critical branches.
 

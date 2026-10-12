@@ -1453,6 +1453,143 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.authority.mutations, [])
 
+    def test_saved_each_session(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+        self.bridge.flush()
+        successor = 'successor-session'
+        self.authority.sessions[successor] = {'id': successor, 'issue': {'id': ISSUE}, 'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+        self.authority.activities['successor-activity'] = {'id': 'successor-activity', 'user': {'id': USER}, 'agentSession': {'id': successor}}
+        old = self.kanban.comment
+        self.kanban.comment = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('before delivery'))
+        with self.assertRaises(RuntimeError): self.bridge.handle_webhook(self.session_event('prompted'))
+        event = self.session_event('prompted')
+        event['agentSession']['id'] = successor
+        event['agentActivity']['id'] = 'successor-activity'
+        event['createdAt'] = '2026-01-01T00:00:01Z'
+        with self.assertRaises(RuntimeError): self.bridge.handle_webhook(event)
+        self.kanban.comment = old
+        self.authority.sessions[SESSION]['appUser'] = {'id': 'foreign-app'}
+        bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'}), self.kanban, profile='synthetic')
+        bridge._recover_kanban()
+        self.assertEqual(self.kanban.comments, [], 'old saved session wrong app must prevent every delivery')
+
+    def test_blank_legacy_provenance(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+        self.bridge.flush()
+        stamp = self.store.get(ISSUE)['last_updated_at'] + 1
+        note = 'legacy reply missing actor provenance'
+        key = f'{SESSION}:{stamp}:{note}'
+        intent = {'kind': 'kanban', 'note': note, 'last_note': note, 'marker': '', 'markers': [key], 'messages': [{'key': key, 'note': note, 'activity_id': '', 'session_id': SESSION}], 'session_id': SESSION, 'stamp': stamp, 'receipt': 'receipt'}
+        self.store.update(ISSUE, pending_resume=json.dumps(intent), last_updated_at=stamp)
+        self.bridge._recover_kanban()
+        self.assertEqual(self.kanban.comments, [], 'empty activity id is missing provenance, not authority')
+
+    def test_direct_activity_target_retry(self):
+        self.bridge.handle_webhook(self.session_event())
+        other = 'other-session'
+        self.authority.sessions[other] = {'id': other, 'issue': {'id': ISSUE}, 'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+        original = self.api.transport
+        attempts = []
+        def provider(): return 'synthetic'
+        provider.invalidate = lambda: None
+        self.api.token = provider
+        def transport(url, body, headers):
+            query = json.loads(body)['query']
+            if query.lstrip().startswith('mutation'):
+                attempts.append(query)
+                if len(attempts) == 1:
+                    self.authority.sessions[other]['appUser'] = {'id': 'foreign-app'}
+                    return 401, {}, b'{}'
+            return original(url, body, headers)
+        self.api.transport = transport
+        with self.assertRaises(LinearError):
+            self.api.create_activity('client', other, {'type': 'response', 'body': 'must not deliver'}, issue_id=ISSUE)
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(len(attempts), 1, 'must recheck actual target session after credential refresh')
+
+    def test_direct_project_target_retry(self):
+        self.api = self.authority.api(scope={'all_teams': True, 'all_projects': True, 'allowed_requester_ids': [USER], 'requester_basis': 'agent_session'})
+        self.bridge = Bridge(self.store, self.api, self.kanban, profile='synthetic')
+        self.bridge.handle_webhook(self.session_event())
+        original = self.api.transport
+        attempts = []
+        def provider(): return 'synthetic'
+        provider.invalidate = lambda: None
+        self.api.token = provider
+        def transport(url, body, headers):
+            query = json.loads(body)['query']
+            if query.lstrip().startswith('mutation'):
+                attempts.append(query)
+                if len(attempts) == 1:
+                    self.authority.issues[ISSUE]['project'] = {'id': 'other-project'}
+                    return 401, {}, b'{}'
+            return original(url, body, headers)
+        self.api.transport = transport
+        with self.assertRaises(LinearError):
+            self.api.create_project_update('client', PROJECT, 'must not deliver', issue_ids=[ISSUE])
+        self.assertEqual(self.authority.mutations, [])
+        self.assertEqual(len(attempts), 1, 'must recheck membership of actual target project after credential refresh')
+
+    def test_terminal_successor_during_credentials(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+        self.bridge.flush()
+        task = self.kanban.tasks['task-1']
+        task.status = 'done'
+        self.kanban.evidence_text = lambda task: 'https://example.test/findings'
+        self.bridge.pump_kanban()
+        self.bridge.await_retired(ISSUE)
+        self.authority.mutations.clear()
+        changed = []
+        def provider():
+            if getattr(self.api._graphql_permit, 'issue_targets', ()) and not changed:
+                changed.append(True)
+                self.store.put(ISSUE, 'kanban', SESSION, task_id='successor-task', project_id=PROJECT)
+            return 'synthetic'
+        self.api.token = provider
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, [], 'terminal status must recheck superseded ownership at transport attempt')
+
+    def test_coalesced_original_binding(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+        self.bridge.flush()
+        self.bridge.project_update('shared-batch', PROJECT, 'OPS-1', 'original line', quiet=False, issue_id=ISSUE)
+        other = 'successor-session'
+        self.authority.sessions[other] = {'id': other, 'issue': {'id': ISSUE}, 'creator': {'id': USER}, 'appUser': {'id': VIEWER}}
+        self.store.update(ISSUE, owner_ref=other)
+        self.bridge.project_update('shared-batch', PROJECT, 'OPS-RENAMED', 'successor line', quiet=False, issue_id=ISSUE)
+        payload = self.store.project_update('shared-batch', PROJECT)['payload']
+        batches = [r['payload'] for r in self.store.pending() if r['kind'] == 'project_update']
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(batches[0]['requester_sessions'], {ISSUE: SESSION})
+        self.assertEqual(batches[1]['requester_sessions'], {ISSUE: other})
+        self.assertEqual(set(batches[0]['lines']), {'OPS-1'})
+        self.assertEqual(set(batches[1]['lines']), {'OPS-RENAMED'})
+        self.authority.sessions[SESSION]['creator'] = {'id': 'foreign'}
+        self.authority.mutations.clear()
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, [], 'original retained line must not borrow successor binding')
+
+
+    def test_typed_delegation_resume_rechecks_session_and_recovers(self):
+        self.bridge.handle_webhook(self.session_event())
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        original = self.kanban.comment
+        def crash(*args, **kwargs): raise RuntimeError("interrupted delegation receipt")
+        self.kanban.comment = crash
+        row = self.store.get(ISSUE)
+        with self.assertRaises(RuntimeError):
+            self.bridge._resume(row, "Verified delegation resumed", SESSION, row["last_updated_at"] + 1)
+        self.kanban.comment = original
+        self.authority.requests.clear()
+        self.bridge._recover_kanban()
+        self.assertTrue(any("query AgentSessionAuthorization" in q for q in self.authority.requests))
+        self.assertTrue(self.kanban.comments)
+        self.assertIsNone(self.store.get(ISSUE)["pending_resume"])
+
     def test_unbound_issue_does_not_gain_authority_from_author(self):
         self.authority.issues[ISSUE] = issue_record()
         with self.assertRaises(LinearError):
