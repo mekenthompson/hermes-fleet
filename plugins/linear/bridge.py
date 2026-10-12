@@ -32,32 +32,43 @@ def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
     return author == "linear" or author.startswith("linear:")
-def resolve_comment_body(comments, author: str, length: int) -> str:
-    """Match the comment core stored for a commented event.
+def resolve_comment_body(comments, author: str, length: int, *, event_at: int | None = None) -> str:
+    """Match the comment row written in the same core transaction as the event.
 
-    add_comment stores author.strip() and body.strip(), but the event records
-    the raw author and len(raw body). A trailing newline must still resolve.
-    Ambiguous same-length comments are refused rather than guessed. Bridge
-    authors are never published back to Linear.
+    add_comment stores author.strip() and body.strip(), then records the raw
+    author and len(raw body). The event timestamp identifies that row. Length
+    is only a cross-check. An exact length match is not preferred over another
+    row, and more than one candidate is refused.
     """
     raw_author = str(author or "")
     stored_author = raw_author.strip()
     if (not stored_author or _bridge_comment_author(raw_author)
-            or _bridge_comment_author(stored_author)):
+            or _bridge_comment_author(stored_author) or event_at is None):
         return ""
     try:
         raw_len = int(length)
+        stamped = int(event_at)
     except (TypeError, ValueError):
         return ""
-    owned = [item for item in comments if getattr(item, "author", None) == stored_author]
-    exact = [item for item in owned if len(item.body) == raw_len]
-    if len(exact) == 1:
-        return item_body(exact[0])
-    if exact:
+    candidates = []
+    earlier = []
+    for item in comments:
+        if getattr(item, "author", None) != stored_author:
+            continue
+        created = getattr(item, "created_at", None)
+        body = item_body(item)
+        if len(body) > raw_len:
+            continue
+        if created == stamped:
+            candidates.append(body)
+        elif created == stamped - 1:
+            earlier.append(body)
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
         return ""
-    padded = [item for item in owned if item.body == item.body.strip() and 0 < raw_len - len(item.body)]
-    if len(padded) == 1:
-        return item_body(padded[0])
+    if len(earlier) == 1:
+        return earlier[0]
     return ""
 def item_body(item) -> str:
     return str(getattr(item, "body", "") or "")
@@ -197,10 +208,10 @@ class Kanban:
         with self.conn() as conn:
             return [event for event in self.kb.list_events(conn, task_id)
                     if event.id > after_id and event.kind in EVENT_KINDS]
-    def comment_text(self, task_id: str, author: str, length: int) -> str:
+    def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.conn() as conn:
             comments = self.kb.list_comments(conn, task_id)
-        return resolve_comment_body(comments, author, length)
+        return resolve_comment_body(comments, author, length, event_at=event_at)
     def evidence_text(self, task) -> str:
         with self.conn() as conn:
             run = self.kb.latest_run(conn, task.id)
@@ -976,8 +987,11 @@ class Bridge:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
         elif event.kind == "commented":
             reader = getattr(self.kanban, "comment_text", None)
-            body = _progress_text(reader(row["task_id"], str(payload.get("author") or ""),
-                                         int(payload.get("len") or 0)) if callable(reader) else "", 800)
+            event_at = getattr(event, "created_at", None)
+            body = ""
+            if callable(reader) and event_at is not None:
+                body = _progress_text(reader(row["task_id"], str(payload.get("author") or ""),
+                                             int(payload.get("len") or 0), event_at), 800)
             if body:
                 writes = [("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                         "content": {"type": "thought", "body": body}, **route})]

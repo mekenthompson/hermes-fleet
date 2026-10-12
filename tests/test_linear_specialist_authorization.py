@@ -1265,11 +1265,11 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         row = self.store.get(ISSUE)
-        setattr(self.kanban, "comment_text", lambda task_id, author, length: "Checked the Sydney stock file" if length == 29 else "")
+        setattr(self.kanban, "comment_text", lambda task_id, author, length, event_at: "Checked the Sydney stock file" if length == 29 else "")
         self.bridge._task_event(row, SimpleNamespace(id=9, kind="heartbeat", payload={"note": "Reading the stock report"}), "running", {})
         self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(id=10, kind="heartbeat", payload={}), "running", {})
         self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(
-            id=11, kind="commented", payload={"author": "worker", "len": 29}), "running", {})
+            id=11, kind="commented", payload={"author": "worker", "len": 29}, created_at=11), "running", {})
         actions = [item["payload"] for item in self.store.pending()
                    if item["kind"] == "activity" and item["payload"]["content"].get("type") == "action"]
         thoughts = [item["payload"]["content"].get("body") for item in self.store.pending()
@@ -1282,13 +1282,15 @@ class SessionRequesterTests(unittest.TestCase):
     def test_comment_resolver_uses_core_strip_contract_and_skips_bridge_authors(self):
         from types import SimpleNamespace
         from hermes_fleet_linear_plugin.bridge import resolve_comment_body
-        stored = SimpleNamespace(author="worker", body="hello")
-        self.assertEqual(resolve_comment_body([stored], "worker\n", len("hello\n")), "hello")
-        other = SimpleNamespace(author="worker", body="hello")
-        self.assertEqual(resolve_comment_body([stored, other], "worker", len("hello")), "")
-        self.assertEqual(resolve_comment_body([stored], "linear", len("hello")), "")
-        marked = SimpleNamespace(author="linear:abc", body="Keep this instruction")
-        self.assertEqual(resolve_comment_body([marked], "linear:abc", len("Keep this instruction")), "")
+        stored = SimpleNamespace(author="worker", body="hello", created_at=20)
+        earlier = SimpleNamespace(author="worker", body="ok", created_at=10)
+        same_len = SimpleNamespace(author="worker", body="abcdef", created_at=10)
+        self.assertEqual(resolve_comment_body([earlier, stored], "worker\n", len("hello\n"), event_at=20), "hello")
+        self.assertEqual(resolve_comment_body([same_len, stored], "worker", len("hello\n"), event_at=20), "hello")
+        self.assertEqual(resolve_comment_body([stored, SimpleNamespace(author="worker", body="hello", created_at=20)], "worker", len("hello"), event_at=20), "")
+        self.assertEqual(resolve_comment_body([stored], "linear", len("hello"), event_at=20), "")
+        marked = SimpleNamespace(author="linear:abc", body="Keep this instruction", created_at=20)
+        self.assertEqual(resolve_comment_body([marked], "linear:abc", len("Keep this instruction"), event_at=20), "")
 
     def test_foreign_requester_cannot_use_allowed_author_or_poison_issue(self):
         self.authority.issues[ISSUE] = issue_record()

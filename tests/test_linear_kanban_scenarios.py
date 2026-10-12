@@ -2890,6 +2890,22 @@ class LinearKanbanScenarios(unittest.TestCase):
         with self.bridge.kanban.conn() as conn:
             self.assertEqual(sum(c.body.count("Keep this instruction") for c in kb.list_comments(conn, task)), 1)
 
+    def test_trailing_newline_comment_resolves_its_own_row_not_an_earlier_one(self):
+        self.delegate()
+        task = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            kb.add_comment(conn, task, author="worker", body="ok")
+        time.sleep(1.1)
+        with self.bridge.kanban.conn() as conn:
+            kb.add_comment(conn, task, author="worker", body="hello\n")
+        time.sleep(1.1)
+        with self.bridge.kanban.conn() as conn:
+            kb.add_comment(conn, task, author="worker", body="abcdef")
+        self.bridge.tick()
+        thoughts = [a["content"].get("body") for a in self.linear.activities if a["content"].get("type") == "thought"]
+        self.assertIn("hello", thoughts)
+        self.assertEqual(thoughts.count("hello"), 1)
+
     def test_stop_caused_triage_holds_live_worker_across_restart(self):
         from hermes_fleet_linear_plugin.api import LinearError
         with self.stopped_worker() as (process, task, event):
