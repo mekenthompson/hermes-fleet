@@ -239,9 +239,9 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 | Event | Kanban | Linear |
 |---|---|---|
 | Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A receipt thought, sent after the first ownership read and before any Kanban wait, so it meets Linear's 10 s limit. Then task progress and the claim. The receipt is advisory: ownership admits the work, and a lost or refused receipt never blocks it |
-| Delegation we will not act on (now delegated elsewhere, or closed) | none | One `response` saying why, so the session is not left unresponsive |
-| Work runs 20 minutes with no activity | none | An ephemeral "Working" (or "Waiting to resume") action, so the session does not go stale at 30 minutes. Never while waiting for input |
-| Claiming an issue | none | Delegate = self. Status moves to the configured `in_progress` state only if the issue has not started (or is in the configured `blocked` state); a team without that state name uses its first `started` state by position |
+| Delegation or follow-up we will not act on | none | One `response` saying why, once Linear confirms the issue is closed or delegated elsewhere, so the session is not left unresponsive. A failed read retries the delivery instead |
+| Work runs about 20 minutes with no activity accepted on its session | none | An ephemeral "Working" (or "Waiting to resume") action, so the session does not go stale at 30 minutes. Never while waiting for input |
+| Claiming an issue | none | Delegate = self. Status moves to the configured `in_progress` state unless the issue already sits in another `started` state (the configured `blocked` state does move). Re-delegating a closed issue reopens it. A team without that state name uses its first `started` state by position, with a warning |
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
 | Follow-up prompt | Task comment, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |

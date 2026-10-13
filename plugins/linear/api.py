@@ -395,5 +395,7 @@ def state_id(issue: dict[str, Any], name: str, *, first_started: bool = False) -
             return str(node["id"])
     started = sorted((n for n in nodes if n.get("type") == "started"), key=lambda n: n.get("position") or 0)
     if first_started and started:
+        logging.getLogger("linear").warning("linear: team has no '%s' state; using first started state '%s'",
+                                            name, started[0].get("name"))
         return str(started[0]["id"])
     raise LinearError(f"team has no '{name}' workflow state; add it or fix the states config", retryable=False)
