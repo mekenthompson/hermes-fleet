@@ -500,6 +500,12 @@ class Bridge:
         candidates.extend((payload.get("line_issues") or {}).values())
         return list(dict.fromkeys(issue_id for issue_id in candidates if issue_id))
     @contextmanager
+    def _one_try(self, row):
+        """A thought or action is tried once: whatever held it, it never lands after a Stop, question or result."""
+        try: yield
+        finally:
+            if advisory(row): self.store.retire_advisory(row["id"], self.clock())
+    @contextmanager
     def _outbox_requester_scope(self, row):
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             with self.api.requester_session(row["payload"].get("requester_sessions") or {}): yield
@@ -1205,10 +1211,9 @@ class Bridge:
             progress = False
             for row in self.store.due(self.clock()):
                 if only_id is not None and row["id"] != only_id: continue
-                with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row):
+                with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row), self._one_try(row):
                     if not self._authorize_outbox_effect(row):
-                        if advisory(row):
-                            self.store.retire_advisory(row["id"]); continue
+                        if advisory(row): continue
                         payload = row["payload"]
                         missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
                                    and any(not (payload.get("requester_sessions") or {}).get(issue_id)
@@ -1248,9 +1253,9 @@ class Bridge:
                             if not denied and targets:
                                 self._fence_scope_denial(targets[0], exc)
                             continue
-                        if advisory(row):  # one try: a late thought could land after a Stop or a question
+                        if advisory(row):
                             log.warning("linear: dropped %s activity %s: %s", row["payload"]["content"]["type"], row["id"], exc)
-                            self.store.retire_advisory(row["id"]); progress = True
+                            progress = True
                         elif not exc.retryable:
                             self.store.mark(row["id"], "failed")
                             if row["payload"].get("reconcile_required"): progress = True
@@ -1287,7 +1292,7 @@ class Bridge:
                         (issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()) or
                         ((issue.get("state") or {}).get("type") in CLOSED and
                          float(payload.get("source_ms") or 0) < self.closure_ms(issue))):
-                    self.store.retire_advisory(row_id)  # moot once ownership moved; never hold it pending
+                    self.store.retire_advisory(row_id, self.clock())  # moot once ownership moved; never hold it
                     raise ProjectUpdateDeferred
             if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
                         payload.get("superseded_receipt")):

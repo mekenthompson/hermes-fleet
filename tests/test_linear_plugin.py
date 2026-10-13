@@ -44,14 +44,16 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Measured 4226, allowance 8.
 # Advisory thoughts replace the acknowledgement gate; ingress deliveries back off durably.
 # Two duplicated lookups were folded to pay for most of it. Independent review added one-try
-# thoughts, a 15 s Stop retry cap and a one-day retry ceiling. Measured 4252, allowance 0:
-# remove lines before adding them.
-BUDGET = 4252
+# thoughts, a 15 s Stop retry cap and a one-day retry ceiling. Measured 4252.
+# ops.py gives every fence a visible reason and a supported command (status, resolve, replay).
+# Measured 4369, allowance 0: remove lines before adding them.
+BUDGET = 4369
 
 
 class FakeContext:
     def __init__(self, settings: dict) -> None:
         self.settings, self.tools, self.hooks, self.services = settings, [], [], []
+        self.cli_commands, self.commands = [], []
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
@@ -64,6 +66,12 @@ class FakeContext:
 
     def register_profile_service(self, name, factory):
         self.services.append(name)
+
+    def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
+        self.cli_commands.append(name)
+
+    def register_command(self, name, handler, description="", args_hint="", argument_mode=None):
+        self.commands.append(name)
 
 
 class LinearOutboxOrderTests(unittest.TestCase):
@@ -140,6 +148,8 @@ class LinearPluginUnitTests(unittest.TestCase):
         self.assertIn("expected_description", on.tools[0]["schema"]["parameters"]["properties"])
         self.assertIn("headings", on.tools[0]["schema"]["parameters"]["properties"]["body"]["description"])
         self.assertEqual((on.hooks, on.services), (["on_session_end"], ["linear"]))
+        self.assertEqual((on.cli_commands, on.commands), (["linear"], ["linear-status"]))
+        self.assertEqual((idle.cli_commands, idle.commands), ([], []))
         contract = json.loads((ROOT / "contracts" / "plugins.json").read_text(encoding="utf-8"))
         self.assertFalse(next(c for c in contract["components"] if c["id"] == "linear")["default_enabled"])
 
@@ -148,7 +158,7 @@ class LinearPluginUnitTests(unittest.TestCase):
                     for p in PLUGIN.iterdir() if p.suffix in {".py", ".yaml"})
         self.assertLessEqual(lines, BUDGET)
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "oauth.py", "plugin.yaml",
+                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "oauth.py", "ops.py", "plugin.yaml",
                           "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:
