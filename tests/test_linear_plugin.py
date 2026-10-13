@@ -45,9 +45,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Advisory thoughts replace the acknowledgement gate; ingress deliveries back off durably.
 # Two duplicated lookups were folded to pay for most of it. Independent review added one-try
 # thoughts, a 15 s Stop retry cap and a one-day retry ceiling. Measured 4252.
-# ops.py gives every fence a visible reason and a supported command (status, resolve, replay).
-# Measured 4369, allowance 0: remove lines before adding them.
-BUDGET = 4369
+# ops.py gives every fence a visible reason and a supported command (status, resolve, replay);
+# review added in-flight refusal, ACT-only exit codes, legacy-schema tolerance and the gateway's
+# profile rule. Measured 4389, allowance 0: remove lines before adding them.
+BUDGET = 4389
 
 
 class FakeContext:

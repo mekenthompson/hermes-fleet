@@ -395,11 +395,12 @@ def register(ctx: Any) -> None:
         home = active_home()
         return (Path(ctx.get_config("state_database") or home / "linear" / "state.db"),
                 Path(ctx.get_config("ingress_database") or home / "workspace" / "linear" / "ingress.db"),
-                validate_ingress_profile(ctx.get_config("ingress_profile")) or getattr(ctx, "profile_name", "default"))
+                validate_ingress_profile(ctx.get_config("ingress_profile")) or  # the gateway's own profile rule
+                os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or "default")
     if hasattr(ctx, "register_cli_command"):  # hermes linear status | resolve | replay
         ctx.register_cli_command("linear", "Show and resolve held Linear work", ops.setup,
                                  lambda args: ops.run(args, *paths()))
-    if hasattr(ctx, "register_command"):  # read-only, from any chat surface
+    if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):  # other requesters share chat
         ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths())),
                              description="Show held Linear work and the next step")
 
