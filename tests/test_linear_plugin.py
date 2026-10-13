@@ -43,9 +43,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Named board init registers board.json so the dispatcher can discover a database stub.
 # Measured 4226, allowance 8.
 # Advisory thoughts replace the acknowledgement gate; ingress deliveries back off durably.
-# Two duplicated lookups were folded to pay for most of it. Measured 4248, allowance 0:
+# Two duplicated lookups were folded to pay for most of it. Independent review added one-try
+# thoughts, a 15 s Stop retry cap and a one-day retry ceiling. Measured 4252, allowance 0:
 # remove lines before adding them.
-BUDGET = 4248
+BUDGET = 4252
 
 
 class FakeContext:

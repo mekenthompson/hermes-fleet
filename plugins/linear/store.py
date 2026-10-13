@@ -579,8 +579,8 @@ class Store:
             existing = db.execute("SELECT kind, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if existing:
                 saved = json.loads(existing["payload"])
-                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in
-                        ("issue_id", "body", "expected_description", "id", "session_key", "work_owner")):
+                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in  # a stamped work_owner is not the caller's
+                        ("issue_id", "body", "expected_description", "id", "session_key", "work_owner") if k in payload or k != "work_owner"):
                     return row_id
                 raise ValueError("outbox id reused with conflicting content")
             if not self._effect_admitted(db, *self._targets(payload)): return ""
@@ -639,9 +639,13 @@ class Store:
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
-            rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND "
+            rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND NOT " + ADVISORY + " AND "
                               "COALESCE(json_extract(payload, '$.reported'), 0) = 0 ORDER BY rowid").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+    def retire_advisory(self, row_id: str) -> None:
+        """Retire an advisory thought or action. It changes no issue, so no fence has to admit this."""
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND " + ADVISORY, (row_id,))
     def mark(self, row_id: str, state: str) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return

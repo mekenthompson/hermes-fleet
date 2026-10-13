@@ -27,10 +27,11 @@ URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
                   "/merge_requests/", "/merge-requests/")
-# A failing delivery is retried after 5 s, then with doubling gaps up to 15 min, so one bad event
-# cannot flood logs and Linear quota or hold newer deliveries behind the batch limit.
-INGRESS_DUE = ("(attempts <= 0 OR received_at + CASE WHEN attempts > 7 THEN 635 + (attempts - 7) * 900 "
-               "ELSE 5 * ((1 << attempts) - 1) END <= ?)")
+def ingress_due(gap: int) -> str:
+    """A failing delivery is retried 5 s after receipt, then at doubling gaps of at most `gap` s, and once
+    more after a day so it parks loudly. One bad event cannot flood logs and quota or hold newer ones back."""
+    return ("(attempts <= 0 OR received_at + MIN(86401, %d * attempts, CASE WHEN attempts > 7 THEN 635 + "
+            "(attempts - 7) * 900 ELSE 5 * ((1 << attempts) - 1) END) <= ?)" % gap)
 OWN = "linear:"  # reason prefix on blocks this plugin makes, so their events are not echoed back
 def stable_uuid4(*parts: str) -> str:
     """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
@@ -1206,6 +1207,8 @@ class Bridge:
                 if only_id is not None and row["id"] != only_id: continue
                 with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row):
                     if not self._authorize_outbox_effect(row):
+                        if advisory(row):
+                            self.store.retire_advisory(row["id"]); continue
                         payload = row["payload"]
                         missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
                                    and any(not (payload.get("requester_sessions") or {}).get(issue_id)
@@ -1245,9 +1248,12 @@ class Bridge:
                             if not denied and targets:
                                 self._fence_scope_denial(targets[0], exc)
                             continue
-                        if not exc.retryable:
+                        if advisory(row):  # one try: a late thought could land after a Stop or a question
+                            log.warning("linear: dropped %s activity %s: %s", row["payload"]["content"]["type"], row["id"], exc)
+                            self.store.retire_advisory(row["id"]); progress = True
+                        elif not exc.retryable:
                             self.store.mark(row["id"], "failed")
-                            if row["payload"].get("reconcile_required") or advisory(row): progress = True  # don't delay the next write
+                            if row["payload"].get("reconcile_required"): progress = True
                         else:
                             self.store.retry(row, self.clock())
                         continue
@@ -1255,11 +1261,6 @@ class Bridge:
                         sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 if only_id is not None and row["id"] != only_id: continue
-                if advisory(row):
-                    log.warning("linear: dropped undeliverable %s activity %s for %s", row["payload"]["content"]["type"],
-                                row["id"], row["payload"].get("issue_id"))
-                    self.store.report(row["id"])
-                    continue
                 if not self._authorize_outbox_effect(row): continue
                 with self.store.guard_outbox(row["id"], "failed") as admitted:
                     if not admitted: continue
@@ -1286,8 +1287,7 @@ class Bridge:
                         (issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()) or
                         ((issue.get("state") or {}).get("type") in CLOSED and
                          float(payload.get("source_ms") or 0) < self.closure_ms(issue))):
-                    self.store.mark(row_id, "failed")  # moot once ownership moved; never hold it pending
-                    self.store.report(row_id)
+                    self.store.retire_advisory(row_id)  # moot once ownership moved; never hold it pending
                     raise ProjectUpdateDeferred
             if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
                         payload.get("superseded_receipt")):
@@ -1583,7 +1583,7 @@ class Bridge:
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
                           "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
                           "json_extract(payload, '$.agentActivity.signal') END='stop' "
-                          f"AND (? IS NULL OR {INGRESS_DUE}) ORDER BY received_at, delivery_id",
+                          f"AND (? IS NULL OR {ingress_due(15)}) ORDER BY received_at, delivery_id",
                           (self.ingress_profile, due_at, due_at)).fetchall()
     def _queued_stop(self, issue_id: str, stamp: float) -> bool:
         if self._ingress is None or not self._ingress.exists(): return False
@@ -1603,7 +1603,7 @@ class Bridge:
             owned = {row["issue_id"] for row in self.store.active()}
             stops = [row[:5] for row in self._stop_deliveries(db, now) if not row[5] or row[5] in owned][:limit]
             rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at, attempts FROM deliveries "
-                              f"WHERE profile = ? AND status = 'pending' AND {INGRESS_DUE} "
+                              f"WHERE profile = ? AND status = 'pending' AND {ingress_due(900)} "
                               "ORDER BY received_at, delivery_id LIMIT ?", (self.ingress_profile, now, limit)).fetchall()
             selected = {(row[0], row[1]) for row in stops}
             rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
