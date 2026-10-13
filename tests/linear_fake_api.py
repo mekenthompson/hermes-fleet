@@ -174,7 +174,12 @@ class FakeLinear:
         if "issue(" in query:
             issue = self.issues.get(variables["id"]) or next(
                 (i for i in self.issues.values() if i["identifier"] == variables["id"]), None)
-            return 200, {"data": {"issue": json.loads(json.dumps(issue)) if issue else None}}
+            issue = json.loads(json.dumps(issue)) if issue else None
+            if issue and "comments(" in query:
+                issue["comments"] = {"nodes": [
+                    {"body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()), "user": {"name": c.get("author", "Pat Example")}}
+                    for c in self.comments if c.get("issueId") == issue["id"]]}
+            return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}
 
     def session_event(self, action: str, issue_id: str, session_id: str, *, body: str = "", signal: str | None = None,

@@ -277,6 +277,14 @@ class LinearAPI:
         if not data.get("issue"):
             raise LinearError(f"Linear issue {ref} not found", retryable=False)
         return data["issue"]
+    def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
+        """The issue's latest comments, oldest first: who wrote what, and when."""
+        data = self.graphql("query IssueThread($id: String!) { issue(id: $id) { comments(last: %d) "
+                            "{ nodes { body createdAt user { name } botActor { name } } } } }" % limit, {"id": issue_id})
+        nodes = ((data.get("issue") or {}).get("comments") or {}).get("nodes") or []
+        return sorted(({"at": str(n.get("createdAt") or ""), "body": str(n.get("body") or ""),
+                        "who": str((n.get("user") or n.get("botActor") or {}).get("name") or "unknown")}
+                       for n in nodes if isinstance(n, dict)), key=lambda comment: comment["at"])
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
                             "{ issueUpdate(id: $id, input: $input) { success } }",
