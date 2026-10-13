@@ -277,14 +277,20 @@ class LinearAPI:
         if not data.get("issue"):
             raise LinearError(f"Linear issue {ref} not found", retryable=False)
         return data["issue"]
+    def issue_with_thread(self, issue_id: str, limit: int = 50) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        """The issue and its latest comments, oldest first, in one read."""
+        data = self.graphql("query IssueThread($id: String!) { issue(id: $id) { %s comments(last: %d) "
+                            "{ nodes { body createdAt user { id name } botActor { name } } } } }" % (ISSUE_FIELDS, limit),
+                            {"id": issue_id})
+        if not data.get("issue"):
+            raise LinearError(f"Linear issue {issue_id} not found", retryable=False)
+        nodes = (data["issue"].get("comments") or {}).get("nodes") or []
+        return data["issue"], sorted(({"at": str(n.get("createdAt") or ""), "body": str(n.get("body") or ""),
+                                       "user_id": (n.get("user") or {}).get("id"),
+                                       "who": str((n.get("user") or n.get("botActor") or {}).get("name") or "unknown")}
+                                      for n in nodes if isinstance(n, dict)), key=lambda comment: comment["at"])
     def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
-        """The issue's latest comments, oldest first: who wrote what, and when."""
-        data = self.graphql("query IssueThread($id: String!) { issue(id: $id) { comments(last: %d) "
-                            "{ nodes { body createdAt user { name } botActor { name } } } } }" % limit, {"id": issue_id})
-        nodes = ((data.get("issue") or {}).get("comments") or {}).get("nodes") or []
-        return sorted(({"at": str(n.get("createdAt") or ""), "body": str(n.get("body") or ""),
-                        "who": str((n.get("user") or n.get("botActor") or {}).get("name") or "unknown")}
-                       for n in nodes if isinstance(n, dict)), key=lambda comment: comment["at"])
+        return self.issue_with_thread(issue_id, limit)[1]
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
                             "{ issueUpdate(id: $id, input: $input) { success } }",

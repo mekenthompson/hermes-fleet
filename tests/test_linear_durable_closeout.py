@@ -325,7 +325,8 @@ class DurableCloseoutTests(unittest.TestCase):
                     {'at': '2026-01-01T00:00:02Z', 'who': 'This Agent', 'body': 'Opened a PR for the token refresh.'}]
         with tempfile.TemporaryDirectory() as directory:
             bridge, authority, kanban, calls = self.thread_bridge(directory, comments)
-            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            delegated_at = 1767225610000  # 2026-01-01T00:00:10Z, after both comments
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, delegated_at, 'synthetic-start'))
             body = kanban.creates[0]['body']
             self.assertIn('Linear thread', body)
             self.assertLess(body.index('staging fix'), body.index('token refresh'))  # oldest first
@@ -350,6 +351,21 @@ class DurableCloseoutTests(unittest.TestCase):
             self.assertNotIn('note 5 ', since)
             self.assertIn('note 19 ', since)
             self.assertLessEqual(len(since), 8300)
+
+    def test_specialist_thread_keeps_only_allowed_requesters_and_this_app(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        authority = Authority()
+        authority.comments[ISSUE] = [
+            {'body': 'allowed requester', 'createdAt': '2026-01-01T00:00:01Z', 'user': {'id': USER, 'name': 'Ally'}},
+            {'body': 'refused stranger', 'createdAt': '2026-01-01T00:00:02Z', 'user': {'id': 'stranger', 'name': 'S'}},
+            {'body': 'this app', 'createdAt': '2026-01-01T00:00:03Z', 'user': {'id': VIEWER, 'name': 'Agent'}},
+            {'body': 'some bot', 'createdAt': '2026-01-01T00:00:04Z', 'botActor': {'name': 'Bot'}}]
+        api = authority.api()
+        self.assertEqual([c['body'] for c in api.issue_thread(ISSUE)], ['allowed requester', 'this app'])
+        self.assertEqual(sum('IssueThread' in q for q in authority.requests), 1)  # one read, scoped
+        authority.issues[ISSUE]['team'] = {'id': 'team-outside', 'key': 'OUT'}
+        with self.assertRaises(LinearError):
+            api.issue_thread(ISSUE)
 
     def test_inconsistent_ownership_read_retries_instead_of_dropping(self):
         from hermes_fleet_linear_plugin.api import LinearError

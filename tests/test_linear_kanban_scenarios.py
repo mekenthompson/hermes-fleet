@@ -867,6 +867,25 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Explicit new work"))
                 self.assertEqual(len(self.tasks()), 1)
 
+    def test_follow_up_brings_the_thread_since_the_last_update_once(self) -> None:
+        self.delegate()
+        task = self.task_id()
+        self.clock.now += 5
+        self.linear.comments.append({"issueId": ISSUE, "id": "c-thread", "body": "Staging is down; use the canary.",
+                                     "createdAt": self.clock.iso(), "author": "Pat Example"})
+        self.clock.now += 5
+        prompt = self.linear.session_event("prompted", ISSUE, "s-1", body="Please continue", activity_id="act-thread")
+        self.deliver(prompt)
+        self.linear.comments.append({"issueId": ISSUE, "id": "c-late", "body": "Written after the prompt.",
+                                     "createdAt": self.clock.iso(30), "author": "Pat Example"})
+        self.deliver(prompt)  # redelivered after the thread changed: still one instruction
+        with self.bridge.kanban.conn() as conn:
+            notes = "\n".join(c.body for c in kb.list_comments(conn, task))
+        self.assertEqual(notes.count("Please continue"), 1)
+        self.assertEqual(notes.count("Staging is down; use the canary."), 1)
+        self.assertNotIn("Written after the prompt", notes)
+        self.assertIn("since your last update", notes)
+
     def test_follow_up_is_forwarded_to_the_owner(self) -> None:
         self.delegate()
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Please also update the changelog"))
