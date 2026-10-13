@@ -305,8 +305,9 @@ when the first send begins.
 
 Every Linear write goes through a local outbox. Everything except Agent Activity thoughts and
 actions goes out oldest first per issue. Thoughts and actions are advisory progress: they never wait
-for, or hold back, another write. A refused or expired one is logged and dropped. It is never
-alerted, revived, or used to fence work.
+for, or hold back, another write, and each gets one try. A failed one is logged and dropped, never
+retried, alerted, revived, or used to fence work, so a late thought cannot land after a Stop,
+question or result.
 
 - **Creates** (comment, activity, project update) carry a UUID v4 client `id`, stored when the
   write is queued. Linear rejects a repeat with `INPUT_ERROR` "conflict on insert of ..." naming that
@@ -340,9 +341,10 @@ alerted, revived, or used to fence work.
   `X-RateLimit-*-Reset` time (epoch milliseconds).
 - **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
   outage. A failing inbox delivery is retried 5 seconds after receipt, then with doubling gaps up
-  to every 15 minutes, for a day before it is parked. Retries never hold newer deliveries back. The
-  first failure and the parking each log a traceback; retries in between log one line. HTTP 403
-  fails loudly at once.
+  to every 15 minutes (every 15 seconds for a Stop), and is tried once more after a day, then
+  parked. Retries never hold newer deliveries back, and a restart retries them all once. The first
+  failure and the parking each log a traceback; retries in between log one line. HTTP 403 fails
+  loudly at once.
 - **Missing states**: a configured state name that does not exist on the team fails loudly. Set a
   team's state to `null` to skip that status change. The comment or activity still posts.
 

@@ -1946,7 +1946,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.project_updates, [])
         self.assertIn("without evidence", self.linear.activities[-1]["content"]["body"])
 
-    def test_ack_transport_failure_never_blocks_work_and_delivers_one_receipt(self) -> None:
+    def test_ack_transport_failure_never_blocks_work_or_posts_late(self) -> None:
         from unittest.mock import patch
         event = self.linear.session_event("created", ISSUE, "receipt-retry")
         self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
@@ -1965,17 +1965,14 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.linear.activities, [])
         self.bridge = self.make_bridge()
-        self.clock.now += 61
-        self.bridge.tick()
-        receipts = [a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
-                    and "Received" in a["content"]["body"]]
-        self.assertEqual(len(receipts), 1)
+        self.clock.now += 3601
+        self.bridge.tick()  # a thought gets one try: a late one could land after a Stop or a question
         self.bridge = self.make_bridge()
         self.bridge.handle_webhook(event)
         self.bridge.tick()
         self.assertEqual(len(self.tasks()), 1)
-        self.assertEqual(len([a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
-                              and "Received" in a["content"]["body"]]), 1)
+        self.assertEqual(self.linear.activities, [])
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
 
     def test_refused_ack_imports_delivery_and_starts_work(self) -> None:
         from unittest.mock import patch

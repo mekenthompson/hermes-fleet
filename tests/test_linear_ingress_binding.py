@@ -93,6 +93,28 @@ class IngressBindingTests(unittest.TestCase):
         with patch.object(bridge, "handle_webhook"):
             bridge.recover(self.inbox)  # a restart retries backed-off deliveries at once
         self.assertEqual(self.statuses(), {"bad-1": "imported", "bad-2": "imported", "good": "imported"})
+        self.enqueue("default", "stuck", {"type": "unused", "tag": "bad-stuck"})
+        with closing(sqlite3.connect(self.inbox)) as db, db:  # stuck under the old every-tick loop
+            db.execute("UPDATE deliveries SET received_at = 1000, attempts = 1800 WHERE delivery_id = 'stuck'")
+        now[0] = 1000 + 86_402  # still tried once after a day, so it parks loudly instead of idling
+        with patch.object(bridge, "handle_webhook", side_effect=handle), self.assertLogs("linear", "ERROR"):
+            bridge.drain_ingress(self.inbox)
+        self.assertEqual(self.statuses()["stuck"], "failed")
+
+    def test_failing_stop_retries_within_fifteen_seconds(self):
+        from unittest.mock import patch
+        self.store.put("i", "chat", "owner")
+        stop = {"agentActivity": {"signal": "stop"}, "agentSession": {"issue": {"id": "i"}}}
+        self.enqueue("default", "stop", stop)
+        self.enqueue("default", "work", {"type": "unused"})
+        with closing(sqlite3.connect(self.inbox)) as db, db:
+            db.execute("UPDATE deliveries SET received_at = 1000, attempts = 8")
+        bridge = Bridge(self.store, SimpleNamespace(), SimpleNamespace(executor_profile="default"),
+                        profile="default", clock=lambda: 1000 + 120)
+        with patch.object(bridge, "handle_webhook") as handle:
+            bridge.drain_ingress(self.inbox)
+        self.assertEqual(handle.call_count, 1)  # the Stop is due; ordinary work waits its longer gap
+        self.assertEqual(self.statuses(), {"stop": "imported", "work": "pending"})
 
     def test_absent_binding_preserves_legacy_profile_selection(self):
         self.enqueue("default", "local")
