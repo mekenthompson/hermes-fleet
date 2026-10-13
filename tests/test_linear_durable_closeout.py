@@ -14,11 +14,36 @@ import unittest
 from pathlib import Path
 
 from test_linear_specialist_authorization import (
-    Authority, FakeKanban, Bridge, Store, ISSUE, SESSION, USER, VIEWER, SCOPE,
+    Authority, FakeKanban, Bridge, Store, ISSUE, SESSION, USER, VIEWER, SCOPE, issue_record,
 )
 
 
 class DurableCloseoutTests(unittest.TestCase):
+    def test_shared_store_effect_capture_fences_legacy_target_only(self):
+        for state in ('pending', 'failed'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / 'state.db')
+                store.put(ISSUE, 'chat', 'owner-chat')
+                receipt = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                    f'linear-session-received:{ISSUE}:{SESSION}'))
+                store.enqueue('activity', {'id': receipt, 'issue_id': ISSUE,
+                    'session_id': SESSION, 'initial_ack': True,
+                    'requester_sessions': {ISSUE: SESSION}}, at=1)
+                if state == 'failed': store.mark(receipt, 'failed')
+                before = store.outbox_row(receipt)
+                self.assertEqual(store.enqueue('comment', {'issue_id': ISSUE, 'body': 'No'}, at=2), '')
+                self.assertFalse(store.enqueue_many([('status', {'issue_id': ISSUE,
+                    'state': 'blocked'})], at=2))
+                self.assertFalse(store.finish(ISSUE, [('status', {'issue_id': ISSUE,
+                    'state': 'done'})], at=2))
+                self.assertFalse(store.queue_project_update({'issue_id': 'update:other',
+                    'session_id': 'other', 'project_id': 'project', 'lines': {'OPS-1': 'No'},
+                    'line_issues': {'OPS-1': ISSUE}, 'quiet': 0}, due=2, quiet=False))
+                self.assertEqual(store.get(ISSUE)['owner_ref'], 'owner-chat')
+                self.assertEqual(store.outbox_row(receipt), before)
+                self.assertTrue(store.enqueue('comment', {'issue_id': 'other-issue',
+                    'body': 'Allowed'}, at=2))
+
     def test_legacy_receipt_fences_existing_work_webhook_and_chat_followup(self):
         for origin, action in (('kanban', 'created'), ('kanban', 'prompted'),
                                ('chat', 'prompted')):
@@ -352,6 +377,8 @@ class DurableCloseoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
             authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            authority.issues['other-issue'] = issue_record(id='other-issue', identifier='OPS-2')
+            authority.issues['other-issue']['delegate'] = {'id': VIEWER}
             path = Path(directory) / 'state.db'
             store = Store(path)
             legacy = str(uuid.uuid5(uuid.NAMESPACE_URL,
@@ -360,9 +387,8 @@ class DurableCloseoutTests(unittest.TestCase):
                 'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
                 'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
             store.retry(store.outbox_row(legacy), 86402)
-            other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
-                'requester_sessions': {ISSUE: SESSION},
-                'content': {'type': 'thought', 'body': 'Separate update.'}}, at=1)
+            self.assertEqual(store.enqueue('comment', {'issue_id': ISSUE, 'body': 'Denied'}, at=1), '')
+            other = store.enqueue('comment', {'issue_id': 'other-issue', 'body': 'Separate update.'}, at=1)
             before = store.outbox_row(legacy)
             bridge = Bridge(Store(path), authority.api(), FakeKanban(), profile='synthetic', clock=lambda: 86402)
             self.assertEqual(bridge.flush(), 1)

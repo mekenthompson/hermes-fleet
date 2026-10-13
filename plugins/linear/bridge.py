@@ -1175,6 +1175,9 @@ class Bridge:
                             self.store.mark_recovery_delivered(
                                 row["issue_id"], row.get("ownership_id"), row.get("run_generation"), "stop")
                 continue
+            if not self.store.legacy_initial_ack_admitted(
+                    row["issue_id"], row.get("linear_session_id") or row["owner_ref"]):
+                continue
             if not self.may_execute_existing(row["issue_id"]):
                 continue
             with self.store.guard_issue_work(row["issue_id"]) as admitted:

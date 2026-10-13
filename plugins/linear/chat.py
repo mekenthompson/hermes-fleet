@@ -65,7 +65,7 @@ def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
                    "Continue its existing task/Linear session rather than creating another executor.")
     return _reply(False, f"{message} {issue.get('url', '')}", code=code, ownership=ownership)
 
-def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
+def _plan(bridge: Bridge, args: dict[str, Any], action: str, session_id: str) -> str:
     """Create or link as this app. Do not assign, delegate, or start tracking."""
     client_id = str(args.get("id") or "").strip()
     try:
@@ -90,7 +90,15 @@ def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
             related, relation = str(args.get("related") or "").strip(), str(args.get("relation") or "").strip()
             if not issue or not related or not relation:
                 return _reply(False, "link_issue needs issue, related, and relation.")
-            linked = bridge.api.link_issue(issue, related, relation)
+            targets = []
+            for ref in (issue, related):
+                target = bridge.api.issue(ref)
+                if ref not in (target.get("id"), target.get("identifier")):
+                    return _reply(False, "Linear issue resolution did not match the requested issue.")
+                if not bridge.store.legacy_initial_ack_admitted(target["id"], session_id):
+                    return _reply(False, "Legacy initial Linear acknowledgement requires operator reconciliation")
+                targets.append(target["id"])
+            linked = bridge.api.link_issue(*targets, relation)
             return _reply(True, f"Linked {linked.get('type')} {issue} -> {related}.")
     except LinearError as exc:
         return _reply(False, str(exc))
@@ -138,6 +146,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                     return _reply(False, "Content changes require the owning chat's active Linear claim.")
                 if owner.get("release_pending") or owner.get("stop_requested_at"):
                     return _reply(False, "Content changes are blocked during Stop or release reconciliation.")
+                if not bridge.store.legacy_initial_ack_admitted(issue_id, session_id):
+                    return _reply(False, "Legacy initial Linear acknowledgement requires operator reconciliation")
                 payload = {"issue_id": issue_id, "body": body, "session_key": session_key,
                            "work_owner": owner.get("ownership_id"), "id": client_id, "content_action": True, "write_started": False}
                 if action == "update_description":
@@ -163,7 +173,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 return _reply(False, "This issue is outside the configured Linear specialist scope.")
             return _reply(False, f"Linear is unavailable ({exc}); no content change was confirmed.")
     if action in {"create_issue", "create_project", "link_issue"}:
-        return _plan(bridge, args, action)
+        return _plan(bridge, args, action, session_id)
     ref = str(args.get("issue", "")).strip()
     if not ref:
         return _reply(False, "tracking needs an issue identifier.")
@@ -198,6 +208,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
             return _ownership_refusal(issue, row, "chat_ownership_conflict")
+        if not bridge.store.legacy_initial_ack_admitted(issue_id, session_id):
+            return _reply(False, "Legacy initial Linear acknowledgement requires operator reconciliation")
         if action == "done":
             if row.get("stop_requested_at"):
                 return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "

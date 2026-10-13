@@ -113,10 +113,10 @@ class Store:
                       (row["attempts"] > 0 and "write_started" not in payload)))):
                 return True
         return False
-    @classmethod
-    def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
-        return cls._admitted(db, *issue_ids) and all(
-            not cls._unresolved_terminal(db, ident, except_id=except_id) for ident in issue_ids)
+    def _effect_admitted(self, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
+        return self._admitted(db, *issue_ids) and all(
+            not self._unresolved_terminal(db, ident, except_id=except_id) and
+            self.legacy_initial_ack_admitted(ident, "") for ident in issue_ids)
     def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> bool:
         with self._tx() as db:
             return self._unresolved_terminal(db, issue_id, except_id=except_id)
@@ -476,7 +476,7 @@ class Store:
             if not self._effect_admitted(db, issue_id): return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not work: return False
-            if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
+            if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 if kind == "project_update":
                     prior = db.execute("SELECT payload, state FROM outbox WHERE kind='project_update' AND "
@@ -531,7 +531,7 @@ class Store:
             row = db.execute("SELECT last_event_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not row or event_id <= row["last_event_id"]:
                 return False
-            if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
+            if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
@@ -607,7 +607,7 @@ class Store:
     def enqueue_once(self, kind: str, payload: dict[str, Any], marker: str, *, at: float) -> str:
         """Capture an ingress failure alert once across retries and process restarts."""
         with self._tx() as db:
-            if not self._admitted(db, *self._targets(payload)): return ""
+            if not self._effect_admitted(db, *self._targets(payload)): return ""
             existing = db.execute("SELECT id FROM outbox WHERE json_extract(payload, '$.parked_delivery') = ?",
                                   (marker,)).fetchone()
             if existing:
