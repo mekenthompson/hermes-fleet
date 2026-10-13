@@ -643,7 +643,7 @@ class Bridge:
                           not self.store.has_start_ack(issue_id, row["task_id"]))
         if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(
                 issue_id, retryable=self._specialist_scope_active(), source_ms=stamp):
-            return
+            return self._decline(issue_id, session_id, "Not resuming: this issue is closed or delegated elsewhere.")
         session = event.get("agentSession") or {}
         creator = session.get("creatorId") or (session.get("creator") or {}).get("id")
         echo = creator is not None and creator == self.me()  # our own chat-start delegation fires 'created'
@@ -665,6 +665,7 @@ class Bridge:
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}", existing=row)
                 return
             if row["owner_ref"] == session_id and not row.get("pending_resume"): return
+            self._acknowledge(issue_id, session_id, stamp)  # ownership was just read; Kanban comes next
             if not self._resume(row, "Re-delegated in Linear; continue the existing work.",
                                 session_id, stamp, "Resuming the existing task."):
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
@@ -675,7 +676,7 @@ class Bridge:
             return
         if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active(),
                                                  source_ms=event_ms(event)):
-            return
+            return self._decline(issue["id"], session_id, "Not resuming: this issue is closed or delegated elsewhere.")
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
         if row and row["origin"] == "kanban_chat":
@@ -817,6 +818,27 @@ class Bridge:
         prior = next((json.loads(r["snapshot"]) for r in self.store.retired(row["issue_id"])
                       if r["task_id"] == row["task_id"]), None)
         self.store.retire(row["issue_id"], row["task_id"], self.kanban.retirement(row["task_id"], prior))
+    def _acknowledge(self, issue_id: str, session_id: str, stamp: float) -> None:
+        """Advisory: answer within seconds, before Kanban or ownership work. Ownership, not this receipt,
+        admits work; a rejected or lost acknowledgement never blocks the task."""
+        ack_id = stable_uuid4("linear-session-received", issue_id, session_id)
+        self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
+                           "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
+                           "content": {"type": "thought", "body": "Received. Checking durable work admission."}}, at=self.clock())
+        self.flush(only_id=ack_id)
+    def _decline(self, issue_id: str, session_id: str, body: str) -> None:
+        """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent."""
+        if self.authorize_specialist_effect(issue_id):
+            self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "requester_sessions":
+                               {issue_id: session_id}, "content": {"type": "response", "body": body}}, at=self.clock())
+    def _keepalive(self, row: dict[str, Any]) -> None:
+        """A Linear session goes stale after 30 min without activity; show running work is still alive."""
+        if self.clock() - self.store.last_activity_at(row["issue_id"]) < 20 * 60: return
+        task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
+        if task and task.status in ("running", "ready"):  # never cover an elicitation awaiting input
+            kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
+                                                    else "Waiting to resume", row["task_id"], ephemeral=True)
+            self.store.enqueue(kind, payload, at=self.clock())
     def await_retired(self, issue_id: str) -> None:
         for retired in self.store.retired(issue_id):
             task_id = retired["task_id"]
@@ -837,7 +859,6 @@ class Bridge:
                           "content": {"type": "error", "body": body}, **route})], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "", existing: dict | None = None) -> bool:
         issue_id = issue["id"]
-        self.await_retired(issue_id)
         if self.store.issue_reconciliation_blocked(issue_id) or not self._require_effect(issue_id): return False
         fresh = self._effect_issue(issue_id)  # refuse new execution until current ownership is known
         me = self.me()
@@ -846,16 +867,16 @@ class Bridge:
         delegate = ((fresh or {}).get("delegate") or {}).get("id")
         if fresh and delegate and delegate != me:
             log.info("linear: ignoring delegation of %s; delegate is now %s", issue_id, delegate)
+            name = (fresh.get("delegate") or {}).get("name") or "someone else"
+            self._decline(issue_id, session_id, f"Not starting: this issue is now delegated to {name}.")
             return True
         if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
+            self._decline(issue_id, session_id, "Not starting: this issue was closed after the request.")
             return True
-        # Advisory: Linear wants a reply within seconds, so try it now. Ownership, not this
-        # receipt, admits work; a rejected or lost acknowledgement never blocks the task.
-        ack_id = stable_uuid4("linear-session-received", issue_id, session_id)
-        self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
-                           "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
-                           "content": {"type": "thought", "body": "Received. Checking durable work admission."}}, at=self.clock())
-        self.flush(only_id=ack_id)
+        # Answer between the two ownership reads (a human change in between still refuses work) and
+        # before any Kanban wait, so a slow or exiting predecessor never delays it past Linear's 10 s.
+        self._acknowledge(issue_id, session_id, stamp)
+        self.await_retired(issue_id)
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
@@ -938,7 +959,8 @@ class Bridge:
                                          self.profile, at=self.clock(), stamp=stamp)
             return
         self.status(row["issue_id"], "blocked")
-        self.say(row, f"Stopped by {who}. Re-delegate or reply here to resume.")
+        self.say(row, f"Stopped by {who}: the task is blocked and its worker shuts down within a few minutes. "
+                      "Re-delegate or reply here to resume.")
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
@@ -1138,7 +1160,8 @@ class Bridge:
                     if pending_claim and self.may_write(issue, True, pending_claim["enqueued_at"],
                                                         pending_claim.get("seen"), pending_claim.get("source_ms")):
                         continue
-                    self.may_write(issue, claim=False)
+                    if self.may_write(issue, claim=False) and row["origin"] == "kanban":
+                        self._keepalive(row)
                 except LinearError as exc:
                     if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
                         self._alert_reauthorization()
@@ -1420,9 +1443,13 @@ class Bridge:
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
                     raise LinearError(acceptance_refusal(delivery_failures, where="delivery"), retryable=False)
             name = self.state_name(issue, payload["state"])
+            current = issue.get("state") or {}
+            if (payload["state"] == "in_progress" and current.get("type") == "started" and
+                    str(current.get("name", "")).casefold() != str(self.state_name(issue, "blocked") or "").casefold()):
+                name = None  # Linear: move only unstarted work; a human's later started state stands
             if payload.get("release") and not name:
                 raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
-            fields = {"stateId": state_id(issue, name)} if name else {}
+            fields = {"stateId": state_id(issue, name, first_started=payload["state"] == "in_progress")} if name else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if payload.get("release"):

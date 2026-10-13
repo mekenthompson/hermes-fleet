@@ -245,6 +245,66 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
             self.assertEqual(store.outbox_row(old)['state'], 'pending')
 
+    def test_refused_session_gets_an_answer_instead_of_silence(self):
+        for change in ('foreign', 'closed'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                authority = Authority()
+                if change == 'foreign':
+                    authority.issues[ISSUE]['delegate'] = {'id': 'other-agent', 'name': 'Other Agent'}
+                else:
+                    authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                    authority.issues[ISSUE]['state'] = {'type': 'completed', 'name': 'Done'}
+                    authority.issues[ISSUE]['completedAt'] = '2026-01-01T00:00:02Z'
+                store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+                bridge = Bridge(store, authority.api(), kanban, profile='synthetic', clock=lambda: 10)
+                self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+                self.assertEqual(kanban.creates, [])
+                [reply] = [r for r in store.pending(ISSUE) if r['kind'] == 'activity']
+                self.assertEqual(reply['payload']['content']['type'], 'response')
+                self.assertIn('Other Agent' if change == 'foreign' else 'closed', reply['payload']['content']['body'])
+
+    def test_running_work_keeps_its_session_alive_but_never_covers_a_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [10_000.0]
+            store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+            bridge = Bridge(store, Authority().api(), kanban, profile='synthetic', clock=lambda: now[0])
+            task = kanban.create(initial_status='running')
+            kanban.tasks[task.id].status = 'running'
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            row = store.get(ISSUE)
+            bridge._keepalive(row)
+            [alive] = [r for r in store.pending(ISSUE) if r['kind'] == 'activity']
+            self.assertEqual((alive['payload']['content']['action'], alive['payload']['ephemeral']), ('Working', True))
+            now[0] += 60
+            bridge._keepalive(row)  # recent activity: nothing more
+            self.assertEqual(len([r for r in store.pending(ISSUE) if r['kind'] == 'activity']), 1)
+            kanban.tasks[task.id].status = 'blocked'
+            now[0] += 25 * 60
+            bridge._keepalive(row)  # an elicitation is awaiting input: a thought would hide it
+            self.assertEqual(len([r for r in store.pending(ISSUE) if r['kind'] == 'activity']), 1)
+
+    def test_started_issue_keeps_its_status_and_a_missing_name_uses_first_started(self):
+        from hermes_fleet_linear_plugin.api import state_id
+        team = {'states': {'nodes': [{'id': 'review', 'name': 'In Review', 'type': 'started', 'position': 3},
+                                     {'id': 'doing', 'name': 'Doing', 'type': 'started', 'position': 1},
+                                     {'id': 'todo', 'name': 'Todo', 'type': 'unstarted', 'position': 0}]}}
+        self.assertEqual(state_id({'team': team}, 'In Progress', first_started=True), 'doing')
+        with self.assertRaises(Exception):
+            state_id({'team': team}, 'Blocked')
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            authority.issues[ISSUE]['state'] = {'id': 'review', 'name': 'In Review', 'type': 'started'}
+            api, sent = authority.api(), []
+            original = api.update_issue
+            api.update_issue = lambda issue_id, fields: sent.append(fields) or original(issue_id, fields)
+            store = Store(Path(directory) / 'state.db')
+            store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'claim': True, 'seen': VIEWER,
+                                     'requester_sessions': {ISSUE: SESSION}}, at=1)
+            Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10).flush()
+            self.assertTrue(sent)
+            self.assertNotIn('stateId', sent[0])  # a human's later started state stands
+
     def test_local_completion_delivers_persisted_run_summary_without_url(self):
         summary = 'Reconciled all rows. The report lacks sale prices.'
         with tempfile.TemporaryDirectory() as directory:

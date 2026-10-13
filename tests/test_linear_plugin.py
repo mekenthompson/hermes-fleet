@@ -48,8 +48,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # ops.py gives every fence a visible reason and a supported command (status, resolve, replay);
 # review added in-flight refusal, ACT-only exit codes, legacy-schema tolerance and the gateway's
 # profile rule, then no false green on a locked database and an alarm for a send held an hour.
-# Measured 4391, allowance 0: remove lines before adding them.
-BUDGET = 4391
+# Linear's agent contract: an answer within 10 s before any Kanban wait, a reply to every refused
+# session, a keepalive before the 30 min stale mark, and no status move backwards.
+# Measured 4428, allowance 0: remove lines before adding them.
+BUDGET = 4428
 
 
 class FakeContext:

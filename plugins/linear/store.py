@@ -630,6 +630,11 @@ class Store:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'pending' AND (? IS NULL OR "
                               "json_extract(payload, '$.issue_id') = ?) ORDER BY rowid", (issue_id, issue_id)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
+    def last_activity_at(self, issue_id: str) -> float:
+        with self._tx() as db:
+            row = db.execute("SELECT MAX(json_extract(payload, '$.enqueued_at')) FROM outbox WHERE kind = 'activity' "
+                             "AND json_extract(payload, '$.issue_id') = ?", (issue_id,)).fetchone()
+        return float(row[0] or 0)
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND NOT " + ADVISORY + " AND "
