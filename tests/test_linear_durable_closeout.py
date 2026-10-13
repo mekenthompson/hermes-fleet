@@ -42,6 +42,8 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertEqual(kanban.creates, [])
                 self.assertIsNone(store.get(ISSUE))
                 self.assertEqual(len(authority.mutations), 1)
+                replies = [r for r in store.pending(ISSUE) if r['payload']['content']['type'] == 'response']
+                self.assertEqual(len(replies), 1)  # the session hears why, not just "Received"
 
     def test_acknowledgement_outcome_never_gates_current_ownership(self):
         """The receipt thought is advisory: ownership admits work, and a lost or rejected
@@ -304,6 +306,93 @@ class DurableCloseoutTests(unittest.TestCase):
             Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10).flush()
             self.assertTrue(sent)
             self.assertNotIn('stateId', sent[0])  # a human's later started state stands
+
+    def thread_bridge(self, directory, comments=None, *, fail=False):
+        from hermes_fleet_linear_plugin.api import LinearError
+        authority = Authority()
+        authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+        api, calls = authority.api(), []
+        def thread(issue_id):
+            calls.append(issue_id)
+            if fail: raise LinearError('thread read outage')
+            return comments or []
+        api.issue_thread = thread
+        store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+        return Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10), authority, kanban, calls
+
+    def test_new_work_includes_the_linear_thread_the_worker_cannot_read(self):
+        comments = [{'at': '2026-01-01T00:00:01Z', 'who': 'Pat Example', 'body': 'Tried the staging fix; it failed on auth.'},
+                    {'at': '2026-01-01T00:00:02Z', 'who': 'This Agent', 'body': 'Opened a PR for the token refresh.'}]
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, authority, kanban, calls = self.thread_bridge(directory, comments)
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            body = kanban.creates[0]['body']
+            self.assertIn('Linear thread', body)
+            self.assertLess(body.index('staging fix'), body.index('token refresh'))  # oldest first
+            self.assertIn('cannot read Linear yourself', body)
+        with tempfile.TemporaryDirectory() as directory:  # Linear's promptContext already includes the thread
+            bridge, authority, kanban, calls = self.thread_bridge(directory, comments)
+            bridge._start({'promptContext': 'Issue and its comments'}, authority.issues[ISSUE], SESSION, 1, 'k')
+            self.assertEqual(calls, [])
+            self.assertIn('Issue and its comments', kanban.creates[0]['body'])
+        with tempfile.TemporaryDirectory() as directory:  # a failed thread read never blocks the work
+            bridge, authority, kanban, calls = self.thread_bridge(directory, fail=True)
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'k'))
+            self.assertEqual(len(kanban.creates), 1)
+
+    def test_thread_since_last_update_is_bounded_and_newest_wins(self):
+        comments = [{'at': '2026-01-01T00:00:%02dZ' % i, 'who': 'Pat', 'body': f'note {i} ' + 'x' * 1500}
+                    for i in range(1, 20)]
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = self.thread_bridge(directory, comments)[0]
+            since = bridge._thread(ISSUE, since_ms=1767225605000)  # after 00:00:05
+            self.assertIn('since your last update', since)
+            self.assertNotIn('note 5 ', since)
+            self.assertIn('note 19 ', since)
+            self.assertLessEqual(len(since), 8300)
+
+    def test_inconsistent_ownership_read_retries_instead_of_dropping(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, authority = self.thread_bridge(directory)[:2]
+            with self.assertRaises(LinearError) as raised:
+                bridge._decline_existing(ISSUE, SESSION)  # Linear says we own the open issue after all
+            self.assertTrue(raised.exception.retryable)
+            self.assertEqual(bridge.store.pending(ISSUE), [])
+
+    def test_decline_gets_one_try_and_never_holds_later_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            api = authority.api()
+            original = authority.transport
+            def transport(url, body, headers):
+                if 'agentActivityCreate' in json.loads(body)['query']:
+                    return 503, {}, b'{}'
+                return original(url, body, headers)
+            api.transport = transport
+            store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
+            bridge._decline(ISSUE, SESSION, 'Not resuming: this issue is closed.')
+            claim = store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'claim': True, 'seen': VIEWER,
+                                             'requester_sessions': {ISSUE: SESSION}}, at=10)
+            bridge.flush()
+            self.assertEqual(store.outbox_row(claim)['state'], 'sent')  # not held behind the failed reply
+            self.assertEqual(store.unreported_failed(), [])  # no endless "gave up" alert
+            self.assertEqual(kanban.comments, [])
+
+    def test_keepalive_counts_only_its_own_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+            bridge = Bridge(store, Authority().api(), kanban, profile='synthetic', clock=lambda: 10_000)
+            task = kanban.create(initial_status='running')
+            kanban.tasks[task.id].status = 'running'
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': 'other-session',
+                                               'content': {'type': 'response', 'body': 'elsewhere'}}, at=9_990)
+            store.mark_sent(other, True)
+            bridge._keepalive(store.get(ISSUE))
+            self.assertTrue(any(r['payload'].get('session_id') == SESSION for r in store.pending(ISSUE)))
 
     def test_local_completion_delivers_persisted_run_summary_without_url(self):
         summary = 'Reconciled all rows. The report lacks sale prices.'

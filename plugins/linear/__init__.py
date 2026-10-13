@@ -162,6 +162,10 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear issue project is outside configured scope", retryable=False, authoritative_issue_id=issue.get("id"))
         self._check_issue(issue)
         return issue
+    def issue_thread(self, issue_id, limit=50):
+        self.issue(issue_id)  # the same identity, team, project and specialist checks as any issue read
+        with self._permit_specialist_operation():
+            return super().issue_thread(issue_id, limit)
     def _mutation_issue(self, issue_id):
         issue = self.issue(issue_id)
         if not isinstance(issue_id, str) or not issue_id.strip() or issue.get("id") != issue_id:

@@ -244,7 +244,8 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 | Claiming an issue | none | Delegate = self. Status moves to the configured `in_progress` state unless the issue already sits in another `started` state (the configured `blocked` state does move). Re-delegating a closed issue reopens it. A team without that state name uses its first `started` state by position, with a warning |
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
-| Follow-up prompt | Task comment, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
+| Follow-up prompt | Task comment with the message and every Linear comment since the agent's last update, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
+| Any new or resumed Kanban task | The task includes the Linear thread: Linear's `promptContext` for new work (fetched by the plugin when absent), and comments since the last update for re-delegation and follow-ups. Detached workers cannot read Linear themselves | none |
 | Worker completes with a saved local summary or accepted external evidence | task done | Done state, one response with the saved summary and any links, one project update |
 | Worker completes without an accepted result | task done | Blocked state, one error: unfinished |
 | Worker blocks (`needs_input`) | task blocked | Blocked state, one elicitation |
