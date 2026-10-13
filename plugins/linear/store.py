@@ -162,7 +162,7 @@ class Store:
             payload = json.loads(row["payload"])
             if not self.uncertain(row, payload): return False
             payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
-            payload["reconcile_required"] = True
+            payload["reconcile_required"], payload["reported"] = True, 1  # the operator acted; no alert
             if payload.get("release"):
                 payload["applied"] = int(outcome == "applied")
                 sql = "DELETE FROM work" if payload["applied"] else "UPDATE work SET release_pending=0"

@@ -33,10 +33,12 @@ class LinearOperatorTests(unittest.TestCase):
             code = ops.run(parser.parse_args(argv), self.state, self.inbox, "default")
         return code, out.getvalue()
 
-    def uncertain(self, kind, issue, **payload):
+    def uncertain(self, kind, issue, *, settled=True, **payload):
         row = self.store.enqueue(kind, {"issue_id": issue, **payload}, at=100)
         saved = self.store.outbox_row(row)
         self.store.rewrite(row, {**saved["payload"], "write_started": True}, 100)
+        if settled:  # the gateway has given up on settling it by itself
+            self.store.mark(row, "failed")
         return row
 
     def test_nothing_held_is_said_plainly(self):
@@ -58,6 +60,25 @@ class LinearOperatorTests(unittest.TestCase):
         self.assertFalse(self.store.issue_reconciliation_blocked("issue-5"))
         self.assertEqual(self.cli("status")[0], 0)
         self.assertEqual(self.cli("resolve", status, "applied", "--evidence", "again")[0], 1)  # already resolved
+        self.assertEqual(self.store.unreported_failed(), [])  # the operator acted: no "held" alert follows
+
+    def test_in_flight_write_is_shown_but_cannot_be_resolved_under_the_sender(self):
+        row = self.uncertain("status", "issue-6", settled=False, state="done", terminal=True)
+        [item] = ops.stuck(self.state, self.inbox, "default")
+        self.assertFalse(item["act"])
+        self.assertIn("being sent", item["why"])
+        self.assertEqual(self.cli("status")[0], 0)
+        self.assertEqual(self.cli("resolve", row, "not_applied", "--evidence", "Linear shows Todo")[0], 1)
+        self.assertTrue(self.store.issue_reconciliation_blocked("issue-6"))
+
+    def test_retried_terminal_comment_never_asks_for_resolve(self):
+        comment = self.store.enqueue("comment", {"issue_id": "issue-7", "body": "Done", "terminal": True}, at=100)
+        self.store.retry(self.store.outbox_row(comment), 100)
+        self.store.mark(comment, "failed")
+        items = ops.stuck(self.state, self.inbox, "default", now=200)
+        self.assertEqual([(i["ref"], i["act"]) for i in items], [(comment, False)])
+        self.assertNotIn("resolve", items[0]["action"])
+        self.assertEqual(ops.stuck(self.state, self.inbox, "default", now=100 + 8 * 86_400), [])
 
     def test_parked_delivery_is_listed_and_replayed_once(self):
         route = Route("default", "default", "/webhook/default", self.home / "unused", self.inbox)
@@ -85,7 +106,9 @@ class LinearOperatorTests(unittest.TestCase):
         self.assertIn("approved procedure", items["fence"]["action"])
         self.assertIn("redo the step", items[refused]["action"])
         self.assertNotIn(thought, items)  # a dropped thought holds nothing
-        self.assertEqual(json.loads(self.cli("status", "--json")[1])[0]["issue"], "issue-3")
+        code, text = self.cli("status", "--json")
+        self.assertEqual((code, json.loads(text)[0]["issue"]), (0, "issue-3"))  # a policy fence alone is not an alarm
+        self.assertNotIn("requester outside scope", text)  # fence reasons stay in the database
 
 
 if __name__ == "__main__":

@@ -11,47 +11,63 @@ from .store import ADVISORY, Store
 RESOLVE = "Check the issue in Linear, then: hermes linear resolve {id} applied|not_applied --evidence \"<what you saw>\""
 
 def _read(path: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
     db.row_factory = sqlite3.Row
     return db
 
+def _rows(db: sqlite3.Connection, sql: str, *args: Any) -> list[sqlite3.Row]:
+    try:
+        return db.execute(sql, args).fetchall()
+    except sqlite3.OperationalError:  # a state database the gateway has not migrated yet
+        return []
+
+def needs_resolution(row: Any, payload: dict[str, Any]) -> bool:
+    """An uncertain issue write the gateway will not settle by itself: only an operator can say what happened."""
+    return (row["kind"] in ("status", "description") and Store.uncertain(row, payload) and
+            (row["state"] == "failed" or bool(payload.get("reconcile_required"))))
+
 def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) -> list[dict[str, Any]]:
-    """Every item holding an issue or a delivery, oldest first, each with its next supported action."""
+    """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
     now, items = time.time() if now is None else now, []
-    def add(issue: str, ref: str, since: float, why: str, action: str) -> None:
-        items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why, "action": action})
+    def add(issue: str, ref: str, since: float, why: str, action: str, act: bool = False) -> None:
+        items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why,
+                      "action": action, "act": act})
     if state.is_file():
         with closing(_read(state)) as db:
-            rows = db.execute("SELECT * FROM outbox WHERE state != 'sent' AND NOT " + ADVISORY + " ORDER BY rowid").fetchall()
+            rows = _rows(db, "SELECT * FROM outbox WHERE state != 'sent' AND NOT " + ADVISORY + " ORDER BY rowid")
             for row in rows:
-                payload, since = json.loads(row["payload"]), float(json.loads(row["payload"]).get("enqueued_at") or row["next_at"])
-                if Store.uncertain(row, payload):
+                payload = json.loads(row["payload"])
+                since, issue = float(payload.get("enqueued_at") or row["next_at"]), payload.get("issue_id", "")
+                if needs_resolution(row, payload):
                     held = sum(1 for r in rows if json.loads(r["payload"]).get("requires_status_id") == row["id"])
-                    add(payload.get("issue_id", ""), row["id"], since, f"{row['kind']} write may or may not have "
-                        f"reached Linear; it holds this issue" + (f" and {held} dependent write(s)" if held else ""),
-                        RESOLVE.format(id=row["id"]))
+                    add(issue, row["id"], since, f"{row['kind']} write may or may not have reached Linear; it holds "
+                        "this issue" + (f" and {held} dependent write(s)" if held else ""), RESOLVE.format(id=row["id"]), True)
+                elif row["kind"] in ("status", "description") and Store.uncertain(row, payload):
+                    add(issue, row["id"], since, f"{row['kind']} write is being sent; it holds this issue",
+                        "Settles or escalates on its next send; check again in a few minutes.")
                 elif row["state"] == "failed" and not payload.get("reconciliation") and now - since < 7 * 86_400:
-                    add(payload.get("issue_id", ""), row["id"], since, f"{row['kind']} write was not delivered"
-                        + (f": {payload['authorization_error']}" if payload.get("authorization_error") else ""),
-                        "Retried after the next successful write." if row["attempts"] else "Not retried: redo the step.")
-            for row in db.execute("SELECT * FROM specialist_scope_fence"):
-                add(row["issue_id"], "fence", row["fenced_at"], f"outside specialist scope: {row['reason']}",
+                    add(issue, row["id"], since, f"{row['kind']} write was not delivered",
+                        "Retried after the next successful write." if row["attempts"] else "Not retried: redo the step.",
+                        not row["attempts"])
+            for row in _rows(db, "SELECT * FROM specialist_scope_fence"):
+                add(row["issue_id"], "fence", row["fenced_at"], "outside specialist scope",
                     "Permanent by policy; recover only through an approved procedure.")
-            for row in db.execute("SELECT * FROM chat_admissions WHERE state IN ('claiming', 'ambiguous')"):
+            for row in _rows(db, "SELECT * FROM chat_admissions WHERE state IN ('claiming', 'ambiguous')"):
                 add(row["issue_id"], row["request_id"], now, f"chat-to-worker admission is {row['state']}"
                     + (f" for task {row['task_id']}" if row["task_id"] else ""),
-                    "Confirm the task and delegate in Linear and Kanban before new work on this issue.")
-            for row in db.execute("SELECT issue_id, last_updated_at FROM work WHERE release_pending = 1"):
-                add(row["issue_id"], "release", row["last_updated_at"] / 1000,
+                    "Confirm the task and delegate in Linear and Kanban before new work on this issue.",
+                    row["state"] == "ambiguous")
+            for row in _rows(db, "SELECT issue_id, last_updated_at FROM work WHERE release_pending = 1"):
+                add(row["issue_id"], "release", (row["last_updated_at"] or now * 1000) / 1000,
                     "chat release is waiting for Linear to read back no delegate", "Retried each tick; check Linear.")
-            for row in db.execute("SELECT task_id, issue_id FROM retirement"):
+            for row in _rows(db, "SELECT task_id, issue_id FROM retirement"):
                 add(row["issue_id"], row["task_id"], now, f"waiting for Kanban task {row['task_id']} to exit",
                     "Stop the worker in Kanban if it is still running.")
     if ingress.is_file():
         with closing(_read(ingress)) as db:
-            for row in db.execute("SELECT delivery_id, payload, received_at, status, attempts FROM deliveries "
-                                  "WHERE profile = ? AND (status = 'failed' OR (status = 'pending' AND attempts > 0)) "
-                                  "ORDER BY received_at", (profile,)):
+            for row in _rows(db, "SELECT delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
+                             "profile = ? AND (status = 'failed' OR (status = 'pending' AND attempts > 0)) "
+                             "ORDER BY received_at", profile):
                 try:
                     event = json.loads(row["payload"])
                     issue = ((event.get("agentSession") or {}).get("issue") or {}).get("id") or (event.get("data") or {}).get("id")
@@ -61,15 +77,16 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 add(issue or "", row["delivery_id"], row["received_at"],
                     f"Linear delivery {'parked' if parked else 'retrying'} after {row['attempts']} failed attempt(s)",
                     f"Fix the logged cause, then: hermes linear replay {row['delivery_id']}" if parked
-                    else "Backing off; a restart retries it at once.")
+                    else "Backing off; a restart retries it at once.", parked)
     return sorted(items, key=lambda item: -item["age_s"])
 
 def report(items: list[dict[str, Any]]) -> str:
     if not items:
         return "Linear: nothing is held."
-    lines = [f"Linear: {len(items)} item(s) held."]
+    lines = [f"Linear: {len(items)} item(s) held, {sum(i['act'] for i in items)} need an operator."]
     for item in items:
-        lines += [f"- {item['issue']} [{item['ref']}] {item['age_s'] / 3600:.1f}h: {item['why']}", f"  {item['action']}"]
+        lines += [f"- {'ACT ' if item['act'] else ''}{item['issue']} [{item['ref']}] {item['age_s'] / 3600:.1f}h: "
+                  f"{item['why']}", f"  {item['action']}"]
     return "\n".join(lines)
 
 def replay(ingress: Path, profile: str, delivery_id: str) -> bool:
@@ -93,12 +110,14 @@ def run(args: Any, state: Path, ingress: Path, profile: str) -> int:
     if args.linear_command == "status":
         items = stuck(state, ingress, profile)
         print(json.dumps(items, indent=2) if args.json else report(items))
-        return 1 if items else 0
+        return 1 if any(item["act"] for item in items) else 0
     if args.linear_command == "resolve":
-        done = state.is_file() and Store(state).reconcile_terminal(
-            args.row_id, outcome=args.outcome, evidence=args.evidence, at=time.time())
+        store = Store(state) if state.is_file() else None
+        row = store.outbox_row(args.row_id) if store else None
+        done = bool(row and needs_resolution(row, row["payload"]) and store.reconcile_terminal(
+            args.row_id, outcome=args.outcome, evidence=args.evidence, at=time.time()))
         print(f"Recorded {args.outcome} for {args.row_id}; the issue is released." if done else
-              f"{args.row_id} is not an uncertain status or description write; see: hermes linear status")
+              f"{args.row_id} does not need resolving now; see: hermes linear status")
         return 0 if done else 1
     done = replay(ingress, profile, args.delivery_id)
     print(f"Delivery {args.delivery_id} will be retried on the next tick." if done else

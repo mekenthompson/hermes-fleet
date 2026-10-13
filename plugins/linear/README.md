@@ -372,20 +372,25 @@ hermes linear resolve <row> applied|not_applied --evidence "Issue shows Done at 
 hermes linear replay <delivery>   # one more try for a parked inbox delivery
 ```
 
-`/linear-status` shows the same report from any chat surface. It is read-only.
+`/linear-status` shows the same report from any chat surface. It is read-only and is not offered
+under `specialist_scope`, where other requesters can reach the same chat.
 
-`status` exits 1 while anything is held, so a health check can alert on it. It lists:
+`status` marks with `ACT` the items only an operator can clear, and exits 1 while any exist, so a
+health check can alert on it without flapping on work the gateway is still settling. It lists:
 
 | Held item | Next step |
 |---|---|
-| Status or description write whose outcome is unknown, with any writes held behind it | Check Linear, then `resolve` |
-| Issue write Linear refused or timed out on, in the last 7 days | Retried after the next successful write, or redo the step |
-| Parked inbox delivery, or one still backing off | Fix the logged cause, then `replay`; a restart retries backing-off ones |
-| Specialist scope fence | Permanent by policy; approved recovery only |
-| Ambiguous chat-to-worker admission, unfinished release, worker still exiting | Check Linear and Kanban; the gateway retries each tick |
+| `ACT` Status or description write the gateway stopped trying, outcome unknown, with any writes held behind it | Check Linear, then `resolve` |
+| Status or description write still being sent | None; it settles or escalates on its next send |
+| Issue write Linear refused (`ACT`) or timed out on, in the last 7 days | Redo the step, or wait for the retry after the next successful write |
+| `ACT` Parked inbox delivery; a delivery still backing off | Fix the logged cause, then `replay`; a restart retries backing-off ones |
+| `ACT` Ambiguous chat-to-worker admission | Confirm the task and delegate before new work |
+| Specialist scope fence, claiming admission, unfinished release, worker still exiting | Approved recovery only for fences; the gateway retries the rest each tick |
 
-`resolve` records what you saw; it never writes to Linear. `applied` and `not_applied` both release
-the issue for new work; writes held behind the receipt stay held. A replayed delivery that fails
+`resolve` records what you saw; it never writes to Linear, and it refuses a write that is still
+being sent. `applied` and `not_applied` both release the issue for new work; writes held behind the
+receipt stay held. The CLI reads the inbox for the same profile as the gateway: `ingress_profile`,
+else `HERMES_PROFILE`, else `HERMES_AGENT_PROFILE`, else `default`. A replayed delivery that fails
 again parks again without a second alert.
 
 ## Known limits
