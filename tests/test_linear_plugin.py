@@ -41,8 +41,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Definite 401 refreeze keeps an already-started project create frozen. Measured 4132, allowance 8.
 # Agent progress activities add action content, ephemeral current-step replacement, and comment text.
 # Named board init registers board.json so the dispatcher can discover a database stub.
-# Measured 4226, allowance 8.
-BUDGET = 4234
+# Measured 4276, reviewed allowance 4300.
+# Keep acknowledgement and legacy-receipt safety checks readable.
+BUDGET = 4300
 
 
 class FakeContext:
