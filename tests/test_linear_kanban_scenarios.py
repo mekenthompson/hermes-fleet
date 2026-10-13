@@ -1946,9 +1946,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.project_updates, [])
         self.assertIn("without evidence", self.linear.activities[-1]["content"]["body"])
 
-    def test_ack_transport_failure_replays_after_restart_before_worker_creation(self) -> None:
+    def test_ack_transport_failure_never_blocks_work_and_delivers_one_receipt(self) -> None:
         from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
         event = self.linear.session_event("created", ISSUE, "receipt-retry")
         self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         original = self.linear.handle
@@ -1959,16 +1958,15 @@ class LinearKanbanScenarios(unittest.TestCase):
                 return 503, {}, {"errors": [{"message": "service unavailable"}]}
             return original(query, variables)
         with patch.object(self.linear, "handle", side_effect=fail_receipt):
-            with self.assertRaises(LinearError):
-                self.bridge.handle_webhook(event)
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(self.tasks(), [])
+            self.bridge.handle_webhook(event)  # ownership admits the work; the receipt is advisory
+            self.bridge.tick()
+        self.assertGreaterEqual(len(attempts), 1)
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.linear.activities, [])
         self.bridge = self.make_bridge()
         self.clock.now += 61
-        self.bridge.handle_webhook(event)
         self.bridge.tick()
-        self.assertEqual(len(self.tasks()), 1)
         receipts = [a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
                     and "Received" in a["content"]["body"]]
         self.assertEqual(len(receipts), 1)
@@ -1979,7 +1977,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(len([a for a in self.linear.activities if a["agentSessionId"] == "receipt-retry"
                               and "Received" in a["content"]["body"]]), 1)
 
-    def test_failed_ack_keeps_ingress_pending_until_replayed(self) -> None:
+    def test_refused_ack_imports_delivery_and_starts_work(self) -> None:
         from unittest.mock import patch
         from linear_ingress_fixture import IngressStore, Route
         inbox = self.dir / "ingress.db"
@@ -1990,24 +1988,20 @@ class LinearKanbanScenarios(unittest.TestCase):
         with sqlite3.connect(inbox) as conn:
             conn.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
         original = self.linear.handle
-        def fail_receipt(query, variables):
-            if "agentActivityCreate" in query:
-                return 503, {}, {"errors": [{"message": "service unavailable"}]}
+        def refuse_receipt(query, variables):
+            if "agentActivityCreate" in query and "Received" in json.dumps(variables):
+                return 200, {}, {"data": None, "errors": [{"message": "Argument Validation Error",
+                                                           "extensions": {"code": "INPUT_ERROR"}}]}
             return original(query, variables)
-        with patch.object(self.linear, "handle", side_effect=fail_receipt):
+        with patch.object(self.linear, "handle", side_effect=refuse_receipt):
             self.bridge.drain_ingress(inbox)
-        with sqlite3.connect(inbox) as conn:
-            self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "pending")
-        self.assertEqual(self.tasks(), [])
-        self.clock.now += 61
-        self.bridge = self.make_bridge()
-        self.bridge.drain_ingress(inbox)
-        self.bridge.tick()
+            self.bridge.tick()
         with sqlite3.connect(inbox) as conn:
             self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
         self.assertEqual(len(self.tasks()), 1)
-        self.assertEqual(len([a for a in self.linear.activities if a["agentSessionId"] == "inbox-retry"
-                              and "Received" in a["content"]["body"]]), 1)
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertFalse(any("Received" in a["content"].get("body", "") for a in self.linear.activities))
+        self.assertFalse(any("has not accepted" in text for _, text in self.injected))
 
     def test_local_project_finding_is_bounded_and_hides_local_artifacts(self) -> None:
         self.delegate()
@@ -2905,6 +2899,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge = self.make_bridge()
                 self.bind_identity()
                 self.bridge.recover()
+                self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
                 self.bridge.tick(inbox)
                 self.assertEqual(self.bridge.kanban.get(task).status, "ready")
                 with self.bridge.kanban.conn() as conn:
@@ -3116,6 +3111,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.recover(inbox)
             self.assertEqual(self.tasks(), [(task, "blocked")])
             self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stamp)
+            self.clock.now += 15  # startup retried it; the next retry is due 15 s after receipt
             self.bridge.tick(inbox)
             self.assertEqual(self.tasks(), [(task, "blocked")])
             self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
@@ -3217,6 +3213,7 @@ class LinearKanbanScenarios(unittest.TestCase):
             self.bridge = self.make_bridge()
             self.bind_identity()
             self.bridge.recover()
+            self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
             self.bridge.tick(inbox)
             self.bridge = self.make_bridge()
             self.bind_identity()
@@ -3731,6 +3728,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge()
         self.bind_identity()
         self.inject_ok = True
+        self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
         self.bridge.tick(inbox)
         self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], retry["webhookTimestamp"])
         with sqlite3.connect(inbox) as db:

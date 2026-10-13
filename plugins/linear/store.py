@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
+ADVISORY = "(kind = 'activity' AND json_extract(payload, '$.content.type') IN ('thought', 'action'))"
+def advisory(row: dict[str, Any]) -> bool:
+    """A thought or action shows progress; losing one changes no issue, so it never alerts, revives or fences."""
+    return row["kind"] == "activity" and (row["payload"].get("content") or {}).get("type") in ("thought", "action")
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -608,7 +612,7 @@ class Store:
                        (row_id, kind, body, at))
             return row_id
     def due(self, now: float) -> list[dict[str, Any]]:
-        """Oldest pending row per issue, if due: writes for one issue go out in order."""
+        """Oldest pending issue write per issue, if due, plus any due thought: issue writes go out in order."""
         def eligible(alias: str) -> str:
             dependency = f"json_extract({alias}.payload, '$.requires_status_id')"
             return (f"(NOT EXISTS (SELECT 1 FROM outbox h WHERE h.id={dependency} "
@@ -623,9 +627,9 @@ class Store:
         with self._tx() as db:
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
-                " AND ((o.kind = 'activity' AND json_extract(o.payload, '$.initial_ack')=1) OR o.rowid = ("
+                " AND (" + ADVISORY + " OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
-                " AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
+                " AND NOT " + ADVISORY + " AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
                 ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
     def pending(self, issue_id: str | None = None) -> list[dict[str, Any]]:
@@ -723,7 +727,7 @@ class Store:
         with self._tx() as db:
             rows = db.execute(
                 "SELECT id, payload FROM outbox WHERE state = 'failed' AND attempts > 0 AND "
-                "COALESCE(json_extract(payload, '$.reconcile_required'), 0)=0 AND NOT ("
+                "COALESCE(json_extract(payload, '$.reconcile_required'), 0)=0 AND NOT " + ADVISORY + " AND NOT ("
                 " kind = 'status' AND EXISTS (SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > outbox.rowid"
                 " AND json_extract(l.payload, '$.issue_id') = json_extract(outbox.payload, '$.issue_id')))",
                 ).fetchall()
@@ -733,14 +737,15 @@ class Store:
                     db.execute("UPDATE outbox SET state='pending', next_at=? WHERE id=?", (now, row["id"]))
                     revived += 1
             return revived
+    @staticmethod
+    def _latest_project_update(db: sqlite3.Connection, session_id: str, project_id: str | None):
+        return db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
+                          "json_extract(payload, '$.session_id') = ? AND json_extract(payload, '$.project_id') IS ? "
+                          "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
+                          "rowid DESC LIMIT 1", (session_id, project_id)).fetchone()
     def project_update(self, session_id: str, project_id: str) -> dict[str, Any] | None:
         with self._tx() as db:
-            row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
-                             "json_extract(payload, '$.session_id') = ? AND "
-                             "json_extract(payload, '$.project_id') IS ? "
-                             "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
-                             "rowid DESC LIMIT 1",
-                             (session_id, project_id)).fetchone()
+            row = self._latest_project_update(db, session_id, project_id)
         return {**dict(row), "payload": json.loads(row["payload"])} if row else None
     def outbox_row(self, row_id: str) -> dict[str, Any] | None:
         with self._tx() as db:
@@ -754,12 +759,7 @@ class Store:
         """Merge a session's update atomically with terminal capture in finish()."""
         with self._tx() as db:
             if not self._effect_admitted(db, *self._targets(payload)): return False
-            row = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
-                             "json_extract(payload, '$.session_id') = ? AND "
-                             "json_extract(payload, '$.project_id') IS ? "
-                             "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
-                             "rowid DESC LIMIT 1",
-                             (payload["session_id"], payload["project_id"])).fetchone()
+            row = self._latest_project_update(db, payload["session_id"], payload["project_id"])
             if row and self._requester_conflict(json.loads(row["payload"]), payload): row = None
             if row:
                 prior = json.loads(row["payload"])

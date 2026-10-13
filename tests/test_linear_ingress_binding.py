@@ -66,6 +66,34 @@ class IngressBindingTests(unittest.TestCase):
         self.assertEqual(seen, ["target-stop", "work"])
         self.assertEqual(self.statuses(), {"a-work": "imported", "z-stop": "imported", "foreign-stop": "pending"})
 
+    def test_failing_delivery_backs_off_without_holding_newer_deliveries(self):
+        from unittest.mock import patch
+        for name in ("bad-1", "bad-2", "good"):
+            self.enqueue("default", name, {"type": "unused", "tag": name})
+        with closing(sqlite3.connect(self.inbox)) as db, db:
+            db.execute("UPDATE deliveries SET received_at = 1000")
+        now = [1000.0]
+        bridge = Bridge(self.store, SimpleNamespace(), SimpleNamespace(executor_profile="default"),
+                        profile="default", clock=lambda: now[0])
+        seen = []
+        def handle(event):
+            seen.append(event["tag"])
+            if event["tag"].startswith("bad"): raise RuntimeError("synthetic failure")
+        with patch.object(bridge, "handle_webhook", side_effect=handle):
+            with self.assertLogs("linear", "ERROR"):
+                bridge.drain_ingress(self.inbox, limit=2)  # both failures fill the batch
+            bridge.drain_ingress(self.inbox, limit=2)  # backing off: the newer delivery is not held
+            self.assertEqual(seen, ["bad-1", "bad-2", "good"])
+            now[0] = 1005  # first retry is due 5 s after receipt, and logs one line, not a traceback
+            with self.assertLogs("linear", "WARNING") as logs:
+                bridge.drain_ingress(self.inbox)
+            self.assertTrue(all(r.levelname == "WARNING" and not r.exc_info for r in logs.records))
+            bridge.drain_ingress(self.inbox)
+            self.assertEqual(seen, ["bad-1", "bad-2", "good", "bad-1", "bad-2"])
+        with patch.object(bridge, "handle_webhook"):
+            bridge.recover(self.inbox)  # a restart retries backed-off deliveries at once
+        self.assertEqual(self.statuses(), {"bad-1": "imported", "bad-2": "imported", "good": "imported"})
+
     def test_absent_binding_preserves_legacy_profile_selection(self):
         self.enqueue("default", "local")
         self.enqueue("worker-a", "foreign")

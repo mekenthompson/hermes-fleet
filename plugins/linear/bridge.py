@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 from .api import markdown_matches, LinearAPI, LinearError, RateLimited, state_id
 from .oauth import ReauthorizationRequired
-from .store import Store
+from .store import Store, advisory
 log = logging.getLogger("linear")
 EVENT_KINDS = ("completed", "blocked", "block_loop_detected", "gave_up", "unblocked", "archived",
                "spawned", "heartbeat", "commented")
@@ -27,7 +27,15 @@ URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
                   "/merge_requests/", "/merge-requests/")
+# A failing delivery is retried after 5 s, then with doubling gaps up to 15 min, so one bad event
+# cannot flood logs and Linear quota or hold newer deliveries behind the batch limit.
+INGRESS_DUE = ("(attempts <= 0 OR received_at + CASE WHEN attempts > 7 THEN 635 + (attempts - 7) * 900 "
+               "ELSE 5 * ((1 << attempts) - 1) END <= ?)")
 OWN = "linear:"  # reason prefix on blocks this plugin makes, so their events are not echoed back
+def stable_uuid4(*parts: str) -> str:
+    """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
+    digest = hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4))
 def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
@@ -834,16 +842,13 @@ class Bridge:
             return True
         if (fresh.get("state") or {}).get("type") in CLOSED and stamp < self.closure_ms(fresh):
             return True
-        ack_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-session-received:{issue_id}:{session_id}"))
+        # Advisory: Linear wants a reply within seconds, so try it now. Ownership, not this
+        # receipt, admits work; a rejected or lost acknowledgement never blocks the task.
+        ack_id = stable_uuid4("linear-session-received", issue_id, session_id)
         self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
                            "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
                            "content": {"type": "thought", "body": "Received. Checking durable work admission."}}, at=self.clock())
         self.flush(only_id=ack_id)
-        receipt = self.store.outbox_row(ack_id)
-        if not (receipt and (payload := receipt["payload"]) and receipt["state"] == "sent" and payload.get("applied") == 1 and
-                payload.get("issue_id") == issue_id and payload.get("session_id") == session_id and
-                (payload.get("requester_sessions") or {}).get(issue_id) == session_id and payload.get("initial_ack")):
-            raise LinearError("Initial Linear acknowledgement is not accepted; retry durable ingress delivery")
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
@@ -1137,7 +1142,7 @@ class Bridge:
         """After a restart: Kanban workers are respawned by core; chat work is asked to reconcile."""
         for issue_id in {row["issue_id"] for row in self.store.retired()}:
             with suppress(LinearError): self.await_retired(issue_id)
-        if ingress is not None: self.drain_ingress(ingress)
+        if ingress is not None: self.drain_ingress(ingress, retry_now=True)  # a restart retries backed-off deliveries
         self._recover_kanban()
         self._recover_chats()
     def _recover_kanban(self) -> None:
@@ -1242,7 +1247,7 @@ class Bridge:
                             continue
                         if not exc.retryable:
                             self.store.mark(row["id"], "failed")
-                            if row["payload"].get("reconcile_required"): progress = True
+                            if row["payload"].get("reconcile_required") or advisory(row): progress = True  # don't delay the next write
                         else:
                             self.store.retry(row, self.clock())
                         continue
@@ -1250,6 +1255,11 @@ class Bridge:
                         sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 if only_id is not None and row["id"] != only_id: continue
+                if advisory(row):
+                    log.warning("linear: dropped undeliverable %s activity %s for %s", row["payload"]["content"]["type"],
+                                row["id"], row["payload"].get("issue_id"))
+                    self.store.report(row["id"])
+                    continue
                 if not self._authorize_outbox_effect(row): continue
                 with self.store.guard_outbox(row["id"], "failed") as admitted:
                     if not admitted: continue
@@ -1271,12 +1281,13 @@ class Bridge:
             if row and not self._authorize_outbox_effect(row, issue_ids): raise ProjectUpdateDeferred
             if payload.get("initial_ack"):
                 issue = self._effect_issue(payload["issue_id"])
-                if (self._specialist_scope_active() and
-                        self.api.agent_session(payload["session_id"])["issue"]["id"] != issue["id"]):
-                    raise ProjectUpdateDeferred
-                if ((issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()) or
+                if ((self._specialist_scope_active() and
+                        self.api.agent_session(payload["session_id"])["issue"]["id"] != issue["id"]) or
+                        (issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()) or
                         ((issue.get("state") or {}).get("type") in CLOSED and
                          float(payload.get("source_ms") or 0) < self.closure_ms(issue))):
+                    self.store.mark(row_id, "failed")  # moot once ownership moved; never hold it pending
+                    self.store.report(row_id)
                     raise ProjectUpdateDeferred
             if row and ((payload.get("requester_sessions") and payload.get("terminal")) or
                         payload.get("superseded_receipt")):
@@ -1567,42 +1578,47 @@ class Bridge:
         self.store.hold_terminal(row["id"])
         row["payload"]["reconcile_required"] = True
         raise LinearError(message, retryable=False)
-    def _stop_deliveries(self, db) -> list:
-        return db.execute("SELECT logical_agent, delivery_id, payload, received_at, "
+    def _stop_deliveries(self, db, due_at: float | None = None) -> list:
+        return db.execute("SELECT logical_agent, delivery_id, payload, received_at, attempts, "
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
                           "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
-                          "json_extract(payload, '$.agentActivity.signal') END='stop' ORDER BY received_at, delivery_id",
-                          (self.ingress_profile,)).fetchall()
+                          "json_extract(payload, '$.agentActivity.signal') END='stop' "
+                          f"AND (? IS NULL OR {INGRESS_DUE}) ORDER BY received_at, delivery_id",
+                          (self.ingress_profile, due_at, due_at)).fetchall()
     def _queued_stop(self, issue_id: str, stamp: float) -> bool:
         if self._ingress is None or not self._ingress.exists(): return False
         try:
             with closing(sqlite3.connect(f"file:{self._ingress}?mode=ro", uri=True, timeout=10)) as db:
                 return any((not target or target == issue_id) and event_ms(json.loads(payload)) > stamp
-                           for _, _, payload, _, target in self._stop_deliveries(db))
+                           for _, _, payload, _, _, target in self._stop_deliveries(db))
         except (sqlite3.Error, ValueError, TypeError, AttributeError) as exc:
             raise LinearError("Ingress Stop state unavailable; retry the saved resume transition") from exc
-    def drain_ingress(self, database: Path, limit: int = 50) -> None:
+    def drain_ingress(self, database: Path, limit: int = 50, *, retry_now: bool = False) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
         self._ingress = Path(database)
         if not Path(database).exists():
             return
+        now = math.inf if retry_now else self.clock()
         with closing(sqlite3.connect(database, timeout=10, isolation_level=None)) as db:
             owned = {row["issue_id"] for row in self.store.active()}
-            stops = [row[:4] for row in self._stop_deliveries(db) if not row[4] or row[4] in owned][:limit]
-            rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at FROM deliveries WHERE profile = ? "
-                              "AND status = 'pending' ORDER BY received_at, delivery_id LIMIT ?",
-                              (self.ingress_profile, limit)).fetchall()
+            stops = [row[:5] for row in self._stop_deliveries(db, now) if not row[5] or row[5] in owned][:limit]
+            rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at, attempts FROM deliveries "
+                              f"WHERE profile = ? AND status = 'pending' AND {INGRESS_DUE} "
+                              "ORDER BY received_at, delivery_id LIMIT ?", (self.ingress_profile, now, limit)).fetchall()
             selected = {(row[0], row[1]) for row in stops}
             rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
-            for agent, delivery, payload, received in rows:
+            for agent, delivery, payload, received, attempts in rows:
                 status = "imported"
                 try:
                     self.handle_webhook(json.loads(payload))
                 except (ValueError, TypeError):
                     status = "invalid"
-                except Exception:  # noqa: BLE001 - keep the inbox moving; retry for a day, then park it loudly
-                    log.exception("linear: delivery %s failed", delivery)
+                except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly
                     status = "failed" if self.clock() - float(received) > 86_400 else "pending"
+                    if attempts and status == "pending":
+                        log.warning("linear: delivery %s failed again (attempt %d): %s", delivery, attempts + 1, exc)
+                    else:
+                        log.exception("linear: delivery %s failed", delivery)
                     if status == "failed":
                         try:
                             event = json.loads(payload)
