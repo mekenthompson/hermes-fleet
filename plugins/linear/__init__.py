@@ -153,6 +153,8 @@ class BoundLinearAPI(LinearAPI):
     def issue(self, ref):
         with self._permit_specialist_operation():
             issue = super().issue(ref)
+        return self._scoped(issue, ref)
+    def _scoped(self, issue, ref):
         if ref not in (issue.get("id"), issue.get("identifier")):
             raise LinearError("Linear issue resolution does not match the requested ref")
         team = issue.get("team") or {}
@@ -163,9 +165,15 @@ class BoundLinearAPI(LinearAPI):
         self._check_issue(issue)
         return issue
     def issue_thread(self, issue_id, limit=50):
-        self.issue(issue_id)  # the same identity, team, project and specialist checks as any issue read
+        """Issue and comments in one read, scoped like any issue read. Under specialist_scope only allowed
+        requesters and this app are passed on, so a refused requester's words never reach the worker."""
         with self._permit_specialist_operation():
-            return super().issue_thread(issue_id, limit)
+            issue, comments = super().issue_with_thread(issue_id, limit)
+        self._scoped(issue, issue_id)
+        if self.specialist_scope is not None:
+            allowed = set(self.specialist_scope["allowed_requester_ids"]) | {self.viewer_id()}
+            comments = [comment for comment in comments if comment.get("user_id") in allowed]
+        return comments
     def _mutation_issue(self, issue_id):
         issue = self.issue(issue_id)
         if not isinstance(issue_id, str) or not issue_id.strip() or issue.get("id") != issue_id:

@@ -68,6 +68,7 @@ class Authority:
                                       "agentSession": {"id": SESSION}}}
         self.requests: list[str] = []
         self.mutations: list[str] = []
+        self.comments: dict[str, list] = {}
         self.fail_session = False
         self.fail_issue = False
 
@@ -83,6 +84,9 @@ class Authority:
             data = {"agentSession": self.sessions.get(variables["id"])}
         elif "query AgentActivityAuthorization" in query:
             data = {"agentActivity": self.activities.get(variables["id"])}
+        elif "query IssueThread(" in query:
+            issue = self.issues.get(variables["id"])
+            data = {"issue": {**issue, "comments": {"nodes": self.comments.get(variables["id"], [])}} if issue else None}
         elif "query Issue(" in query:
             if self.fail_issue:
                 return 503, {}, json.dumps({"errors": [{"message": "fixture unavailable"}]}).encode()

@@ -69,7 +69,7 @@ plugins:
           example-project-id: example-org/example-repo
         ingress_database: /opt/data/workspace/linear/ingress.db
         quiet_minutes: 30                   # chat project-update quiet period
-        recheck_minutes: 5                  # ownership re-read interval for active work
+        recheck_minutes: 5                  # ownership re-read interval for active work; capped at 10
 ```
 
 Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (Kanban board slug),
@@ -245,7 +245,7 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
 | Follow-up prompt | Task comment with the message and every Linear comment since the agent's last update, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
-| Any new or resumed Kanban task | The task includes the Linear thread: Linear's `promptContext` for new work (fetched by the plugin when absent), and comments since the last update for re-delegation and follow-ups. Detached workers cannot read Linear themselves | none |
+| Any new or resumed Kanban task | The task includes the Linear thread: Linear's `promptContext` for new work (fetched by the plugin when absent), and comments between the last update and the event for re-delegation and follow-ups. Under `specialist_scope` only allowed requesters' and this app's comments are included. Detached workers cannot read Linear themselves | none |
 | Worker completes with a saved local summary or accepted external evidence | task done | Done state, one response with the saved summary and any links, one project update |
 | Worker completes without an accepted result | task done | Blocked state, one error: unfinished |
 | Worker blocks (`needs_input`) | task blocked | Blocked state, one elicitation |

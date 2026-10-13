@@ -307,7 +307,10 @@ class Bridge:
         self.team_states = settings.get("team_states") or {}
         self.contracts = settings.get("completion_contracts") or {}
         self.quiet = float(settings.get("quiet_minutes", 30)) * 60
-        self.recheck_every = min(float(settings.get("recheck_minutes", 5)), 10) * 60  # keepalive needs <= 10
+        self.recheck_every = float(settings.get("recheck_minutes", 5)) * 60
+        if self.recheck_every > 600:  # the keepalive must beat Linear's 30 min stale mark
+            log.warning("linear: recheck_minutes above 10 is capped at 10")
+            self.recheck_every = 600
         self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
@@ -668,7 +671,7 @@ class Bridge:
             self._acknowledge(issue_id, session_id, stamp)  # ownership was just read; Kanban comes next
             if not self._resume(row, "Re-delegated in Linear; continue the existing work.",
                                 session_id, stamp, "Resuming the existing task.",
-                                context=self._thread(issue_id, since_ms=float(row["last_updated_at"]))):
+                                context=lambda: self._thread(issue_id, since_ms=float(row["last_updated_at"]), until_ms=stamp)):
                 self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
         else:
             self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
@@ -690,7 +693,8 @@ class Bridge:
         if row:
             if self._resume(row, f"Follow-up from Linear: {body}", session_id,
                             event_ms(event), "Instruction saved on the existing task.", str(activity.get("id") or ""),
-                            context=self._thread(issue["id"], since_ms=float(row["last_updated_at"]))):
+                            context=lambda: self._thread(issue["id"], since_ms=float(row["last_updated_at"]),
+                                                         until_ms=event_ms(event))):
                 return
         # The session key comes first so an out-of-order prompt and created event share a task.
         stamp = event_ms(event)
@@ -736,7 +740,7 @@ class Bridge:
         raise LinearError("Owning chat refused injection; retry the durable ingress delivery")
     def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
                 stamp: float | None = None, receipt: str = "Resuming the existing task.", marker: str = "",
-                context: str = "") -> bool:
+                context: Callable[[], str] | None = None) -> bool:
         """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
         if self.store.issue_reconciliation_blocked(row["issue_id"]): return False
         if not self._require_effect(row["issue_id"]): return False
@@ -766,7 +770,8 @@ class Bridge:
                 messages = intent.get("messages", [{"key": markers[0], "note": intent["note"]}])
             if key not in markers:
                 markers.append(key)
-                message = {"key": key, "note": "\n\n".join(x for x in (incoming, context) if x)}  # the key stays stable
+                # The thread is read only for a new instruction and kept out of the key, so a redelivery still dedupes.
+                message = {"key": key, "note": "\n\n".join(x for x in (incoming, context() if context else "") if x)}
                 if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
                     message.update(activity_id=marker, session_id=session_id,
                                    provenance="activity" if marker else "delegation")
@@ -850,18 +855,21 @@ class Bridge:
                           f"{delegate.get('name') or 'no one'}, not this agent.")
         else:  # still ours and open: the first read failed, so retry the delivery rather than drop it
             raise LinearError("Linear ownership read was inconsistent; retrying the delivery")
-    def _thread(self, issue_id: str, since_ms: float = 0) -> str:
-        """The Linear thread for a detached worker, which cannot read Linear. Best effort and bounded: the
-        newest comments win, and a failed read leaves the work to proceed without it."""
+    def _thread(self, issue_id: str, since_ms: float = 0, until_ms: float = math.inf) -> str:
+        """The Linear thread for a detached worker, which cannot read Linear: comments after `since_ms` and before
+        the event itself. Best effort and bounded; the newest comments win. A quota pause retries the delivery."""
         reader = getattr(self.api, "issue_thread", None)
         try:
             comments = reader(issue_id) if callable(reader) else []
+        except RateLimited:
+            raise
         except LinearError as exc:
             log.warning("linear: thread for %s unavailable: %s", issue_id, exc)
             return ""
         lines, size = [], 0
-        for comment in reversed([c for c in comments if iso_ms(c["at"]) > since_ms]):
-            line = f"- {comment['at'][:16]} {comment['who']}: {' '.join(comment['body'].split())[:1200]}"
+        for comment in reversed([c for c in comments if since_ms < iso_ms(c["at"]) < until_ms]):
+            who = " ".join(comment["who"].split())[:60]
+            line = f"- {comment['at'][:16]} {who}: {' '.join(comment['body'].split())[:1200]}"
             if size + len(line) > 8000: break
             lines.append(line)
             size += len(line)
@@ -916,8 +924,8 @@ class Bridge:
         info = {**issue, **(fresh or {})}
         project = (info.get("project") or {}).get("id") or issue.get("projectId")
         ident = info.get("identifier") or issue_id
-        context = "\n\n".join(x for x in (event.get("promptContext") or info.get("description") or "",
-                                           "" if event.get("promptContext") else self._thread(issue_id), prompt) if x)
+        thread = "" if event.get("promptContext") or existing else self._thread(issue_id, until_ms=stamp)
+        context = "\n\n".join(x for x in (event.get("promptContext") or info.get("description") or "", thread, prompt) if x)
         with self.store.guard_issue_work(issue_id) as admitted:
             if not admitted: return False
             if stamp <= self.store.chat_closeout_ms(issue_id): return True
