@@ -381,8 +381,8 @@ health check can alert on it without flapping on work the gateway is still settl
 | Held item | Next step |
 |---|---|
 | `ACT` Status or description write the gateway stopped trying, outcome unknown, with any writes held behind it | Check Linear, then `resolve` |
-| Status or description write still being sent | None; it settles or escalates on its next send |
-| Issue write Linear refused (`ACT`) or timed out on, in the last 7 days | Redo the step, or wait for the retry after the next successful write |
+| Status or description write still being sent; `ACT` once held unsent for an hour | None at first; it settles or escalates on its next send |
+| Issue write Linear refused (`ACT`) or timed out on, in the last 7 days; it then drops off the list | Redo the step, or wait for the retry after the next successful write |
 | `ACT` Parked inbox delivery; a delivery still backing off | Fix the logged cause, then `replay`; a restart retries backing-off ones |
 | `ACT` Ambiguous chat-to-worker admission | Confirm the task and delegate before new work |
 | Specialist scope fence, claiming admission, unfinished release, worker still exiting | Approved recovery only for fences; the gateway retries the rest each tick |

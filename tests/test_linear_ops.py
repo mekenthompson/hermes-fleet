@@ -64,12 +64,20 @@ class LinearOperatorTests(unittest.TestCase):
 
     def test_in_flight_write_is_shown_but_cannot_be_resolved_under_the_sender(self):
         row = self.uncertain("status", "issue-6", settled=False, state="done", terminal=True)
-        [item] = ops.stuck(self.state, self.inbox, "default")
+        [item] = ops.stuck(self.state, self.inbox, "default", now=160)
         self.assertFalse(item["act"])
         self.assertIn("being sent", item["why"])
-        self.assertEqual(self.cli("status")[0], 0)
         self.assertEqual(self.cli("resolve", row, "not_applied", "--evidence", "Linear shows Todo")[0], 1)
         self.assertTrue(self.store.issue_reconciliation_blocked("issue-6"))
+        [late] = ops.stuck(self.state, self.inbox, "default", now=100 + 3601)
+        self.assertTrue(late["act"])  # held unsent for an hour: the health check fires
+
+    def test_locked_state_database_is_an_error_not_an_all_clear(self):
+        from unittest.mock import patch
+        with patch.object(ops, "_read") as read:
+            read.return_value.execute.side_effect = sqlite3.OperationalError("database is locked")
+            with self.assertRaises(sqlite3.OperationalError):
+                ops.stuck(self.state, self.inbox, "default")
 
     def test_retried_terminal_comment_never_asks_for_resolve(self):
         comment = self.store.enqueue("comment", {"issue_id": "issue-7", "body": "Done", "terminal": True}, at=100)
@@ -106,9 +114,9 @@ class LinearOperatorTests(unittest.TestCase):
         self.assertIn("approved procedure", items["fence"]["action"])
         self.assertIn("redo the step", items[refused]["action"])
         self.assertNotIn(thought, items)  # a dropped thought holds nothing
-        code, text = self.cli("status", "--json")
-        self.assertEqual((code, json.loads(text)[0]["issue"]), (0, "issue-3"))  # a policy fence alone is not an alarm
-        self.assertNotIn("requester outside scope", text)  # fence reasons stay in the database
+        self.assertFalse(items["fence"]["act"])  # a policy fence alone is not an alarm
+        self.assertNotIn("requester outside scope", ops.report(list(items.values())))  # reasons stay in the database
+        self.assertTrue(items[refused]["act"])
 
 
 if __name__ == "__main__":

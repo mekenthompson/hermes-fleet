@@ -47,8 +47,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # thoughts, a 15 s Stop retry cap and a one-day retry ceiling. Measured 4252.
 # ops.py gives every fence a visible reason and a supported command (status, resolve, replay);
 # review added in-flight refusal, ACT-only exit codes, legacy-schema tolerance and the gateway's
-# profile rule. Measured 4389, allowance 0: remove lines before adding them.
-BUDGET = 4389
+# profile rule, then no false green on a locked database and an alarm for a send held an hour.
+# Measured 4391, allowance 0: remove lines before adding them.
+BUDGET = 4391
 
 
 class FakeContext:

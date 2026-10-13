@@ -18,7 +18,8 @@ def _read(path: Path) -> sqlite3.Connection:
 def _rows(db: sqlite3.Connection, sql: str, *args: Any) -> list[sqlite3.Row]:
     try:
         return db.execute(sql, args).fetchall()
-    except sqlite3.OperationalError:  # a state database the gateway has not migrated yet
+    except sqlite3.OperationalError as exc:  # only a schema the gateway has not migrated yet is empty
+        if "no such" not in str(exc): raise
         return []
 
 def needs_resolution(row: Any, payload: dict[str, Any]) -> bool:
@@ -43,8 +44,9 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     add(issue, row["id"], since, f"{row['kind']} write may or may not have reached Linear; it holds "
                         "this issue" + (f" and {held} dependent write(s)" if held else ""), RESOLVE.format(id=row["id"]), True)
                 elif row["kind"] in ("status", "description") and Store.uncertain(row, payload):
-                    add(issue, row["id"], since, f"{row['kind']} write is being sent; it holds this issue",
-                        "Settles or escalates on its next send; check again in a few minutes.")
+                    late = now - since > 3600  # a send held this long is not settling by itself
+                    add(issue, row["id"], since, f"{row['kind']} write is {'held unsent' if late else 'being sent'}; it holds "
+                        "this issue", "Check the gateway log for what holds it." if late else "Settles on its next send.", late)
                 elif row["state"] == "failed" and not payload.get("reconciliation") and now - since < 7 * 86_400:
                     add(issue, row["id"], since, f"{row['kind']} write was not delivered",
                         "Retried after the next successful write." if row["attempts"] else "Not retried: redo the step.",
