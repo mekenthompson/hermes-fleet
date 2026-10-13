@@ -697,7 +697,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 1
         before = self.bridge.store.get(ISSUE)
         self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(LinearError("fixture read outage"))
-        self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
+        with self.assertRaises(LinearError):  # retried from the inbox, never dropped or misreported
+            self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-2", body="continue"))
         self.bridge.tick()
         self.assertEqual(self.tasks(), [(task, "blocked")])
         self.assertEqual(self.bridge.store.get(ISSUE), before)
@@ -745,7 +746,11 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge.api.issue = lambda ref: (_ for _ in ()).throw(plugin.LinearError("fixture read outage"))
             with self.subTest(refusal=refusal):
                 injected = list(self.injected)
-                self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write"))
+                event = self.linear.session_event("prompted", ISSUE, "s-9", body="foreign write")
+                if refusal == "read":  # retried from the inbox, never dropped or misreported
+                    with self.assertRaises(plugin.LinearError): self.bridge.handle_webhook(event)
+                else:
+                    self.bridge.handle_webhook(event)
                 self.assertEqual(self.injected, injected)
                 self.assertEqual(self.bridge.store.get(ISSUE), before)
         self.bridge.api.issue = original_issue

@@ -643,7 +643,7 @@ class Bridge:
                           not self.store.has_start_ack(issue_id, row["task_id"]))
         if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(
                 issue_id, retryable=self._specialist_scope_active(), source_ms=stamp):
-            return self._decline(issue_id, session_id, "Not resuming: this issue is closed or delegated elsewhere.")
+            return self._decline_existing(issue_id, session_id)
         session = event.get("agentSession") or {}
         creator = session.get("creatorId") or (session.get("creator") or {}).get("id")
         echo = creator is not None and creator == self.me()  # our own chat-start delegation fires 'created'
@@ -676,7 +676,7 @@ class Bridge:
             return
         if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active(),
                                                  source_ms=event_ms(event)):
-            return self._decline(issue["id"], session_id, "Not resuming: this issue is closed or delegated elsewhere.")
+            return self._decline_existing(issue["id"], session_id)
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
         if row and row["origin"] == "kanban_chat":
@@ -829,11 +829,25 @@ class Bridge:
     def _decline(self, issue_id: str, session_id: str, body: str) -> None:
         """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent."""
         if self.authorize_specialist_effect(issue_id):
-            self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "requester_sessions":
-                               {issue_id: session_id}, "content": {"type": "response", "body": body}}, at=self.clock())
+            self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "one_try": True,
+                               "requester_sessions": {issue_id: session_id},
+                               "content": {"type": "response", "body": body}}, at=self.clock())
+    def _decline_existing(self, issue_id: str, session_id: str) -> None:
+        """Say why only when Linear confirms it. A failed read retries the delivery instead of guessing."""
+        try:
+            issue = self._effect_issue(issue_id)
+        except LinearError as exc:
+            if exc.retryable: raise
+            return
+        delegate, me = issue.get("delegate") or {}, self.api.viewer_id()
+        if (issue.get("state") or {}).get("type") in CLOSED:
+            self._decline(issue_id, session_id, "Not resuming: this issue is closed.")
+        elif delegate.get("id") != me:
+            self._decline(issue_id, session_id, "Not resuming: this issue is delegated to "
+                          f"{delegate.get('name') or 'no one'}, not this agent.")
     def _keepalive(self, row: dict[str, Any]) -> None:
         """A Linear session goes stale after 30 min without activity; show running work is still alive."""
-        if self.clock() - self.store.last_activity_at(row["issue_id"]) < 20 * 60: return
+        if self.clock() - self.store.last_activity_at(row["issue_id"], row["owner_ref"]) < 25 * 60 - self.recheck_every: return
         task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
         if task and task.status in ("running", "ready"):  # never cover an elicitation awaiting input
             kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
@@ -885,8 +899,12 @@ class Bridge:
             if not admitted: return False
             if stamp <= self.store.chat_closeout_ms(issue_id): return True
             current = self._effect_issue(issue_id)
-            if (now := (current.get("delegate") or {}).get("id")) not in (None, me) or (delegate == me and now is None): return True
-            if (current.get("state") or {}).get("type") in CLOSED and ((fresh.get("state") or {}).get("type") not in CLOSED or stamp < self.closure_ms(current)): return True
+            if (now := (current.get("delegate") or {}).get("id")) not in (None, me) or (delegate == me and now is None):
+                self._decline(issue_id, session_id, "Not starting: the delegation changed while this was starting.")
+                return True
+            if (current.get("state") or {}).get("type") in CLOSED and ((fresh.get("state") or {}).get("type") not in CLOSED or stamp < self.closure_ms(current)):
+                self._decline(issue_id, session_id, "Not starting: this issue was closed while this was starting.")
+                return True
             task = self.kanban.get(existing["task_id"]) if existing else self.kanban.create(
                 title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
                 body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),

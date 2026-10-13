@@ -39,10 +39,13 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
-ADVISORY = "(kind = 'activity' AND json_extract(payload, '$.content.type') IN ('thought', 'action'))"
+ADVISORY = ("(kind = 'activity' AND (json_extract(payload, '$.content.type') IN ('thought', 'action') OR "
+            "COALESCE(json_extract(payload, '$.one_try'), 0) = 1))")
 def advisory(row: dict[str, Any]) -> bool:
-    """A thought or action shows progress; losing one changes no issue, so it never alerts, revives or fences."""
-    return row["kind"] == "activity" and (row["payload"].get("content") or {}).get("type") in ("thought", "action")
+    """A thought, action or decline reply changes no issue: it gets one try and never alerts, revives or fences."""
+    payload = row["payload"]
+    return row["kind"] == "activity" and ((payload.get("content") or {}).get("type") in ("thought", "action")
+                                          or payload.get("one_try") is True)
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -630,10 +633,13 @@ class Store:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'pending' AND (? IS NULL OR "
                               "json_extract(payload, '$.issue_id') = ?) ORDER BY rowid", (issue_id, issue_id)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
-    def last_activity_at(self, issue_id: str) -> float:
+    def last_activity_at(self, issue_id: str, session_id: str) -> float:
+        """When this session last showed, or is about to show, an activity; dropped ones do not count."""
         with self._tx() as db:
             row = db.execute("SELECT MAX(json_extract(payload, '$.enqueued_at')) FROM outbox WHERE kind = 'activity' "
-                             "AND json_extract(payload, '$.issue_id') = ?", (issue_id,)).fetchone()
+                             "AND (state = 'pending' OR (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 1)) AND "
+                             "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ?",
+                             (issue_id, session_id)).fetchone()
         return float(row[0] or 0)
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:

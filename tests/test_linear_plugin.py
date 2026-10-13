@@ -50,8 +50,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # profile rule, then no false green on a locked database and an alarm for a send held an hour.
 # Linear's agent contract: an answer within 10 s before any Kanban wait, a reply to every refused
 # session, a keepalive before the 30 min stale mark, and no status move backwards.
-# Measured 4428, allowance 0: remove lines before adding them.
-BUDGET = 4428
+# Review: decline only on a confirmed reason, one-try declines, session-scoped keepalive.
+# Measured 4454. The owner approved 100 lines of headroom so contract fixes stop moving the cap;
+# growth past it is a design review, not another bump.
+BUDGET = 4554
 
 
 class FakeContext:
