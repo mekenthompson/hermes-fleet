@@ -1971,7 +1971,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.handle_webhook(event)
         self.bridge.tick()
         self.assertEqual(len(self.tasks()), 1)
-        self.assertEqual(self.linear.activities, [])
+        self.assertFalse(any("Received" in str(a["content"]) for a in self.linear.activities))
+        self.assertTrue(all(a.get("ephemeral") for a in self.linear.activities))  # only keepalives after an hour
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
 
     def test_refused_ack_imports_delivery_and_starts_work(self) -> None:

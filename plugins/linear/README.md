@@ -238,7 +238,10 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 
 | Event | Kanban | Linear |
 |---|---|---|
-| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A receipt thought is tried before task creation, then task progress and In Progress are sent. The receipt is advisory: current ownership admits the work, and a lost or refused receipt never blocks it |
+| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A receipt thought, sent after the first ownership read and before any Kanban wait, so it meets Linear's 10 s limit. Then task progress and the claim. The receipt is advisory: ownership admits the work, and a lost or refused receipt never blocks it |
+| Delegation we will not act on (now delegated elsewhere, or closed) | none | One `response` saying why, so the session is not left unresponsive |
+| Work runs 20 minutes with no activity | none | An ephemeral "Working" (or "Waiting to resume") action, so the session does not go stale at 30 minutes. Never while waiting for input |
+| Claiming an issue | none | Delegate = self. Status moves to the configured `in_progress` state only if the issue has not started (or is in the configured `blocked` state); a team without that state name uses its first `started` state by position |
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
 | Follow-up prompt | Task comment, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
@@ -394,6 +397,12 @@ else `HERMES_PROFILE`, else `HERMES_AGENT_PROFILE`, else `default`. A replayed d
 again parks again without a second alert.
 
 ## Known limits
+
+- **Stop does not halt the worker at once.** Core blocks the task immediately, but its reaper
+  terminates the worker 120 seconds after the run ends, on its next dispatcher tick (up to 60 s
+  more). Until then the worker can still run tools. The Stop reply says so. A prompt halt needs a
+  core change: signal the worker when a task is blocked from outside, and skip the turn-end nudge
+  for a task that is no longer running.
 
 - **Chat Stop is scoped to a bound ordinary chat run.** The plugin saves the host-provided session
   key and run generation at `linear start`. A Linear Stop records that exact target durably before
