@@ -42,7 +42,10 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Agent progress activities add action content, ephemeral current-step replacement, and comment text.
 # Named board init registers board.json so the dispatcher can discover a database stub.
 # Measured 4226, allowance 8.
-BUDGET = 4234
+# Advisory thoughts replace the acknowledgement gate; ingress deliveries back off durably.
+# Two duplicated lookups were folded to pay for most of it. Measured 4248, allowance 0:
+# remove lines before adding them.
+BUDGET = 4248
 
 
 class FakeContext:
@@ -108,6 +111,19 @@ class LinearOutboxOrderTests(unittest.TestCase):
         self.assertEqual(receipt["attempts"], 1)
         self.assertEqual(receipt["payload"]["reconciliation"]["outcome"], "not_applied")
 
+
+    def test_advisory_thoughts_never_hold_or_wait_for_issue_writes_and_are_not_revived(self) -> None:
+        thought = self.store.enqueue("activity", {"issue_id": "issue-1", "session_id": "s-1",
+                                                  "content": {"type": "thought", "body": "Working"}}, at=100)
+        self.assertEqual({row["kind"] for row in self.store.due(100)}, {"status", "activity"})
+        self.store.retry(self.store.outbox_row(thought), 100)  # a thought backing off holds nothing
+        self.assertEqual([row["kind"] for row in self.store.due(100)], ["status"])
+        self.store.retry(self.status, 170)  # nor does it wait behind a backing-off issue write
+        self.assertEqual([row["id"] for row in self.store.due(200)], [thought])
+        self.store.mark(thought, "failed")
+        self.store.mark_sent(self.status["id"], True)
+        self.assertEqual(self.store.revive_failed(300), 0)
+        self.assertEqual(self.store.outbox_row(thought)["state"], "failed")
 
 class LinearPluginUnitTests(unittest.TestCase):
     def test_off_by_default_and_one_block_enables_it(self) -> None:

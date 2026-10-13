@@ -1,7 +1,8 @@
 """A small fake of Linear's GraphQL API over real HTTP, for plugins/linear scenario tests.
 
 It models only what the plugin uses, with the live behaviours recorded in plan phase 0:
-client ``id`` on creates (duplicate -> HTTP 200 INPUT_ERROR "conflict on insert of ..."),
+client ``id`` on creates (duplicate -> HTTP 200 INPUT_ERROR "conflict on insert of ...";
+anything but a canonical UUIDv4 -> HTTP 200 INPUT_ERROR "Argument Validation Error"),
 RATELIMITED as HTTP 400 with epoch-millisecond reset headers, and the delegate field.
 """
 from __future__ import annotations
@@ -10,6 +11,7 @@ import importlib.util
 import json
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +26,15 @@ STATES = [
     {"id": "st-done", "name": "Done", "type": "completed"},
     {"id": "st-canceled", "name": "Canceled", "type": "canceled"},
 ]
+
+
+def canonical_uuid4(value) -> bool:
+    """Linear accepts a client-supplied create id only as a UUIDv4."""
+    try:
+        parsed = uuid.UUID(str(value))
+    except ValueError:
+        return False
+    return parsed.version == 4 and str(parsed) == value
 
 
 def load_plugin():
@@ -145,6 +156,11 @@ class FakeLinear:
                                         ("projectUpdateCreate", self.project_updates, "ProjectUpdate")):
             if mutation in query:
                 fields = dict(variables["input"])
+                if not canonical_uuid4(fields.get("id")):
+                    return 200, {"data": None, "errors": [{
+                        "message": "Argument Validation Error",
+                        "extensions": {"type": "invalid input", "code": "INPUT_ERROR", "statusCode": 400,
+                                       "userPresentableMessage": "id must be a UUID v4."}}]}
                 if fields["id"] in self.ids:
                     return 200, {"data": None, "errors": [{
                         "message": f"conflict on insert of {entity}",

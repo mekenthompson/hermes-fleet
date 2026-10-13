@@ -265,10 +265,7 @@ class BoundLinearAPI(LinearAPI):
         if self.specialist_scope is not None:
             raise LinearError("Issue creation is outside specialist scope", retryable=False)
         self.viewer_id()
-        team = self.graphql("query Team($id: String!) { team(id: $id) { id key } }", {"id": team_id}).get("team")
-        if (not isinstance(team, dict) or not team.get("id") or
-                (self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]))):
-            raise LinearError("Linear team is outside configured scope", retryable=False)
+        team = self._scoped_team(team_id)
         if self.identity.get("projects") and project_id not in self.identity["projects"]:
             raise LinearError("Linear project is outside configured scope", retryable=False)
         if project_id:
@@ -291,14 +288,15 @@ class BoundLinearAPI(LinearAPI):
         if self.specialist_scope is not None:
             raise LinearError("Project creation is outside specialist scope", retryable=False)
         self.viewer_id()
-        resolved = []
-        for team_id in team_ids:
-            team = self.graphql("query Team($id: String!) { team(id: $id) { id key } }", {"id": team_id}).get("team")
-            if (not isinstance(team, dict) or not team.get("id") or
-                    (self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]))):
-                raise LinearError("Linear team is outside configured scope", retryable=False)
-            resolved.append(team["id"])
+        resolved = [self._scoped_team(team_id)["id"] for team_id in team_ids]
         return super().create_project(client_id, name, resolved, description=description)
+
+    def _scoped_team(self, team_id):
+        team = self.graphql("query Team($id: String!) { team(id: $id) { id key } }", {"id": team_id}).get("team")
+        if (not isinstance(team, dict) or not team.get("id") or
+                (self.identity.get("teams") and not {team.get("id"), team.get("key")} & set(self.identity["teams"]))):
+            raise LinearError("Linear team is outside configured scope", retryable=False)
+        return team
 
     def link_issue(self, issue_id, related_issue_id, relation):
         if self.specialist_scope is not None:

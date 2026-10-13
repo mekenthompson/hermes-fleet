@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from linear_fake_api import load_plugin
+from linear_fake_api import canonical_uuid4, load_plugin
 from linear_ingress_fixture import IngressStore, Route
 
 plugin = load_plugin()
@@ -90,6 +91,10 @@ class Authority:
             self.mutations.append(query)
             field = next((name for name in ("issueUpdate", "commentCreate", "agentActivityCreate",
                                             "projectUpdateCreate") if name in query), None)
+            client_id = (variables.get("input") or {}).get("id")
+            if field and field.endswith("Create") and not canonical_uuid4(client_id):
+                return 200, {}, json.dumps({"data": None, "errors": [{"message": "Argument Validation Error",
+                    "extensions": {"code": "INPUT_ERROR"}}]}).encode()
             data = {field: {"success": True}} if field else {}
         else:
             data = {"organization": {"id": ORG}}
@@ -736,6 +741,9 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.pending(), [])
         self.authority.fail_issue = False
         self.kanban.create = lambda **fields: self.kanban.tasks["task-1"]
+        self.bridge.drain_ingress(inbox)  # backing off: not retried on the very next tick
+        self.assertIsNone(self.store.get(ISSUE))
+        self.bridge.clock = lambda: time.time() + 5  # the first retry is due 5 s after receipt
         self.bridge.drain_ingress(inbox)
         with sqlite3.connect(inbox) as db:
             self.assertEqual(db.execute("SELECT status FROM deliveries").fetchone()[0], "imported")

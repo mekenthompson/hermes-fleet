@@ -238,7 +238,7 @@ existing product ownership. Acceptance uses a fresh disposable issue after separ
 
 | Event | Kanban | Linear |
 |---|---|---|
-| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A durable receipt thought is sent before task creation, then task progress and In Progress are sent |
+| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A receipt thought is tried before task creation, then task progress and In Progress are sent. The receipt is advisory: current ownership admits the work, and a lost or refused receipt never blocks it |
 | `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
 | Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
 | Follow-up prompt | Task comment, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
@@ -303,7 +303,10 @@ when the first send begins.
 
 ## Delivery guarantees
 
-Every Linear write goes through a local outbox, oldest first per issue.
+Every Linear write goes through a local outbox. Everything except Agent Activity thoughts and
+actions goes out oldest first per issue. Thoughts and actions are advisory progress: they never wait
+for, or hold back, another write. A refused or expired one is logged and dropped. It is never
+alerted, revived, or used to fence work.
 
 - **Creates** (comment, activity, project update) carry a UUID v4 client `id`, stored when the
   write is queued. Linear rejects a repeat with `INPUT_ERROR` "conflict on insert of ..." naming that
@@ -326,8 +329,8 @@ Every Linear write goes through a local outbox, oldest first per issue.
   unrelated edit. A successor ownership generation suppresses old release comments, responses
   and project-update lines. Read-before-write plus readback is best-effort, not remote CAS.
 - **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
-  failed. This is loud: an error log, a message in the owning chat (or a comment on the Kanban
-  task), and one more try after the next successful write. A failed chat alert remains due until
+  failed. For an issue write this is loud: an error log, a message in the owning chat (or a
+  comment on the Kanban task), and one more try after the next successful write. A failed chat alert remains due until
   injection succeeds. A superseded status write never replays.
 - **Historical requester gaps** quarantine the original outbox row as failed with a durable authorization reason.
   They require reconciliation with the original session; a newer session never supplies authority
@@ -336,8 +339,10 @@ Every Linear write goes through a local outbox, oldest first per issue.
 - **Rate limits**: when Linear answers `RATELIMITED`, all calls pause until the
   `X-RateLimit-*-Reset` time (epoch milliseconds).
 - **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
-  outage; inbox deliveries are retried for a day before they are parked. HTTP 403 fails loudly
-  at once.
+  outage. A failing inbox delivery is retried 5 seconds after receipt, then with doubling gaps up
+  to every 15 minutes, for a day before it is parked. Retries never hold newer deliveries back. The
+  first failure and the parking each log a traceback; retries in between log one line. HTTP 403
+  fails loudly at once.
 - **Missing states**: a configured state name that does not exist on the team fails loudly. Set a
   team's state to `null` to skip that status change. The comment or activity still posts.
 
@@ -347,7 +352,9 @@ activity, session key and generation across crashes. Its Stop receipt and worker
 be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
 core accepted an interrupt request; worker completion never proves external effects stopped.
 The outbox keeps each activity ID stable across retries; the initial session receipt uses a
-deterministic issue/session ID, so duplicate deliveries do not create another receipt.
+deterministic issue/session ID in UUIDv4 form, so duplicate deliveries do not create another receipt.
+Linear refuses other UUID versions. Receipts queued by the earlier UUIDv5 build are refused on their
+next send and dropped like any refused thought; they never hold a session or an issue.
 `outbox` has pending, sent and failed states.
 
 ## Known limits
@@ -474,8 +481,8 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation is capped at 4,100 lines. This includes the bounded
-session-requester authorization path and existing recovery/transport safeguards.
+The production implementation has a line budget, enforced by `tests/test_linear_plugin.py`.
+This includes the bounded session-requester authorization path and existing recovery/transport safeguards.
 The unit suite enforces measured headroom without compressing safety-critical branches.
 
 Ownership loss archives directly through core so a running worker retains its termination identity.

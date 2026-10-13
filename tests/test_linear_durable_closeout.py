@@ -43,29 +43,46 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertIsNone(store.get(ISSUE))
                 self.assertEqual(len(authority.mutations), 1)
 
-    def test_unapplied_or_foreign_receipt_never_provisions_worker(self):
-        for mode in ("unapplied", "foreign_session", "uncertain"):
+    def test_acknowledgement_outcome_never_gates_current_ownership(self):
+        """The receipt thought is advisory: ownership admits work, and a lost or rejected
+        acknowledgement (including a legacy UUIDv5 row Linear refuses) never blocks the issue."""
+        legacy = str(uuid.uuid5(uuid.NAMESPACE_URL, f'linear-session-received:{ISSUE}:{SESSION}'))
+        for mode in ('rejected', 'unavailable', 'legacy_pending', 'legacy_failed', 'legacy_other_session'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 authority = Authority()
                 authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+                authority.sessions['earlier-session'] = {'id': 'earlier-session', 'issue': {'id': ISSUE},
+                                                         'creator': {'id': USER}}
                 api = authority.api()
+                original = authority.transport
+                def transport(url, body, headers):
+                    if mode in ('rejected', 'unavailable') and 'agentActivityCreate' in json.loads(body)['query']:
+                        if mode == 'unavailable':
+                            return 503, {}, b'{}'
+                        return 200, {}, json.dumps({'data': None, 'errors': [
+                            {'message': 'Argument Validation Error', 'extensions': {'code': 'INPUT_ERROR'}}]}).encode()
+                    return original(url, body, headers)
+                api.transport = transport
                 store = Store(Path(directory) / 'state.db')
-                ack_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
-                    f'linear-session-received:{ISSUE}:{SESSION}'))
-                store.enqueue('activity', {'id': ack_id, 'issue_id': ISSUE,
-                    'session_id': 'other-session' if mode == 'foreign_session' else SESSION,
-                    'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
-                    'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
-                if mode != 'uncertain':
-                    store.mark_sent(ack_id, mode == 'foreign_session')
-                else:
-                    row = store.outbox_row(ack_id)
-                    store.rewrite(ack_id, {**row['payload'], 'write_started': True}, 9999999999)
+                if mode.startswith('legacy'):
+                    store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'initial_ack': True,
+                        'session_id': 'earlier-session' if mode == 'legacy_other_session' else SESSION,
+                        'requester_sessions': {ISSUE: SESSION},
+                        'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+                    if mode == 'legacy_failed':
+                        store.mark(legacy, 'failed')
                 kanban = FakeKanban()
                 bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
-                with self.assertRaisesRegex(Exception, 'acknowledgement'):
-                    bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start')
-                self.assertEqual(kanban.creates, [])
+                self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+                self.assertEqual(len(kanban.creates), 1)
+                self.assertIsNotNone(store.get(ISSUE))
+                bridge.flush()
+                self.assertTrue(any('issueUpdate' in query for query in authority.mutations),
+                                'the In Progress claim must not wait behind the acknowledgement')
+                if mode.startswith('legacy') and mode != 'legacy_failed':
+                    self.assertEqual(store.outbox_row(legacy)['state'], 'failed')  # Linear refuses v5 ids
+                self.assertEqual(kanban.comments, [])  # a dropped thought is logged, never alerted
+                self.assertEqual(bridge.flush(), 0)
 
     def test_applied_receipt_cannot_revive_stale_closed_issue(self):
         with tempfile.TemporaryDirectory() as directory:
