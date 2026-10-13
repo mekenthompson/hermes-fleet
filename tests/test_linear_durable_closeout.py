@@ -142,8 +142,27 @@ class DurableCloseoutTests(unittest.TestCase):
             self.assertTrue(store.issue_reconciliation_blocked(ISSUE))
             bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 0)
-            self.assertEqual(store.outbox_row(ack)['state'], 'pending')
+            self.assertEqual(store.outbox_row(ack)['state'], 'failed')  # one try: never posts after the hold
             self.assertEqual(authority.mutations, [])
+            self.assertTrue(store.issue_reconciliation_blocked(ISSUE))
+
+    def test_rate_limited_thought_keeps_its_place_until_the_pause_ends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
+            api = authority.api()
+            original = authority.transport
+            def transport(url, body, headers):
+                if 'agentActivityCreate' in json.loads(body)['query']:
+                    return 429, {}, b'{}'
+                return original(url, body, headers)
+            api.transport = transport
+            store = Store(Path(directory) / 'state.db')
+            thought = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
+                'requester_sessions': {ISSUE: SESSION}, 'content': {'type': 'thought', 'body': 'Working'}}, at=1)
+            bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
+            bridge.flush()
+            self.assertEqual(store.outbox_row(thought)['state'], 'pending')  # nothing is written during the pause
 
     def test_unbound_authorization_failure_is_durable_and_never_borrows_new_owner(self):
         with tempfile.TemporaryDirectory() as directory:

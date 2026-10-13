@@ -2794,8 +2794,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "Done")  # FakeLinear applied the mutation before 502.
         self.assertTrue(self.bridge.store.outbox_row(terminal["id"])["payload"]["write_started"])
         self.assertEqual(self.bridge.store.outbox_row(claim)["state"], "pending")
-        self.assertEqual([self.bridge.store.outbox_row(row_id)["state"]
-                          for row_id in (stale_comment, stale_activity)], ["pending", "pending"])
+        self.assertEqual([self.bridge.store.outbox_row(row_id)["state"]  # a held thought is dropped, never late
+                          for row_id in (stale_comment, stale_activity)], ["pending", "failed"])
 
         self.clock.now += 1
         created = self.linear.session_event("created", ISSUE, "fresh-session")

@@ -95,18 +95,13 @@ class Store:
             return False
         rows = db.execute("SELECT id, state, attempts, payload FROM outbox WHERE kind IN ('status','description') AND "
                           "json_extract(payload, '$.issue_id')=?", (issue_id,)).fetchall()
-        for row in rows:
-            if row["id"] == except_id:
-                continue
-            payload = json.loads(row["payload"])
-            if not (payload.get("terminal") or payload.get("content_action")) or payload.get("reconciliation"):
-                continue
-            if (payload.get("reconcile_required") or
-                    (row["state"] in ("pending", "failed") and
-                     (payload.get("write_started") is True or
-                      (row["attempts"] > 0 and "write_started" not in payload)))):
-                return True
-        return False
+        return any(row["id"] != except_id and Store.uncertain(row, json.loads(row["payload"])) for row in rows)
+    @staticmethod
+    def uncertain(row, payload: dict[str, Any]) -> bool:
+        """An attempted terminal or content write whose remote effect stays unknown until resolved."""
+        return bool((payload.get("terminal") or payload.get("content_action")) and not payload.get("reconciliation") and (
+            payload.get("reconcile_required") or (row["state"] in ("pending", "failed") and (
+                payload.get("write_started") is True or (row["attempts"] > 0 and "write_started" not in payload)))))
     @classmethod
     def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
         return cls._admitted(db, *issue_ids) and all(
@@ -163,11 +158,9 @@ class Store:
             raise ValueError("terminal reconciliation requires a verified outcome and evidence")
         with self._tx() as db:
             row = db.execute("SELECT kind, state, attempts, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
-            if not row or row["kind"] != "status": return False
+            if not row or row["kind"] not in ("status", "description"): return False
             payload = json.loads(row["payload"])
-            attempted = payload.get("reconcile_required") or (row["state"] in ("pending", "failed") and
-                (payload.get("write_started") is True or (row["attempts"] > 0 and "write_started" not in payload)))
-            if not payload.get("terminal") or payload.get("reconciliation") or not attempted: return False
+            if not self.uncertain(row, payload): return False
             payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
             payload["reconcile_required"] = True
             if payload.get("release"):
@@ -642,10 +635,11 @@ class Store:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND NOT " + ADVISORY + " AND "
                               "COALESCE(json_extract(payload, '$.reported'), 0) = 0 ORDER BY rowid").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
-    def retire_advisory(self, row_id: str) -> None:
-        """Retire an advisory thought or action. It changes no issue, so no fence has to admit this."""
+    def retire_advisory(self, row_id: str, now: float) -> None:
+        """Retire a due, unsent thought; one a quota pause deferred keeps its place. It changes no issue: no fence applies."""
         with self._tx() as db:
-            db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND " + ADVISORY, (row_id,))
+            db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND next_at <= ? AND "
+                       + ADVISORY, (row_id, now))
     def mark(self, row_id: str, state: str) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return

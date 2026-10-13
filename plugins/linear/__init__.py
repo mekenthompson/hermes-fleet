@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from . import chat
+from . import chat, ops
 from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import token_provider
@@ -390,6 +390,18 @@ def register(ctx: Any) -> None:
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
                       description=chat.SCHEMA["description"], inject_invocation_context=True)
     ctx.register_hook("on_session_end", on_session_end)
+
+    def paths() -> tuple[Path, Path, str]:
+        home = active_home()
+        return (Path(ctx.get_config("state_database") or home / "linear" / "state.db"),
+                Path(ctx.get_config("ingress_database") or home / "workspace" / "linear" / "ingress.db"),
+                validate_ingress_profile(ctx.get_config("ingress_profile")) or getattr(ctx, "profile_name", "default"))
+    if hasattr(ctx, "register_cli_command"):  # hermes linear status | resolve | replay
+        ctx.register_cli_command("linear", "Show and resolve held Linear work", ops.setup,
+                                 lambda args: ops.run(args, *paths()))
+    if hasattr(ctx, "register_command"):  # read-only, from any chat surface
+        ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths())),
+                             description="Show held Linear work and the next step")
 
     async def service(runtime: Any) -> None:
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}

@@ -305,9 +305,10 @@ when the first send begins.
 
 Every Linear write goes through a local outbox. Everything except Agent Activity thoughts and
 actions goes out oldest first per issue. Thoughts and actions are advisory progress: they never wait
-for, or hold back, another write, and each gets one try. A failed one is logged and dropped, never
-retried, alerted, revived, or used to fence work, so a late thought cannot land after a Stop,
-question or result.
+for, or hold back, another write, and each gets one try. One that fails, or is held by
+authorization or an unresolved write, is logged and dropped, never retried, alerted, revived or used
+to fence work, so a late thought cannot land after a Stop, question or result. A Linear quota pause
+only delays it: nothing is written during the pause, so order is kept.
 
 - **Creates** (comment, activity, project update) carry a UUID v4 client `id`, stored when the
   write is queued. Linear rejects a repeat with `INPUT_ERROR` "conflict on insert of ..." naming that
@@ -317,8 +318,9 @@ question or result.
   claim that meets a newer human edit (a close, or another delegate) is dropped rather than
   reopening the issue. A late Stop for an older session does not stop newer work.
 - **Uncertain terminal status** holds fresh work and queued writes for that issue, including after
-  restart. An operator must verify the remote outcome and record it with
-  `Store.reconcile_terminal(row_id, outcome="applied" | "not_applied", evidence=..., at=...)`.
+  restart. An operator verifies the remote outcome in Linear and records it with
+  `hermes linear resolve <row> applied|not_applied --evidence "..."` (see [Operate it](#operate-it)).
+  An uncertain description replacement is resolved the same way.
   The original receipt and dependent writes remain available; neither a remote Done nor a newer
   reopen proves the predecessor's outcome. A failed lookup before send (`write_started=False`)
   remains retryable and can yield to a successor. Other issues in a shared project update proceed.
@@ -358,6 +360,33 @@ deterministic issue/session ID in UUIDv4 form, so duplicate deliveries do not cr
 Linear refuses other UUID versions. Receipts queued by the earlier UUIDv5 build are refused on their
 next send and dropped like any refused thought; they never hold a session or an issue.
 `outbox` has pending, sent and failed states.
+
+## Operate it
+
+Every fence has a visible reason and one supported way out. Run these in the profile's container;
+they read the same state and inbox as the gateway and never need it stopped.
+
+```bash
+hermes linear status          # everything held, oldest first, with the next step; --json for scripts
+hermes linear resolve <row> applied|not_applied --evidence "Issue shows Done at 14:02"
+hermes linear replay <delivery>   # one more try for a parked inbox delivery
+```
+
+`/linear-status` shows the same report from any chat surface. It is read-only.
+
+`status` exits 1 while anything is held, so a health check can alert on it. It lists:
+
+| Held item | Next step |
+|---|---|
+| Status or description write whose outcome is unknown, with any writes held behind it | Check Linear, then `resolve` |
+| Issue write Linear refused or timed out on, in the last 7 days | Retried after the next successful write, or redo the step |
+| Parked inbox delivery, or one still backing off | Fix the logged cause, then `replay`; a restart retries backing-off ones |
+| Specialist scope fence | Permanent by policy; approved recovery only |
+| Ambiguous chat-to-worker admission, unfinished release, worker still exiting | Check Linear and Kanban; the gateway retries each tick |
+
+`resolve` records what you saw; it never writes to Linear. `applied` and `not_applied` both release
+the issue for new work; writes held behind the receipt stay held. A replayed delivery that fails
+again parks again without a second alert.
 
 ## Known limits
 

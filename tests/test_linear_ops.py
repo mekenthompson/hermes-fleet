@@ -1,0 +1,92 @@
+"""Operators can see every held item and clear it through a supported command, never a database edit."""
+import argparse
+import io
+import json
+import sqlite3
+import tempfile
+import unittest
+import uuid
+from contextlib import closing, redirect_stdout
+from pathlib import Path
+
+from linear_fake_api import load_plugin
+from linear_ingress_fixture import IngressStore, Route
+
+load_plugin()
+from hermes_fleet_linear_plugin import ops
+from hermes_fleet_linear_plugin.store import Store
+
+
+class LinearOperatorTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.state, self.inbox = self.home / "state.db", self.home / "ingress.db"
+        self.store = Store(self.state)
+
+    def cli(self, *argv):
+        parser = argparse.ArgumentParser()
+        ops.setup(parser)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = ops.run(parser.parse_args(argv), self.state, self.inbox, "default")
+        return code, out.getvalue()
+
+    def uncertain(self, kind, issue, **payload):
+        row = self.store.enqueue(kind, {"issue_id": issue, **payload}, at=100)
+        saved = self.store.outbox_row(row)
+        self.store.rewrite(row, {**saved["payload"], "write_started": True}, 100)
+        return row
+
+    def test_nothing_held_is_said_plainly(self):
+        self.assertEqual(self.cli("status"), (0, "Linear: nothing is held.\n"))
+
+    def test_uncertain_status_and_description_are_listed_and_resolved_by_command(self):
+        status = self.uncertain("status", "issue-1", state="done", terminal=True)
+        description = self.uncertain("description", "issue-5", id=str(uuid.uuid4()), body="New",
+                                     expected_description="Old", content_action=True)
+        self.assertTrue(self.store.issue_reconciliation_blocked("issue-1"))
+        self.assertTrue(self.store.issue_reconciliation_blocked("issue-5"))
+        code, text = self.cli("status")
+        self.assertEqual(code, 1)
+        for row in (status, description):
+            self.assertIn(f"hermes linear resolve {row} applied|not_applied", text)
+        self.assertEqual(self.cli("resolve", status, "applied", "--evidence", "Issue shows Done")[0], 0)
+        self.assertEqual(self.cli("resolve", description, "not_applied", "--evidence", "Old text in Linear")[0], 0)
+        self.assertFalse(self.store.issue_reconciliation_blocked("issue-1"))
+        self.assertFalse(self.store.issue_reconciliation_blocked("issue-5"))
+        self.assertEqual(self.cli("status")[0], 0)
+        self.assertEqual(self.cli("resolve", status, "applied", "--evidence", "again")[0], 1)  # already resolved
+
+    def test_parked_delivery_is_listed_and_replayed_once(self):
+        route = Route("default", "default", "/webhook/default", self.home / "unused", self.inbox)
+        event = {"type": "AgentSessionEvent", "agentSession": {"issue": {"id": "issue-2"}}}
+        IngressStore(self.inbox).enqueue(route, "parked-1", json.dumps(event).encode())
+        with closing(sqlite3.connect(self.inbox)) as db, db:
+            db.execute("UPDATE deliveries SET status = 'failed', attempts = 40")
+        items = ops.stuck(self.state, self.inbox, "default")
+        self.assertEqual([(i["issue"], i["ref"]) for i in items], [("issue-2", "parked-1")])
+        self.assertIn("hermes linear replay parked-1", items[0]["action"])
+        self.assertFalse(ops.replay(self.inbox, "worker-a", "parked-1"))  # another profile's inbox row
+        self.assertEqual(self.cli("replay", "parked-1")[0], 0)
+        with closing(sqlite3.connect(self.inbox)) as db:
+            self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("pending", 0))
+        self.assertEqual(self.cli("replay", "parked-1")[0], 1)
+
+    def test_fences_and_undelivered_writes_explain_the_next_step(self):
+        self.store.fence_scope("issue-3", "requester outside scope", at=50)
+        refused = self.store.enqueue("comment", {"issue_id": "issue-4", "body": "evidence"}, at=100)
+        self.store.mark(refused, "failed")
+        thought = self.store.enqueue("activity", {"issue_id": "issue-4", "session_id": "s",
+                                                  "content": {"type": "thought", "body": "Working"}}, at=100)
+        self.store.mark(thought, "failed")
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=200)}
+        self.assertIn("approved procedure", items["fence"]["action"])
+        self.assertIn("redo the step", items[refused]["action"])
+        self.assertNotIn(thought, items)  # a dropped thought holds nothing
+        self.assertEqual(json.loads(self.cli("status", "--json")[1])[0]["issue"], "issue-3")
+
+
+if __name__ == "__main__":
+    unittest.main()
