@@ -1,7 +1,10 @@
 --- a/server.js
 +++ b/server.js
-@@ -1155,6 +1155,12 @@
+@@ -1176,9 +1176,15 @@
+         enable_cache: true,
+         proxy: launchProxy,
          geoip: !!launchProxy,
+         locale: launchLocale({ hasProxy: !!proxyPool, directIdentity: CONFIG.directIdentity }),
          virtual_display: vdDisplay,
          exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
 +        // Pin the BrowserForge-generated screen/window fingerprint to the

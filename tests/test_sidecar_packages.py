@@ -600,8 +600,8 @@ class KokoroPublicTests(unittest.TestCase):
 
 
 class CamofoxPublicTests(unittest.TestCase):
-    COMMIT = "771b610a7b5994759c138b912741de58b0edd588"
-    TAG = "v1.15.0"
+    COMMIT = "39c82094013480b373df6600d44c7f036f58356e"
+    TAG = "v1.18.1"
     GIT = "https://github.com/jo-inc/camofox-browser.git"
 
     def test_lock_pins_upstream_commit_without_household_state(self) -> None:
@@ -612,9 +612,11 @@ class CamofoxPublicTests(unittest.TestCase):
         self.assertEqual(payload["commit"], self.COMMIT)
         self.assertEqual(payload["tag"], self.TAG)
         self.assertEqual(payload["window"], [1920, 1080])
+        self.assertEqual(payload["camoufox"], {"version": "152.0.4", "release": "beta.30"})
         text = lock_path.read_text(encoding="utf-8").lower()
         for needle in ("mar" + "ko", "over" + "lord", "klank" + "er", "hermes-fleet-private", "sha256:"):
             self.assertNotIn(needle, text)
+        self.assertNotIn("156.0.1", text)
 
     def test_patches_pin_window_screen_and_media_runtime(self) -> None:
         window = (ROOT / "sidecars/camofox/patches/camofox-window-1920x1080.patch").read_text(
@@ -623,27 +625,37 @@ class CamofoxPublicTests(unittest.TestCase):
         media = (ROOT / "sidecars/camofox/patches/camofox-media-runtime.patch").read_text(
             encoding="utf-8"
         )
+        browser = (ROOT / "sidecars/camofox/patches/camofox-camoufox-beta30.patch").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("window: [1920, 1080]", window)
         self.assertIn(
             "screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }",
             window,
         )
+        self.assertIn("locale: launchLocale", window)
         self.assertIn("ffmpeg", media)
         self.assertIn("fonts-noto-cjk", media)
+        self.assertIn("ARG CAMOUFOX_RELEASE=beta.30", browser)
+        self.assertNotIn("156.0.1", browser)
 
     def test_workflow_bakes_locked_upstream_to_public_package(self) -> None:
         workflow = (ROOT / ".github/workflows/sidecar-camofox.yml").read_text(encoding="utf-8")
         lock = json.loads((ROOT / "sidecars/camofox/lock.json").read_text(encoding="utf-8"))
         self.assertIn(lock["commit"], workflow)
+        self.assertIn("ref: ${{ env.CAMOFOX_COMMIT }}", workflow)
         self.assertIn("jo-inc/camofox-browser", workflow)
         self.assertIn("camofox-browser/Dockerfile", workflow)
         self.assertIn("sidecars/camofox/patches/camofox-window-1920x1080.patch", workflow)
         self.assertIn("sidecars/camofox/patches/camofox-media-runtime.patch", workflow)
+        self.assertIn("sidecars/camofox/patches/camofox-camoufox-beta30.patch", workflow)
+        self.assertIn("ARG CAMOUFOX_RELEASE=beta.30", workflow)
         self.assertIn("screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }", workflow)
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", workflow)
         self.assertNotIn("load-secrets", workflow)
         self.assertNotIn("MAR" + "KO_", workflow)
         self.assertNotIn("workflow_call", workflow)
+        self.assertNotIn("771b610", workflow)
 
     def test_public_camofox_tree_has_no_household_or_secret_files(self) -> None:
         root = ROOT / "sidecars/camofox"

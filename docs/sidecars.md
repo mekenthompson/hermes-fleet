@@ -41,6 +41,6 @@ matching `PUBLIC_BASE`/`PUBLIC_ORIGIN` from the environment.
 
 Kokoro is a CUDA runtime image. Model weights are not baked into the image.
 
-Camofox bakes pinned `jo-inc/camofox-browser` `v1.15.0` plus window, screen,
-and media patches from `sidecars/camofox`. Overlay entrypoints and secret
-loaders stay private.
+Camofox bakes pinned `jo-inc/camofox-browser` `v1.18.1` plus window, screen,
+media, and Camoufox `152.0.4-beta.30` patches from `sidecars/camofox`. Overlay
+entrypoints and secret loaders stay private.
