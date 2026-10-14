@@ -96,14 +96,146 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(board.get(task_id).status, "ready")
         bridge.flush()
         with board.conn() as conn:
-            self.assertTrue(kb.complete_task(conn, task_id, result="Findings: https://example.test/findings"))
+            self.assertTrue(kb.complete_task(
+                conn, task_id, result="Findings: https://example.test/findings",
+                metadata={"issue_comment": "### Recommendation\nKeep the recorded findings.\n"}))
         bridge.pump_kanban()
         self.assertIsNone(store.get(scoped_issue))
         authority.mutations.clear()
         reopened = Bridge(Store(store.path), authority.api(scope=policy), Kanban(), profile="alpha")
-        self.assertEqual(reopened.flush(), 3)
-        self.assertEqual(len(authority.mutations), 3)
+        self.assertEqual(reopened.flush(), 4)
+        self.assertEqual(len(authority.mutations), 4)
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 1)
         self.assertEqual(reopened.store.pending(), [])
+
+    def test_specialist_assessment_posts_one_issue_comment(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        assessment = (
+            "### Recommendation\n"
+            "**3-day solve:** add the missing price column. **Fix it?** Yes, after the dealer sends price.\n"
+            "\n### Diagnosis\n"
+            "- Classification: product feedback\n"
+            "- Cause: the export has cost columns and no selling price\n"
+        )
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        api = authority.api(scope=policy)
+        store = Store(self.dir / "assessment.db")
+        board = Kanban()
+        bridge = Bridge(store, api, board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        task_id = store.get(scoped_issue)["task_id"]
+        bridge.flush()
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(
+                conn, task_id, result="Findings: https://example.test/findings",
+                metadata={"issue_comment": assessment}))
+        bridge.pump_kanban()
+        comments = [row for row in store.pending(scoped_issue) if row["kind"] == "comment"]
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(comments[0]["payload"]["body"], assessment)
+        self.assertTrue(comments[0]["payload"].get("assessment"))
+        authority.mutations.clear()
+        reopened = Bridge(Store(store.path), authority.api(scope=policy), Kanban(), profile="alpha")
+        reopened.flush()
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 1)
+        authority.mutations.clear()
+        Bridge(Store(store.path), authority.api(scope=policy), Kanban(), profile="alpha").flush()
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 0)
+
+    def test_specialist_assessment_without_comment_is_unfinished(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        store = Store(self.dir / "missing-comment.db")
+        board = Kanban()
+        bridge = Bridge(store, authority.api(scope=policy), board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        task_id = store.get(scoped_issue)["task_id"]
+        self.assertIn("metadata.issue_comment", board.get(task_id).body)
+        bridge.flush()
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, task_id, result="Findings: https://example.test/findings"))
+        bridge.pump_kanban()
+        pending = store.pending(scoped_issue)
+        self.assertFalse(any(row["kind"] == "comment" for row in pending))
+        self.assertEqual(next(row["payload"]["state"] for row in pending if row["kind"] == "status"), "blocked")
+        authority.mutations.clear()
+        bridge.flush()
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 0)
+        self.assertFalse(any("issueUpdate" in query and "Done" in query for query in authority.mutations))
+
+    def test_unchanged_specialist_assessment_is_not_posted_twice(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        assessment = "### Recommendation\nKeep the recorded findings.\n"
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        authority.sessions["session-2"] = {"id": "session-2", "issue": {"id": scoped_issue},
+                                           "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        store = Store(self.dir / "duplicate-comment.db")
+        board = Kanban()
+        bridge = Bridge(store, authority.api(scope=policy), board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        first = store.get(scoped_issue)["task_id"]
+        bridge.flush()
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, first, result="Findings: https://example.test/findings",
+                                             metadata={"issue_comment": assessment}))
+        bridge.pump_kanban()
+        self.assertEqual(bridge.flush(), 4)
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-02T00:00:00Z", "agentSession": {
+                "id": "session-2", "creatorId": USER, "issue": {"id": scoped_issue}}})
+        second = store.get(scoped_issue)["task_id"]
+        self.assertNotEqual(second, first)
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, second, result="Findings: https://example.test/findings",
+                                             metadata={"issue_comment": assessment}))
+        bridge.pump_kanban()
+        authority.mutations.clear()
+        bridge.flush()
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 0)
+
+    def test_revoked_specialist_authority_does_not_publish_assessment(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        store = Store(self.dir / "revoked-comment.db")
+        board = Kanban()
+        bridge = Bridge(store, authority.api(scope=policy), board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        task_id = store.get(scoped_issue)["task_id"]
+        bridge.flush()
+        store.fence_scope(scoped_issue, "revoked", at=bridge.clock())
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(
+                conn, task_id, result="Findings: https://example.test/findings",
+                metadata={"issue_comment": "### Recommendation\nKeep the recorded findings.\n"}))
+        bridge.pump_kanban()
+        self.assertFalse(any(row["kind"] == "comment" for row in store.pending(scoped_issue)))
+        authority.mutations.clear()
+        bridge.flush()
+        self.assertEqual(sum("commentCreate" in query for query in authority.mutations), 0)
 
     def test_chat_admission_identity_requires_live_host_turn_and_catalog(self):
         from types import SimpleNamespace

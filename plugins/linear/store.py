@@ -479,7 +479,8 @@ class Store:
             status_id = str(uuid.uuid4())
             for kind, payload in writes:
                 payload = {**payload, "work_owner": work["ownership_id"]}
-                row_id = status_id if kind == "status" else str(uuid.uuid4())
+                row_id = status_id if kind == "status" else (
+                    str(payload["id"]) if kind == "comment" and payload.get("id") else str(uuid.uuid4()))
                 if kind != "status":
                     payload = {**payload, "requires_status_id": status_id}
                 if kind == "project_update":
@@ -552,6 +553,14 @@ class Store:
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
                                    "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id,)).fetchone())
+    def assessment_comment_id(self, issue_id: str, body: str) -> str | None:
+        with self._tx() as db:
+            row = db.execute("SELECT id FROM outbox WHERE kind='comment' AND "
+                             "json_extract(payload, '$.issue_id')=? AND "
+                             "json_extract(payload, '$.assessment')=1 AND "
+                             "json_extract(payload, '$.body')=? AND state IN ('sent', 'pending') LIMIT 1",
+                             (issue_id, body)).fetchone()
+        return str(row["id"]) if row else None
     def superseded(self, row: dict[str, Any]) -> bool:
         payload, owner = row["payload"], row["payload"].get("work_owner")
         with self._tx() as db:

@@ -9,6 +9,14 @@ between them. Core owns execution; the plugin retains admission and effect recei
   reclaim, the retry breaker, and `blocked(needs_input)` as a durable stop.
 - **The plugin** turns Linear events into Kanban calls, and Kanban events into Linear writes.
 
+A specialist Agent Session (`requester_basis: agent_session`) must finish with
+`metadata.issue_comment`: the human issue comment, Linear markdown, 40 to 4000
+characters, with a newline, and no Project status update heading. The bridge
+posts that text once on the issue, using the session it already bound. The same
+text on a later card is not posted again. Missing text, or revoked authority,
+does not report Done and does not publish a comment. The worker must not call
+the `linear` tool to post it.
+
 It is off by default. It shares nothing across containers: the Linear delegate is the only
 cross-agent record.
 

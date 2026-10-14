@@ -37,6 +37,9 @@ def stable_uuid4(*parts: str) -> str:
     """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
     digest = hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).digest()
     return str(uuid.UUID(bytes=digest[:16], version=4))
+def _valid_assessment(body: str) -> bool:
+    text = body.strip()
+    return 40 <= len(text) <= 4000 and "\n" in text and "### Project status update" not in text
 def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
@@ -100,6 +103,9 @@ How to work this task:
    metadata.published_pr), the merged commit, the deploy check, or the findings link. A run without
    evidence is reported to Linear as unfinished.
 3. If you need a human decision, kanban_block with kind needs_input and say exactly what you need.
+"""
+ASSESSMENT_NOTE = """
+4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 4000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.
 """
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
@@ -235,6 +241,12 @@ class Kanban:
         with self.conn() as conn:
             run = self.kb.latest_run(conn, task.id)
         return ((run.summary if run else None) or task.result or "").strip()
+    def issue_comment(self, task) -> str:
+        with self.conn() as conn:
+            run = self.kb.latest_run(conn, task.id)
+        metadata = run.metadata if run else None
+        body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
+        return body if isinstance(body, str) else ""
     def block(self, task_id: str, reason: str) -> bool:
         with self.conn() as conn:
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input")
@@ -926,6 +938,8 @@ class Bridge:
         ident = info.get("identifier") or issue_id
         thread = "" if event.get("promptContext") or existing else self._thread(issue_id, until_ms=stamp)
         context = "\n\n".join(x for x in (event.get("promptContext") or info.get("description") or "", thread, prompt) if x)
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            context = f"{context}\n{ASSESSMENT_NOTE}" if context else ASSESSMENT_NOTE.strip()
         with self.store.guard_issue_work(issue_id) as admitted:
             if not admitted: return False
             if stamp <= self.store.chat_closeout_ms(issue_id): return True
@@ -1139,6 +1153,25 @@ class Bridge:
                                                        "terminal": True, "owner_issue_id": issue_id,
                                                        "content": {"type": "error", "body": body}})], at=self.clock())
             return
+        assessment = ""
+        if (row.get("origin") == "kanban" and
+                (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
+            reader = getattr(self.kanban, "issue_comment", None)
+            raw = reader(task) if callable(reader) else ""
+            assessment = raw if isinstance(raw, str) else ""
+            if not _valid_assessment(assessment):
+                body = ("The assessment finished without an issue comment. Complete again with "
+                        "metadata.issue_comment: Linear markdown, 40 to 4000 characters, with a newline, "
+                        "and no Project status update heading.")
+                if not self.authorize_specialist_effect(issue_id): return
+                self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
+                                                        "task_id": row["task_id"], "terminal": True,
+                                                        "owner_issue_id": issue_id}),
+                                             ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
+                                                           "task_id": row["task_id"],
+                                                           "terminal": True, "owner_issue_id": issue_id,
+                                                           "content": {"type": "error", "body": body}})], at=self.clock())
+                return
         links = " ".join(dict.fromkeys(evidence))
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
@@ -1148,6 +1181,10 @@ class Bridge:
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
                                       "lines": {task.title.split(":")[0]: f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
+        if assessment and not self.store.assessment_comment_id(issue_id, assessment):
+            writes.insert(2, ("comment", {
+                "id": stable_uuid4("assessment-comment", issue_id, hashlib.sha256(assessment.encode()).hexdigest()),
+                "issue_id": issue_id, "body": assessment, "assessment": True, "task_id": row["task_id"]}))
         if not self.authorize_specialist_effect(issue_id): return
         self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock())
