@@ -21,7 +21,7 @@ concurrency:
 
 env:
   IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-camofox
-  CAMOFOX_COMMIT: 771b610a7b5994759c138b912741de58b0edd588
+  CAMOFOX_COMMIT: 39c82094013480b373df6600d44c7f036f58356e
 
 jobs:
   test:
@@ -57,7 +57,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: jo-inc/camofox-browser
-          ref: 771b610a7b5994759c138b912741de58b0edd588
+          ref: ${{ env.CAMOFOX_COMMIT }}
           path: camofox-browser
           persist-credentials: false
       - name: Verify lock commit
@@ -86,6 +86,11 @@ jobs:
           git -C camofox-browser apply ../sidecars/camofox/patches/camofox-media-runtime.patch
           grep -F "ffmpeg" camofox-browser/Dockerfile
           grep -F "fonts-noto-cjk" camofox-browser/Dockerfile
+          git -C camofox-browser apply --check ../sidecars/camofox/patches/camofox-camoufox-beta30.patch
+          git -C camofox-browser apply ../sidecars/camofox/patches/camofox-camoufox-beta30.patch
+          grep -F "ARG CAMOUFOX_RELEASE=beta.30" camofox-browser/Dockerfile
+          ! grep -F "ARG CAMOUFOX_RELEASE=beta.28" camofox-browser/Dockerfile
+          ! grep -F "156.0.1" camofox-browser/Dockerfile
       - name: Reclaim disk for the browser bake
         run: |
           set -eux
