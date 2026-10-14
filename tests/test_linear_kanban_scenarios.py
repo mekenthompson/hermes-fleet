@@ -215,7 +215,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         comments = [row for row in store.pending(scoped_issue) if row["kind"] == "comment"]
         self.assertEqual(len(comments), 1)
         body = comments[0]["payload"]["body"]
-        self.assertLessEqual(len(body), 4000)
+        self.assertEqual(body, assessment)
+        self.assertGreater(len(body), 4000)
         self.assertIn("### Recommendation", body)
         visible = json.dumps([row["payload"].get("content") for row in store.pending(scoped_issue)])
         self.assertNotIn("metadata.issue_comment", visible)

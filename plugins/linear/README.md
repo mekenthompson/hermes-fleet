@@ -10,8 +10,8 @@ between them. Core owns execution; the plugin retains admission and effect recei
 - **The plugin** turns Linear events into Kanban calls, and Kanban events into Linear writes.
 
 A specialist Agent Session (`requester_basis: agent_session`) must finish with
-`metadata.issue_comment`: the human issue comment, Linear markdown, 40 to 4000
-characters, with a newline, and no Project status update heading. Text over 4000
+`metadata.issue_comment`: the human issue comment, Linear markdown, 40 to 12000
+characters, with a newline, and no Project status update heading. Text over 12000
 characters is trimmed to the last fitting line and still posted. The bridge
 posts that text once on the issue, using the session it already bound. The same
 text on a later card is not posted again. Missing text, or revoked authority,

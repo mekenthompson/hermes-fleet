@@ -38,9 +38,9 @@ def stable_uuid4(*parts: str) -> str:
     digest = hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).digest()
     return str(uuid.UUID(bytes=digest[:16], version=4))
 def _fit_assessment(body: str) -> str:
-    raw = body if isinstance(body, str) else ""; t = raw.strip(); t = raw if "\n" in raw and len(t) <= 4000 else (t if "\n" in t else t + "\n")
-    if len(t) > 4000: cut = t.rfind("\n", 0, 4000); t = (t[:cut] if cut >= 40 else t[:3999]).rstrip() + "\n"
-    return "" if "### Project status update" in t or not (40 <= len(t.strip()) <= 4000 and "\n" in t) else t
+    raw = body if isinstance(body, str) else ""; t = raw.strip(); t = raw if "\n" in raw and len(t) <= 12000 else (t if "\n" in t else t + "\n")
+    if len(t) > 12000: cut = t.rfind("\n", 0, 12000); t = (t[:cut] if cut >= 40 else t[:11999]).rstrip() + "\n"
+    return "" if "### Project status update" in t or not (40 <= len(t.strip()) <= 12000 and "\n" in t) else t
 def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
@@ -105,7 +105,7 @@ How to work this task:
    evidence is reported to Linear as unfinished.
 3. If you need a human decision, kanban_block with kind needs_input and say exactly what you need.
 """
-ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 4000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
+ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
     activity, session = event.get("agentActivity") or {}, event.get("agentSession") or {}
