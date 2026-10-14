@@ -191,6 +191,36 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertNotIn("t_6b2c5776", response)
         self.assertIn("issue", response.casefold())
 
+    def test_oversize_assessment_is_posted_trimmed(self):
+        from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
+        assessment = "### Recommendation\nAdd the missing price column.\n" + ("More detail.\n" * 400)
+        self.assertGreater(len(assessment), 4000)
+        authority = Authority()
+        authority.issues[scoped_issue]["creator"] = {"id": "third-party"}
+        authority.issues[scoped_issue]["delegate"] = {"id": VIEWER}
+        authority.sessions[SESSION]["appUser"] = {"id": VIEWER}
+        policy = {**SCOPE, "requester_basis": "agent_session"}
+        store = Store(self.dir / "oversize-comment.db")
+        board = Kanban()
+        bridge = Bridge(store, authority.api(scope=policy), board, profile="alpha")
+        bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
+            "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
+                "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
+        task_id = store.get(scoped_issue)["task_id"]
+        with board.conn() as conn:
+            self.assertTrue(kb.complete_task(
+                conn, task_id, result="Findings saved.",
+                metadata={"issue_comment": assessment}))
+        bridge.pump_kanban()
+        comments = [row for row in store.pending(scoped_issue) if row["kind"] == "comment"]
+        self.assertEqual(len(comments), 1)
+        body = comments[0]["payload"]["body"]
+        self.assertLessEqual(len(body), 4000)
+        self.assertIn("### Recommendation", body)
+        visible = json.dumps([row["payload"].get("content") for row in store.pending(scoped_issue)])
+        self.assertNotIn("metadata.issue_comment", visible)
+        self.assertNotIn("without an issue comment", visible)
+
     def test_specialist_assessment_without_comment_is_unfinished(self):
         from test_linear_specialist_authorization import Authority, SCOPE, USER, VIEWER, SESSION, ISSUE as scoped_issue
         authority = Authority()
