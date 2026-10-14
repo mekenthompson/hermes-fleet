@@ -37,8 +37,10 @@ def stable_uuid4(*parts: str) -> str:
     """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
     digest = hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).digest()
     return str(uuid.UUID(bytes=digest[:16], version=4))
-def _valid_assessment(body: str) -> bool:
-    text = body.strip(); return 40 <= len(text) <= 4000 and "\n" in text and "### Project status update" not in text
+def _fit_assessment(body: str) -> str:
+    raw = body if isinstance(body, str) else ""; t = raw.strip(); t = raw if "\n" in raw and len(t) <= 4000 else (t if "\n" in t else t + "\n")
+    if len(t) > 4000: cut = t.rfind("\n", 0, 4000); t = (t[:cut] if cut >= 40 else t[:3999]).rstrip() + "\n"
+    return "" if "### Project status update" in t or not (40 <= len(t.strip()) <= 4000 and "\n" in t) else t
 def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
@@ -1155,11 +1157,9 @@ class Bridge:
         if (callable(reader) and row.get("origin") == "kanban" and
                 (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
             raw = reader(task)
-            assessment = raw if isinstance(raw, str) else ""
-            if not _valid_assessment(assessment):
-                body = ("The assessment finished without an issue comment. Complete again with "
-                        "metadata.issue_comment: Linear markdown, 40 to 4000 characters, with a newline, "
-                        "and no Project status update heading.")
+            assessment = _fit_assessment(raw if isinstance(raw, str) else "")
+            if not assessment:
+                body = "The assessment did not include a recommendation. Reply to try again."
                 if not self.authorize_specialist_effect(issue_id): return
                 self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                         "task_id": row["task_id"], "terminal": True,

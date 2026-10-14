@@ -11,7 +11,8 @@ between them. Core owns execution; the plugin retains admission and effect recei
 
 A specialist Agent Session (`requester_basis: agent_session`) must finish with
 `metadata.issue_comment`: the human issue comment, Linear markdown, 40 to 4000
-characters, with a newline, and no Project status update heading. The bridge
+characters, with a newline, and no Project status update heading. Text over 4000
+characters is trimmed to the last fitting line and still posted. The bridge
 posts that text once on the issue, using the session it already bound. The same
 text on a later card is not posted again. Missing text, or revoked authority,
 does not report Done and does not publish a comment. The worker must not call
