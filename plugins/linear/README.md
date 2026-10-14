@@ -15,7 +15,10 @@ characters, with a newline, and no Project status update heading. The bridge
 posts that text once on the issue, using the session it already bound. The same
 text on a later card is not posted again. Missing text, or revoked authority,
 does not report Done and does not publish a comment. The worker must not call
-the `linear` tool to post it.
+the `linear` tool to post it. Session activities never name a Kanban task.
+A heartbeat note becomes an ephemeral Working action. A Kanban comment
+becomes a thought. The specialist session close says the assessment is on
+the issue. A direct agent and a worker use that same activity vocabulary.
 
 It is off by default. It shares nothing across containers: the Linear delegate is the only
 cross-agent record.

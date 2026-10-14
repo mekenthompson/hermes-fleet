@@ -890,7 +890,7 @@ class Bridge:
         task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
         if task and task.status in ("running", "ready"):  # never cover an elicitation awaiting input
             kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
-                                                    else "Waiting to resume", row["task_id"], ephemeral=True)
+                                                    else "Waiting to resume", "Still working", ephemeral=True)
             self.store.enqueue(kind, payload, at=self.clock())
     def await_retired(self, issue_id: str) -> None:
         for retired in self.store.retired(issue_id):
@@ -968,7 +968,7 @@ class Bridge:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             route["requester_sessions"] = {issue_id: session_id}
         writes = [("activity", {"issue_id": issue_id, "session_id": session_id,
-                                "content": {"type": "thought", "body": f"On it. Queued as Kanban task {task.id}."},
+                                "content": {"type": "thought", "body": "On it. Reading the ticket."},
                                 **route}),
                   ("status", {"issue_id": issue_id, "state": "in_progress", "claim": True,
                               "seen": me, "source_ms": stamp, "terminal": False, **route})]
@@ -1083,7 +1083,7 @@ class Bridge:
         elif event.kind == "unblocked":
             writes = [("status", {"issue_id": issue_id, "state": "in_progress", **route})]
         elif event.kind == "spawned":
-            writes = [self._progress_activity(row, route, "Started", row["task_id"])]
+            writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
         elif event.kind == "heartbeat":
             note = _progress_text(payload.get("note"))
             if note:
@@ -1173,10 +1173,10 @@ class Bridge:
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
+                                "content": {"type": "response", "body": "Assessment posted on the issue." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
                   ("project_update", {"issue_id": issue_id, "session_id": task.id, "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: f"Done: {links or _project_summary(summary)}"},
+                                      "lines": {task.title.split(":")[0]: "Assessment posted on the issue." if assessment else f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
         if assessment and not self.store.assessment_comment_id(issue_id, assessment):
             writes.insert(2, ("comment", {
