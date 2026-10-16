@@ -127,7 +127,7 @@ def markdown_matches(actual: object, expected: str) -> bool:
             if not line and after_heading:
                 continue
             after_heading = bool(re.match(r'^#{1,6} +', line))
-            result.append(re.sub(r'^[*+] ', '- ', line))
+            result.append(re.sub(r'^[*+] ', '- ', re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)))
         return result
     return canonical(actual) == canonical(expected)
 
