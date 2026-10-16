@@ -1021,8 +1021,8 @@ class Bridge:
                                          self.profile, at=self.clock(), stamp=stamp)
             return
         self.status(row["issue_id"], "blocked")
-        self.say(row, f"Stopped by {who}: the task is blocked and its worker shuts down within a few minutes. "
-                      "Re-delegate or reply here to resume.")
+        self.say(row, f"Stopped by {who}: the task is blocked and its proven worker is stopped now. "
+                      "An unproven worker stays running until its identity is verified. Re-delegate or reply here to resume.")
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):

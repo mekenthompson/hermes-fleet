@@ -411,11 +411,10 @@ again parks again without a second alert.
 
 ## Known limits
 
-- **Stop does not halt the worker at once.** Core blocks the task immediately, but its reaper
-  terminates the worker 120 seconds after the run ends, on its next dispatcher tick (up to 60 s
-  more). Until then the worker can still run tools. The Stop reply says so. A prompt halt needs a
-  core change: signal the worker when a task is blocked from outside, and skip the turn-end nudge
-  for a task that is no longer running.
+- **Stop halts a proven worker now.** A supervisor block ends the fingerprinted host-local
+  worker immediately: SIGTERM, then SIGKILL if it ignores TERM. An unverified or recycled
+  identity is never signalled. A worker that survives stays fenced until it exits. The Stop
+  reply says so.
 
 - **Chat Stop is scoped to a bound ordinary chat run.** The plugin saves the host-provided session
   key and run generation at `linear start`. A Linear Stop records that exact target durably before
@@ -431,8 +430,9 @@ again parks again without a second alert.
   delayed events cannot create a second executor while closeout is still being delivered.
 - **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
   the plugin says so in Linear instead of claiming it stopped.
-  Core owns worker teardown. A prompt received while a stopped worker is still exiting stays
-  queued durably; the task becomes ready only after its fingerprinted worker has exited.
+  Core owns worker teardown. A prompt received while a worker that could not be halted is still
+  exiting stays queued durably; the task becomes ready only after that fingerprinted worker has
+  exited. A proven worker is already gone when Stop returns, so that resume is not held.
   Core's immutable spawn history preserves this guard even after terminal cleanup clears a run's PID.
   A newer Stop cancels that pending resume. Newer follow-ups are retained together while teardown waits.
   Its fence commits before core is called, so a core failure cannot revive an older instruction.
