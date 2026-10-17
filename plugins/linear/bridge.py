@@ -1364,7 +1364,7 @@ class Bridge:
                             log.warning("linear: dropped %s activity %s: %s", row["payload"]["content"]["type"], row["id"], exc)
                             progress = True
                         elif not exc.retryable:
-                            self.store.mark(row["id"], "failed", _public(str(exc))[:300])
+                            self.store.mark(row["id"], "failed", ("refused: " if exc.errors is not None or "rejected the mutation" in str(exc) else "") + _public(str(exc))[:300])
                             if row["payload"].get("reconcile_required"): progress = True
                         else:
                             self.store.retry(row, self.clock(), _public(str(exc))[:300])
@@ -1666,12 +1666,12 @@ class Bridge:
         log.error("linear: gave up on %s write for %s after retries: %s",
                   row["kind"], payload.get("issue_id"), exc)
         work = self.store.get(str(payload.get("issue_id")))
-        cause = payload.get("last_error") or str(exc)
+        refused, cause = str(payload.get("last_error") or "").startswith("refused: "), str(payload.get("last_error") or exc).removeprefix("refused: ")
         note = f"Linear has not accepted {row['kind']} update {row['id']} for this issue: {cause}. " + (
             "It will be retried after the next successful write." if getattr(exc, "retryable", True)
             else "It will not be retried; fix the cause and redo the step.")
         if row["kind"] in ("status", "description") and Store.uncertain(row, payload):
-            note = held(row, cause)  # an attempted write may have landed: never claim it was not accepted
+            note = held(row, cause, refused)  # only a definite Linear refusal may say "not accepted"
         if payload.get("reconcile_required"):
             work = None
         chat = work["owner_ref"] if work and work["origin"] == "chat" else payload.get("session_key")

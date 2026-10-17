@@ -161,6 +161,19 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.assertIn(f'hermes linear resolve {self.request_id}', text)
         self.assertNotIn('delivery failed', text)
 
+    def test_definite_refusal_notice_says_not_accepted_and_still_names_resolution(self):
+        self.assertTrue(self.invoke()['ok'])
+        original = self.remote._apply
+        self.remote._apply = lambda query, variables: ((200, {'data': {'issueUpdate': {'success': False}}})
+                                                       if 'issueUpdate' in query else original(query, variables))
+        self.bridge.flush()
+        self.assertEqual(len(self.notes), 1)
+        text = self.notes[0][1]
+        self.assertIn(f'Linear has not accepted description write ({self.request_id})', text)
+        self.assertIn('rejected the mutation', text)
+        self.assertIn(f'hermes linear resolve {self.request_id}', text)
+        self.assertNotIn('may or may not', text)
+
     def test_held_issue_refusals_name_the_write_and_supported_resolution(self):
         self.wedge()
         replies = [self.invoke('add_comment', request_id=str(uuid.uuid4())),
