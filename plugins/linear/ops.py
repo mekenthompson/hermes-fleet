@@ -9,6 +9,9 @@ from typing import Any
 from .store import ADVISORY, Store
 
 RESOLVE = "Check the issue in Linear, then: hermes linear resolve {id} applied|not_applied --evidence \"<what you saw>\""
+def held(write: dict[str, str], cause: str = "") -> str:
+    return (f"An earlier {write['kind']} write ({write['id']}) may or may not have reached Linear{f' ({cause})' if cause else ''}; "
+            "it holds this issue until reconciled. " + RESOLVE.format(id=write["id"]) + ".")
 
 def _read(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)

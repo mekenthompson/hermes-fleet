@@ -92,13 +92,14 @@ class Store:
         return all(not db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id=?", (ident,)).fetchone()
                    for ident in issue_ids if ident)
     @staticmethod
-    def _unresolved_terminal(db: sqlite3.Connection, issue_id: str, *, except_id: str = "") -> bool:
-        """An attempted terminal write has an unknown effect until an explicit durable resolution."""
+    def _unresolved_terminal(db: sqlite3.Connection, issue_id: str, *, except_id: str = "") -> list[dict[str, str]]:
+        """Attempted terminal writes, oldest first, whose effect stays unknown until an explicit durable resolution."""
         if not issue_id or issue_id.startswith("update:"):
-            return False
-        rows = db.execute("SELECT id, state, attempts, payload FROM outbox WHERE kind IN ('status','description') AND "
-                          "json_extract(payload, '$.issue_id')=?", (issue_id,)).fetchall()
-        return any(row["id"] != except_id and Store.uncertain(row, json.loads(row["payload"])) for row in rows)
+            return []
+        rows = db.execute("SELECT id, kind, state, attempts, payload FROM outbox WHERE kind IN ('status','description') AND "
+                          "json_extract(payload, '$.issue_id')=? ORDER BY rowid", (issue_id,)).fetchall()
+        return [{"id": row["id"], "kind": row["kind"]} for row in rows
+                if row["id"] != except_id and Store.uncertain(row, json.loads(row["payload"]))]
     @staticmethod
     def uncertain(row, payload: dict[str, Any]) -> bool:
         """An attempted terminal or content write whose remote effect stays unknown until resolved."""
@@ -109,7 +110,8 @@ class Store:
     def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
         return cls._admitted(db, *issue_ids) and all(
             not cls._unresolved_terminal(db, ident, except_id=except_id) for ident in issue_ids)
-    def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> bool:
+    def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> list[dict[str, str]]:
+        """Falsy when the issue is free; otherwise the held writes, so a refusal can name them."""
         with self._tx() as db:
             return self._unresolved_terminal(db, issue_id, except_id=except_id)
     @contextmanager
@@ -660,10 +662,11 @@ class Store:
         with self._tx() as db:
             db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND next_at <= ? AND "
                        + ADVISORY, (row_id, now))
-    def mark(self, row_id: str, state: str) -> None:
+    def mark(self, row_id: str, state: str, error: str | None = None) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
-            db.execute("UPDATE outbox SET state = ? WHERE id = ?", (state, row_id))
+            db.execute("UPDATE outbox SET state = ?, payload = CASE WHEN ? IS NULL THEN payload ELSE "
+                       "json_set(payload, '$.last_error', ?) END WHERE id = ?", (state, error, error, row_id))
     def mark_sent(self, row_id: str, applied: bool) -> bool:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return False
@@ -726,13 +729,14 @@ class Store:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
             db.execute("UPDATE outbox SET next_at = ? WHERE id = ?", (until, row_id))
-    def retry(self, row: dict[str, Any], now: float) -> bool:
+    def retry(self, row: dict[str, Any], now: float, error: str | None = None) -> bool:
         """Back off 1 min doubling to 1 h. Returns True when the row is given up (24 h old)."""
         attempts = int(row["attempts"]) + 1
         if now - float(row["payload"].get("enqueued_at", now)) >= GIVE_UP_AFTER:
             with self._tx() as db:
                 if not self._row_admitted(db, row["id"]): return False
-                db.execute("UPDATE outbox SET state = 'failed', attempts = ? WHERE id = ?", (attempts, row["id"]))
+                db.execute("UPDATE outbox SET state = 'failed', attempts = ?, payload = CASE WHEN ? IS NULL THEN payload "
+                           "ELSE json_set(payload, '$.last_error', ?) END WHERE id = ?", (attempts, error, error, row["id"]))
             return True
         delay = min(MIN_BACKOFF * 2 ** (attempts - 1), MAX_BACKOFF)
         with self._tx() as db:

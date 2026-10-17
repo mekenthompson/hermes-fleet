@@ -2102,7 +2102,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.linear.comments, [])
         self.assertEqual(self.linear.project_updates, [])
-        self.assertTrue(any("has not accepted" in message for _, message in self.injected))
+        notices = [message for _, message in self.injected if status_id in message]
+        self.assertTrue(notices)
+        self.assertTrue(any("may or may not have reached Linear" in message for message in notices))
+        self.assertTrue(any(f"hermes linear resolve {status_id} applied|not_applied" in message
+                            for message in notices))
+        self.assertFalse(any("has not accepted" in message for message in notices))
+        self.assertFalse(any("will be retried" in message for message in notices))
 
     def test_give_up_after_a_day_is_loud_and_retried_later(self) -> None:
         self.assertTrue(self.chat("start")["ok"])
