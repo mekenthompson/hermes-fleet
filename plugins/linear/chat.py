@@ -4,6 +4,7 @@ import json
 from typing import Any
 from .api import LinearError
 from .bridge import Bridge, acceptance_refusal, evidence_links, iso_ms
+from .ops import held
 SCHEMA = {
     "name": "linear",
     "description": (
@@ -42,6 +43,9 @@ SCHEMA = {
 def _reply(ok: bool, message: str, **details: Any) -> str:
     return json.dumps({"ok": ok, "message": message, **details})
 
+def _held(bridge: Bridge, issue_id: str) -> str | None:
+    writes = bridge.store.issue_reconciliation_blocked(issue_id)
+    return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes]) if writes else None
 def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
     """Durable ownership is not a liveness observation. Do not invent one."""
     owner = row.get("owner_ref") or ""
@@ -153,7 +157,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
                 except ValueError:
                     return _reply(False, f"Caller id conflicts with an earlier {action}; no change was made.")
                 if not row_id:
-                    return _reply(False, "Content change was not admitted; no change was made.")
+                    return _held(bridge, issue_id) or _reply(False, "Content change was not admitted; no change was made.")
                 warning = (" Formatting tip: split this long single paragraph with headings and bullets/checklists."
                            if len(body) > 500 and "\n" not in body else "")
                 return _reply(True, f"{action} queued durably for {issue.get('identifier')}; delivery is not yet confirmed.{warning}", outbox_id=row_id)
@@ -189,14 +193,16 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         if action == "start":
             try: bridge.await_retired(issue_id)
             except LinearError as exc: return _reply(False, str(exc))
-            if bridge.store.issue_reconciliation_blocked(issue_id):
-                return _reply(False, "An earlier terminal write needs reconciliation before fresh work.")
+            if refusal := _held(bridge, issue_id):
+                return refusal
             return _start(bridge, issue, row, me, session_key, session_id, generation)
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
             return _ownership_refusal(issue, row, "chat_ownership_conflict")
         if action == "done":
+            if refusal := _held(bridge, issue_id):
+                return refusal  # before evidence: a held write must be reconciled, not replayed under a new closeout
             if row.get("stop_requested_at"):
                 return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "
                                      "instruction explicitly resumes it.")
