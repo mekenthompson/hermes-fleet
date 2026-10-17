@@ -106,7 +106,7 @@ def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read() or b""
 
 def markdown_matches(actual: object, expected: str) -> bool:
-    """Accept only editor heading spacing/bullet canonicalization; preserve code/text."""
+    """Accept only Linear's editor rewrites (heading spacing, `*` bullets, `[X]`, `<url>`); preserve code/text."""
     if not isinstance(actual, str):
         return False
     def canonical(text: str) -> list[str]:
@@ -127,7 +127,8 @@ def markdown_matches(actual: object, expected: str) -> bool:
             if not line and after_heading:
                 continue
             after_heading = bool(re.match(r'^#{1,6} +', line))
-            result.append(re.sub(r'^[*+] ', '- ', re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)))
+            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)
+            result.append(re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)))
         return result
     return canonical(actual) == canonical(expected)
 

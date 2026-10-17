@@ -27,6 +27,26 @@ class CheckboxRemote(ContentRemote):
             variables = {**variables, 'input': {**fields, 'description': stored}}
         return super()._apply(query, variables)
 
+LINEAR_SHAPED = ('### Acceptance\n\n- [x] Hourly collection\n  - nested detail [run](https://example.test/run/1)\n'
+                 '- [ ] Follow-up\n\n[Dashboard](https://example.test/dash) and [wiki](https://w.test/Foo_(bar))\n\n```\n- [x] literal (keep)\n[a](b)\n```')
+
+class LinearRemote(ContentRemote):
+    """Linear's editor, as observed in production: `*` bullets at any depth, `[X]`, and `<...>` link destinations."""
+    def _apply(self, query, variables):
+        fields = (variables or {}).get('input') or {}
+        if 'issueUpdate' in query and isinstance(fields.get('description'), str):
+            prose, fence, out = True, False, []
+            for line in fields['description'].split('\n'):
+                if line.startswith('```'):
+                    fence = not fence
+                elif not fence:
+                    line = re.sub(r'^(\s*)- ', r'\1* ', line)
+                    line = re.sub(r'^(\s*\* )\[x\]', r'\1[X]', line)
+                    line = re.sub(r'\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)', r'](<\1>)', line)
+                out.append(line)
+            variables = {**variables, 'input': {**fields, 'description': '\n'.join(out)}}
+        return super()._apply(query, variables)
+
 class CheckboxCanonicalTests(unittest.TestCase):
     def test_checked_task_case_is_equivalent_but_state_and_code_are_not(self):
         self.assertTrue(markdown_matches('- [X] Done', '- [x] Done'))
@@ -40,6 +60,17 @@ class CheckboxCanonicalTests(unittest.TestCase):
         self.assertFalse(markdown_matches('- [X] Done', '- [x] Gone'))
         self.assertFalse(markdown_matches('- [X](https://a.test)', '- [x](https://a.test)'))
         self.assertFalse(markdown_matches('- [X]abc', '- [x]abc'))
+
+    def test_linear_bullet_depth_and_link_wrappers_are_equivalent_but_targets_are_not(self):
+        self.assertTrue(markdown_matches('  * nested', '  - nested'))
+        self.assertTrue(markdown_matches('[Run](<https://a.test/x>)', '[Run](https://a.test/x)'))
+        self.assertTrue(markdown_matches('* [X] [Run](<https://a.test/x>)', '- [x] [Run](https://a.test/x)'))
+        self.assertTrue(markdown_matches('[w](<https://w.test/Foo_(bar)>)', '[w](https://w.test/Foo_(bar))'))
+        self.assertFalse(markdown_matches('[w](<https://w.test/Foo_(bar)>)', '[w](https://w.test/Foo_(baz))'))
+        self.assertFalse(markdown_matches('[Run](<https://a.test/x>)', '[Run](https://a.test/y)'))
+        self.assertFalse(markdown_matches('[Run](<https://a.test/x>)', '[Walk](https://a.test/x)'))
+        self.assertFalse(markdown_matches('```\n[a](<b>)\n```', '```\n[a](b)\n```'))
+        self.assertFalse(markdown_matches('```\n  * code\n```', '```\n  - code\n```'))
 
 class DescriptionSettlementTests(unittest.TestCase):
     def setUp(self):
@@ -91,6 +122,24 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.assertEqual(self.notes, [])
         self.assertFalse(self.store.issue_reconciliation_blocked('issue-1'))
         self.assertTrue(self.invoke('add_comment', request_id=str(uuid.uuid4()))['ok'])
+
+    def test_linear_shaped_rewrite_settles_without_alert_or_wedge(self):
+        self.remote.close()
+        self.remote = LinearRemote(self.clock)
+        self.addCleanup(self.remote.close)
+        self.remote.add_issue('issue-1', 'ABC-1', project=None)
+        self.remote.set_delegate('issue-1', {'id': SELF})
+        self.bridge.api = self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
+        self.assertTrue(self.invoke(content=LINEAR_SHAPED)['ok'])
+        self.assertEqual(self.bridge.flush(), 1)
+        stored = self.remote.issues['issue-1']['description']
+        self.assertIn('  * nested', stored)
+        self.assertIn('(<https://example.test/dash>)', stored)
+        self.assertIn('(<https://w.test/Foo_(bar)>)', stored)
+        self.assertIn('- [x] literal (keep)', stored)
+        self.assertEqual(self.row()['state'], 'sent')
+        self.assertEqual(self.notes, [])
+        self.assertFalse(self.store.issue_reconciliation_blocked('issue-1'))
 
     def test_lost_response_then_canonicalised_readback_settles_once(self):
         self.assertTrue(self.invoke()['ok'])
