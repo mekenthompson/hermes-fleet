@@ -206,7 +206,9 @@ blank lines after headings, and angle brackets around an unchanged link destinat
 It also accepts an expected plain ASCII host such as `example.com` becoming
 `[example.com](<http://example.com>)` in prose. This exception is directional:
 removing an authored link, changing its scheme/host/path, or rewriting code does
-not match. Ambiguous Markdown contexts are deliberately not autolink candidates.
+not match. Ambiguous Markdown contexts are deliberately not autolink candidates:
+lines containing code/escapes/authored links, multiline open delimiters, or source
+text containing `<` remain conservative. Inline/indented code lines compare exactly.
 Create, description replacement/recovery, and comment verification share this
 comparison; retry a landed create with the original caller ID, never a fresh ID.
 A queued receipt is not remote delivery, source tests are not live activation, and the
