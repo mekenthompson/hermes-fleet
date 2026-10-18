@@ -137,6 +137,20 @@ class ContentActionTests(unittest.TestCase):
                        body.replace(host, link) + '\nExtra line'):
             self.assertFalse(markdown_matches(stored, body))
 
+    def test_editor_rewrites_do_not_change_code_or_ambiguous_contexts(self):
+        from hermes_fleet_linear_plugin.api import markdown_matches
+        for expected, actual in (
+            ('`[x](<https://example.com>)`', '`[x](https://example.com)`'),
+            ('``[x](<https://example.com>)``', '``[x](https://example.com)``'),
+            ('`start\n[x](<https://example.com>)\nend`', '`start\n[x](https://example.com)\nend`'),
+            ('    [x](<https://example.com>)', '    [x](https://example.com)'),
+            ('  \texample.com', '  \t[example.com](<http://example.com>)'),
+            ('<pre>\nexample.com\n</pre>', '<pre>\n[example.com](<http://example.com>)\n</pre>'),
+            ('<!--\nexample.com\n-->', '<!--\n[example.com](<http://example.com>)\n-->'),
+        ):
+            with self.subTest(expected=expected):
+                self.assertFalse(markdown_matches(actual, expected))
+
     def test_same_id_duplicate_create_reconciles_autolink_without_another_issue(self):
         body = 'Visit example.com'
         stored = 'Visit [example.com](<http://example.com>)'

@@ -53,8 +53,8 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Review: decline only on a confirmed reason, one-try declines, session-scoped keepalive.
 # Measured 4454. The owner approved 100 lines of headroom so contract fixes stop moving the cap;
 # growth past it is a design review, not another bump.
-# Design review: the owner approved 4571 for held-write refusals and Linear's markdown rewrites.
-BUDGET = 4571
+# Design review: the owner approved 4614 for directional host autolinks and code-context preservation.
+BUDGET = 4614
 
 
 class FakeContext:

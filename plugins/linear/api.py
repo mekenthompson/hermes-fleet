@@ -164,12 +164,15 @@ def markdown_matches(actual: object, expected: str) -> bool:
                 elif inline_run is None:
                     delimiters = max(0, delimiters + (1 if token in '[(<' else -1))
             prose = prose and inline_run is None and delimiters == 0
+            if not prose or '`' in line or line.expandtabs(4).startswith('    '):
+                result.append((line, False))
+                continue
             line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)
             result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)), prose))
         return result
     received, authored = canonical(actual), canonical(expected)
     return len(received) == len(authored) and all(
-        line == wanted or (prose and expected_prose and _bare_host_line_matches(line, wanted))
+        line == wanted or ('<' not in expected and prose and expected_prose and _bare_host_line_matches(line, wanted))
         for (line, prose), (wanted, expected_prose) in zip(received, authored))
 
 class LinearAPI:
