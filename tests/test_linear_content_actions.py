@@ -84,6 +84,122 @@ class ContentActionTests(unittest.TestCase):
         self.assertEqual(created['description'], BODY)
         self.assertTrue(any(q == 'query CreatedIssue' for q in self.remote.requests))
 
+    def test_create_accepts_bare_host_editor_autolink(self):
+        body = '### Outcome\n\nClick **Sign in** on example.com to continue.'
+        stored = body.replace('example.com', '[example.com](<http://example.com>)')
+        original = self.remote._apply
+        def canonicalized(query, variables):
+            status, payload = original(query, variables)
+            if 'issueCreate' in query:
+                self.remote.issues[variables['input']['id']]['description'] = stored
+            return status, payload
+        self.remote._apply = canonicalized
+        created = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+        self.assertEqual(created['id'], self.request_id)
+        self.assertEqual(created['description'], stored)
+        self.assertIsNone(created['delegate'])
+        self.assertIsNone(created['assignee'])
+
+    def test_bare_host_readback_is_directional_and_preserves_other_content(self):
+        from hermes_fleet_linear_plugin.api import markdown_matches
+        host = 'example.com'
+        link = '[example.com](<http://example.com>)'
+        for body in (host, f'Click **Sign in** on {host}.', f'Visit ({host}).',
+                     f'- [ ] Visit {host}', f'Use {host} or docs.example.org'):
+            stored = body.replace(host, link)
+            with self.subTest(body=body):
+                self.assertTrue(markdown_matches(stored, body))
+                self.assertFalse(markdown_matches(body, stored))
+        for stored in ('[other.com](<http://other.com>)',
+                       '[example.com](<http://other.com>)',
+                       '[example.com](<https://example.com>)',
+                       '[example.com](<http://example.com/>)',
+                       '[example.com](<http://example.com/path>)',
+                       '[example.com](<http://example.com?x=1>)',
+                       '[example.com](<http://example.com#section>)',
+                       '[example.com](<http://example.com:80>)',
+                       'example.org'):
+            with self.subTest(stored=stored):
+                self.assertFalse(markdown_matches(stored, host))
+        for body in ('`example.com`', '``example.com``', '    example.com', '\texample.com',
+                     '`start\nexample.com\nend`', '[label\nexample.com\n](https://a.test)',
+                     '```text\nexample.com\n```', '~~~\nexample.com\n~~~',
+                     '[example.com](https://example.com)', '![example.com](image.png)',
+                     '[example.com][ref]', '[ref]: example.com', r'\example.com',
+                     'http://example.com', 'https://example.com', 'user@example.com',
+                     'example.com/path', 'example.com?x=1', 'example.com#section',
+                     'example.com:80', 'prefix-example.com/path'):
+            with self.subTest(body=body):
+                self.assertFalse(markdown_matches(body.replace(host, link), body))
+        body = f'- [ ] Visit {host} today.'
+        for stored in (body.replace(host, link).replace('[ ]', '[x]'),
+                       body.replace(host, link).replace('today', 'tomorrow'),
+                       body.replace(host, link) + '\nExtra line'):
+            self.assertFalse(markdown_matches(stored, body))
+
+    def test_same_id_duplicate_create_reconciles_autolink_without_another_issue(self):
+        body = 'Visit example.com'
+        stored = 'Visit [example.com](<http://example.com>)'
+        self.remote.add_issue(self.request_id, 'ABC-2', project=None).update(
+            title='Outcome', description=stored, assignee=None, parent=None)
+        seen = []
+        original = self.remote._apply
+        def duplicate(query, variables):
+            if 'issueCreate' in query:
+                seen.append(variables['input']['id'])
+                return 200, {'data': None, 'errors': [{
+                    'message': 'conflict on insert of Issue', 'extensions': {
+                        'code': 'INPUT_ERROR',
+                        'userPresentableMessage': f'Issue {self.request_id} already exists.'}}]}
+            return original(query, variables)
+        self.remote._apply = duplicate
+        for _ in range(2):
+            created = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+            self.assertEqual(created['id'], self.request_id)
+        self.assertEqual(seen, [self.request_id, self.request_id])
+        self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
+        self.remote.issues[self.request_id]['description'] = 'Visit other.com'
+        with self.assertRaises(LinearError):
+            self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+
+    def test_autolink_description_response_loss_restart_settles_without_resend(self):
+        body = '### Outcome\n\nVisit example.com'
+        original = self.remote._apply
+        def canonicalized(query, variables):
+            status, payload = original(query, variables)
+            if 'issueUpdate' in query and 'description' in variables['input']:
+                self.remote.issues['issue-1']['description'] = body.replace(
+                    'example.com', '[example.com](<http://example.com>)')
+            return status, payload
+        self.remote._apply = canonicalized
+        self.assertTrue(self.invoke(content=body)['ok'])
+        self.remote.lose_next_response = True
+        self.assertEqual(self.bridge.flush(), 0)
+        self.bridge.store = self.store = Store(self.path)
+        self.clock.now += 3601
+        self.assertEqual(self.bridge.flush(), 1)
+        self.assertEqual(self.row()['state'], 'sent')
+        self.assertEqual(len(self.mutations()), 1)
+        self.assertFalse(self.store.issue_reconciliation_blocked('issue-1'))
+
+    def test_autolink_comment_readback_settles_durable_action(self):
+        body = '### Progress\n\nVisit example.com'
+        original = self.remote._apply
+        def canonicalized(query, variables):
+            status, payload = original(query, variables)
+            if 'commentCreate' in query and payload.get('data'):
+                self.remote.comments[-1]['body'] = body.replace(
+                    'example.com', '[example.com](<http://example.com>)')
+            return status, payload
+        self.remote._apply = canonicalized
+        self.assertTrue(self.invoke('add_comment', content=body)['ok'])
+        self.assertEqual(self.bridge.flush(), 1)
+        self.assertEqual(self.row()['state'], 'sent')
+        self.assertTrue(self.api.verify_comment(self.request_id, 'issue-1', body))
+        self.assertEqual(len(self.remote.comments), 1)
+        self.remote.comments[0]['body'] = '### Progress\n\nVisit other.com'
+        self.assertFalse(self.api.verify_comment(self.request_id, 'issue-1', body))
+
     def test_create_wrong_description_is_refused(self):
         original = self.remote._apply
         def changed(query, variables):

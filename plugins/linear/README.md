@@ -201,9 +201,15 @@ remote content, never blindly resent. A different remote value retains an
 unresolved receipt and fences new writes for operator reconciliation.
 
 Successful delivery verifies the exact issue/comment ID and Markdown content.
-Readback tolerates only top-level bullet-marker canonicalization and blank lines
-after Markdown headings, preserving code, links and checklist state. A queued
-receipt is not remote delivery, source tests are not live activation, and the
+Readback tolerates bullet-marker canonicalization, checked-task `[X]` case,
+blank lines after headings, and angle brackets around an unchanged link destination.
+It also accepts an expected plain ASCII host such as `example.com` becoming
+`[example.com](<http://example.com>)` in prose. This exception is directional:
+removing an authored link, changing its scheme/host/path, or rewriting code does
+not match. Ambiguous Markdown contexts are deliberately not autolink candidates.
+Create, description replacement/recovery, and comment verification share this
+comparison; retry a landed create with the original caller ID, never a fresh ID.
+A queued receipt is not remote delivery, source tests are not live activation, and the
 bridge's automatic closeout must not be duplicated with manual comments.
 
 ## Chat-to-worker admission
