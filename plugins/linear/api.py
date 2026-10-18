@@ -105,32 +105,72 @@ def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read() or b""
 
+def _bare_host_line_matches(actual: str, expected: str) -> bool:
+    """Permit only an observed HTTP autolink added to an expected bare host.
+
+    Be conservative around Markdown syntax: code, escapes, HTML and authored
+    links are not candidates. Do not erase links on both sides, which would
+    hide a removed authored link or a changed destination.
+    """
+    prose = re.sub(r'^(?:[ \t]*(?:[-*+]|[0-9]+[.)]) )\[[xX ]\] ', '', expected)
+    if expected.startswith(('    ', '\t')) or any(char in prose for char in '`\\[]<>'):
+        return False
+    hosts = re.finditer(
+        r'(?<![\w@./:+%?&=#~-])'
+        r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}'
+        r'(?![\w@/:+%?&=#~-]|\.[\w-])', expected)
+    parts, offset = [], 0
+    for match in hosts:
+        host = re.escape(match.group())
+        parts.extend((re.escape(expected[offset:match.start()]),
+                      rf'(?:{host}|\[{host}\]\(http://{host}\))'))
+        offset = match.end()
+    parts.append(re.escape(expected[offset:]))
+    return re.fullmatch(''.join(parts), actual) is not None
+
+
 def markdown_matches(actual: object, expected: str) -> bool:
-    """Accept only Linear's editor rewrites (heading spacing, `*` bullets, `[X]`, `<url>`); preserve code/text."""
+    """Accept narrow editor rewrites, including bare-host autolinks; preserve code/text."""
     if not isinstance(actual, str):
         return False
-    def canonical(text: str) -> list[str]:
+    def canonical(text: str) -> list[tuple[str, bool]]:
         lines, result, fence = text.splitlines(), [], None
         after_heading = False
+        inline_run, delimiters = None, 0
         for line in lines:
             marker = re.match(r'^\s*(`{3,}|~{3,})', line)
             if marker:
                 run = marker.group(1)
                 if fence is None: fence = (run[0], len(run))
                 elif run[0] == fence[0] and len(run) >= fence[1]: fence = None
-                result.append(line)
+                result.append((line, False))
                 after_heading = False
                 continue
             if fence is not None:
-                result.append(line)
+                result.append((line, False))
                 continue
             if not line and after_heading:
                 continue
             after_heading = bool(re.match(r'^#{1,6} +', line))
+            # A bare-looking host on a later line may still be inside inline
+            # code, a link label/destination, or an HTML tag opened earlier.
+            prose = inline_run is None and delimiters == 0
+            for token in re.findall(r'\\.|`+|[\[\]()<>]', line):
+                if token.startswith('\\'):
+                    continue
+                if token.startswith('`'):
+                    if inline_run is None: inline_run = len(token)
+                    elif len(token) == inline_run: inline_run = None
+                elif inline_run is None:
+                    delimiters = max(0, delimiters + (1 if token in '[(<' else -1))
+            prose = prose and inline_run is None and delimiters == 0
             line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)
-            result.append(re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)))
+            result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)), prose))
         return result
-    return canonical(actual) == canonical(expected)
+    received, authored = canonical(actual), canonical(expected)
+    return len(received) == len(authored) and all(
+        line == wanted or (prose and expected_prose and _bare_host_line_matches(line, wanted))
+        for (line, prose), (wanted, expected_prose) in zip(received, authored))
 
 class LinearAPI:
     """``token`` is the provider interface: a callable returning an access token, with an
