@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE TABLE IF NOT EXISTS chat_stop (
   id TEXT PRIMARY KEY, profile TEXT NOT NULL, issue_id TEXT NOT NULL,
   linear_session_id TEXT NOT NULL, source_activity_id TEXT NOT NULL,
-  session_key TEXT NOT NULL, run_generation INTEGER NOT NULL,
+  session_key TEXT NOT NULL, run_generation INTEGER,
   status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
   completion_activity_id TEXT, uncertainty_activity_id TEXT,
   UNIQUE(profile, issue_id, linear_session_id, source_activity_id));
@@ -46,6 +46,12 @@ def advisory(row: dict[str, Any]) -> bool:
     payload = row["payload"]
     return row["kind"] == "activity" and ((payload.get("content") or {}).get("type") in ("thought", "action")
                                           or payload.get("one_try") is True)
+
+
+class SharedChatOwner(ValueError):
+    """The core fences whole chats, so a predecessor with other work cannot move one issue."""
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -69,6 +75,24 @@ class Store:
                 db.execute("ALTER TABLE work ADD COLUMN release_pending INTEGER NOT NULL DEFAULT 0")
             if "ownership_id" not in columns:
                 db.execute("ALTER TABLE work ADD COLUMN ownership_id TEXT")
+            if next(row[3] for row in db.execute("PRAGMA table_info(chat_stop)") if row[1] == "run_generation"):
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("""CREATE TABLE chat_stop_nullable (
+                      id TEXT PRIMARY KEY, profile TEXT NOT NULL, issue_id TEXT NOT NULL,
+                      linear_session_id TEXT NOT NULL, source_activity_id TEXT NOT NULL,
+                      session_key TEXT NOT NULL, run_generation INTEGER,
+                      status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
+                      completion_activity_id TEXT, uncertainty_activity_id TEXT,
+                      UNIQUE(profile, issue_id, linear_session_id, source_activity_id))""")
+                    db.execute("INSERT INTO chat_stop_nullable SELECT * FROM chat_stop")
+                    db.execute("DROP TABLE chat_stop")
+                    db.execute("ALTER TABLE chat_stop_nullable RENAME TO chat_stop")
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         active = getattr(self._local, "db", None)
@@ -117,6 +141,24 @@ class Store:
             transfer = json.loads(row[0])
             if transfer["issue_id"] == issue_id and transfer["state"] in ("prepared", "committed"):
                 return transfer
+        return None
+    @staticmethod
+    def _reserved_predecessor(db: sqlite3.Connection, owner_ref: str) -> bool:
+        return any(json.loads(row[0])["predecessor"]["owner_ref"] == owner_ref
+                   for row in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"))
+    @staticmethod
+    def _shared_owner(db: sqlite3.Connection, issue_id: str, owner_ref: str) -> bool:
+        return db.execute("SELECT 1 FROM work WHERE issue_id!=? AND owner_ref=? LIMIT 1",
+                          (issue_id, owner_ref)).fetchone() is not None
+    @staticmethod
+    def _successor_transfer(db: sqlite3.Connection, issue_id: str,
+                            work: sqlite3.Row) -> tuple[str, dict] | None:
+        for row in db.execute("SELECT key, value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
+            saved = json.loads(row["value"])
+            if (saved["issue_id"] == issue_id and saved["state"] in ("committed", "resumed") and
+                    saved["successor_owner"] == work["ownership_id"] and
+                    saved["session_key"] == work["owner_ref"]):
+                return row["key"], saved
         return None
     def chat_transfer(self, request_id: str) -> dict | None:
         with self._tx() as db:
@@ -177,6 +219,9 @@ class Store:
                 saved = json.loads(previous[0])
                 if not self._same_transfer_identity(saved, request):
                     raise ValueError("Transfer request identity conflicts")
+                if (saved["state"] == "prepared" and self._shared_owner(
+                        db, saved["issue_id"], saved["predecessor"]["owner_ref"])):
+                    raise SharedChatOwner("Predecessor chat also owns other work")
                 rebound = self._rebind_chat_transfer_db(db, key, saved, request)
                 return rebound
             issue_id = request["issue_id"]
@@ -188,6 +233,8 @@ class Store:
                     or not isinstance(work["run_generation"], int) or work["run_generation"] < 1
                     or self.retired(issue_id)):
                 return None
+            if self._shared_owner(db, issue_id, work["owner_ref"]):
+                raise SharedChatOwner("Predecessor chat also owns other work")
             saved = {**request, "state": "prepared", "created_at": at, "predecessor": dict(work),
                      "successor_owner": str(uuid.uuid4())}
             db.execute("INSERT INTO metadata (key,value) VALUES (?,?)", (key, json.dumps(saved)))
@@ -213,6 +260,7 @@ class Store:
             work = db.execute("SELECT * FROM work WHERE issue_id=?", (saved["issue_id"],)).fetchone()
             if (not work or work["ownership_id"] != old["ownership_id"] or
                     work["owner_ref"] != old["owner_ref"] or work["run_generation"] != old["run_generation"] or
+                    self._shared_owner(db, saved["issue_id"], old["owner_ref"]) or
                     work["release_pending"] or work["stop_requested_at"] or
                     not self._admitted(db, saved["issue_id"])):
                 return None
@@ -231,9 +279,13 @@ class Store:
             if not row:
                 return None
             saved = json.loads(row[0])
-            if saved["state"] == "resumed":
-                return saved if saved.get("reconciliation") == evidence.strip() else None
             work = db.execute("SELECT * FROM work WHERE issue_id=?", (saved["issue_id"],)).fetchone()
+            if saved["state"] == "resumed":
+                return saved if (saved.get("reconciliation") == evidence.strip() and work and
+                                 work["owner_ref"] == saved["session_key"] and
+                                 work["ownership_id"] == saved["successor_owner"] and
+                                 not work["stop_requested_at"] and not work["release_pending"] and
+                                 self._admitted(db, saved["issue_id"])) else None
             if (saved["state"] != "committed" or not evidence.strip() or not work or
                     work["owner_ref"] != saved["session_key"] or
                     work["ownership_id"] != saved["successor_owner"] or
@@ -249,6 +301,11 @@ class Store:
         """Falsy when the issue is free; otherwise the held writes, so a refusal can name them."""
         with self._tx() as db:
             return self._unresolved_terminal(db, issue_id, except_id=except_id)
+    def transfer_control_stopped(self, issue_id: str) -> bool:
+        with self._tx() as db:
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            return bool(work and work["stop_requested_at"] and
+                        self._successor_transfer(db, issue_id, work))
     @contextmanager
     def guard_issue_work(self, issue_id: str) -> Iterator[bool]:
         with self._tx() as db:
@@ -262,10 +319,34 @@ class Store:
             if not row or row["state"] != "pending":
                 return False
             payload = json.loads(row["payload"])
-            for issue_id in self._targets(payload):
+            targets = self._targets(payload)
+            for issue_id in targets:
                 if self._predecessor_transfer_blocks(db, issue_id, payload):
                     return False
-            if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
+            control_stop = False
+            for issue_id in targets:
+                work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+                if payload.get("stop_intent_id") and (not work or not work["stop_requested_at"]):
+                    return False
+                if not work or not work["stop_requested_at"] or not self._successor_transfer(db, issue_id, work):
+                    continue
+                stop = db.execute("SELECT * FROM chat_stop WHERE id=? AND issue_id=? AND profile=?",
+                                  (payload.get("stop_intent_id"), issue_id, payload.get("stop_profile"))).fetchone()
+                control_stop = bool(stop and stop["status"] == "unsupported" and
+                                    stop["run_generation"] is None and
+                                    stop["session_key"] == work["owner_ref"] and
+                                    payload.get("session_key") == work["owner_ref"] and
+                                    payload.get("work_owner") == work["ownership_id"] and
+                                    ((row["kind"] == "status" and payload.get("state") == "blocked") or
+                                     (row["kind"] == "activity" and
+                                      (payload.get("content") or {}).get("type") == "error")))
+                if not control_stop:
+                    return False
+            if control_stop and len(targets) != 1:
+                return False
+            if not control_stop and not self._effect_admitted(db, *targets, except_id=row_id):
+                return False
+            if control_stop and not self._admitted(db, *targets):
                 return False
             if payload.get("content_action"):
                 work = db.execute("SELECT origin, owner_ref, ownership_id, stop_requested_at, release_pending FROM work WHERE issue_id=?",
@@ -469,7 +550,8 @@ class Store:
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
         with self._tx() as db:
-            if not self._effect_admitted(db, issue_id) or self.retired(issue_id): return False
+            if (not self._effect_admitted(db, issue_id) or self.retired(issue_id) or
+                    self._reserved_predecessor(db, owner_ref)): return False
             db.execute("INSERT OR REPLACE INTO work (issue_id, origin, owner_ref, task_id, project_id, "
                        "last_updated_at, run_generation, ownership_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation, str(uuid.uuid4())))
@@ -487,11 +569,21 @@ class Store:
             work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
             if not work or work["origin"] != "chat":
                 return None
+            successor = self._successor_transfer(db, issue_id, work) if work["run_generation"] is None else None
+            control_only = successor is not None
+            if control_only and (not activity_id or work["linear_session_id"] != linear_session_id):
+                return None
+            stop_id = str(uuid.uuid4())
+            marker = {"stop_intent_id": stop_id, "stop_profile": profile,
+                      "work_owner": work["ownership_id"]} if control_only else {}
             if stamp:
                 db.execute("UPDATE work SET last_updated_at=MAX(last_updated_at, ?), stop_requested_at=? "
                            "WHERE issue_id=?", (stamp, stamp, issue_id))
+            elif control_only:
+                db.execute("UPDATE work SET stop_requested_at=MAX(stop_requested_at, ?) WHERE issue_id=?",
+                           (max(at * 1000, 1), issue_id))
             status_payload = {"issue_id": issue_id, "state": "blocked", "session_key": work["owner_ref"],
-                              "enqueued_at": at}
+                              "enqueued_at": at, **marker}
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'status', ?, ?)",
                        (str(uuid.uuid4()), json.dumps(status_payload), at))
             if not activity_id or work["linear_session_id"] != linear_session_id or \
@@ -500,15 +592,20 @@ class Store:
                                  "content": {"type": "error", "body": "Stop recorded, but this chat turn has no "
                                              "verified run binding. Cancellation is unsupported; stop it in chat "
                                              "and reconcile external effects."},
-                                 "session_key": work["owner_ref"], "enqueued_at": at}
+                                 "session_key": work["owner_ref"], "enqueued_at": at, **marker}
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'activity', ?, ?)",
                            (str(uuid.uuid4()), json.dumps(error_payload), at))
-                return None
-            stop_id = str(uuid.uuid4())
+                if not control_only:
+                    return None
             db.execute("INSERT INTO chat_stop (id, profile, issue_id, linear_session_id, source_activity_id, "
-                       "session_key, run_generation) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       "session_key, run_generation, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (stop_id, profile, issue_id, linear_session_id, activity_id,
-                        work["owner_ref"], work["run_generation"]))
+                        work["owner_ref"], work["run_generation"],
+                        "unsupported" if control_only else "requested"))
+            if control_only:
+                key, saved = successor
+                saved.update(execution_admitted=False, stop_activity_id=activity_id)
+                db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
             return dict(db.execute("SELECT * FROM chat_stop WHERE id=?", (stop_id,)).fetchone())
     def stop_intents(self) -> list[dict[str, Any]]:
         with self._tx() as db:
@@ -552,6 +649,13 @@ class Store:
         cols = ", ".join(f"{name} = ?" for name in fields)
         with self._tx() as db:
             if not self._admitted(db, issue_id): return False
+            if "owner_ref" in fields and self._reserved_predecessor(db, fields["owner_ref"]): return False
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            successor = self._successor_transfer(db, issue_id, work) if work else None
+            if (successor and work["stop_requested_at"] and successor[1].get("stop_activity_id") and
+                    ("run_generation" in fields or "owner_ref" in fields or
+                     fields.get("stop_requested_at") == 0)):
+                return False
             admits_work = "owner_ref" in fields or "run_generation" in fields or fields.get("stop_requested_at") == 0
             if admits_work and not self._effect_admitted(db, issue_id): return False
             db.execute(f"UPDATE work SET {cols} WHERE issue_id = ?", (*fields.values(), issue_id))

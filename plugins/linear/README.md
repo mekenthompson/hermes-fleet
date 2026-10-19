@@ -232,6 +232,9 @@ must name the issue and the destination chat. The Agent core must support durabl
 `retire_for_handoff`; an older image refuses before creating a pending intent. A
 recorded predecessor generation is required. New Desktop turns receive a real core
 journal generation, but claims created before that producer existed remain unsupported.
+Core retirement fences the whole predecessor chat. If its local work store also has
+another issue owned by that chat, transfer refuses before saving intent or fencing core;
+finish or release the other work first. This is a refusal, not a partial handoff.
 
 The plugin saves intent and fences old issue writes before it asks core to retire the
 predecessor. Core checks every recorded worker and detached resource, fences future old
@@ -256,6 +259,12 @@ work and never relabels old effects or replays a prior action. Unresolved local 
 receipts must first be reconciled through the existing `hermes linear resolve` path.
 Stop, release, closed/canceled issues, human reassignment, profile or requester-scope
 changes, another owner, and an uncertain physical worker keep the transfer fenced.
+After transfer, a Linear Stop for the issue's exact saved Linear session records a
+durable control Stop and fences further work even when the successor has no native
+run generation. Its receipt says cancellation is unsupported; it does not claim a
+worker was stopped. A Stop after reconciliation also revokes the previous resume;
+the issue stays fenced for a guarded operator reconciliation. This control-only Stop
+cannot be cleared by retrying `resume_transfer` or presenting a chat generation.
 Native gateway turns use the existing in-process live-turn validator. Desktop uses its
 server-stamped authenticated WebSocket identity and user instruction over the profile's
 private serialized transport; it does not acquire the gateway's live-turn delegation
@@ -482,6 +491,8 @@ again parks again without a second alert.
   An ambiguous response stays visible as unknown or stale, never as proof of cancellation.
   `linear done` stays fenced until a newer prompt or explicit chat start resumes it. Stop does not
   undo tools, child processes or external effects that already ran; reconcile before resuming.
+  A transferred successor with no native generation records a durable control Stop
+  for its exact Linear session, without sending a core cancellation request.
 - **Chat commands need Linear reachable** to resolve an identifier. When it is not, the tool says
   so and asks the agent to retry.
   Chat closeout receipts fence older delegation echoes and prompts, including after restart;

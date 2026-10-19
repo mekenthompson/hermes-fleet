@@ -58,7 +58,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # authenticated transport snapshot and Store CAS; no unallocated headroom (4614 + 278).
 # Review repairs: 71 measured lines for predecessor project-batch fencing, authenticated
 # API provenance and stable Desktop/API destination rebinding (4892 + 71).
-BUDGET = 4963
+# Shared-chat refusal, old-schema-safe control Stop, and its exact outbox fence:
+# 109 measured lines (4963 + 109). No quality or scope gate is disabled.
+BUDGET = 5072
 
 
 class FakeContext:

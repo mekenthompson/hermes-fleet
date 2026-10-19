@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .api import LinearError
 from .bridge import CLOSED
+from .store import SharedChatOwner
 
 
 def _reply(ok, message, **details):
@@ -169,5 +170,8 @@ def handle(bridge, args, context):
             if not result:
                 return _reply(False, "Stop, release, scope, or ownership changed; transfer remains fenced.")
             return _ownership_receipt(result)
+    except SharedChatOwner:
+        return _reply(False, "This predecessor chat owns another issue. Finish or release that issue "
+                      "before retrying; no transfer was prepared.", code="shared_predecessor")
     except (LinearError, ValueError, OSError) as exc:
         return _reply(False, f"Transfer cannot be confirmed: {exc}. Reuse the same request id.")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -90,6 +91,17 @@ class ChatTransferTests(unittest.TestCase):
         self.assertIsNone(Store(self.path).chat_transfer(self.request_id))
         self.assertEqual(self.store.get("issue-1"), self.owner)
 
+    def test_shared_predecessor_refuses_before_intent_or_core_retirement(self):
+        self.assertTrue(self.store.put("issue-2", "chat", "old-chat", run_generation=3))
+        calls = []
+        self.bridge.retire_chat = lambda *args: (calls.append(args), self.retired(*args))[1]
+        result = self.transfer()
+        self.assertEqual(result["code"], "shared_predecessor")
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.get("issue-1"), self.owner)
+        self.assertEqual(self.store.get("issue-2")["owner_ref"], "old-chat")
+
     def test_prepared_transfer_fences_old_mutations_but_not_another_issue(self):
         old_write = self.bridge.status("issue-1", "blocked")
         self.assertTrue(old_write)
@@ -99,7 +111,28 @@ class ChatTransferTests(unittest.TestCase):
         refused = json.loads(chat.handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context))
         self.assertFalse(refused["ok"])
         self.assertEqual(self.store.get("issue-1"), self.owner)
+        self.assertFalse(self.store.put("issue-2", "chat", "old-chat"))
         self.assertTrue(self.store.put("issue-2", "chat", "other-owner"))
+
+    def test_legacy_stop_table_migrates_without_losing_exact_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.db"
+            with sqlite3.connect(path) as db:
+                db.execute("""CREATE TABLE chat_stop (
+                  id TEXT PRIMARY KEY, profile TEXT NOT NULL, issue_id TEXT NOT NULL,
+                  linear_session_id TEXT NOT NULL, source_activity_id TEXT NOT NULL,
+                  session_key TEXT NOT NULL, run_generation INTEGER NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
+                  completion_activity_id TEXT, uncertainty_activity_id TEXT,
+                  UNIQUE(profile, issue_id, linear_session_id, source_activity_id))""")
+                db.execute("INSERT INTO chat_stop (id,profile,issue_id,linear_session_id,source_activity_id,"
+                           "session_key,run_generation) VALUES ('saved','alpha','issue-1','linear-s',"
+                           "'stop-a','old-chat',3)")
+            reopened = Store(path)
+            self.assertEqual(reopened.stop_intents()[0]["run_generation"], 3)
+            with sqlite3.connect(path) as db:
+                self.assertEqual(next(row[3] for row in db.execute("PRAGMA table_info(chat_stop)")
+                                      if row[1] == "run_generation"), 0)
 
     def test_unsupported_runtime_does_not_prepare_or_fence(self):
         del self.bridge.retire_chat
@@ -119,6 +152,50 @@ class ChatTransferTests(unittest.TestCase):
         self.assertEqual(self.store.chat_transfer(self.request_id)["state"], "prepared")
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "old-chat")
         self.assertFalse(self.bridge.status("issue-1", "blocked"))
+
+    def test_stop_after_control_handoff_is_durable_without_native_generation(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.store.update("issue-1", linear_session_id="linear-s"))
+        self.assertTrue(self.transfer()["ok"])
+        self.bridge.handle_webhook(self.remote.session_event(
+            "prompted", "issue-1", "other-session", signal="stop", activity_id="wrong"))
+        self.assertEqual(self.store.stop_intents(), [])
+        self.clock.now += 1
+        self.bridge.handle_webhook(self.remote.session_event(
+            "prompted", "issue-1", "linear-s", signal="stop", activity_id="stop-a"))
+        stops = Store(self.path).stop_intents()
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["source_activity_id"], "stop-a")
+        self.assertIsNone(stops[0]["run_generation"])
+        self.assertEqual(stops[0]["status"], "unsupported")
+        self.assertTrue(self.store.get("issue-1")["stop_requested_at"])
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+        notices = [row for row in self.store.pending("issue-1")
+                   if row["payload"].get("stop_intent_id") == stops[0]["id"]]
+        self.assertEqual({row["kind"] for row in notices}, {"status", "activity"})
+        self.assertTrue(all(self.store.admit_mutation(row["id"]) for row in notices))
+
+    def test_stop_after_resume_revokes_execution_admission(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.store.update("issue-1", linear_session_id="linear-s"))
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/reconciled"
+        self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
+        args = {"action": "resume_transfer", "issue": "ABC-1", "id": self.request_id, "evidence": link}
+        self.assertTrue(json.loads(chat.handle(self.bridge, args, self.context))["ok"])
+        queued = self.bridge.status("issue-1", "in_progress")
+        self.assertTrue(queued)
+        self.clock.now += 1
+        self.bridge.handle_webhook(self.remote.session_event(
+            "prompted", "issue-1", "linear-s", signal="stop", activity_id="stop-b"))
+        self.assertEqual(len(Store(self.path).stop_intents()), 1)
+        self.assertFalse(json.loads(chat.handle(self.bridge, args, self.context))["ok"])
+        self.assertFalse(self.store.admit_mutation(queued))
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+                                                self.context))["ok"])
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "done", "issue": "ABC-1"},
+                                                self.context))["ok"])
 
     def test_completed_control_handoff_keeps_effects_unknown_until_user_reconciliation(self):
         self.bridge.retire_chat = self.retired

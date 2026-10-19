@@ -716,6 +716,7 @@ class Bridge:
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
         issue_id = row["issue_id"]
+        if self.store.transfer_control_stopped(issue_id): return
         if (self.store.get(issue_id) or {}).get("release_pending"): return
         if self.store.issue_reconciliation_blocked(issue_id): return
         marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
