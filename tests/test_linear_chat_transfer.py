@@ -304,6 +304,52 @@ class ChatTransferTests(unittest.TestCase):
         self.assertEqual(self.store.chat_transfer(self.request_id)["retirement"]["effects"], "unknown")
         self.assertEqual(json.loads(chat.handle(self.bridge, args, self.context)), accepted)
 
+    def test_repeated_matching_comment_does_not_change_durable_resume_receipt(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/review"
+        self.add_reconciliation(link)
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link} and continue here")
+        args = {"action": "resume_transfer", "issue": "ABC-1", "id": self.request_id,
+                "evidence": link}
+        first = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(first["ok"])
+        self.clock.now += 2
+        self.add_reconciliation(link)
+        self.assertEqual(json.loads(chat.handle(self.bridge, args, self.context)), first)
+
+    def test_app_created_issue_accepts_later_human_reconciliation(self):
+        self.remote.issues["issue-1"]["creator"] = {"id": SELF}
+        self.remote.issues["issue-1"]["assignee"] = {"id": "human-1"}
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/review"
+        self.add_reconciliation(link)
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link} and continue here")
+        resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer",
+            "issue": "ABC-1", "id": self.request_id, "evidence": link}, self.context))
+        self.assertTrue(resumed["ok"], resumed)
+
+    def test_reassignment_during_reconciliation_read_refuses_resume(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/review"
+        self.add_reconciliation(link)
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link} and continue here")
+        original = self.bridge.api.issue_thread
+        def reassigned(issue_id):
+            comments = original(issue_id)
+            self.remote.set_delegate("issue-1", {"id": "other-agent"})
+            return comments
+        self.bridge.api.issue_thread = reassigned
+        resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer",
+            "issue": "ABC-1", "id": self.request_id, "evidence": link}, self.context))
+        self.assertFalse(resumed["ok"])
+        self.assertEqual(self.store.chat_transfer(self.request_id)["state"], "committed")
+
     def test_completed_control_handoff_keeps_effects_unknown_until_user_reconciliation(self):
         self.bridge.retire_chat = self.retired
         old_write = self.bridge.status("issue-1", "blocked")

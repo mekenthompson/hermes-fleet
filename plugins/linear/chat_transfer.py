@@ -114,9 +114,12 @@ def _retirement_sha256(receipt):
 def _reconciliation_decision(bridge, issue, saved, evidence):
     """Read a later, issue-bound human decision from Linear, not caller prose."""
     creator = (issue.get("creator") or {}).get("id")
+    assignee = (issue.get("assignee") or {}).get("id")
     allowed = set((getattr(bridge.api, "specialist_scope", None) or {}).get("allowed_requester_ids", ()))
     if creator:
         allowed.add(creator)
+    if assignee:
+        allowed.add(assignee)
     allowed.discard(bridge.api.viewer_id())
     if not allowed:
         return None
@@ -191,9 +194,21 @@ def handle(bridge, args, context):
                 saved = bridge.store.rebind_chat_transfer(request_id, identity, issue_id)
                 if not saved:
                     return _reply(False, "Transfer receipt does not belong to this issue and chat.")
-                decision = _reconciliation_decision(bridge, fresh, saved, evidence)
+                previous = saved.get("reconciliation") if saved["state"] == "resumed" else None
+                decision = (previous if isinstance(previous, dict) and
+                            previous.get("evidence") == evidence else
+                            _reconciliation_decision(bridge, fresh, saved, evidence))
                 if not decision:
                     return _reply(False, "A later issue-bound human reconciliation decision is required.",
+                                  code="reconciliation_required")
+                if not bridge.authorize_specialist_effect(issue_id):
+                    return _reply(False, "Issue authorization changed during reconciliation.",
+                                  code="reconciliation_required")
+                current = bridge.api.issue(issue_id)
+                if (current.get("id") != issue_id or
+                        (current.get("state") or {}).get("type") in CLOSED or
+                        (current.get("delegate") or {}).get("id") != bridge.api.viewer_id()):
+                    return _reply(False, "Issue authority changed during reconciliation.",
                                   code="reconciliation_required")
                 result = bridge.store.resume_chat_transfer(request_id, evidence=decision, at=bridge.clock())
                 if not result:
