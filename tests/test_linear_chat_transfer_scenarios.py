@@ -60,6 +60,7 @@ class ChatTransferScenarios(unittest.TestCase):
         self.bridge.profile_home = self.home
         self.bridge.retire_chat = lambda key, generation, request: self.core.retire_for_handoff(
             key, generation, request)
+        self.bridge.chat_lineage = self.core.lineage_keys
         self.request_id = str(uuid.uuid4())
         self.args = {"action": "transfer", "issue": "ABC-1", "id": self.request_id,
                      "expected_owner": self.previous["ownership_id"]}
@@ -217,6 +218,35 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertEqual(self.store.get("issue-1"), self.previous)
         self.assertEqual(self.store.get("issue-2")["owner_ref"], "old-chat")
         self.assertEqual(self.core.start_local_worker("old-chat", "next-real-session"), 2)
+
+    def test_compressed_predecessor_refuses_before_intent_or_other_issue_fence(self):
+        from gateway.session_context import clear_session_vars, set_session_vars, set_turn_user_message
+        self.assertTrue(self.core.link_session_keys("old-chat", "compressed-chat"))
+        child_generation = self.core.start_local_worker("compressed-chat", "child-agent")
+        self.assertEqual(child_generation, 1)
+        self.assertTrue(self.core.worker_finished("compressed-chat", child_generation))
+        self.assertTrue(self.store.put("issue-2", "chat", "compressed-chat",
+                                       run_generation=child_generation))
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
+                session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
+                browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
+            try:
+                set_turn_user_message("Transfer ABC-1 to this chat")
+                context = registry._current_tool_invocation_context()
+                server = transport.Server(self.home, "alpha", lambda args, host:
+                    chat.handle(self.bridge, args, host), lambda _: None)
+                try:
+                    result = json.loads(transport.chat_request(self.home, self.args, context))
+                finally:
+                    server.close()
+            finally:
+                clear_session_vars(tokens)
+        self.assertEqual(result["code"], "compressed_predecessor")
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(self.store.get("issue-1"), self.previous)
+        self.assertEqual(self.store.get("issue-2")["owner_ref"], "compressed-chat")
+        self.assertEqual(self.core.start_local_worker("compressed-chat", "unrelated-worker"), 2)
 
     def test_serialized_authenticated_api_instruction_moves_control(self):
         from gateway.session_context import (clear_session_vars, set_api_transfer_identity,

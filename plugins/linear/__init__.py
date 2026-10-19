@@ -445,9 +445,11 @@ def register(ctx: Any) -> None:
         bridge.profile_home = home.resolve(strict=True)
         try:
             from gateway.chat_execution_recovery import ChatExecutionStore
-            if callable(getattr(ChatExecutionStore, "retire_for_handoff", None)):
+            if (callable(getattr(ChatExecutionStore, "retire_for_handoff", None))
+                    and callable(getattr(ChatExecutionStore, "lineage_keys", None))):
                 bridge.retire_chat = lambda key, generation, request_id: ChatExecutionStore(
                     bridge.profile_home).retire_for_handoff(key, generation, request_id)
+                bridge.chat_lineage = lambda key: ChatExecutionStore(bridge.profile_home).lineage_keys(key)
         except ImportError:
             pass  # Older Agent images refuse transfer before preparing any intent.
         def native_transfer_message(context):
