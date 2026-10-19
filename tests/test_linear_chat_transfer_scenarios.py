@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import sqlite3
@@ -71,10 +72,10 @@ class ChatTransferScenarios(unittest.TestCase):
         successor_generation = self.core.start_local_worker("new-chat", "new-real-session")
         self.assertEqual(successor_generation, 1)
         context = registry.ToolInvocationContext(profile="alpha", platform="telegram", chat_id="chat",
-            chat_type="dm", session_key="new-chat", session_id="new-real-session",
-            run_generation=successor_generation)
+            chat_type="dm", user_id="alice", session_key="new-chat", session_id="new-real-session",
+            run_generation=successor_generation, user_message="Transfer ABC-1 to this chat")
         source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat",
-            thread_id="", chat_type="dm", user_id="", scope_id="")
+            thread_id="", chat_type="dm", user_id="alice", scope_id="")
         event = SimpleNamespace(source=source, internal=False, text="Transfer ABC-1 to this chat")
         turn = SimpleNamespace(session_key=context.session_key, session_id=context.session_id,
                                run_generation=successor_generation, _run_still_current=lambda: True)
@@ -101,6 +102,7 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertIn("transfer", registration.tool["schema"]["parameters"]["properties"]["action"]["enum"])
         self.assertIn("resume_transfer", registration.tool["schema"]["parameters"]["properties"]["action"]["enum"])
         captured = []
+        active = [context]
         def at_recover(*_):
             handler = registration.tool["handler"]
             captured.append(json.loads(handler(self.args, context)))
@@ -108,6 +110,10 @@ class ChatTransferScenarios(unittest.TestCase):
             event.text = "I reconciled ABC-1 against https://example.test/effects and continue here"
             captured.append(json.loads(handler({"action": "resume_transfer", "issue": "ABC-1",
                                                  "id": self.request_id, "evidence": "https://example.test/effects"}, context)))
+            next_context = replace(context, user_message=event.text, message_id="next-turn")
+            active[0] = next_context
+            captured.append(json.loads(handler({"action": "resume_transfer", "issue": "ABC-1",
+                                                 "id": self.request_id, "evidence": "https://example.test/effects"}, next_context)))
         async def run_service():
             stop = asyncio.Event(); stop.set()
             await registration.service(SimpleNamespace(gateway=gateway, profile_home=self.home,
@@ -119,13 +125,14 @@ class ChatTransferScenarios(unittest.TestCase):
                 patch.object(plugin, "Bridge", return_value=self.bridge), \
                 patch.object(self.bridge, "chat_profile_matches", return_value=True), \
                 patch.object(self.bridge, "recover", side_effect=at_recover), \
-                patch.object(registry, "_current_tool_invocation_context", return_value=context):
+                patch.object(registry, "_current_tool_invocation_context", side_effect=lambda: active[0]):
             asyncio.run(run_service())
         self.assertEqual(captured[0], captured[1])
         self.assertTrue(captured[0]["ok"], captured)
         self.assertEqual(captured[0]["predecessor_effects"], "unknown")
         self.assertFalse(captured[0]["execution_admitted"])
-        self.assertTrue(captured[2]["ok"], captured)
+        self.assertFalse(captured[2]["ok"], captured)
+        self.assertTrue(captured[3]["ok"], captured)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
         self.assertEqual(self.store.get("issue-1")["project_id"], "project-1")
         self.assertFalse(self.core.start("old-chat", 2, "late-old"))

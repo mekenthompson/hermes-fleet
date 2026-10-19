@@ -56,6 +56,10 @@ def _explicit(text, identifier, *, resume=False):
     if not isinstance(text, str) or not text or identifier.casefold() not in text.casefold():
         return False
     words = text.casefold()
+    action = (r"resume|continue|proceed" if resume else
+              r"transfer|move|handoff|hand over|take over")
+    if re.search(rf"\b(?:do\s+not|don't|dont|never|not|without|no)\b[^.!?;]{{0,120}}\b(?:{action})\b", words):
+        return False
     if resume:
         return bool(re.search(r"\b(reconcil\w*|reviewed effects)\b", words) and
                     re.search(r"\b(resume|continue|proceed)\b", words))
@@ -73,6 +77,12 @@ def _identity(bridge, context):
     ui = getattr(context, "ui_session_id", "") if platform == "desktop" else ""
     api = [getattr(context, "api_control_principal", ""),
            getattr(context, "api_control_transport_family", "")] if platform == "api_server" else ["", ""]
+    native = None
+    if platform not in ("desktop", "api_server"):
+        native = [getattr(context, field, "") for field in
+                  ("user_id", "chat_id", "chat_type", "thread_id", "scope_id")]
+        if not all(isinstance(value, str) for value in native) or not native[0] or not native[1]:
+            return None
     destination = (ui if platform == "desktop" else
                    getattr(context, "api_conversation_key", "") if platform == "api_server" else
                    getattr(context, "session_key", ""))
@@ -82,7 +92,8 @@ def _identity(bridge, context):
             "platform": platform, "destination_id": destination, "ui_session_id": ui,
             "api_identity": api,
             "browser_identity": [getattr(context, "browser_control_provider", ""),
-                                 getattr(context, "browser_control_subject", "")]}
+                                 getattr(context, "browser_control_subject", "")],
+            **({"native_identity": native} if native is not None else {})}
 
 
 def _ownership_receipt(saved):

@@ -60,7 +60,7 @@ PLUGIN = ROOT / "plugins" / "linear"
 # API provenance and stable Desktop/API destination rebinding (4892 + 71).
 # Shared-chat refusal, old-schema-safe control Stop, and its exact outbox fence:
 # 109 measured lines (4963 + 109). No quality or scope gate is disabled.
-BUDGET = 5086
+BUDGET = 5097
 
 
 class FakeContext:

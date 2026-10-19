@@ -455,9 +455,9 @@ def register(ctx: Any) -> None:
         def native_transfer_message(context):
             if not admission.bound_to_live_turn(runtime, context):
                 return ""
-            state = runtime.gateway._peek_session_state(context.session_key)
-            event = state.turn.event if state else None
-            return str(getattr(event, "text", "") or "") if event and not event.internal else ""
+            # Agent stamps the committed original human text only for this exact
+            # native turn. The mutable event text can be rewritten during a turn.
+            return context.user_message if isinstance(context.user_message, str) else ""
         bridge.transfer_user_message = native_transfer_message
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge

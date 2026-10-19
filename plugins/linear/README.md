@@ -227,6 +227,9 @@ predecessor ownership:
 {"action":"transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","expected_owner":"the-current-ownership-id"}
 ```
 
+An issue may be Blocked; its status alone never supplies permission or retirement
+proof. A negated transfer or resume instruction refuses before a control change.
+
 Reuse the same UUID and payload after a lost response or restart. The user instruction
 must name the issue and the destination chat. The Agent core must support durable
 `retire_for_handoff` and physical chat lineage; an older image refuses before creating a pending intent. A
@@ -268,7 +271,8 @@ run generation. Its receipt says cancellation is unsupported; it does not claim 
 worker was stopped. A Stop after reconciliation also revokes the previous resume;
 the issue stays fenced for a guarded operator reconciliation. This control-only Stop
 cannot be cleared by retrying `resume_transfer` or presenting a chat generation.
-Native gateway turns use the existing in-process live-turn validator. Desktop uses its
+Native gateway turns bind the validated requester and Agent's stamped original
+message alongside the existing in-process live-turn validator. Desktop uses its
 server-stamped authenticated WebSocket identity and user instruction over the profile's
 private serialized transport; it does not acquire the gateway's live-turn delegation
 grant. A Desktop tab retains the same transfer across transcript compression. Authenticated

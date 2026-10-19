@@ -41,7 +41,9 @@ class ChatTransferTests(unittest.TestCase):
         self.bridge.retire_chat = lambda key, generation, request: {"status": "blocked", "effects": "unknown"}
         self.bridge.chat_lineage = lambda key: (key,)
         self.context = SimpleNamespace(session_key="new-chat", session_id="new-session",
-                                       profile="alpha", platform="slack", run_generation=4)
+                                       profile="alpha", platform="slack", run_generation=4,
+                                       user_id="alice", chat_id="chat", chat_type="dm",
+                                       thread_id="", scope_id="")
         self.request_id = str(uuid.uuid4())
 
     def transfer(self, **changes):
@@ -73,6 +75,31 @@ class ChatTransferTests(unittest.TestCase):
         self.assertFalse(denied["ok"])
         self.assertIsNone(self.store.chat_transfer(self.request_id))
         self.assertEqual(self.store.get("issue-1"), self.owner)
+
+    def test_denied_transfer_and_resume_instructions_never_change_control(self):
+        self.bridge.retire_chat = self.retired
+        self.bridge.transfer_user_message = lambda _context: "Do not transfer ABC-1 to this chat"
+        self.assertFalse(self.transfer()["ok"])
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(self.store.get("issue-1"), self.owner)
+        self.bridge.transfer_user_message = lambda _context: "Transfer ABC-1 to this chat"
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/effects"
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link}; do not resume here")
+        refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))
+        self.assertFalse(refused["ok"])
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+
+    def test_retry_from_another_native_requester_cannot_reuse_receipt(self):
+        self.bridge.retire_chat = self.retired
+        first = self.transfer()
+        self.assertTrue(first["ok"])
+        self.context.user_id = "bob"
+        refused = self.transfer()
+        self.assertFalse(refused["ok"])
+        self.assertEqual(self.store.get("issue-1")["ownership_id"], first["owner_id"])
 
 
     def test_retry_reuses_one_durable_intent(self):
