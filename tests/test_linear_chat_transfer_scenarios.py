@@ -170,6 +170,53 @@ class ChatTransferScenarios(unittest.TestCase):
                 clear_session_vars(tokens)
         self.assertEqual(retry, result)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "desktop-after-compress")
+        self.assertTrue(self.store.update("issue-1", linear_session_id="linear-s"))
+        self.bridge.handle_webhook(self.linear.session_event(
+            "prompted", "issue-1", "other-s", signal="stop", activity_id="wrong-target"))
+        self.assertEqual(self.store.stop_intents(), [])
+        self.clock.now += 1
+        self.bridge.handle_webhook(self.linear.session_event(
+            "prompted", "issue-1", "linear-s", signal="stop", activity_id="stop-control"))
+        saved_stop = Store(self.home / "linear.db").stop_intents()
+        self.assertEqual(len(saved_stop), 1)
+        self.assertEqual(saved_stop[0]["status"], "unsupported")
+        self.assertIsNone(saved_stop[0]["run_generation"])
+        class NoNativeStop:
+            async def get_chat_run_stop_observation(self, **kwargs):
+                raise AssertionError("control Stop has no native generation")
+            async def request_chat_run_stop(self, **kwargs):
+                raise AssertionError("control Stop has no native generation")
+        asyncio.run(plugin.process_chat_stops(self.bridge, SimpleNamespace(
+            gateway=NoNativeStop(), profile_home=self.home)))
+        self.assertTrue(self.store.get("issue-1")["stop_requested_at"])
+        self.bridge.tick()
+        self.assertTrue(any("Cancellation is unsupported" in activity["content"]["body"]
+                            for activity in self.linear.activities))
+
+    def test_shared_predecessor_refusal_leaves_other_issue_running(self):
+        from gateway.session_context import clear_session_vars, set_session_vars, set_turn_user_message
+        self.assertTrue(self.store.put("issue-2", "chat", "old-chat",
+                                       run_generation=self.old_generation))
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
+                session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
+                browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
+            try:
+                set_turn_user_message("Transfer ABC-1 to this chat")
+                context = registry._current_tool_invocation_context()
+                server = transport.Server(self.home, "alpha", lambda args, host:
+                    chat.handle(self.bridge, args, host), lambda _: None)
+                try:
+                    result = json.loads(transport.chat_request(self.home, self.args, context))
+                finally:
+                    server.close()
+            finally:
+                clear_session_vars(tokens)
+        self.assertEqual(result["code"], "shared_predecessor")
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(self.store.get("issue-1"), self.previous)
+        self.assertEqual(self.store.get("issue-2")["owner_ref"], "old-chat")
+        self.assertEqual(self.core.start_local_worker("old-chat", "next-real-session"), 2)
 
     def test_serialized_authenticated_api_instruction_moves_control(self):
         from gateway.session_context import (clear_session_vars, set_api_transfer_identity,
