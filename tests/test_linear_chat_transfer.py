@@ -39,6 +39,7 @@ class ChatTransferTests(unittest.TestCase):
         self.bridge.validate_chat_admission = lambda context: context is self.context
         self.bridge.transfer_user_message = lambda context: "Transfer ABC-1 to this chat"
         self.bridge.retire_chat = lambda key, generation, request: {"status": "blocked", "effects": "unknown"}
+        self.bridge.chat_lineage = lambda key: (key,)
         self.context = SimpleNamespace(session_key="new-chat", session_id="new-session",
                                        profile="alpha", platform="slack", run_generation=4)
         self.request_id = str(uuid.uuid4())

@@ -229,12 +229,15 @@ predecessor ownership:
 
 Reuse the same UUID and payload after a lost response or restart. The user instruction
 must name the issue and the destination chat. The Agent core must support durable
-`retire_for_handoff`; an older image refuses before creating a pending intent. A
+`retire_for_handoff` and physical chat lineage; an older image refuses before creating a pending intent. A
 recorded predecessor generation is required. New Desktop turns receive a real core
 journal generation, but claims created before that producer existed remain unsupported.
 Core retirement fences the whole predecessor chat. If its local work store also has
 another issue owned by that chat, transfer refuses before saving intent or fencing core;
 finish or release the other work first. This is a refusal, not a partial handoff.
+If the predecessor chat was compressed into a new physical session key, transfer
+also refuses before intent or fencing: the later segment may own another issue.
+The refusal does not transfer ownership or stop work in that later segment.
 
 The plugin saves intent and fences old issue writes before it asks core to retire the
 predecessor. Core checks every recorded worker and detached resource, fences future old

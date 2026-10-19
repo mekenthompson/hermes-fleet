@@ -101,7 +101,8 @@ def handle(bridge, args, context):
     if not isinstance(ref, str) or not ref or ref != ref.strip():
         return _reply(False, "Transfer needs an exact issue identifier.")
     retire = getattr(bridge, "retire_chat", None)
-    if not callable(retire):
+    lineage = getattr(bridge, "chat_lineage", None)
+    if not callable(retire) or not callable(lineage):
         return _reply(False, "This Agent runtime lacks durable chat retirement; no transfer was prepared.",
                       code="capability_unavailable")
     try:
@@ -125,6 +126,17 @@ def handle(bridge, args, context):
                 return _reply(False, "Closed issues cannot be transferred or resumed.")
             if (fresh.get("delegate") or {}).get("id") != bridge.api.viewer_id():
                 return _reply(False, "This agent no longer owns the Linear delegation.")
+            if not resume:
+                predecessor = bridge.store.get(issue_id)
+                if predecessor and predecessor["origin"] == "chat":
+                    keys = tuple(lineage(predecessor["owner_ref"]))
+                    if not keys or keys[0] != predecessor["owner_ref"]:
+                        return _reply(False, "Predecessor physical chat lineage could not be verified.",
+                                      code="lineage_unverified")
+                    if len(keys) != 1:
+                        return _reply(False, "A compressed predecessor may share another issue. "
+                                      "Transfer it only after the chat lineage is isolated.",
+                                      code="compressed_predecessor")
             if resume:
                 evidence = args.get("evidence")
                 if (not isinstance(evidence, str) or not evidence.startswith("https://") or
