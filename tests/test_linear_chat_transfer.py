@@ -82,11 +82,20 @@ class ChatTransferTests(unittest.TestCase):
         self.assertFalse(self.transfer()["ok"])
         self.assertIsNone(self.store.chat_transfer(self.request_id))
         self.assertEqual(self.store.get("issue-1"), self.owner)
+        self.bridge.transfer_user_message = lambda _context: 'The note says "Transfer ABC-1 to this chat".'
+        self.assertFalse(self.transfer()["ok"])
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
         self.bridge.transfer_user_message = lambda _context: "Transfer ABC-1 to this chat"
         self.assertTrue(self.transfer()["ok"])
         link = "https://example.test/effects"
         self.bridge.transfer_user_message = lambda _context: (
             f"I reconciled ABC-1 at {link}; do not resume here")
+        refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))
+        self.assertFalse(refused["ok"])
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+        self.bridge.transfer_user_message = lambda _context: (
+            f"Here is an example: I reconciled ABC-1 at {link} and continue here")
         refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))
         self.assertFalse(refused["ok"])

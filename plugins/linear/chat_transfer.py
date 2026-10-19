@@ -58,6 +58,12 @@ def _explicit(text, identifier, *, resume=False):
     words = text.casefold()
     action = (r"resume|continue|proceed" if resume else
               r"transfer|move|handoff|hand over|take over")
+    lead = (r"(?:i(?:'ve| have)?\s+(?:reconciled|reviewed)|(?:please\s+)?(?:resume|continue|proceed))\b"
+            if resume else
+            rf"(?:(?:please\s+)?(?:{action})|i\s+(?:want|would like|authorize|request|ask)\b"
+            rf"[^.!?;]{{0,80}}\b(?:{action}))\b")
+    if not re.match(lead, words.lstrip()):
+        return False
     if re.search(rf"\b(?:do\s+not|don't|dont|never|not|without|no)\b[^.!?;]{{0,120}}\b(?:{action})\b", words):
         return False
     if resume:
