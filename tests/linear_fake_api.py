@@ -102,7 +102,8 @@ class FakeLinear:
     def add_issue(self, issue_id: str, identifier: str, *, project: str | None = "proj-1") -> dict:
         issue = {"id": issue_id, "identifier": identifier, "title": f"Title of {identifier}",
                  "description": "Synthetic issue body", "url": f"https://linear.example/issue/{identifier}",
-                 "updatedAt": self.clock.iso(), "delegate": None, "state": dict(STATES[0]),
+                 "updatedAt": self.clock.iso(), "delegate": None, "creator": {"id": "human-1"},
+                 "state": dict(STATES[0]),
                  "project": {"id": project} if project else None,
                  "team": {"id": "team-1", "key": "ABC", "states": {"nodes": STATES}}}
         self.issues[issue_id] = issue
@@ -177,7 +178,8 @@ class FakeLinear:
             issue = json.loads(json.dumps(issue)) if issue else None
             if issue and "comments(" in query:
                 issue["comments"] = {"nodes": [
-                    {"body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()), "user": {"name": c.get("author", "Pat Example")}}
+                    {"body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()),
+                     "user": {"id": c.get("author_id", SELF), "name": c.get("author", "Pat Example")}}
                     for c in self.comments if c.get("issueId") == issue["id"]]}
             return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}

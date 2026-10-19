@@ -251,15 +251,27 @@ no work. Pending predecessor outbox rows remain available for reconciliation and
 send after the successor resumes.
 
 The successor may inspect the retained receipts and external outcomes while execution
-is blocked. After a human has reconciled predecessor effects, that human sends a fresh
-instruction in the owning chat naming the issue, saying to reconcile and continue, and
-including an `https://` evidence link. The tool call uses the same transfer UUID:
+is blocked. A human who created the issue, or an allowed specialist requester, must
+review those effects and add a later comment on the same Linear issue. The comment's
+body is a JSON decision bound to the exact issue, transfer UUID, predecessor
+ownership id from the original transfer request, and the digest of the core
+retirement receipt returned by the ownership transfer. For example:
+
+```json
+{"kind":"chat-transfer-reconciliation/v1","issue_id":"issue-1","transfer_id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","predecessor_owner":"original-ownership-id","retirement_sha256":"sha256-from-ownership-receipt","decision":"resume_after_review","evidence":"https://example.test/reconciled"}
+```
+
+The human then sends a fresh instruction in the owning chat naming the issue, saying
+to reconcile and continue, and including that same `https://` evidence link. The
+tool call uses the same transfer UUID:
 
 ```json
 {"action":"resume_transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","evidence":"https://example.test/reconciled"}
 ```
 
-The link must appear in the authenticated user instruction. The plugin still records
+The link must appear in the authenticated user instruction. A bare URL, a model claim,
+an app-authored comment, or an earlier or mismatched decision cannot admit work.
+The plugin still records
 predecessor core effects as `unknown`; the human reconciliation admits *new* successor
 work and never relabels old effects or replays a prior action. Unresolved local outbox
 receipts must first be reconciled through the existing `hermes linear resolve` path.

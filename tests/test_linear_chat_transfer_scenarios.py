@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import replace
 import json
 import os
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -30,6 +31,7 @@ except ImportError as exc:
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat, transport
+from hermes_fleet_linear_plugin.chat_transfer import _retirement_sha256
 from hermes_fleet_linear_plugin.api import LinearAPI
 from hermes_fleet_linear_plugin.bridge import Bridge
 from hermes_fleet_linear_plugin.store import Store
@@ -65,6 +67,16 @@ class ChatTransferScenarios(unittest.TestCase):
         self.request_id = str(uuid.uuid4())
         self.args = {"action": "transfer", "issue": "ABC-1", "id": self.request_id,
                      "expected_owner": self.previous["ownership_id"]}
+
+    def add_reconciliation(self, link="https://example.test/effects"):
+        saved = self.store.chat_transfer(self.request_id)
+        self.linear.comments.append({"issueId": "issue-1", "author_id": "human-1",
+            "createdAt": self.clock.iso(1), "body": json.dumps({
+                "kind": "chat-transfer-reconciliation/v1", "issue_id": "issue-1",
+                "transfer_id": self.request_id,
+                "predecessor_owner": saved["predecessor"]["ownership_id"],
+                "retirement_sha256": _retirement_sha256(saved["retirement"]),
+                "decision": "resume_after_review", "evidence": link})})
 
     def test_registered_native_route_retains_unknown_effects_and_requires_explicit_resume(self):
         from hermes_fleet_linear_plugin import admission
@@ -107,6 +119,7 @@ class ChatTransferScenarios(unittest.TestCase):
             handler = registration.tool["handler"]
             captured.append(json.loads(handler(self.args, context)))
             captured.append(json.loads(handler(self.args, context)))
+            self.add_reconciliation()
             event.text = "I reconciled ABC-1 against https://example.test/effects and continue here"
             captured.append(json.loads(handler({"action": "resume_transfer", "issue": "ABC-1",
                                                  "id": self.request_id, "evidence": "https://example.test/effects"}, context)))
@@ -139,13 +152,17 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertFalse(any(query.startswith("mutation") for query in self.linear.requests))
 
     def test_serialized_desktop_identity_moves_control_without_live_gateway_grant(self):
-        from gateway.session_context import clear_session_vars, set_session_vars, set_turn_user_message
+        from gateway.session_context import (clear_session_vars, set_session_run_generation,
+                                             set_session_vars, set_turn_user_message)
+        desktop_generation = self.core.start_local_worker("desktop-chat", "actual-desktop-session")
+        self.assertEqual(desktop_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             self.bridge.validate_chat_admission = lambda context: False
             tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
                 session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
                 browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
             try:
+                set_session_run_generation(desktop_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 context = registry._current_tool_invocation_context()
                 server = transport.Server(self.home, "alpha", lambda args, host:
@@ -161,11 +178,14 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "desktop-chat")
         self.assertEqual(self.store.chat_transfer(self.request_id)["retirement"]["effects"], "unknown")
         self.assertFalse(self.core.start_local_worker("old-chat", "late"))
+        compressed_generation = self.core.start_local_worker("desktop-after-compress", "compressed-session")
+        self.assertEqual(compressed_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-after-compress",
                 session_id="compressed-session", browser_control_provider="synthetic-ticket",
                 browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
             try:
+                set_session_run_generation(compressed_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 context = registry._current_tool_invocation_context()
                 server = transport.Server(self.home, "alpha", lambda args, host:
@@ -201,15 +221,44 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertTrue(any("Cancellation is unsupported" in activity["content"]["body"]
                             for activity in self.linear.activities))
 
+    def test_unbound_same_uid_socket_packet_cannot_invent_desktop_instruction(self):
+        self.assertEqual(self.core.start_local_worker("forged-chat", "forged-session"), 1)
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            server = transport.Server(self.home, "alpha", lambda args, context:
+                chat.handle(self.bridge, args, context), lambda _: None)
+            try:
+                payload = {"op": "chat", "home": str(self.home), "args": self.args,
+                    "context": {"profile": "alpha", "platform": "desktop", "session_key": "forged-chat",
+                                "session_id": "forged-session", "run_generation": 1},
+                    "transfer_auth": {"browser_control_provider": "forged-provider",
+                        "browser_control_subject": "forged-subject", "user_message": "Transfer ABC-1 to this chat",
+                        "ui_session_id": "forged-tab", "api_control_principal": "",
+                        "api_control_transport_family": "", "api_conversation_key": ""}}
+                script = "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read()); print(s.recv(65536).decode())"
+                child = subprocess.run([sys.executable, "-c", script, str(transport.endpoint(self.home))],
+                                       input=(json.dumps(payload) + "\n").encode(), capture_output=True, timeout=10)
+            finally:
+                server.close()
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertTrue(child.stdout.strip())
+        self.assertEqual(json.loads(json.loads(child.stdout)["result"])["code"], "unverified_host_turn")
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(self.store.get("issue-1"), self.previous)
+        self.assertEqual(self.core.start_local_worker("old-chat", "late-turn"), 2)
+
     def test_shared_predecessor_refusal_leaves_other_issue_running(self):
-        from gateway.session_context import clear_session_vars, set_session_vars, set_turn_user_message
+        from gateway.session_context import (clear_session_vars, set_session_run_generation,
+                                             set_session_vars, set_turn_user_message)
         self.assertTrue(self.store.put("issue-2", "chat", "old-chat",
                                        run_generation=self.old_generation))
+        destination_generation = self.core.start_local_worker("desktop-chat", "actual-desktop-session")
+        self.assertEqual(destination_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
                 session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
                 browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
             try:
+                set_session_run_generation(destination_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 context = registry._current_tool_invocation_context()
                 server = transport.Server(self.home, "alpha", lambda args, host:
@@ -227,18 +276,22 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertEqual(self.core.start_local_worker("old-chat", "next-real-session"), 2)
 
     def test_compressed_predecessor_refuses_before_intent_or_other_issue_fence(self):
-        from gateway.session_context import clear_session_vars, set_session_vars, set_turn_user_message
+        from gateway.session_context import (clear_session_vars, set_session_run_generation,
+                                             set_session_vars, set_turn_user_message)
         self.assertTrue(self.core.link_session_keys("old-chat", "compressed-chat"))
         child_generation = self.core.start_local_worker("compressed-chat", "child-agent")
         self.assertEqual(child_generation, 1)
         self.assertTrue(self.core.worker_finished("compressed-chat", child_generation))
         self.assertTrue(self.store.put("issue-2", "chat", "compressed-chat",
                                        run_generation=child_generation))
+        destination_generation = self.core.start_local_worker("desktop-chat", "actual-desktop-session")
+        self.assertEqual(destination_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
                 session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
                 browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
             try:
+                set_session_run_generation(destination_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 context = registry._current_tool_invocation_context()
                 server = transport.Server(self.home, "alpha", lambda args, host:
@@ -257,12 +310,15 @@ class ChatTransferScenarios(unittest.TestCase):
 
     def test_serialized_authenticated_api_instruction_moves_control(self):
         from gateway.session_context import (clear_session_vars, set_api_transfer_identity,
-                                             set_session_vars, set_turn_user_message)
+                                             set_session_run_generation, set_session_vars, set_turn_user_message)
         self.bridge.validate_chat_admission = lambda context: False
+        first_generation = self.core.start_local_worker("api-run-1", "api-conversation")
+        self.assertEqual(first_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             tokens = set_session_vars(platform="api_server", profile="alpha", session_key="api-run-1",
                                       session_id="api-conversation")
             try:
+                set_session_run_generation(first_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 set_api_transfer_identity("principal:alpha:verified", "local-api", "api-conversation")
                 context = registry._current_tool_invocation_context()
@@ -277,10 +333,13 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "api-run-1")
         self.assertFalse(result["execution_admitted"])
+        second_generation = self.core.start_local_worker("api-run-2", "api-conversation")
+        self.assertEqual(second_generation, 1)
         with patch.object(self.bridge, "chat_profile_matches", return_value=True):
             tokens = set_session_vars(platform="api_server", profile="alpha", session_key="api-run-2",
                                       session_id="api-conversation")
             try:
+                set_session_run_generation(second_generation)
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 set_api_transfer_identity("principal:alpha:verified", "local-api", "api-conversation")
                 context = registry._current_tool_invocation_context()

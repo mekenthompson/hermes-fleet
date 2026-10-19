@@ -94,7 +94,7 @@ class Server:
                     raise Unavailable('A Linear gateway service already owns this profile')
         scope = contextvars.copy_context()
         slots = threading.BoundedSemaphore(8)
-        def handle(payload):
+        def handle(payload, peer_pid):
             op = payload.get('op')
             if op == 'status':
                 return {'ok': True, 'profile': profile, 'pid': os.getpid(), 'ready': True}
@@ -108,6 +108,19 @@ class Server:
                 if args.get('action') in ('transfer', 'resume_transfer'):
                     if not isinstance(transfer_auth, dict) or set(transfer_auth) != set(TRANSFER_FIELDS):
                         raise ValueError('Linear transfer has no host instruction and identity')
+                    try:
+                        from gateway.chat_execution_recovery import ChatExecutionStore
+                    except ImportError:
+                        return json.dumps({'ok': False, 'code': 'capability_unavailable',
+                                           'message': 'This Agent runtime cannot verify a serialized chat turn.'})
+                    verifier = getattr(ChatExecutionStore(self.home), 'worker_process_matches', None)
+                    if not callable(verifier):
+                        return json.dumps({'ok': False, 'code': 'capability_unavailable',
+                                           'message': 'This Agent runtime cannot verify a serialized chat turn.'})
+                    if not verifier(context.get('session_key'), context.get('run_generation'),
+                                    context.get('session_id'), peer_pid):
+                        return json.dumps({'ok': False, 'code': 'unverified_host_turn',
+                                           'message': 'Transfer needs a current Agent worker in this profile.'})
                     context = {**context, **transfer_auth, '_serialized_transport': True}
                 else:
                     context = dict(context)
@@ -122,7 +135,8 @@ class Server:
                     return
                 try:
                     inner.request.settimeout(20)
-                    uid = struct.unpack('3i', inner.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+                    peer_pid, uid, _gid = struct.unpack(
+                        '3i', inner.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
                     if uid != os.geteuid():
                         return
                     raw = inner.rfile.readline(MAX_BYTES + 1)
@@ -131,7 +145,7 @@ class Server:
                     payload = json.loads(raw)
                     if not isinstance(payload, dict):
                         return
-                    result = scope.copy().run(handle, payload)
+                    result = scope.copy().run(handle, payload, peer_pid)
                     body = json.dumps({'result': result}).encode() + b'\n'
                     if len(body) <= MAX_BYTES:
                         inner.wfile.write(body)
