@@ -20,7 +20,7 @@ from .oauth import ReauthorizationRequired
 
 ENDPOINT = "https://api.linear.app/graphql"
 DEFAULT_RATE_LIMIT_PAUSE = 60.0
-ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id }
+ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id } assignee { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type position } } }"""
 

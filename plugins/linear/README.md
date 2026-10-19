@@ -251,7 +251,7 @@ no work. Pending predecessor outbox rows remain available for reconciliation and
 send after the successor resumes.
 
 The successor may inspect the retained receipts and external outcomes while execution
-is blocked. A human who created the issue, or an allowed specialist requester, must
+is blocked. A human who created or is assigned the issue, or an allowed specialist requester, must
 review those effects and add a later comment on the same Linear issue. The comment's
 body is a JSON decision bound to the exact issue, transfer UUID, predecessor
 ownership id from the original transfer request, and the digest of the core
