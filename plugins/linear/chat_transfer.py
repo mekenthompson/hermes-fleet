@@ -1,9 +1,11 @@
 """User-authorized control handoff with a separate execution admission decision."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from .api import LinearError
@@ -101,7 +103,39 @@ def _ownership_receipt(saved):
                   "resume this transfer before any issue work; no work was replayed.",
                   code="ownership_transferred", transfer_id=saved["id"],
                   owner_id=saved["successor_owner"], execution_admitted=False,
+                  retirement_sha256=_retirement_sha256(saved["retirement"]),
                   predecessor_effects=saved["retirement"]["effects"])
+
+
+def _retirement_sha256(receipt):
+    return hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _reconciliation_decision(bridge, issue, saved, evidence):
+    """Read a later, issue-bound human decision from Linear, not caller prose."""
+    creator = (issue.get("creator") or {}).get("id")
+    allowed = set((getattr(bridge.api, "specialist_scope", None) or {}).get("allowed_requester_ids", ()))
+    if creator:
+        allowed.add(creator)
+    allowed.discard(bridge.api.viewer_id())
+    if not allowed:
+        return None
+    expected = {"kind": "chat-transfer-reconciliation/v1", "issue_id": saved["issue_id"],
+                "transfer_id": saved["id"], "predecessor_owner": saved["predecessor"]["ownership_id"],
+                "retirement_sha256": _retirement_sha256(saved["retirement"]),
+                "decision": "resume_after_review", "evidence": evidence}
+    for comment in reversed(bridge.api.issue_thread(saved["issue_id"])):
+        if comment.get("user_id") not in allowed:
+            continue
+        try:
+            created = datetime.fromisoformat(comment["at"].replace("Z", "+00:00"))
+            body = json.loads(comment["body"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            continue
+        if (created.tzinfo is not None and created.timestamp() > saved["committed_at"]
+                and body == expected):
+            return {"comment_at": comment["at"], "author_id": comment["user_id"], **expected}
+    return None
 
 
 def handle(bridge, args, context):
@@ -157,7 +191,11 @@ def handle(bridge, args, context):
                 saved = bridge.store.rebind_chat_transfer(request_id, identity, issue_id)
                 if not saved:
                     return _reply(False, "Transfer receipt does not belong to this issue and chat.")
-                result = bridge.store.resume_chat_transfer(request_id, evidence=evidence, at=bridge.clock())
+                decision = _reconciliation_decision(bridge, fresh, saved, evidence)
+                if not decision:
+                    return _reply(False, "A later issue-bound human reconciliation decision is required.",
+                                  code="reconciliation_required")
+                result = bridge.store.resume_chat_transfer(request_id, evidence=decision, at=bridge.clock())
                 if not result:
                     return _reply(False, "Reconciliation, Stop, release, or ownership still blocks execution.",
                                   code="reconciliation_required")

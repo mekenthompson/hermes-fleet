@@ -13,6 +13,7 @@ from linear_fake_api import Clock, FakeLinear, SELF, load_plugin
 
 load_plugin()
 from hermes_fleet_linear_plugin import chat
+from hermes_fleet_linear_plugin.chat_transfer import _retirement_sha256
 from hermes_fleet_linear_plugin.api import LinearAPI
 from hermes_fleet_linear_plugin.bridge import Bridge
 from hermes_fleet_linear_plugin.store import Store
@@ -55,6 +56,17 @@ class ChatTransferTests(unittest.TestCase):
         return {"kind": "chat-retirement/v1", "status": "retired", "execution_admitted": False,
                 "session_key": key, "claim_generation": generation, "recovery_id": request,
                 "profile_home": str(self.path.parent), "effects": "unknown"}
+
+    def add_reconciliation(self, link="https://example.test/reconciled", **changes):
+        saved = self.store.chat_transfer(self.request_id)
+        self.remote.comments.append({"issueId": changes.pop("issue_id", "issue-1"),
+            "author_id": changes.pop("author_id", "human-1"),
+            "createdAt": changes.pop("created_at", self.clock.iso(1)),
+            "body": json.dumps({"kind": "chat-transfer-reconciliation/v1", "issue_id": "issue-1",
+                "transfer_id": self.request_id,
+                "predecessor_owner": saved["predecessor"]["ownership_id"],
+                "retirement_sha256": _retirement_sha256(saved["retirement"]),
+                "decision": "resume_after_review", "evidence": link, **changes})})
 
     def test_transfer_intent_reopens_without_assuming_the_old_executor_stopped(self):
         reply = self.transfer()
@@ -236,6 +248,7 @@ class ChatTransferTests(unittest.TestCase):
         self.assertTrue(self.store.update("issue-1", linear_session_id="linear-s"))
         self.assertTrue(self.transfer()["ok"])
         link = "https://example.test/reconciled"
+        self.add_reconciliation(link)
         self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
         args = {"action": "resume_transfer", "issue": "ABC-1", "id": self.request_id, "evidence": link}
         self.assertTrue(json.loads(chat.handle(self.bridge, args, self.context))["ok"])
@@ -253,6 +266,44 @@ class ChatTransferTests(unittest.TestCase):
         self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "done", "issue": "ABC-1"},
                                                 self.context))["ok"])
 
+    def test_unverified_url_cannot_admit_unknown_predecessor_effects(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/unverified-claim"
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link} and continue here")
+        resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))
+        self.assertFalse(resumed["ok"])
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+
+    def test_reconciliation_requires_later_correct_issue_author_and_transfer(self):
+        self.bridge.retire_chat = self.retired
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/review"
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I reconciled ABC-1 at {link} and continue here")
+        args = {"action": "resume_transfer", "issue": "ABC-1", "id": self.request_id,
+                "evidence": link}
+        cases = ({"issue_id": "issue-2"}, {"author_id": SELF},
+                 {"author_id": "other-human"}, {"created_at": self.clock.iso(-1)},
+                 {"transfer_id": str(uuid.uuid4())}, {"predecessor_owner": "other-owner"},
+                 {"retirement_sha256": "0" * 64},
+                 {"decision": "pending_review"}, {"evidence": "https://example.test/other"})
+        for change in cases:
+            with self.subTest(change=change):
+                self.remote.comments.clear()
+                self.add_reconciliation(link, **change)
+                denied = json.loads(chat.handle(self.bridge, args, self.context))
+                self.assertEqual(denied.get("code"), "reconciliation_required")
+                self.assertEqual(self.store.chat_transfer(self.request_id)["state"], "committed")
+        self.remote.comments.clear()
+        self.add_reconciliation(link)
+        accepted = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(self.store.chat_transfer(self.request_id)["retirement"]["effects"], "unknown")
+        self.assertEqual(json.loads(chat.handle(self.bridge, args, self.context)), accepted)
+
     def test_completed_control_handoff_keeps_effects_unknown_until_user_reconciliation(self):
         self.bridge.retire_chat = self.retired
         old_write = self.bridge.status("issue-1", "blocked")
@@ -266,6 +317,7 @@ class ChatTransferTests(unittest.TestCase):
         self.assertFalse(self.store.admit_mutation(old_write))
         self.assertFalse(self.bridge.status("issue-1", "blocked"))
         link = "https://example.test/reconciled"
+        self.add_reconciliation(link)
         self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
         resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))
@@ -293,6 +345,7 @@ class ChatTransferTests(unittest.TestCase):
         self.assertFalse(first["execution_admitted"])
         self.assertIsNotNone(self.store.outbox_row(uncertain))
         link = "https://example.test/reconciled"
+        self.add_reconciliation(link)
         self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
         refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))
@@ -307,6 +360,7 @@ class ChatTransferTests(unittest.TestCase):
             "lines": {"ABC-1": "Blocked"}, "line_issues": {"ABC-1": "issue-1"}}, at=self.clock())
         self.assertTrue(self.transfer()["ok"])
         link = "https://example.test/reconciled"
+        self.add_reconciliation(link)
         self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
         self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))["ok"])
@@ -323,6 +377,7 @@ class ChatTransferTests(unittest.TestCase):
         self.context.session_id = "new-transcript-after-compression"
         self.assertEqual(self.transfer(), first)
         link = "https://example.test/reconciled"
+        self.add_reconciliation(link)
         self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
         resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))
@@ -342,6 +397,7 @@ class ChatTransferTests(unittest.TestCase):
         self.context.session_id = "new-transcript-after-compression"
         self.assertEqual(self.transfer(), first)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], self.context.session_key)
+        self.add_reconciliation()
         self.context.user_message = "I reconciled ABC-1 at https://example.test/reconciled and continue here"
         resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": "https://example.test/reconciled"}, self.context))

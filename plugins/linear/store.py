@@ -271,7 +271,7 @@ class Store:
                          execution_admitted=False)
             db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
             return saved
-    def resume_chat_transfer(self, request_id: str, *, evidence: str, at: float) -> dict | None:
+    def resume_chat_transfer(self, request_id: str, *, evidence: dict, at: float) -> dict | None:
         """Admit new work only after an explicit successor reconciliation decision."""
         key = f"chat-transfer:{request_id}"
         with self._tx() as db:
@@ -281,19 +281,19 @@ class Store:
             saved = json.loads(row[0])
             work = db.execute("SELECT * FROM work WHERE issue_id=?", (saved["issue_id"],)).fetchone()
             if saved["state"] == "resumed":
-                return saved if (saved.get("reconciliation") == evidence.strip() and work and
+                return saved if (saved.get("reconciliation") == evidence and work and
                                  work["owner_ref"] == saved["session_key"] and
                                  work["ownership_id"] == saved["successor_owner"] and
                                  not work["stop_requested_at"] and not work["release_pending"] and
                                  self._admitted(db, saved["issue_id"])) else None
-            if (saved["state"] != "committed" or not evidence.strip() or not work or
+            if (saved["state"] != "committed" or not evidence or not work or
                     work["owner_ref"] != saved["session_key"] or
                     work["ownership_id"] != saved["successor_owner"] or
                     work["stop_requested_at"] or work["release_pending"] or
                     not self._admitted(db, saved["issue_id"]) or
                     self._unresolved_terminal(db, saved["issue_id"])):
                 return None
-            saved.update(state="resumed", resumed_at=at, reconciliation=evidence.strip(),
+            saved.update(state="resumed", resumed_at=at, reconciliation=evidence,
                          execution_admitted=True)
             db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
             return saved
