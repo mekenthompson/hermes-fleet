@@ -216,6 +216,53 @@ bridge's automatic closeout must not be duplicated with manual comments.
 
 ## Chat-to-worker admission
 
+### Transfer chat ownership to another thread
+
+An authenticated user turn in the destination chat may explicitly ask to transfer an
+existing issue to that chat. Read the current `ownership_id` from a conflicting `linear
+start` receipt, then call the registered `linear` tool with the same issue and exact
+predecessor ownership:
+
+```json
+{"action":"transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","expected_owner":"the-current-ownership-id"}
+```
+
+Reuse the same UUID and payload after a lost response or restart. The user instruction
+must name the issue and the destination chat. The Agent core must support durable
+`retire_for_handoff`; an older image refuses before creating a pending intent. A
+recorded predecessor generation is required. New Desktop turns receive a real core
+journal generation, but claims created before that producer existed remain unsupported.
+
+The plugin saves intent and fences old issue writes before it asks core to retire the
+predecessor. Core checks every recorded worker and detached resource, fences future old
+turns, and keeps historical tool effects `unknown`. A successful receipt moves the
+same issue's local chat owner; it does not change the human assignee, Linear delegate,
+workspace, project, checkpoints, or approved scope. It starts no new task and replays
+no work. Pending predecessor outbox rows remain available for reconciliation and cannot
+send after the successor resumes.
+
+The successor may inspect the retained receipts and external outcomes while execution
+is blocked. After a human has reconciled predecessor effects, that human sends a fresh
+instruction in the owning chat naming the issue, saying to reconcile and continue, and
+including an `https://` evidence link. The tool call uses the same transfer UUID:
+
+```json
+{"action":"resume_transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","evidence":"https://example.test/reconciled"}
+```
+
+The link must appear in the authenticated user instruction. The plugin still records
+predecessor core effects as `unknown`; the human reconciliation admits *new* successor
+work and never relabels old effects or replays a prior action. Unresolved local outbox
+receipts must first be reconciled through the existing `hermes linear resolve` path.
+Stop, release, closed/canceled issues, human reassignment, profile or requester-scope
+changes, another owner, and an uncertain physical worker keep the transfer fenced.
+Native gateway turns use the existing in-process live-turn validator. Desktop uses its
+server-stamped authenticated WebSocket identity and user instruction over the profile's
+private serialized transport; it does not acquire the gateway's live-turn delegation
+grant. A same-UID process remains inside the documented local trust boundary.
+
+### Delegate chat work to Kanban
+
 `linear start` tracks work performed by the current chat. It is not a detached-worker
 identity grant. Detached Kanban workers must not call chat `start` or inherit a previous
 chat's routing/environment to manufacture authority.

@@ -103,6 +103,7 @@ class LinearTransportTests(unittest.TestCase):
             home=Path(tmp)
             with self.assertRaises(transport.Unavailable):transport.request(home,{'op':'status'})
             transport.endpoint(home).parent.mkdir(mode=0o755)
+            transport.endpoint(home).parent.chmod(0o755)  # the process umask may mask mkdir's mode
             with self.assertRaises(transport.Unavailable):transport.Server(home,'alpha',lambda *args:None,lambda session:None)
             transport.endpoint(home).parent.chmod(0o700);transport.endpoint(home).write_text('not a socket')
             with self.assertRaises(transport.Unavailable):transport.Server(home,'alpha',lambda *args:None,lambda session:None)

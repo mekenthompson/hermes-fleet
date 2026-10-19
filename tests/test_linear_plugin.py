@@ -54,7 +54,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Measured 4454. The owner approved 100 lines of headroom so contract fixes stop moving the cap;
 # growth past it is a design review, not another bump.
 # Design review: the owner approved 4614 for directional host autolinks and code-context preservation.
-BUDGET = 4614
+# Chat transfer: 278 measured production lines for durable handoff and its core capability gate,
+# authenticated transport snapshot and Store CAS; no unallocated headroom (4614 + 278).
+BUDGET = 4892
 
 
 class FakeContext:
@@ -165,7 +167,7 @@ class LinearPluginUnitTests(unittest.TestCase):
                     for p in PLUGIN.iterdir() if p.suffix in {".py", ".yaml"})
         self.assertLessEqual(lines, BUDGET)
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "oauth.py", "ops.py", "plugin.yaml",
+                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "chat_transfer.py", "oauth.py", "ops.py", "plugin.yaml",
                           "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:

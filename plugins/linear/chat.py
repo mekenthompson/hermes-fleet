@@ -13,6 +13,10 @@ SCHEMA = {
         "delegate: session-free gateway-chat handoff of a fresh unowned issue to one durable Kanban task; requires id. "
         "done: finish it; needs an evidence link. blocked: you need a human. "
         "release: stop tracking unfinished work. "
+        "transfer: move the same issue's chat owner to this authenticated thread after durable retirement; "
+        "requires id and expected_owner. Execution remains blocked. "
+        "resume_transfer: after reconciling predecessor effects, explicitly admit this chat to continue; "
+        "requires id and an evidence URL present in the user's instruction. "
         "create_issue: create an undelegated issue; requires id, title, and team. "
         "update_description: replace an issue description with an expected_description preflight; readable headings and bullets/checklists required. "
         "add_comment: add a concise progress note with headings; requires a caller UUID id. "
@@ -21,9 +25,10 @@ SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
+            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "transfer", "resume_transfer", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
             "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking, link_issue, update_description and add_comment."},
-            "id": {"type": "string", "description": "Canonical caller UUID for create_issue, create_project, update_description and add_comment. Reuse the exact id/payload to reconcile a lost response."},
+            "id": {"type": "string", "description": "Canonical caller UUID for transfer, resume_transfer, create_issue, create_project, update_description and add_comment. Reuse the exact id/payload to reconcile a lost response."},
+            "expected_owner": {"type": "string", "description": "transfer: exact ownership_id of this issue's current chat claim."},
             "title": {"type": "string", "description": "create_issue title."},
             "name": {"type": "string", "description": "create_project name."},
             "team": {"type": "string", "description": "Team id or key. Required for create_issue and create_project."},
@@ -33,7 +38,7 @@ SCHEMA = {
             "parent": {"type": "string", "description": "Optional parent issue id for create_issue."},
             "related": {"type": "string", "description": "Other issue id for link_issue."},
             "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"], "description": "link_issue relation."},
-            "evidence": {"type": "string", "description": "done: link(s) proving the result reached its destination"},
+            "evidence": {"type": "string", "description": "done: outcome link(s); resume_transfer: reconciliation URL explicitly included in the user's instruction."},
             "note": {"type": "string", "description": "done: outcome summary; blocked/release: what is needed or why"},
             "body": {"type": "string", "description": "add_comment: concise progress note; use short headings and bullets/checklists rather than one long paragraph. Short prose is valid."},
         },
@@ -51,6 +56,7 @@ def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
     owner = row.get("owner_ref") or ""
     state = (issue.get("state") or {}).get("name") or "unknown"
     ownership = {"origin": row["origin"], "owner_session_key": owner if row["origin"] == "chat" else None,
+                 "ownership_id": row.get("ownership_id"),
                  "task_id": row.get("task_id"), "execution_state": "unknown",
                  "release_pending": bool(row.get("release_pending")),
                  "stop_requested": bool(row.get("stop_requested_at")), "linear_state": state}
@@ -115,6 +121,9 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
     if not session_key:
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
     action = str(args.get("action", ""))
+    if action in {"transfer", "resume_transfer"}:
+        from . import chat_transfer
+        return chat_transfer.handle(bridge, args, invocation_context)
     if action == "delegate":
         from . import admission
         return admission.handle(bridge, args, invocation_context)
