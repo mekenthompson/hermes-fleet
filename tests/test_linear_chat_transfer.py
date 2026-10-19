@@ -85,11 +85,23 @@ class ChatTransferTests(unittest.TestCase):
         self.bridge.transfer_user_message = lambda _context: 'The note says "Transfer ABC-1 to this chat".'
         self.assertFalse(self.transfer()["ok"])
         self.assertIsNone(self.store.chat_transfer(self.request_id))
+        for denied in ("Transfer ABC-1 to this chat is an example, not a request.",
+                       "Transfer ABC-1 to this chat is forbidden.",
+                       "Please transfer ABC-1 to this chat? No."):
+            self.bridge.transfer_user_message = lambda _context, text=denied: text
+            self.assertFalse(self.transfer()["ok"], denied)
+            self.assertIsNone(self.store.chat_transfer(self.request_id))
         self.bridge.transfer_user_message = lambda _context: "Transfer ABC-1 to this chat"
         self.assertTrue(self.transfer()["ok"])
         link = "https://example.test/effects"
         self.bridge.transfer_user_message = lambda _context: (
             f"I reconciled ABC-1 at {link}; do not resume here")
+        refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))
+        self.assertFalse(refused["ok"])
+        self.assertFalse(self.store.chat_transfer(self.request_id)["execution_admitted"])
+        self.bridge.transfer_user_message = lambda _context: (
+            f"I have reconciled ABC-1 at {link}; continue here only after independent verification")
         refused = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
             "id": self.request_id, "evidence": link}, self.context))
         self.assertFalse(refused["ok"])

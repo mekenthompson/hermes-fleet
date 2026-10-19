@@ -53,25 +53,19 @@ def _host_instruction(bridge, context):
 
 
 def _explicit(text, identifier, *, resume=False):
-    if not isinstance(text, str) or not text or identifier.casefold() not in text.casefold():
+    if not isinstance(text, str) or not text:
         return False
-    words = text.casefold()
-    action = (r"resume|continue|proceed" if resume else
-              r"transfer|move|handoff|hand over|take over")
-    lead = (r"(?:i(?:'ve| have)?\s+(?:reconciled|reviewed)|(?:please\s+)?(?:resume|continue|proceed))\b"
-            if resume else
-            rf"(?:(?:please\s+)?(?:{action})|i\s+(?:want|would like|authorize|request|ask)\b"
-            rf"[^.!?;]{{0,80}}\b(?:{action}))\b")
-    if not re.match(lead, words.lstrip()):
-        return False
-    if re.search(rf"\b(?:do\s+not|don't|dont|never|not|without|no)\b[^.!?;]{{0,120}}\b(?:{action})\b", words):
-        return False
+    issue = re.escape(identifier.casefold())
     if resume:
-        return bool(re.search(r"\b(reconcil\w*|reviewed effects)\b", words) and
-                    re.search(r"\b(resume|continue|proceed)\b", words))
-    return bool(re.search(r"\b(transfer|move|handoff|hand over|take over)\b", words) and
-                re.search(r"\b(this|here|current|new)\b", words) and
-                re.search(r"\b(chat|thread|conversation|here)\b", words))
+        pattern = (rf"i(?:'ve| have)?\s+(?:reconciled|reviewed(?:\s+effects(?:\s+(?:for|of))?)?)\s+"
+                   rf"{issue}\s+(?:at|against)\s+https://[^\s;]+\s+(?:and|;)\s*"
+                   r"(?:please\s+)?(?:resume|continue|proceed)(?:\s+(?:here|now|work))?[.!]?")
+    else:
+        pattern = (r"(?:please\s+|i\s+(?:want|would like|authorize|request|ask)\s+"
+                   r"(?:you\s+)?to\s+)?(?:transfer|move|handoff|hand\s+over|take\s+over)\s+"
+                   rf"(?:issue\s+)?{issue}\s+(?:(?:to|into)\s+)?"
+                   r"(?:(?:this|current|new)\s+(?:chat|thread|conversation)|here)[.!]?")
+    return re.fullmatch(pattern, text.casefold().strip()) is not None
 
 
 def _identity(bridge, context):
