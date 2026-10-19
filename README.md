@@ -55,7 +55,7 @@ Optional, **disabled by default**. They exist so isolation does not mean a dumb 
 
 ### Linear
 
-`plugins/linear/` provides native Linear tracking and execution through Kanban. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Native sessions receive a durable early acknowledgement, and saved local review summaries can be delivered without an external URL. Bound ordinary-chat work uses core's generation-fenced Stop API; a receipt does not prove external effects ended. It remains disabled until an operator enables it with a reviewed overlay settings block; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
+`plugins/linear/` provides native Linear tracking and execution through Kanban. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Native sessions receive a durable early acknowledgement, and saved local review summaries can be delivered without an external URL. Bound ordinary-chat work uses core's generation-fenced Stop API; a receipt does not prove external effects ended. An authenticated user can transfer a journaled chat claim to another thread; successor execution waits for explicit reconciliation. It remains disabled until an operator enables it with a reviewed overlay settings block; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
 
 ### Browser handoff
 

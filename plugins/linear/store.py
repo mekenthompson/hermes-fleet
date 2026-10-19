@@ -109,7 +109,95 @@ class Store:
     @classmethod
     def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
         return cls._admitted(db, *issue_ids) and all(
-            not cls._unresolved_terminal(db, ident, except_id=except_id) for ident in issue_ids)
+            not cls._unresolved_terminal(db, ident, except_id=except_id)
+            and not cls._pending_chat_transfer(db, ident) for ident in issue_ids)
+    @staticmethod
+    def _pending_chat_transfer(db: sqlite3.Connection, issue_id: str) -> dict | None:
+        for row in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
+            transfer = json.loads(row[0])
+            if transfer["issue_id"] == issue_id and transfer["state"] in ("prepared", "committed"):
+                return transfer
+        return None
+    def chat_transfer(self, request_id: str) -> dict | None:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (f"chat-transfer:{request_id}",)).fetchone()
+            return json.loads(row[0]) if row else None
+    def prepare_chat_transfer(self, request: dict, *, at: float) -> dict | None:
+        """Fence issue mutations with the existing metadata store before retiring its executor."""
+        key = f"chat-transfer:{request['id']}"
+        with self._tx() as db:
+            previous = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if previous:
+                saved = json.loads(previous[0])
+                if any(saved.get(field) != value for field, value in request.items()):
+                    raise ValueError("Transfer request identity conflicts")
+                return saved
+            issue_id = request["issue_id"]
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            if (not work or work["origin"] != "chat" or work["ownership_id"] != request["expected_owner"]
+                    or work["owner_ref"] == request["session_key"] or work["release_pending"]
+                    or work["stop_requested_at"] or not self._admitted(db, issue_id)
+                    or self._pending_chat_transfer(db, issue_id)
+                    or not isinstance(work["run_generation"], int) or work["run_generation"] < 1
+                    or self.retired(issue_id)):
+                return None
+            saved = {**request, "state": "prepared", "created_at": at, "predecessor": dict(work),
+                     "successor_owner": str(uuid.uuid4())}
+            db.execute("INSERT INTO metadata (key,value) VALUES (?,?)", (key, json.dumps(saved)))
+            return saved
+    def commit_chat_transfer(self, request_id: str, retirement: dict, *, at: float) -> dict | None:
+        """CAS the one existing work row after the core's durable physical fence."""
+        key = f"chat-transfer:{request_id}"
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if not row:
+                return None
+            saved = json.loads(row[0])
+            if saved["state"] in ("committed", "resumed"):
+                return saved
+            old = saved["predecessor"]
+            if (saved["state"] != "prepared" or retirement.get("kind") != "chat-retirement/v1"
+                    or retirement.get("status") != "retired" or retirement.get("execution_admitted") is not False
+                    or retirement.get("session_key") != old["owner_ref"]
+                    or retirement.get("claim_generation") != old["run_generation"]
+                    or retirement.get("recovery_id") != request_id
+                    or retirement.get("profile_home") != saved["home"]):
+                return None
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (saved["issue_id"],)).fetchone()
+            if (not work or work["ownership_id"] != old["ownership_id"] or
+                    work["owner_ref"] != old["owner_ref"] or work["run_generation"] != old["run_generation"] or
+                    work["release_pending"] or work["stop_requested_at"] or
+                    not self._admitted(db, saved["issue_id"])):
+                return None
+            db.execute("UPDATE work SET owner_ref=?, ownership_id=?, run_generation=NULL WHERE issue_id=? "
+                       "AND ownership_id=?", (saved["session_key"], saved["successor_owner"],
+                                              saved["issue_id"], old["ownership_id"]))
+            saved.update(state="committed", committed_at=at, retirement=retirement,
+                         execution_admitted=False)
+            db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
+            return saved
+    def resume_chat_transfer(self, request_id: str, *, evidence: str, at: float) -> dict | None:
+        """Admit new work only after an explicit successor reconciliation decision."""
+        key = f"chat-transfer:{request_id}"
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if not row:
+                return None
+            saved = json.loads(row[0])
+            if saved["state"] == "resumed":
+                return saved if saved.get("reconciliation") == evidence.strip() else None
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (saved["issue_id"],)).fetchone()
+            if (saved["state"] != "committed" or not evidence.strip() or not work or
+                    work["owner_ref"] != saved["session_key"] or
+                    work["ownership_id"] != saved["successor_owner"] or
+                    work["stop_requested_at"] or work["release_pending"] or
+                    not self._admitted(db, saved["issue_id"]) or
+                    self._unresolved_terminal(db, saved["issue_id"])):
+                return None
+            saved.update(state="resumed", resumed_at=at, reconciliation=evidence.strip(),
+                         execution_admitted=True)
+            db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
+            return saved
     def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> list[dict[str, str]]:
         """Falsy when the issue is free; otherwise the held writes, so a refusal can name them."""
         with self._tx() as db:
@@ -127,6 +215,12 @@ class Store:
             if not row or row["state"] != "pending":
                 return False
             payload = json.loads(row["payload"])
+            for transfer in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
+                saved = json.loads(transfer[0])
+                if saved["issue_id"] == payload.get("issue_id") and (
+                        payload.get("work_owner") == saved["predecessor"]["ownership_id"] or
+                        payload.get("session_key") == saved["predecessor"]["owner_ref"]):
+                    return False
             if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
                 return False
             if payload.get("content_action"):

@@ -442,6 +442,21 @@ def register(ctx: Any) -> None:
                         settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
         from . import admission
         bridge.validate_chat_admission = lambda context: admission.bound_to_live_turn(runtime, context)
+        bridge.profile_home = home.resolve(strict=True)
+        try:
+            from gateway.chat_execution_recovery import ChatExecutionStore
+            if callable(getattr(ChatExecutionStore, "retire_for_handoff", None)):
+                bridge.retire_chat = lambda key, generation, request_id: ChatExecutionStore(
+                    bridge.profile_home).retire_for_handoff(key, generation, request_id)
+        except ImportError:
+            pass  # Older Agent images refuse transfer before preparing any intent.
+        def native_transfer_message(context):
+            if not admission.bound_to_live_turn(runtime, context):
+                return ""
+            state = runtime.gateway._peek_session_state(context.session_key)
+            event = state.turn.event if state else None
+            return str(getattr(event, "text", "") or "") if event and not event.internal else ""
+        bridge.transfer_user_message = native_transfer_message
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge
         server = None

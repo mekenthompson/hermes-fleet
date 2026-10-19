@@ -101,6 +101,14 @@ class Server:
                 context = payload.get('context'); args = payload.get('args')
                 if not isinstance(context, dict) or set(context) != set(CONTEXT_FIELDS) or not isinstance(args, dict):
                     raise ValueError('Linear request has no bound invocation context')
+                transfer_auth = payload.get('transfer_auth')
+                if args.get('action') in ('transfer', 'resume_transfer'):
+                    if not isinstance(transfer_auth, dict) or set(transfer_auth) != {
+                            'browser_control_provider', 'browser_control_subject', 'user_message'}:
+                        raise ValueError('Linear transfer has no host instruction and identity')
+                    context = {**context, **transfer_auth, '_serialized_transport': True}
+                else:
+                    context = dict(context)
                 return chat(args, SimpleNamespace(**context))
             if op == 'turn_end' and isinstance(payload.get('session_id'), str):
                 turn_end(payload['session_id'])
@@ -151,5 +159,9 @@ class Server:
 def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
     # Identity is copied from the immutable host argument, never from model args.
     snapshot = {field: getattr(context, field, None) for field in CONTEXT_FIELDS}
-    return request(home, {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
-                          'args': args, 'context': snapshot})
+    payload = {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
+               'args': args, 'context': snapshot}
+    if args.get('action') in ('transfer', 'resume_transfer'):
+        payload['transfer_auth'] = {field: getattr(context, field, '') for field in
+                                    ('browser_control_provider', 'browser_control_subject', 'user_message')}
+    return request(home, payload)

@@ -71,7 +71,7 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path) -> int:
 
 def run_suite(tests_dir: Path) -> int:
     suite = unittest.defaultTestLoader.discover(
-        start_dir=str(tests_dir), pattern="test_linear_kanban_scenarios.py",
+        start_dir=str(tests_dir), pattern="test_linear_*scenarios.py",
     )
     if suite.countTestCases() == 0:
         print("Linear scenario suite has zero tests", file=sys.stderr)
