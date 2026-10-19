@@ -67,6 +67,13 @@ class ChatTransferTests(unittest.TestCase):
         self.assertEqual(saved["issue_id"], "issue-1")
         self.assertFalse(any(q.startswith("mutation") for q in self.remote.requests))
 
+    def test_blocked_status_alone_never_authorizes_transfer(self):
+        self.bridge.transfer_user_message = lambda _context: ""
+        denied = self.transfer()
+        self.assertFalse(denied["ok"])
+        self.assertIsNone(self.store.chat_transfer(self.request_id))
+        self.assertEqual(self.store.get("issue-1"), self.owner)
+
 
     def test_retry_reuses_one_durable_intent(self):
         first = self.transfer()
