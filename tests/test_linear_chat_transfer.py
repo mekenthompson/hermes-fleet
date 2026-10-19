@@ -166,6 +166,54 @@ class ChatTransferTests(unittest.TestCase):
         self.assertEqual(refused["code"], "reconciliation_required")
         self.assertEqual(self.store.chat_transfer(self.request_id)["state"], "committed")
 
+    def test_old_project_update_remains_fenced_after_successor_resume(self):
+        self.bridge.retire_chat = self.retired
+        old_update = self.store.enqueue("project_update", {
+            "issue_id": "update:old-session:project-1", "session_id": "old-session",
+            "session_key": "old-chat", "project_id": "project-1", "resolve": "issue-1",
+            "lines": {"ABC-1": "Blocked"}, "line_issues": {"ABC-1": "issue-1"}}, at=self.clock())
+        self.assertTrue(self.transfer()["ok"])
+        link = "https://example.test/reconciled"
+        self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
+        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))["ok"])
+        self.assertFalse(self.store.admit_mutation(old_update))
+        other_update = self.store.enqueue("project_update", {
+            "issue_id": "update:old-session:other-project", "session_id": "old-session",
+            "session_key": "old-chat", "project_id": "other-project", "resolve": "issue-2",
+            "lines": {"ABC-2": "In progress"}, "line_issues": {"ABC-2": "issue-2"}}, at=self.clock())
+        self.assertTrue(self.store.admit_mutation(other_update))
+
+    def test_same_chat_reopen_with_rotated_session_id_keeps_transfer_receipt(self):
+        self.bridge.retire_chat = self.retired
+        first = self.transfer()
+        self.context.session_id = "new-transcript-after-compression"
+        self.assertEqual(self.transfer(), first)
+        link = "https://example.test/reconciled"
+        self.bridge.transfer_user_message = lambda context: f"I reconciled ABC-1 at {link} and continue here"
+        resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": link}, self.context))
+        self.assertTrue(resumed["ok"], resumed)
+
+    def test_authenticated_desktop_key_rotation_rebinds_same_successor(self):
+        self.bridge.retire_chat = self.retired
+        self.context.platform = "desktop"
+        self.context._serialized_transport = True
+        self.context.ui_session_id = "stable-ui-tab"
+        self.context.browser_control_provider = "ticket"
+        self.context.browser_control_subject = "subject"
+        self.context.user_message = "Transfer ABC-1 to this chat"
+        first = self.transfer()
+        self.assertTrue(first["ok"], first)
+        self.context.session_key = "new-chat-after-compression"
+        self.context.session_id = "new-transcript-after-compression"
+        self.assertEqual(self.transfer(), first)
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], self.context.session_key)
+        self.context.user_message = "I reconciled ABC-1 at https://example.test/reconciled and continue here"
+        resumed = json.loads(chat.handle(self.bridge, {"action": "resume_transfer", "issue": "ABC-1",
+            "id": self.request_id, "evidence": "https://example.test/reconciled"}, self.context))
+        self.assertTrue(resumed["ok"], resumed)
+
     def test_human_reassignment_or_closed_issue_never_prepares(self):
         self.remote.set_delegate("issue-1", {"id": "other-agent"})
         self.assertFalse(self.transfer()["ok"])

@@ -18,6 +18,9 @@ from typing import Any, Callable
 
 MAX_BYTES = 65536
 CONTEXT_FIELDS = ('profile', 'platform', 'session_key', 'session_id', 'run_generation')
+TRANSFER_FIELDS = ('browser_control_provider', 'browser_control_subject', 'user_message',
+                   'ui_session_id', 'api_control_principal', 'api_control_transport_family',
+                   'api_conversation_key')
 
 class Unavailable(RuntimeError):
     pass
@@ -103,8 +106,7 @@ class Server:
                     raise ValueError('Linear request has no bound invocation context')
                 transfer_auth = payload.get('transfer_auth')
                 if args.get('action') in ('transfer', 'resume_transfer'):
-                    if not isinstance(transfer_auth, dict) or set(transfer_auth) != {
-                            'browser_control_provider', 'browser_control_subject', 'user_message'}:
+                    if not isinstance(transfer_auth, dict) or set(transfer_auth) != set(TRANSFER_FIELDS):
                         raise ValueError('Linear transfer has no host instruction and identity')
                     context = {**context, **transfer_auth, '_serialized_transport': True}
                 else:
@@ -162,6 +164,5 @@ def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
     payload = {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
                'args': args, 'context': snapshot}
     if args.get('action') in ('transfer', 'resume_transfer'):
-        payload['transfer_auth'] = {field: getattr(context, field, '') for field in
-                                    ('browser_control_provider', 'browser_control_subject', 'user_message')}
+        payload['transfer_auth'] = {field: getattr(context, field, '') for field in TRANSFER_FIELDS}
     return request(home, payload)

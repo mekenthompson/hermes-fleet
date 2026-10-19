@@ -56,7 +56,9 @@ PLUGIN = ROOT / "plugins" / "linear"
 # Design review: the owner approved 4614 for directional host autolinks and code-context preservation.
 # Chat transfer: 278 measured production lines for durable handoff and its core capability gate,
 # authenticated transport snapshot and Store CAS; no unallocated headroom (4614 + 278).
-BUDGET = 4892
+# Review repairs: 71 measured lines for predecessor project-batch fencing, authenticated
+# API provenance and stable Desktop/API destination rebinding (4892 + 71).
+BUDGET = 4963
 
 
 class FakeContext:

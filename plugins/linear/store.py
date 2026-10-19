@@ -122,6 +122,52 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"chat-transfer:{request_id}",)).fetchone()
             return json.loads(row[0]) if row else None
+    @staticmethod
+    def _predecessor_transfer_blocks(db: sqlite3.Connection, issue_id: str, payload: dict) -> bool:
+        for row in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
+            saved = json.loads(row[0])
+            if saved["issue_id"] == issue_id and (
+                    payload.get("work_owner") == saved["predecessor"]["ownership_id"] or
+                    payload.get("session_key") == saved["predecessor"]["owner_ref"]):
+                return True
+        return False
+    def predecessor_transfer_blocks(self, issue_id: str, payload: dict) -> bool:
+        with self._tx() as db:
+            return self._predecessor_transfer_blocks(db, issue_id, payload)
+    @staticmethod
+    def _same_transfer_identity(saved: dict, request: dict) -> bool:
+        rotating = saved.get("platform") in ("desktop", "api_server")
+        return all(saved.get(field) == value for field, value in request.items()
+                   if field != "session_id" and (field != "session_key" or not rotating))
+    @classmethod
+    def _rebind_chat_transfer_db(cls, db: sqlite3.Connection, key: str, saved: dict,
+                                 identity: dict) -> dict | None:
+        if not cls._same_transfer_identity(saved, identity):
+            return None
+        new_key = identity["session_key"]
+        if saved["session_key"] != new_key and saved["state"] in ("committed", "resumed"):
+            work = db.execute("SELECT owner_ref, ownership_id, stop_requested_at, release_pending FROM work WHERE issue_id=?",
+                              (saved["issue_id"],)).fetchone()
+            if (not work or work["owner_ref"] != saved["session_key"] or
+                    work["ownership_id"] != saved["successor_owner"] or
+                    work["stop_requested_at"] or work["release_pending"]):
+                return None
+            db.execute("UPDATE work SET owner_ref=? WHERE issue_id=? AND owner_ref=? AND ownership_id=?",
+                       (new_key, saved["issue_id"], saved["session_key"], saved["successor_owner"]))
+        if saved["session_key"] != new_key or saved["session_id"] != identity["session_id"]:
+            saved.update(session_key=new_key, session_id=identity["session_id"])
+            db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved), key))
+        return saved
+    def rebind_chat_transfer(self, request_id: str, identity: dict, issue_id: str) -> dict | None:
+        key = f"chat-transfer:{request_id}"
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if not row:
+                return None
+            saved = json.loads(row[0])
+            if saved["issue_id"] != issue_id:
+                return None
+            return self._rebind_chat_transfer_db(db, key, saved, identity)
     def prepare_chat_transfer(self, request: dict, *, at: float) -> dict | None:
         """Fence issue mutations with the existing metadata store before retiring its executor."""
         key = f"chat-transfer:{request['id']}"
@@ -129,9 +175,10 @@ class Store:
             previous = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
             if previous:
                 saved = json.loads(previous[0])
-                if any(saved.get(field) != value for field, value in request.items()):
+                if not self._same_transfer_identity(saved, request):
                     raise ValueError("Transfer request identity conflicts")
-                return saved
+                rebound = self._rebind_chat_transfer_db(db, key, saved, request)
+                return rebound
             issue_id = request["issue_id"]
             work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
             if (not work or work["origin"] != "chat" or work["ownership_id"] != request["expected_owner"]
@@ -215,11 +262,8 @@ class Store:
             if not row or row["state"] != "pending":
                 return False
             payload = json.loads(row["payload"])
-            for transfer in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
-                saved = json.loads(transfer[0])
-                if saved["issue_id"] == payload.get("issue_id") and (
-                        payload.get("work_owner") == saved["predecessor"]["ownership_id"] or
-                        payload.get("session_key") == saved["predecessor"]["owner_ref"]):
+            for issue_id in self._targets(payload):
+                if self._predecessor_transfer_blocks(db, issue_id, payload):
                     return False
             if not self._effect_admitted(db, *self._targets(payload), except_id=row_id):
                 return False
