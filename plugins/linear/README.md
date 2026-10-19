@@ -259,7 +259,10 @@ changes, another owner, and an uncertain physical worker keep the transfer fence
 Native gateway turns use the existing in-process live-turn validator. Desktop uses its
 server-stamped authenticated WebSocket identity and user instruction over the profile's
 private serialized transport; it does not acquire the gateway's live-turn delegation
-grant. A same-UID process remains inside the documented local trust boundary.
+grant. A Desktop tab retains the same transfer across transcript compression. Authenticated
+API `/v1/runs` turns can use the same serialized path when a valid profile Bearer key and
+an addressable conversation are present; requests without that proof refuse the transfer.
+A same-UID process remains inside the documented local trust boundary.
 
 ### Delegate chat work to Kanban
 

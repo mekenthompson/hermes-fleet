@@ -25,11 +25,27 @@ def _uuid4(value):
 def _host_instruction(bridge, context):
     """Serialized Desktop context never acquires the in-process live gateway grant."""
     if getattr(context, "_serialized_transport", False):
-        if (getattr(context, "platform", "") != "desktop" or
-                not getattr(context, "browser_control_provider", "") or
-                not getattr(context, "browser_control_subject", "")):
+        platform = getattr(context, "platform", "")
+        desktop = (platform == "desktop" and getattr(context, "ui_session_id", "") and
+                   getattr(context, "browser_control_provider", "") and
+                   getattr(context, "browser_control_subject", ""))
+        api = (platform == "api_server" and getattr(context, "api_control_principal", "") and
+               getattr(context, "api_control_transport_family", "") and
+               getattr(context, "api_conversation_key", ""))
+        if not (desktop or api):
             return ""
         return getattr(context, "user_message", "") or ""
+    if getattr(context, "platform", "") == "api_server":
+        try:
+            from tools import registry
+            if (isinstance(context, registry.ToolInvocationContext) and
+                    context == registry._current_tool_invocation_context() and
+                    context.api_control_principal and context.api_control_transport_family and
+                    context.api_conversation_key):
+                return context.user_message
+        except ImportError:
+            pass
+        return ""
     validate = getattr(bridge, "validate_chat_admission", None)
     source = getattr(bridge, "transfer_user_message", None)
     return source(context) if callable(validate) and validate(context) and callable(source) else ""
@@ -52,10 +68,18 @@ def _identity(bridge, context):
     if home is None:
         return None
     home = str(Path(home).resolve(strict=True))
+    platform = getattr(context, "platform", "")
+    ui = getattr(context, "ui_session_id", "") if platform == "desktop" else ""
+    api = [getattr(context, "api_control_principal", ""),
+           getattr(context, "api_control_transport_family", "")] if platform == "api_server" else ["", ""]
+    destination = (ui if platform == "desktop" else
+                   getattr(context, "api_conversation_key", "") if platform == "api_server" else
+                   getattr(context, "session_key", ""))
     return {"profile": bridge.profile, "home": home,
             "session_key": getattr(context, "session_key", ""),
             "session_id": getattr(context, "session_id", ""),
-            "platform": getattr(context, "platform", ""),
+            "platform": platform, "destination_id": destination, "ui_session_id": ui,
+            "api_identity": api,
             "browser_identity": [getattr(context, "browser_control_provider", ""),
                                  getattr(context, "browser_control_subject", "")]}
 
@@ -82,7 +106,7 @@ def handle(bridge, args, context):
     try:
         instruction = _host_instruction(bridge, context)
         identity = _identity(bridge, context)
-        if not identity or not identity["session_key"] or not identity["session_id"]:
+        if not identity or not identity["session_key"] or not identity["session_id"] or not identity["destination_id"]:
             return _reply(False, "Transfer needs a profile-bound authenticated chat turn.")
         issue = bridge.api.issue(ref)
         if ref not in (issue.get("id"), issue.get("identifier")):
@@ -106,8 +130,8 @@ def handle(bridge, args, context):
                         evidence not in instruction):
                     return _reply(False, "Resume needs a reconciliation evidence link supplied in the "
                                   "authenticated user instruction.")
-                saved = bridge.store.chat_transfer(request_id)
-                if not saved or saved["issue_id"] != issue_id or any(saved.get(k) != v for k, v in identity.items()):
+                saved = bridge.store.rebind_chat_transfer(request_id, identity, issue_id)
+                if not saved:
                     return _reply(False, "Transfer receipt does not belong to this issue and chat.")
                 result = bridge.store.resume_chat_transfer(request_id, evidence=evidence, at=bridge.clock())
                 if not result:
@@ -126,7 +150,8 @@ def handle(bridge, args, context):
             if saved["state"] in ("committed", "resumed"):
                 current = bridge.store.get(issue_id)
                 if (not current or current["owner_ref"] != saved["session_key"] or
-                        current["ownership_id"] != saved["successor_owner"]):
+                        current["ownership_id"] != saved["successor_owner"] or
+                        current["stop_requested_at"] or current["release_pending"]):
                     return _reply(False, "Transferred ownership changed; the old receipt grants no authority.")
                 return _ownership_receipt(saved)
             old = saved["predecessor"]

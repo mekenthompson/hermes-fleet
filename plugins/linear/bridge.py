@@ -1593,7 +1593,8 @@ class Bridge:
             waiting_lines: set[str] = set()
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
-                if self.store.issue_reconciliation_blocked(issue_id):
+                if (self.store.predecessor_transfer_blocks(issue_id, payload) or
+                        self.store.issue_reconciliation_blocked(issue_id)):
                     waiting_lines.add(ident)
                     continue
                 try:

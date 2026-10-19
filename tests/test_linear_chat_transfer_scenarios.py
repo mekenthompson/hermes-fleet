@@ -136,7 +136,7 @@ class ChatTransferScenarios(unittest.TestCase):
             self.bridge.validate_chat_admission = lambda context: False
             tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-chat",
                 session_id="actual-desktop-session", browser_control_provider="synthetic-ticket",
-                browser_control_subject="synthetic-user")
+                browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
             try:
                 set_turn_user_message("Transfer ABC-1 to this chat")
                 context = registry._current_tool_invocation_context()
@@ -153,3 +153,60 @@ class ChatTransferScenarios(unittest.TestCase):
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "desktop-chat")
         self.assertEqual(self.store.chat_transfer(self.request_id)["retirement"]["effects"], "unknown")
         self.assertFalse(self.core.start_local_worker("old-chat", "late"))
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            tokens = set_session_vars(platform="desktop", profile="alpha", session_key="desktop-after-compress",
+                session_id="compressed-session", browser_control_provider="synthetic-ticket",
+                browser_control_subject="synthetic-user", ui_session_id="stable-desktop-tab")
+            try:
+                set_turn_user_message("Transfer ABC-1 to this chat")
+                context = registry._current_tool_invocation_context()
+                server = transport.Server(self.home, "alpha", lambda args, host:
+                    chat.handle(self.bridge, args, host), lambda _: None)
+                try:
+                    retry = json.loads(transport.chat_request(self.home, self.args, context))
+                finally:
+                    server.close()
+            finally:
+                clear_session_vars(tokens)
+        self.assertEqual(retry, result)
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], "desktop-after-compress")
+
+    def test_serialized_authenticated_api_instruction_moves_control(self):
+        from gateway.session_context import (clear_session_vars, set_api_transfer_identity,
+                                             set_session_vars, set_turn_user_message)
+        self.bridge.validate_chat_admission = lambda context: False
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            tokens = set_session_vars(platform="api_server", profile="alpha", session_key="api-run-1",
+                                      session_id="api-conversation")
+            try:
+                set_turn_user_message("Transfer ABC-1 to this chat")
+                set_api_transfer_identity("principal:alpha:verified", "local-api", "api-conversation")
+                context = registry._current_tool_invocation_context()
+                server = transport.Server(self.home, "alpha", lambda args, host:
+                    chat.handle(self.bridge, args, host), lambda _: None)
+                try:
+                    result = json.loads(transport.chat_request(self.home, self.args, context))
+                finally:
+                    server.close()
+            finally:
+                clear_session_vars(tokens)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], "api-run-1")
+        self.assertFalse(result["execution_admitted"])
+        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
+            tokens = set_session_vars(platform="api_server", profile="alpha", session_key="api-run-2",
+                                      session_id="api-conversation")
+            try:
+                set_turn_user_message("Transfer ABC-1 to this chat")
+                set_api_transfer_identity("principal:alpha:verified", "local-api", "api-conversation")
+                context = registry._current_tool_invocation_context()
+                server = transport.Server(self.home, "alpha", lambda args, host:
+                    chat.handle(self.bridge, args, host), lambda _: None)
+                try:
+                    retry = json.loads(transport.chat_request(self.home, self.args, context))
+                finally:
+                    server.close()
+            finally:
+                clear_session_vars(tokens)
+        self.assertEqual(retry, result)
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], "api-run-2")
