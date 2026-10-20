@@ -42,9 +42,9 @@ env:
 jobs:
   scope:
     # First, cheap job: did this event change anything the image is built from? Docs-only and
-    # test-only commits skip the bake. Skipped preflight/publish jobs report "skipped", which the
-    # required status checks on main count as passing. Manual dispatches and any range git cannot
-    # resolve (new branch, force push) fail open to "run"; see scripts/fleet-image-change-scope.py.
+    # test-only commits skip the bake. The required preflight job checks that decision explicitly.
+    # Manual dispatches and any range git cannot resolve (new branch, force push) fail open to
+    # "run"; see scripts/fleet-image-change-scope.py.
     if: >-
       github.repository == 'mekenthompson/hermes-fleet-public' ||
       github.repository == 'mekenthompson/hermes-fleet'
@@ -75,7 +75,7 @@ jobs:
             --head "$HEAD" \
             --github-output "$GITHUB_OUTPUT"
 
-  preflight:
+  preflight_bake:
     # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
     # Pushes to main skip preflight: the publish job rebuilds and re-scans the exact commit itself.
     needs: scope
@@ -341,6 +341,53 @@ jobs:
             release/vex-exceptions.json
           if-no-files-found: error
           retention-days: 30
+
+  preflight:
+    # Required PR context: a successful explicit no-image decision permits a skipped bake;
+    # image changes require the full bake to have succeeded. Scope and bake errors fail closed.
+    needs: [scope, preflight_bake]
+    if: >-
+      always() &&
+      (github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
+      (github.repository == 'mekenthompson/hermes-fleet-public' ||
+      github.repository == 'mekenthompson/hermes-fleet')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require applicable preflight result
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          IMAGE: ${{ needs.scope.outputs.image }}
+          BAKE_RESULT: ${{ needs.preflight_bake.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCOPE_RESULT" != success ]]; then
+            echo "scope did not succeed: $SCOPE_RESULT" >&2
+            exit 1
+          fi
+          case "$IMAGE" in
+            true)
+              if [[ "$BAKE_RESULT" != success ]]; then
+                echo "image input requires successful preflight bake; got $BAKE_RESULT" >&2
+                exit 1
+              fi
+              echo "image input: preflight bake succeeded"
+              ;;
+            false)
+              if [[ "$BAKE_RESULT" != skipped ]]; then
+                echo "no-image decision expected skipped preflight bake; got $BAKE_RESULT" >&2
+                exit 1
+              fi
+              echo "no image input: preflight bake correctly skipped"
+              ;;
+            *)
+              echo "scope returned invalid image decision: $IMAGE" >&2
+              exit 1
+              ;;
+          esac
 
   publish:
     # Every push to main that touches the image input set publishes once its exact-SHA CI run is
