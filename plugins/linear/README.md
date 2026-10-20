@@ -635,9 +635,12 @@ is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
 boundary and still require the owning session for terminal actions.
 
-The production implementation has a line budget, enforced by `tests/test_linear_plugin.py`.
-This includes the bounded session-requester authorization path and existing recovery/transport safeguards.
-The unit suite enforces measured headroom without compressing safety-critical branches.
+Review production growth through the ordinary PR diff and architecture review, not a
+blocking physical-line budget. Comments, readable safety branches and necessary contract
+repairs must not require a cap increase or code compression. The explicit file-inventory
+check in `tests/test_linear_plugin.py` remains; authorization, Stop, recovery and native
+Kanban scenario tests remain mandatory. Review changes for a thin adapter with native
+Kanban as the sole scheduler, not a second execution or retry engine.
 
 Ownership loss archives directly through core so a running worker retains its termination identity.
 A durable issue fence blocks native and chat replacements until every recorded predecessor exits.
