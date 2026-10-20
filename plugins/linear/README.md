@@ -145,6 +145,16 @@ window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Deliv
 `deliveries(logical_agent, delivery_id, profile, payload, payload_sha256, received_at, status,
 attempts)`. The plugin reads pending rows for its profile and marks them `imported`.
 
+## Who owns an issue
+
+Three locks. Do not treat them as one.
+
+- **Linear delegate** is the agent app. Changing it is the agent-to-agent handoff. `start` and `transfer` do not move it.
+- **Chat claim** is one session of that agent. Desktop and Telegram are different claims of the same agent. `start` adopts the other claim when the user asked to continue this issue here. A heartbeat cannot. Stop, a pending release, and a Kanban binding still refuse.
+- **Kanban task** owns worker execution. A chat cannot adopt it.
+
+`transfer` remains the heavy predecessor-retirement path. It is not a channel switch. The exact phrase `Transfer ABC-1 to this chat` still uses that path. A looser "continue this chat here" is `start`.
+
 ## Chat work and detached workers
 
 The native `linear` tool is chat-only. Detached Kanban workers intentionally receive
