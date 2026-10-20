@@ -4058,5 +4058,119 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], self.clock() * 1000)
 
 
+    def test_native_review_and_rework_are_milestones_not_completion(self) -> None:
+        for origin in ("kanban", "kanban_chat"):
+            with self.subTest(origin=origin):
+                self.setUp()
+                if origin == "kanban":
+                    self.delegate()
+                    task_id = self.task_id()
+                else:
+                    task = self.bridge.kanban.create(title="Synthetic review", assignee="alpha")
+                    task_id = task.id
+                    self.bridge.store.put(ISSUE, origin, "parent-chat", task_id=task_id,
+                                          last_updated_at=self.clock() * 1000)
+                    self.linear.set_delegate(ISSUE, {"id": SELF})
+                    self.linear.set_state(ISSUE, "In Progress")
+                with self.bridge.kanban.conn() as conn:
+                    self.assertTrue(kb.request_review(conn, task_id, summary="Ready for independent review",
+                                                      reviewer="reviewer"))
+                self.bridge.kanban.events(task_id, ISSUE)  # claimed before the process died
+                self.bridge = self.make_bridge()
+                self.bridge.tick()
+                self.assertEqual(self.bridge.kanban.get(task_id).status, "review")
+                self.assertEqual(self.linear.state(ISSUE), "In Progress")
+                self.assertIsNotNone(self.bridge.store.get(ISSUE))
+                bodies = ([json.dumps(a["content"]) for a in self.linear.activities]
+                          if origin == "kanban" else [c["body"] for c in self.linear.comments])
+                self.assertTrue(any("review" in body.lower() for body in bodies), bodies)
+                prior = (len(self.linear.activities), len(self.linear.comments))
+                self.bridge = self.make_bridge()
+                self.bridge.tick()
+                self.assertEqual((len(self.linear.activities), len(self.linear.comments)), prior)
+                with self.bridge.kanban.conn() as conn:
+                    self.assertIsNotNone(kb.claim_review_task(conn, task_id))
+                    ok, _ = kb.request_changes(conn, task_id, reason="Revise the finding")
+                    self.assertTrue(ok)
+                self.bridge.tick()
+                bodies = ([a["content"].get("body", "") for a in self.linear.activities]
+                          if origin == "kanban" else [c["body"] for c in self.linear.comments])
+                self.assertTrue(any("Revise the finding" in body for body in bodies), bodies)
+                self.assertIsNotNone(self.bridge.store.get(ISSUE))
+                self.assertEqual(self.linear.state(ISSUE), "In Progress")
+                with self.bridge.kanban.conn() as conn:
+                    self.assertTrue(kb.request_review(conn, task_id, summary="Revised finding ready"))
+                    self.assertTrue(kb.reopen_review_task(conn, task_id))
+                self.bridge.tick()
+                bodies = ([json.dumps(a["content"]) for a in self.linear.activities]
+                          if origin == "kanban" else [c["body"] for c in self.linear.comments])
+                self.assertTrue(any("Review reopened" in body for body in bodies), bodies)
+                self.assertEqual(self.linear.state(ISSUE), "In Progress")
+
+    def test_native_schedule_and_dependency_wait_recover_once(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.schedule_task(conn, task_id, reason="Waiting for the window"))
+        self.bridge.kanban.events(task_id, ISSUE)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertTrue(any("Waiting for the window" in a["content"].get("body", "")
+                            for a in self.linear.activities))
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.unblock_task(conn, task_id))
+            parent = kb.create_task(conn, title="Synthetic prerequisite", assignee="alpha")
+            self.assertTrue(kb.link_tasks(conn, parent, task_id))
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertTrue(any("dependenc" in a["content"].get("body", "").lower()
+                            for a in self.linear.activities))
+        count = len(self.linear.activities)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(len(self.linear.activities), count)
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.schedule_task(conn, task_id, reason="Waiting for the same prerequisite"))
+            self.assertTrue(kb.unblock_task(conn, task_id))
+            self.assertEqual(kb.get_task(conn, task_id).status, "todo")
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, parent, result="Prerequisite delivered"))
+            self.assertEqual(kb.get_task(conn, task_id).status, "ready")
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+
+    def test_review_request_survives_reviewer_claim_before_bridge_pump(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.request_review(conn, task_id, summary="Ready for review", reviewer="reviewer"))
+            self.assertIsNotNone(kb.claim_review_task(conn, task_id))
+        self.bridge.kanban.events(task_id, ISSUE)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "running")
+        self.assertTrue(any("Review requested" in json.dumps(a["content"]) for a in self.linear.activities))
+        self.assertEqual(self.linear.state(ISSUE), "In Progress")
+        self.assertIsNotNone(self.bridge.store.get(ISSUE))
+
+    def test_native_milestones_cannot_undo_linear_stop_on_replay(self) -> None:
+        self.delegate()
+        task_id = self.task_id()
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.schedule_task(conn, task_id, reason="Waiting for a window"))
+            self.assertTrue(kb.unblock_task(conn, task_id))
+        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "blocked")
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        before = len(self.linear.activities)
+        self.bridge = self.make_bridge()
+        self.bridge.tick()
+        self.assertEqual(self.linear.state(ISSUE), "Blocked")
+        self.assertEqual(len(self.linear.activities), before)
+
+
 if __name__ == "__main__":
     unittest.main()

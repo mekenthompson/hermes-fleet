@@ -20,7 +20,8 @@ from .store import Store, advisory
 from .ops import held
 log = logging.getLogger("linear")
 EVENT_KINDS = ("completed", "blocked", "block_loop_detected", "gave_up", "unblocked", "archived",
-               "spawned", "heartbeat", "commented")
+               "spawned", "heartbeat", "commented", "review_requested", "changes_requested",
+               "review_reopened", "scheduled", "dependency_wait", "promoted", "descendant_invalidated")
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
 CLOSED = ("completed", "canceled")
@@ -1063,29 +1064,33 @@ class Bridge:
             return
         writes: list[tuple[str, dict[str, Any]]] = []
         route = self._alert_route(row)
+        def status(state: str) -> tuple[str, dict[str, Any]]:
+            return "status", {"issue_id": issue_id, "state": state, **route}
+        def message(kind: str, body: str) -> tuple[str, dict[str, Any]]:
+            return "activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "content": {"type": kind, "body": body}, **route}
         if event.kind in ("blocked", "block_loop_detected") and not str(payload.get("reason") or "").startswith(OWN):
             internal_block = payload.get("kind") in {"capability", "transient"}
-            if task_status == "triage":
-                instruction = "Resolve Kanban triage on the board."
-            elif internal_block:
-                instruction = "Reconcile the runtime failure before resuming the existing task; no user input is requested."
-            else:
-                instruction = "Reply here to unblock."
-            block_type = "error" if internal_block else "elicitation"
-            block_label = f"Blocked ({payload['kind']})" if internal_block else "Blocked"
-            writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
-                      ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                                    "content": {"type": block_type, "body":
-                                                f"{block_label}: {payload.get('reason') or 'needs input'}. {instruction}"},
-                                    **route})]
+            instruction = ("Resolve Kanban triage on the board." if task_status == "triage" else
+                           "Reconcile the runtime failure before resuming the existing task; no user input is requested."
+                           if internal_block else "Reply here to unblock.")
+            block_type, block_label = (("error", f"Blocked ({payload['kind']})") if internal_block else ("elicitation", "Blocked"))
+            writes = [status("blocked"), message(block_type, f"{block_label}: {payload.get('reason') or 'needs input'}. {instruction}")]
         elif event.kind == "gave_up":
-            writes = [("status", {"issue_id": issue_id, "state": "blocked", **route}),
-                      ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                                    "content": {"type": "error", "body":
-                                                f"Stopped after repeated failed attempts (last error: {payload.get('error') or 'unknown'}). "
-                                                "Reply or re-delegate to try again."}, **route})]
+            writes = [status("blocked"), message("error", f"Stopped after repeated failed attempts "
+                      f"(last error: {payload.get('error') or 'unknown'}). Reply or re-delegate to try again.")]
         elif event.kind == "unblocked":
-            writes = [("status", {"issue_id": issue_id, "state": "in_progress", **route})]
+            writes = [status("blocked" if task_status == "todo" else "in_progress")]
+        elif event.kind in ("review_requested", "changes_requested", "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"):
+            # Only the native landing phase can justify a delayed milestone after restart.
+            allowed, state, label, field, fallback = {
+                "review_requested": ({"review", "running"}, None, "Review requested", "summary", "Awaiting independent review"), "review_reopened": ({"todo", "ready", "running"}, None, "Review reopened", None, "Implementation resumed"),
+                "changes_requested": ({"todo", "ready", "running"}, "in_progress", "Changes requested", "reason", "rework is pending"), "promoted": ({"ready", "review"}, "in_progress", "Ready", None, "Dependencies satisfied"),
+                "scheduled": ({"scheduled"}, "blocked", "Scheduled", "reason", "waiting for the scheduled time"), "dependency_wait": ({"todo"}, "blocked", "Waiting for a dependency", None, "work cannot continue"),
+                "descendant_invalidated": ({"todo"}, "blocked", "Waiting for a dependency", None, "work cannot continue"),
+            }[event.kind]
+            if task_status in allowed:
+                detail = _project_summary(payload.get(field) or "", 240) if field else ""
+                writes = ([status(state)] if state else []) + [message("thought", f"{label}: {detail or fallback}.")]
         elif event.kind == "spawned":
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
         elif event.kind == "heartbeat":
@@ -1095,28 +1100,23 @@ class Bridge:
         elif event.kind == "commented":
             reader = getattr(self.kanban, "comment_text", None)
             event_at = getattr(event, "created_at", None)
-            body = ""
-            if callable(reader) and event_at is not None:
-                body = _progress_text(reader(row["task_id"], str(payload.get("author") or ""),
-                                             int(payload.get("len") or 0), event_at), 800)
+            body = (_progress_text(reader(row["task_id"], str(payload.get("author") or ""), int(payload.get("len") or 0), event_at), 800)
+                    if callable(reader) and event_at is not None else "")
             if body:
-                writes = [("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                                        "content": {"type": "thought", "body": body}, **route})]
+                writes = [message("thought", body)]
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
         if activity and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
             if captured.get(key, 0):
-                captured[key] -= 1
-                writes = []
+                captured[key] -= 1; writes = []
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
                 (event.kind == "block_loop_detected" and task_status != "triage") or
-                (event.kind == "unblocked" and task_status in ("blocked", "triage"))):
-            writes = []
+                (event.kind == "unblocked" and task_status not in ("todo", "ready", "review", "running"))): writes = []
+        # A durable Linear Stop fences older native milestones as well as its worker.
+        if row.get("stop_requested_at") and task_status in ("blocked", "triage"): writes = []
         if row["origin"] == "kanban_chat":
-            writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
-                                    "body": _visible_activity(payload.get("content") or {})}) if kind == "activity" else (kind, payload)
+            writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}}, "body": _visible_activity(payload.get("content") or {})}) if kind == "activity" else (kind, payload)
                       for kind, payload in writes]
-        writes = [(kind, {**payload, **self._alert_route(row)}) for kind, payload in writes]
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     def _finish_work(self, issue_id: str, writes: list, *, at: float) -> bool:
         row = self.store.get(issue_id)
