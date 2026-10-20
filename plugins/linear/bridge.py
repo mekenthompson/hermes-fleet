@@ -154,11 +154,24 @@ def _project_summary(text: str, limit: int = 300) -> str:
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
     if isinstance(receipt, dict) and receipt:
-        cause = f"{receipt.get('classification') or 'unknown'}: {_public(str(receipt.get('detail') or 'no detail'))}"
+        detail = receipt.get("detail")
+        if not detail:
+            checks = receipt.get("checks")
+            rejected = [row for row in checks if isinstance(row, dict)
+                        and row.get("classification") != "success"] if isinstance(checks, list) else []
+            # The verifier returns per-check outcomes without a top-level detail for
+            # skipped, missing, pending and failed jobs. Preserve that reason without
+            # treating an intentional workflow skip as proof of executed tests.
+            detail = "; ".join(
+                f"required check {_public(str(row.get('name') or 'unnamed'))[:100]}: "
+                f"{_public(str(row.get('classification') or 'unknown'))[:30]} "
+                f"(conclusion {_public(str(row.get('conclusion') or 'unavailable'))[:30]})"
+                for row in rejected[:2]) or "acceptance evidence unavailable"
+        cause = f"{receipt.get('classification') or 'unknown'}: {_public(str(detail))}"
         cause += f"; source {receipt['evidence_source']}" if receipt.get("evidence_source") else ""
     else:
         cause = "acceptance verifier returned no receipt"
-    return (f"{url}: {cause}" if url else cause)[:500]
+    return _public(f"{url}: {cause}" if url else cause)[:500]
 def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
     cause = _public("; ".join(failures) if failures else "no acceptance receipt")
     if where == "delivery":
