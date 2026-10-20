@@ -319,6 +319,9 @@ class FleetImageReleaseTests(unittest.TestCase):
         preflight_if = text.split("\n  preflight:\n", 1)[1].split("    runs-on:", 1)[0]
         self.assertNotIn("'push'", preflight_if)
         self.assertIn("github.event_name == 'pull_request'", preflight_if)
+        bake_if = text.split("\n  preflight_bake:\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("github.event_name == 'pull_request'", bake_if)
+        self.assertIn("needs.scope.outputs.image == 'true'", bake_if)
         self.assertIn("group: fleet-image-${{ github.event.pull_request.number || github.sha }}", text)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
         self.assertIn("github.repository == 'mekenthompson/hermes-fleet-public'", text)
@@ -461,7 +464,7 @@ class FleetImageReleaseTests(unittest.TestCase):
 
     def test_publish_false_dispatch_runs_read_only_bake_and_promotion_is_verified(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        preflight = text.split("\n  preflight:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        preflight = text.split("\n  preflight_bake:\n", 1)[1].split("\n  preflight:\n", 1)[0]
         publish = text.split("\n  publish:\n", 1)[1]
         self.assertIn("github.event_name == 'workflow_dispatch'", preflight)
         self.assertIn("push: false", preflight)
@@ -475,7 +478,7 @@ class FleetImageReleaseTests(unittest.TestCase):
 
     def test_publishing_dispatch_does_not_duplicate_build_and_scans(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        preflight = text.split("\n  preflight:\n", 1)[1].split("    runs-on:", 1)[0]
+        preflight = text.split("\n  preflight_bake:\n", 1)[1].split("    runs-on:", 1)[0]
         self.assertIn("github.event.inputs.publish != 'true'", preflight)
         publish = text.split("\n  publish:\n", 1)[1]
         self.assertIn("name: Upload publication evidence", publish)
@@ -732,7 +735,7 @@ class FleetImageReleaseTests(unittest.TestCase):
             self.assertIn(token, text)
         validate = "Collect SBOM and validate full and compact SPDX 2.3 documents"
         self.assertEqual(text.count(f"- name: {validate}"), 2)
-        preflight = text.split("\n  preflight:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        preflight = text.split("\n  preflight_bake:\n", 1)[1].split("\n  preflight:\n", 1)[0]
         publish = text.split("\n  publish:\n", 1)[1]
         self.assertLess(preflight.index(validate), preflight.index("Upload pre-publication evidence"))
         # The SBOM finishes while the staging push is in flight and is validated before promotion,

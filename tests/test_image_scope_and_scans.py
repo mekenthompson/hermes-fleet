@@ -150,7 +150,7 @@ class ScopedWorkflowTests(unittest.TestCase):
         cls.jobs = yaml.safe_load(cls.text)["jobs"]
 
     def test_scope_job_is_cheap_read_only_and_first(self):
-        self.assertEqual(list(self.jobs), ["scope", "preflight", "publish"])
+        self.assertEqual(list(self.jobs), ["scope", "preflight_bake", "preflight", "publish"])
         scope = self.jobs["scope"]
         self.assertEqual(scope["permissions"], {"contents": "read"})
         self.assertNotIn("environment", scope)
@@ -162,8 +162,8 @@ class ScopedWorkflowTests(unittest.TestCase):
         self.assertEqual(decide["env"]["HEAD"], "${{ github.event.pull_request.head.sha || github.sha }}")
         self.assertNotIn("docker", json.dumps(scope))
 
-    def test_preflight_and_publish_are_gated_by_scope_and_fail_open(self):
-        for name in ("preflight", "publish"):
+    def test_bake_and_publish_are_gated_by_scope_and_fail_open(self):
+        for name in ("preflight_bake", "publish"):
             with self.subTest(job=name):
                 job = self.jobs[name]
                 self.assertEqual(job["needs"], "scope")
@@ -174,6 +174,86 @@ class ScopedWorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", self.jobs["publish"]["if"])
         self.assertNotIn("paths:", self.text.split("jobs:", 1)[0])
         self.assertNotIn("paths-ignore:", self.text)
+
+    def test_required_preflight_runs_after_scope_and_bake_on_prs(self):
+        gate = self.jobs["preflight"]
+        self.assertEqual(gate["needs"], ["scope", "preflight_bake"])
+        self.assertEqual(gate["permissions"], {"contents": "read"})
+        self.assertNotIn("environment", gate)
+        self.assertIn("always()", gate["if"])
+        self.assertIn("github.event_name == 'pull_request'", gate["if"])
+        self.assertIn("github.event.inputs.publish != 'true'", gate["if"])
+        self.assertNotIn("github.event_name == 'push'", gate["if"])
+        self.assertEqual(len(gate["steps"]), 1)
+        step = gate["steps"][0]
+        self.assertEqual(step["env"], {
+            "SCOPE_RESULT": "${{ needs.scope.result }}",
+            "IMAGE": "${{ needs.scope.outputs.image }}",
+            "BAKE_RESULT": "${{ needs.preflight_bake.result }}",
+        })
+
+    def test_required_preflight_result_truth_table(self):
+        gate = self.jobs["preflight"]["steps"][0]
+        cases = (
+            ("success", "false", "skipped", True),
+            ("success", "true", "success", True),
+            ("failure", "true", "success", False),
+            ("cancelled", "true", "success", False),
+            ("skipped", "true", "success", False),
+            ("success", "", "skipped", False),
+            ("success", "unknown", "skipped", False),
+            ("success", "TRUE", "success", False),
+            ("success", "true", "failure", False),
+            ("success", "true", "cancelled", False),
+            ("success", "true", "skipped", False),
+            ("success", "true", "", False),
+            ("success", "false", "success", False),
+            ("success", "false", "failure", False),
+        )
+        for scope_result, image, bake_result, expected in cases:
+            with self.subTest(scope=scope_result, image=image, bake=bake_result):
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", gate["run"]],
+                    env={**os.environ, "SCOPE_RESULT": scope_result, "IMAGE": image, "BAKE_RESULT": bake_result},
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+
+    def test_workflow_conditions_preserve_trusted_event_boundaries(self):
+        def applies(job, *, event, publish, scope_result, image, cancelled=False):
+            condition = self.jobs[job]["if"]
+            values = {
+                "needs.scope.outputs.image": image,
+                "needs.scope.result": scope_result,
+                "github.event.inputs.publish": publish,
+                "github.event_name": event,
+                "github.repository": "mekenthompson/hermes-fleet",
+                "github.ref": "refs/heads/main",
+            }
+            condition = condition.replace("!cancelled()", str(not cancelled))
+            condition = condition.replace("always()", "True")
+            for reference in sorted(values, key=len, reverse=True):
+                condition = condition.replace(reference, repr(values[reference]))
+            condition = condition.replace("&&", " and ").replace("||", " or ")
+            return bool(eval(condition, {"__builtins__": {}}, {}))
+
+        cases = (
+            ("pull_request", "", "success", "false", (False, True, False)),
+            ("pull_request", "", "success", "true", (True, True, False)),
+            ("pull_request", "", "failure", "", (True, True, False)),
+            ("pull_request", "", "cancelled", "", (False, True, False)),
+            ("pull_request", "", "skipped", "", (False, True, False)),
+            ("pull_request", "", "success", "", (False, True, False)),
+            ("push", "", "success", "false", (False, False, False)),
+            ("push", "", "success", "true", (False, False, True)),
+            ("workflow_dispatch", "false", "success", "true", (True, True, False)),
+            ("workflow_dispatch", "true", "success", "true", (False, False, True)),
+        )
+        for event, publish, scope_result, image, expected in cases:
+            with self.subTest(event=event, publish=publish, scope=scope_result, image=image):
+                actual = tuple(applies(job, event=event, publish=publish, scope_result=scope_result, image=image)
+                               for job in ("preflight_bake", "preflight", "publish"))
+                self.assertEqual(actual, expected)
 
 
 class ScanHelperTests(unittest.TestCase):
@@ -300,7 +380,7 @@ class ScanHelperTests(unittest.TestCase):
         import yaml
         text = WORKFLOW.read_text(encoding="utf-8")
         jobs = yaml.safe_load(text)["jobs"]
-        for name in ("preflight", "publish"):
+        for name in ("preflight_bake", "publish"):
             with self.subTest(job=name):
                 steps = jobs[name]["steps"]
                 names = [step.get("name", "") for step in steps]
