@@ -1,6 +1,7 @@
 """Chat-origin work: `linear start|done|blocked|release`. The chat session stays the executor."""
 from __future__ import annotations
 import json
+import re
 from typing import Any
 from .api import LinearError
 from .bridge import Bridge, acceptance_refusal, evidence_links, iso_ms
@@ -9,12 +10,15 @@ SCHEMA = {
     "name": "linear",
     "description": (
         "Track work on a Linear issue, or create issues and projects as this profile's own app. "
-        "start: claim an existing issue for this chat (refused if another agent is working it). "
+        "start: claim an existing issue for this chat. Another chat of this same agent is adopted "
+        "when the user asked to continue it here. Refused if another agent holds the Linear "
+        "delegate, a Kanban task owns it, or Stop is still fenced. "
         "delegate: session-free gateway-chat handoff of a fresh unowned issue to one durable Kanban task; requires id. "
         "done: finish it; needs an evidence link. blocked: you need a human. "
         "release: stop tracking unfinished work. "
-        "transfer: move the same issue's chat owner to this authenticated thread after durable retirement; "
-        "requires id and expected_owner. Execution remains blocked. "
+        "transfer: heavy control handoff after durable retirement of the predecessor chat; "
+        "requires id and expected_owner. Not a channel switch and not an agent change. "
+        "Execution remains blocked. "
         "resume_transfer: after reconciling predecessor effects, explicitly admit this chat to continue; "
         "requires id and an evidence URL present in the user's instruction. "
         "create_issue: create an undelegated issue; requires id, title, and team. "
@@ -48,6 +52,39 @@ SCHEMA = {
 def _reply(ok: bool, message: str, **details: Any) -> str:
     return json.dumps({"ok": ok, "message": message, **details})
 
+_CONTINUE_WORD = re.compile(r"\b(continue|transfer|take[\s-]?over|handoff|hand[\s-]?over|hand[\s-]?off)\b", re.I)
+_HERE = re.compile(r"\b(here|this chat|this thread|this conversation|the chat)\b", re.I)
+_NEGATION = re.compile(r"\b(do not|don't|dont|never|forbidden|not a request)\b", re.I)
+
+def _user_text(bridge: Bridge, context: Any) -> str:
+    text = getattr(context, "user_message", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    source = getattr(bridge, "transfer_user_message", None)
+    if not callable(source):
+        return ""
+    try:
+        got = source(context)
+    except TypeError:
+        return ""
+    return got if isinstance(got, str) else ""
+
+def _channel_continue(text: str, identifier: str) -> bool:
+    """Same agent, new channel. Not a heartbeat, and not the heavy transfer ritual."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or stripped.startswith("[Heartbeat") or "INTERNAL NOTIFICATION" in stripped:
+        return False
+    if _NEGATION.search(stripped) or not _CONTINUE_WORD.search(stripped):
+        return False
+    from .chat_transfer import _explicit
+    if identifier and _explicit(stripped, identifier):
+        return False
+    if identifier and identifier.casefold() in stripped.casefold():
+        return True
+    return _HERE.search(stripped) is not None
+
 def _held(bridge: Bridge, issue_id: str) -> str | None:
     writes = bridge.store.issue_reconciliation_blocked(issue_id)
     return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes]) if writes else None
@@ -66,7 +103,8 @@ def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
         message = (f"{issue.get('identifier')} has a retained ownership claim from chat {owner!r}. "
                    "This is not proof of active work; execution state is unknown. "
                    f"Linear state is {state!r}, not a liveness signal. "
-                   "Continue in the owning chat to reconcile current evidence and use done or release. "
+                   "Continue in the owning chat, or call start from this chat after the user asks to "
+                   "continue this issue here. transfer does not switch channels or agents. "
                    "If that chat cannot be resumed, request guarded ownership recovery; "
                    "do not clear the claim based on inactivity or an old blocker comment.")
     else:
@@ -204,7 +242,7 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
             except LinearError as exc: return _reply(False, str(exc))
             if refusal := _held(bridge, issue_id):
                 return refusal
-            return _start(bridge, issue, row, me, session_key, session_id, generation)
+            return _start(bridge, issue, row, me, session_key, session_id, generation, invocation_context)
         if not row or row["origin"] != "chat":
             return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
         if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
@@ -269,15 +307,25 @@ def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, projec
                             "quiet": bridge.quiet, **route}),
     ], at=bridge.clock(), release=release)
 def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
-           session_id: str, generation: int | None) -> str:
+           session_id: str, generation: int | None, context: Any = None) -> str:
     ident, url = issue.get("identifier"), issue.get("url", "")
     if row and row["origin"] == "kanban":
         return _ownership_refusal(issue, row, "task_ownership_conflict")
-    if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
-        return _ownership_refusal(issue, row, "chat_ownership_conflict")
     delegate = issue.get("delegate") or {}
     if delegate.get("id") not in (None, me) and (issue.get("state") or {}).get("type") == "started":
         return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")
+    if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
+        if delegate.get("id") not in (None, me):
+            return _reply(False, f"{ident} is delegated to {delegate.get('name') or 'another agent'}; "
+                           f"channel continue does not move it: {url}")
+        if row.get("stop_requested_at") or not _channel_continue(_user_text(bridge, context), ident or ""):
+            return _ownership_refusal(issue, row, "chat_ownership_conflict")
+        fields: dict[str, Any] = {"owner_ref": session_key}
+        if generation is not None:
+            fields["run_generation"] = generation
+        if not bridge.store.update(issue["id"], **fields):
+            return _reply(False, "Could not move this agent's chat claim; no change was made.")
+        row = bridge.store.get(issue["id"])
     project = (issue.get("project") or {}).get("id")
     if row:
         if row.get("stop_requested_at") and (row.get("run_generation") is None or generation is None or
