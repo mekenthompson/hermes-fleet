@@ -58,6 +58,39 @@ class AcceptanceDetailTests(unittest.TestCase):
         self.assertIn("build failed", failures[0])
         self.assertIn("source actions", failures[0])
 
+    def test_skipped_required_job_without_detail_is_actionable_and_refused(self) -> None:
+        receipt = {"ok": False, "classification": "infra", "evidence_source": "actions",
+                   "head_sha": "a" * 40, "checks": [
+                       {"name": "Full suite", "classification": "success", "conclusion": "success"},
+                       {"name": "Targeted tests", "classification": "infra", "conclusion": "skipped",
+                        "raw_response": "must-not-appear"}]}
+        from unittest.mock import patch
+        with patch.object(bridge, "pr_acceptance", return_value=receipt):
+            failures, heads = [], {}
+            self.assertFalse(bridge.Bridge.accepted_evidence(
+                object(), ["https://github.com/acme/repo/pull/7"], failures=failures, heads=heads))
+        self.assertEqual(heads, {})
+        self.assertIn("Targeted tests", failures[0])
+        self.assertIn("skipped", failures[0])
+        self.assertNotIn("Full suite", failures[0])
+        self.assertNotIn("must-not-appear", failures[0])
+        self.assertNotIn("no detail", failures[0])
+        self.assertLessEqual(len(failures[0]), 500)
+
+    def test_receipt_checks_are_bounded_and_redacted(self) -> None:
+        token = "gh" + "p_" + "x" * 40
+        for checks in (None, {}, "not rows", [None, 42, {"name": token,
+                "classification": "infra", "conclusion": "skipped"}]):
+            with self.subTest(checks_type=type(checks).__name__):
+                text = bridge.acceptance_cause({"classification": "infra", "checks": checks})
+                self.assertNotIn(token, text)
+                self.assertLessEqual(len(text), 500)
+        text = bridge.acceptance_cause({"classification": "failure", "checks": [
+            {"name": str(n) + "x" * 300, "classification": "failure", "conclusion": "failure"}
+            for n in range(100)]})
+        self.assertLessEqual(len(text), 500)
+        self.assertNotIn("2xxxx", text)
+
     def test_refusal_text_is_specific_and_still_a_refusal(self) -> None:
         text = bridge.acceptance_refusal(["auth: Checks API denied"])
         self.assertIn("could not be verified", text)
