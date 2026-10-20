@@ -135,12 +135,21 @@ class ChatOwnershipDetailTests(unittest.TestCase):
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
 
-    def test_loose_transfer_call_is_a_channel_continue(self):
+    def test_loose_wording_uses_start_not_transfer(self):
         self.context.user_message = "please continue ABC-1 in this thread"
-        reply = json.loads(chat.handle(self.bridge, {"action": "transfer", "issue": "ABC-1"}, self.context))
+        refused = json.loads(chat.handle(self.bridge, {"action": "transfer", "issue": "ABC-1"}, self.context))
+        self.assertFalse(refused["ok"], refused)
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
+        reply = self.invoke("start")
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
-        self.assertNotIn("execution_admitted", reply)
+
+    def test_negated_transfer_wording_does_not_adopt(self):
+        self.context.user_message = "Do not transfer ABC-1 to this chat"
+        before = self.snapshot()
+        reply = self.invoke("start")
+        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
+        self.assertEqual(self.snapshot(), before)
 
     def test_heartbeat_cannot_adopt_another_chat(self):
         self.context.user_message = "[Heartbeat — recurring instruction] continue the chat here"

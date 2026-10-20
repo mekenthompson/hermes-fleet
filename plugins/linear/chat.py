@@ -54,6 +54,7 @@ def _reply(ok: bool, message: str, **details: Any) -> str:
 
 _CONTINUE_WORD = re.compile(r"\b(continue|transfer|take[\s-]?over|handoff|hand[\s-]?over|hand[\s-]?off)\b", re.I)
 _HERE = re.compile(r"\b(here|this chat|this thread|this conversation|the chat)\b", re.I)
+_NEGATION = re.compile(r"\b(do not|don't|dont|never|forbidden|not a request)\b", re.I)
 
 def _user_text(bridge: Bridge, context: Any) -> str:
     text = getattr(context, "user_message", None)
@@ -75,7 +76,7 @@ def _channel_continue(text: str, identifier: str) -> bool:
     stripped = text.strip()
     if not stripped or stripped.startswith("[Heartbeat") or "INTERNAL NOTIFICATION" in stripped:
         return False
-    if not _CONTINUE_WORD.search(stripped):
+    if _NEGATION.search(stripped) or not _CONTINUE_WORD.search(stripped):
         return False
     if identifier and identifier.casefold() in stripped.casefold():
         return True
@@ -156,15 +157,8 @@ def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any 
         return _reply(False, "linear needs a chat session; it cannot run from this context.")
     action = str(args.get("action", ""))
     if action in {"transfer", "resume_transfer"}:
-        text = _user_text(bridge, invocation_context)
-        issue_ref = str(args.get("issue") or "")
-        if action == "transfer" and _channel_continue(text, issue_ref):
-            from .chat_transfer import _explicit
-            if not _explicit(text, issue_ref):
-                action = "start"
-        if action in {"transfer", "resume_transfer"}:
-            from . import chat_transfer
-            return chat_transfer.handle(bridge, args, invocation_context)
+        from . import chat_transfer
+        return chat_transfer.handle(bridge, args, invocation_context)
     if action == "delegate":
         from . import admission
         return admission.handle(bridge, args, invocation_context)
