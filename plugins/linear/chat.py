@@ -78,6 +78,9 @@ def _channel_continue(text: str, identifier: str) -> bool:
         return False
     if _NEGATION.search(stripped) or not _CONTINUE_WORD.search(stripped):
         return False
+    from .chat_transfer import _explicit
+    if identifier and _explicit(stripped, identifier):
+        return False
     if identifier and identifier.casefold() in stripped.casefold():
         return True
     return _HERE.search(stripped) is not None

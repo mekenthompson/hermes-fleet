@@ -144,7 +144,12 @@ class ChatOwnershipDetailTests(unittest.TestCase):
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
 
-    def test_negated_transfer_wording_does_not_adopt(self):
+    def test_exact_heavy_transfer_wording_does_not_adopt_on_start(self):
+        self.context.user_message = "Transfer ABC-1 to this chat"
+        before = self.snapshot()
+        reply = self.invoke("start")
+        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
+        self.assertEqual(self.snapshot(), before)
         self.context.user_message = "Do not transfer ABC-1 to this chat"
         before = self.snapshot()
         reply = self.invoke("start")
