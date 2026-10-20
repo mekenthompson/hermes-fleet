@@ -20,6 +20,14 @@ the `linear` tool to post it. Session activities never name a Kanban task.
 A heartbeat note becomes an ephemeral Working action. A Kanban comment
 becomes a thought. The specialist session close says the assessment is on
 the issue. A direct agent and a worker use that same activity vocabulary.
+Native review requests, requested changes, review reopening, scheduling, and
+dependency waits are projected as work milestones. Scheduled work and unmet
+dependencies appear Blocked in Linear; native promotion returns them to In
+Progress. Unblocking keeps them Blocked if a dependency still gates the task.
+Review requests keep the issue In Progress and never close
+the Agent Session. Session-owned work uses Agent Session activity; chat-owned
+Kanban work uses issue comments. Native event replay is captured with the
+Linear outbox so a bridge restart does not repeat delivered milestones.
 
 It is off by default. It shares nothing across containers: the Linear delegate is the only
 cross-agent record.
