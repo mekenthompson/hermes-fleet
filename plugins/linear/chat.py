@@ -312,6 +312,9 @@ def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, ses
     if delegate.get("id") not in (None, me) and (issue.get("state") or {}).get("type") == "started":
         return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")
     if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
+        if delegate.get("id") not in (None, me):
+            return _reply(False, f"{ident} is delegated to {delegate.get('name') or 'another agent'}; "
+                           f"channel continue does not move it: {url}")
         if row.get("stop_requested_at") or not _channel_continue(_user_text(bridge, context), ident or ""):
             return _ownership_refusal(issue, row, "chat_ownership_conflict")
         fields: dict[str, Any] = {"owner_ref": session_key}

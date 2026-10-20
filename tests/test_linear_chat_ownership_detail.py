@@ -182,6 +182,16 @@ class ChatOwnershipDetailTests(unittest.TestCase):
         self.assertIn("Other Agent", reply["message"])
         self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
 
+    def test_other_agent_delegate_blocks_continue_when_issue_is_not_started(self):
+        from linear_fake_api import OTHER
+        self.remote.set_delegate("issue-1", OTHER)
+        self.remote.set_state("issue-1", "Todo")
+        self.context.user_message = "continue ABC-1 here"
+        reply = self.invoke("start")
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("delegated to Other Agent", reply["message"])
+        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
+
 
 if __name__ == '__main__':
     unittest.main()
