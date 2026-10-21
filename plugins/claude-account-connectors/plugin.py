@@ -30,6 +30,19 @@ def _refs(result):
                    and isinstance(row.get('tool_name'), str) and _REF.fullmatch(row['tool_name'])})
 
 
+def _capture_cancel_event():
+    # Capture host identity before ACP moves work onto its own thread. Never
+    # accept cancellation authority from tool arguments or another session.
+    from tools.interrupt import acting_for_tid, is_thread_interrupted
+    tids = (threading.get_ident(), acting_for_tid.get())
+
+    class HostCancelEvent(threading.Event):
+        def is_set(self):
+            return super().is_set() or any(is_thread_interrupted(tid) for tid in tids)
+
+    return HostCancelEvent()
+
+
 class NativeGate:
     """One invocation's state. Only trusted transport callbacks reach this object."""
     def __init__(self, tool, arguments, authorize):
@@ -202,8 +215,10 @@ class NativeBackend:
         usage = None
         error = None
         try:
-            response = client.chat.completions.create(model=self.model,
-                messages=[{'role': 'user', 'content': canonical(payload)}], tools=[], timeout=self.timeout)
+            cancel_event = _capture_cancel_event()
+            response = client._create_sync(model=self.model,
+                messages=[{'role': 'user', 'content': canonical(payload)}], tools=[], timeout=self.timeout,
+                _cancel_event=cancel_event)
             raw_usage = response.usage
             usage = {key: getattr(raw_usage, key, None) for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')}
         except Exception as exc:
@@ -245,10 +260,10 @@ def register(ctx):
         return
     tools = ConnectorTools(NativeBackend(ctx.get_config('model', 'sonnet'), ctx.get_config('timeout', 90)))
     def search(args, **kwargs):
-        return tools.claude_connector_search((args or {}).get('query'))
+        return json.dumps(tools.claude_connector_search((args or {}).get('query')))
     def call(args, **kwargs):
         args = args or {}
-        return tools.claude_connector_call(args.get('tool'), args.get('arguments'))
+        return json.dumps(tools.claude_connector_call(args.get('tool'), args.get('arguments')))
     for name, handler, properties in [
         ('claude_connector_search', search, {'query': {'type': 'string', 'maxLength': 2000}}),
         ('claude_connector_call', call, {'tool': {'type': 'string'}, 'arguments': {'type': 'object'}}),
