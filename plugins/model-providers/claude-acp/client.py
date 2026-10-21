@@ -1370,7 +1370,7 @@ class ClaudeACPClient:
                         meta = tool.get("_meta") if isinstance(tool, dict) else None
                         claude_meta = meta.get("claudeCode") if isinstance(meta, dict) else None
                         tool_name = claude_meta.get("toolName") if isinstance(claude_meta, dict) else None
-                        if controller is not None and isinstance(tool_name, str) and tool_name.startswith("mcp__claude_ai__"):
+                        if controller is not None and isinstance(tool_name, str) and tool_name.startswith(_CONNECTOR_PREFIX):
                             try:
                                 decision = controller.on_permission(session_id, json.loads(json.dumps(permission_params)))
                                 options = permission_params.get("options")

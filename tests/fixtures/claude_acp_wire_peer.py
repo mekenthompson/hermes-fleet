@@ -87,7 +87,7 @@ for line in sys.stdin:
                       "toolCall": {"toolCallId": "connector-1" if mode == "permission_connector" else "bash-1",
                                    "title": "Connector action" if mode == "permission_connector" else "Bash",
                                    "kind": "fetch" if mode == "permission_connector" else "execute",
-                                   "_meta": {"claudeCode": {"toolName": "mcp__claude_ai__search" if mode == "permission_connector" else "Bash"}},
+                                   "_meta": {"claudeCode": {"toolName": "mcp__claude_ai_Example__search" if mode == "permission_connector" else "Bash"}},
                                    "rawInput": {"query": "fixture"} if mode == "permission_connector" else {"command": "gh pr view 1"}},
                       "options": BASH_PERMISSION_OPTIONS,
                   }})
