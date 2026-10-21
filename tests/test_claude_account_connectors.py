@@ -60,15 +60,15 @@ class ConnectorTests(unittest.TestCase):
                 class FixtureClient(original):
                     def __init__(self, **kwargs):
                         super().__init__(command=sys.executable, args=[str(peer), mode], acp_cwd=home)
-                with patch.object(acp, 'ClaudeACPClient', FixtureClient), patch.object(acp, 'assert_reviewed_claude_code_version'), patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': home}), patch.object(module, '_load_acp', return_value=acp):
+                with patch.object(acp, 'ClaudeACPClient', FixtureClient), patch.object(acp, 'assert_reviewed_claude_code_version'), patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': home}), patch.object(module, '_load_acp', return_value=acp), patch.object(module, '_capture_cancel_event', side_effect=__import__('threading').Event):
                     class Context:
                         def __init__(self): self.tools = {}
                         def get_config(self, key, default=None): return True if key == 'enabled' else default
                         def register_tool(self, **kw): self.tools[kw['name']] = kw['handler']
                     context = Context()
                     module.register(context)
-                    search = context.tools['claude_connector_search']({'query': 'fixture'})
-                    call = context.tools['claude_connector_call']({'tool': name, 'arguments': {'count': 1}})
+                    search = json.loads(context.tools['claude_connector_search']({'query': 'fixture'}))
+                    call = json.loads(context.tools['claude_connector_call']({'tool': name, 'arguments': {'count': 1}}))
                     if mode == 'no_execution':
                         self.assertEqual(search['status'], 'no_execution')
                         self.assertEqual(call['status'], 'no_execution')
@@ -77,8 +77,61 @@ class ConnectorTests(unittest.TestCase):
                         self.assertFalse(search['schemas_exported'])
                         self.assertEqual(call['status'], 'completed', call)
                         self.assertEqual(call['rawOutput'], {'value': 42})
-                    denied = context.tools['claude_connector_call']({'tool': 'mcp__claude_ai_Other__read', 'arguments': {}})
+                    denied = json.loads(context.tools['claude_connector_call']({'tool': 'mcp__claude_ai_Other__read', 'arguments': {}}))
                     self.assertEqual(denied['status'], 'denied')
+
+    def test_transport_cancellation_before_and_after_approval(self):
+        import tempfile
+        import threading
+        from unittest.mock import patch
+        module = load()
+        acp = module._load_acp()
+        base = acp.ClaudeACPClient
+        name = 'mcp__claude_ai_Example__read'
+        peer = ROOT / 'tests/fixtures/claude_connector_peer.py'
+        for phase in ['before', 'after']:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as home:
+                Path(home, 'settings.json').write_text(json.dumps({'permissions': {'allow': [name]}}))
+                cancelled = threading.Event()
+                if phase == 'before': cancelled.set()
+                class FixtureClient(base):
+                    def __init__(self, **kwargs):
+                        super().__init__(command=sys.executable, args=[str(peer), 'normal'], acp_cwd=home)
+                original = module.NativeGate.on_permission
+                def permission(gate, session, params):
+                    decision = original(gate, session, params)
+                    if decision['kind'] == 'allow_once': cancelled.set()
+                    return decision
+                with patch.object(acp, 'ClaudeACPClient', FixtureClient), patch.object(acp, 'assert_reviewed_claude_code_version'), patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': home}), patch.object(module, '_capture_cancel_event', return_value=cancelled), patch.object(module.NativeGate, 'on_permission', permission):
+                    result = module.NativeBackend(acp=acp).run(tool=name, arguments={'count': 1})
+                self.assertEqual(result['status'], 'no_execution' if phase == 'before' else 'unknown_outcome')
+                self.assertFalse(result['retry'])
+
+    def test_cancel_event_captures_trusted_thread_and_context(self):
+        import contextvars
+        import threading
+        import types
+        from unittest.mock import patch
+        module = load()
+        interrupted = set()
+        owner = contextvars.ContextVar('test_owner', default=None)
+        api = types.ModuleType('tools.interrupt')
+        api.acting_for_tid = owner
+        api.is_thread_interrupted = lambda tid: tid in interrupted
+        with patch.dict(sys.modules, {'tools.interrupt': api}):
+            token = owner.set(123)
+            try: event = module._capture_cancel_event()
+            finally: owner.reset(token)
+            interrupted.add(456)
+            self.assertFalse(event.is_set())
+            interrupted.add(123)
+            self.assertTrue(event.is_set())
+            interrupted.clear()
+            interrupted.add(threading.get_ident())
+            self.assertTrue(event.is_set())
+            interrupted.clear()
+            event.set()
+            self.assertTrue(event.is_set())
 
     def test_reference_shape_is_native_not_model_schema(self):
         module = load()
