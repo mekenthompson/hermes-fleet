@@ -65,6 +65,10 @@ The agent can run an isolated browser and hand the live session to the human whe
 
 Stay on the granted Claude plan login via a profile-local ACP client. The overlay wires the account. The image does not silently fall back to an API key. The provider supports asynchronous auxiliary requests and forwards Hermes-prepared images through ACP; see [image compatibility and limits](docs/image-release.md#asynchronous-auxiliary-requests-and-images).
 
+### Claude Subscription DirectSDK (experimental)
+
+The official Nous Research CLI-backed provider is available as a separately installed, default-disabled source plugin; it is not baked into the Fleet image or routed by Fleet. It uses that profile's own Claude Code login and has no API-key fallback. See [packaging and scope](docs/claude-subscription-directsdk.md).
+
 ### Kokoro voice
 
 Local TTS through a sidecar. Voice on Telegram without a cloud TTS meter. Sidecar URL and token come from the overlay.

@@ -74,6 +74,18 @@
       ]
     },
     {
+      "id": "claude-subscription-directsdk-provider",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity",
+        "subscription_login_only"
+      ]
+    },
+    {
       "id": "browser-handoff",
       "target": "standalone_public_plugin",
       "default_enabled": false,

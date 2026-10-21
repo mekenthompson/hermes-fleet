@@ -13,6 +13,7 @@ ACP = ROOT / "plugins" / "model-providers" / "claude-acp"
 KOKORO = ROOT / "plugins" / "kokoro-voice"
 HANDOFF = ROOT / "plugins" / "browser-handoff"
 READONLY = ROOT / "plugins" / "readonly-source"
+DIRECTSDK = ROOT / "plugins" / "claude-subscription-directsdk"
 DOCKERFILE = ROOT / "Dockerfile"
 CONTRACT = ROOT / "contracts" / "plugins.json"
 HOUSEHOLD = re.compile(
@@ -98,13 +99,29 @@ class PublicGenericPluginTests(unittest.TestCase):
 
     def test_generic_plugin_trees_have_no_household_literals(self) -> None:
         roots = (LINEAR, ACP, KOKORO, HANDOFF, READONLY,
-                 ROOT / "plugins" / "web" / "perplexity")
+                 ROOT / "plugins" / "web" / "perplexity", DIRECTSDK)
         for root in roots:
             for path in root.rglob("*"):
                 if not path.is_file() or path.suffix not in {".py", ".yaml", ".json", ".md"}:
                     continue
                 text = path.read_text(encoding="utf-8")
                 self.assertIsNone(HOUSEHOLD.search(text), path.relative_to(ROOT))
+
+    def test_directsdk_is_pinned_licensed_and_optional(self) -> None:
+        import hashlib
+        provenance = json.loads((DIRECTSDK / "upstream.json").read_text(encoding="utf-8"))
+        self.assertEqual(provenance["source_repository"], "https://github.com/NousResearch/hermes-official-plugins")
+        self.assertEqual(provenance["source_revision"], "9b074e160dbd84427ef59d092e62d9e3e5d44cf7")
+        self.assertEqual(provenance["license"], "MIT")
+        self.assertTrue((DIRECTSDK / "LICENSE").is_file())
+        self.assertEqual(provenance["license_file"], "LICENSE")
+        for relative, digest in provenance["files_sha256"].items():
+            self.assertEqual(hashlib.sha256((DIRECTSDK / relative).read_bytes()).hexdigest(), digest)
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+        entry = [item for item in contract["components"] if item["id"] == "claude-subscription-directsdk-provider"]
+        self.assertEqual(len(entry), 1)
+        self.assertFalse(entry[0]["default_enabled"])
+        self.assertNotIn("COPY plugins/claude-subscription-directsdk/", DOCKERFILE.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

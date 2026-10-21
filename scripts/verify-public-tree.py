@@ -8,7 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_NAMES = {"auth.json", "credentials.json", "sessions", "memories", "logs"}
-ALLOWED_BINARIES: dict[str, str] = {}
+ALLOWED_BINARIES: dict[str, str] = {
+    "plugins/claude-subscription-directsdk/assets/card.png": "14548a1d57e6820daf124bf0646380b1d0fe20c0eb698964d87036186f21e562",
+    "plugins/claude-subscription-directsdk/assets/hero-technohellenic.png": "54cce1379348091e3efb363a005a60c00ee4ec90cda745e8f09f9dd6e357d7a3",
+}
 FORBIDDEN_PATTERNS = {
     "broker reference": re.compile("o" + "p://", re.IGNORECASE),
     "private key": re.compile("BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY"),
