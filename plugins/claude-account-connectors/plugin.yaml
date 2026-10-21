@@ -3,3 +3,6 @@ kind: standalone
 version: 0.1.0
 description: Experimental, default-disabled Claude.ai connector discovery and one-use mediated calls
 author: Hermes Fleet Contributors
+provides_tools:
+  - claude_connector_search
+  - claude_connector_call
