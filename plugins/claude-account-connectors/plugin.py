@@ -185,6 +185,7 @@ class NativeBackend:
                 options['allowedTools'] = ['ToolSearch']
                 options['settings'] = {'disableAllHooks': True, 'permissions': {
                     'ask': ['mcp__*'], 'defaultMode': 'default'}}
+                options['env'] = {**options.get('env', {}), 'MCP_CONNECTION_NONBLOCKING': '0'}
                 return options
 
             def _run(self, messages, bridge_tools, requirement, model, timeout, publish=None, prepared=None):
