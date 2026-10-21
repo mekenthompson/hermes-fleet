@@ -1,0 +1,5 @@
+name: claude-account-connectors
+kind: standalone
+version: 0.1.0
+description: Experimental, default-disabled Claude.ai connector discovery and one-use mediated calls
+author: Hermes Fleet Contributors
