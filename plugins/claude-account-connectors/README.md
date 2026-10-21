@@ -1,6 +1,6 @@
 # Claude account connectors (experimental)
 
-Optional Hermes tools using the existing Claude ACP subscription runtime, independent of the main model provider. Disabled by default. **Not production-qualified:** offline transport tests pass, but authenticated discovery/execution and complete permission mediation remain live acceptance gates. Do not enable on production profiles yet.
+Optional Hermes tools using the existing Claude ACP subscription runtime, independent of the main model provider. Disabled by default. **Not production-qualified:** a controlled live native discovery probe observed improved MCP discovery with `MCP_CONNECTION_NONBLOCKING=0`; authenticated execution and complete permission mediation remain live acceptance gates. Do not enable on production profiles yet.
 
 - `claude_connector_search(query)` returns actual native `tool_reference` names filtered by existing profile authority. It does not export or invent JSON Schemas.
 - `claude_connector_call(tool, arguments)` requests one exact native tool and JSON argument object. Claude Code owns schema validation. The host compares type-sensitive argument values and consumes a single permission budget before selecting the offered `allow_once` option.

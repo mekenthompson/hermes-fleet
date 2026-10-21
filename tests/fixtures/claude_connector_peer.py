@@ -45,6 +45,7 @@ for line in sys.stdin:
         assert options['allowedTools'] == ['ToolSearch']
         assert 'Bash' in options['disallowedTools']
         assert options['settings']['disableAllHooks'] is True
+        assert options['env']['MCP_CONNECTION_NONBLOCKING'] == '0'
         result = {'sessionId': sid, 'configOptions': [{'id': 'model', 'category': 'model', 'currentValue': 'sonnet', 'options': [{'value': 'sonnet'}]}]}
     elif method == 'session/set_config_option':
         result = {'configOptions': [{'id': 'model', 'currentValue': 'sonnet'}]}
