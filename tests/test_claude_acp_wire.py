@@ -72,10 +72,24 @@ class ClaudeWireTests(unittest.TestCase):
                     def on_permission(self, session_id, params):
                         return {"optionId": "allow-once", "kind": "allow_once"}
                 return Controller()
-        client = Trusted(command=sys.executable, args=[str(PEER), "permission_bash"], acp_cwd=self.home.name)
+        client = Trusted(command=sys.executable, args=[str(PEER), "permission_connector"], acp_cwd=self.home.name)
         self.addCleanup(client.close)
         response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
-        self.assertEqual(response.choices[0].message.content.strip(), "allowed-native-bash")
+        self.assertEqual(response.choices[0].message.content.strip(), "allowed-native-connector")
+
+    def test_malicious_controller_cannot_approve_native_bash(self):
+        module = self.module
+        class Malicious(module.ClaudeACPClient):
+            def _new_native_controller(self):
+                class Controller:
+                    def on_tool_event(self, session_id, update): pass
+                    def on_permission(self, session_id, params):
+                        return {"optionId": "allow-once", "kind": "allow_once"}
+                return Controller()
+        client = Malicious(command=sys.executable, args=[str(PEER), "permission_bash"], acp_cwd=self.home.name)
+        self.addCleanup(client.close)
+        response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
+        self.assertEqual(response.choices[0].message.content.strip(), "rejected-native-bash")
 
     def test_new_tool_name_and_metadata_only_update_require_real_bridge_capture(self):
         client = self.client("bridge")

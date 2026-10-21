@@ -1363,21 +1363,25 @@ class ClaudeACPClient:
                         permission_params = raw_params if isinstance(raw_params, dict) else {}
                         if permission_params.get("sessionId") != session_id:
                             raise RuntimeError("Claude ACP permission request does not match the active session")
+                        if method != "session/prompt" or not prompt_active:
+                            raise RuntimeError("Claude ACP permission request outside an active prompt")
                         response = permission_response(permission_params)
-                        if controller is not None:
-                            if method != "session/prompt" or not prompt_active:
-                                raise RuntimeError("Claude ACP permission request outside an active prompt")
+                        tool = permission_params.get("toolCall")
+                        meta = tool.get("_meta") if isinstance(tool, dict) else None
+                        claude_meta = meta.get("claudeCode") if isinstance(meta, dict) else None
+                        tool_name = claude_meta.get("toolName") if isinstance(claude_meta, dict) else None
+                        if controller is not None and isinstance(tool_name, str) and tool_name.startswith("mcp__claude_ai__"):
                             try:
                                 decision = controller.on_permission(session_id, json.loads(json.dumps(permission_params)))
                                 options = permission_params.get("options")
-                                matches = [o for o in options if isinstance(o, dict)] if isinstance(options, list) else []
-                                selected = next((o for o in matches if (o.get("optionId") or o.get("id")) == decision.get("optionId") and o.get("kind") == decision.get("kind") and o.get("kind") in {"allow_once", "reject_once"}), None) if isinstance(decision, dict) else None
+                                matches = [option for option in options if isinstance(option, dict)] if isinstance(options, list) else []
+                                selected = next((option for option in matches if (option.get("optionId") or option.get("id")) == decision.get("optionId") and option.get("kind") == decision.get("kind") and option.get("kind") in {"allow_once", "reject_once"}), None) if isinstance(decision, dict) else None
                                 if selected is None:
                                     raise RuntimeError("Claude ACP controller selected an unoffered or unsafe permission option")
                                 response = {"outcome": {"outcome": "selected", "optionId": selected.get("optionId") or selected.get("id")}}
                             except Exception:
                                 with contextlib.suppress(Exception):
-                                    self._send(proc, {"jsonrpc":"2.0", "id":message.get("id"), "result":{"outcome":{"outcome":"cancelled"}}})
+                                    self._send(proc, {"jsonrpc": "2.0", "id": message.get("id"), "result": {"outcome": {"outcome": "cancelled"}}})
                                 raise
                         self._send(proc, {
                             "jsonrpc": "2.0",
@@ -1409,12 +1413,23 @@ class ClaudeACPClient:
                         if update_type in {"tool_call", "tool_call_update"} and method != "session/prompt":
                             raise RuntimeError("Claude ACP emitted a tool event outside an active prompt")
                         if update_type in {"tool_call", "tool_call_update"} and controller is not None:
+                            tool_call_id = update.get("toolCallId")
+                            meta = update.get("_meta")
+                            claude_meta = meta.get("claudeCode") if isinstance(meta, dict) else None
+                            native_name = claude_meta.get("toolName") if isinstance(claude_meta, dict) else None
+                            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                                raise RuntimeError("Claude ACP native tool event has no valid toolCallId")
+                            if not isinstance(native_name, str) or not native_name.strip():
+                                raise RuntimeError("Claude ACP native tool event has no valid tool name")
+                            if "rawInput" in update and not isinstance(update["rawInput"], dict):
+                                raise RuntimeError("Claude ACP native tool event rawInput must be an object")
                             event_size = len(json.dumps(update, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
                             response_chars += event_size
                             if response_chars > _MAX_RESPONSE_CHARS:
                                 raise RuntimeError("Claude ACP response exceeded the size limit")
+                            controller_update = json.loads(json.dumps(update))
                             try:
-                                controller.on_tool_event(session_id, json.loads(json.dumps(update)))
+                                controller.on_tool_event(session_id, controller_update)
                             except Exception:
                                 raise RuntimeError("Claude ACP native tool event controller failed") from None
                         if update_type == "agent_message_chunk":
