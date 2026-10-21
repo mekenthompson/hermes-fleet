@@ -63,6 +63,20 @@ class ClaudeWireTests(unittest.TestCase):
         self.assertIsNone(response.choices[0].message.tool_calls)
         self.assertTrue(client.is_closed)
 
+    def test_trusted_internal_controller_may_select_only_offered_allow_once(self):
+        module = self.module
+        class Trusted(module.ClaudeACPClient):
+            def _new_native_controller(self):
+                class Controller:
+                    def on_tool_event(self, session_id, update): pass
+                    def on_permission(self, session_id, params):
+                        return {"optionId": "allow-once", "kind": "allow_once"}
+                return Controller()
+        client = Trusted(command=sys.executable, args=[str(PEER), "permission_bash"], acp_cwd=self.home.name)
+        self.addCleanup(client.close)
+        response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
+        self.assertEqual(response.choices[0].message.content.strip(), "allowed-native-bash")
+
     def test_new_tool_name_and_metadata_only_update_require_real_bridge_capture(self):
         client = self.client("bridge")
         response = client.chat.completions.create(messages=[{"role": "user", "content": "test"}], tools=TOOLS, timeout=10)
