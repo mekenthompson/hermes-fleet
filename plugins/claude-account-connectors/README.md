@@ -1,7 +1,25 @@
 # Claude account connectors (experimental)
 
-This optional plugin is disabled unless explicitly enabled in the Hermes plugin manager. It is experimental and is **not production-qualified**. The host must independently authorize each exact native connector tool; discovery does not authorize execution. Claude Code `permissions.ask: ["mcp__*"]` is intended to intercept inherited connector pre-allows. Native/profile allow policy remains independently required. Native and bridge tools remain denied, hooks stay disabled, permission bypass stays false, and the provider's ordinary DirectSDK behavior is unchanged.
+Optional Hermes tools using the existing Claude ACP subscription runtime, independent of the main model provider. Disabled by default. **Not production-qualified:** offline transport tests pass, but authenticated discovery/execution and complete permission mediation remain live acceptance gates. Do not enable on production profiles yet.
 
-`claude_connector_search(query)` performs discovery only. `claude_connector_call(tool, arguments)` accepts exact `mcp__claude_ai_<server>__<tool>` references and forwards only host-correlated raw output. Missing native tool execution is `no_execution`; transport loss after observed approval is `unknown_outcome` with `retry: false`. Assistant prose is never proof of connector success. Tool schemas are not exported as authority.
+- `claude_connector_search(query)` returns actual native `tool_reference` names filtered by existing profile authority. It does not export or invent JSON Schemas.
+- `claude_connector_call(tool, arguments)` requests one exact native tool and JSON argument object. Claude Code owns schema validation. The host compares type-sensitive argument values and consumes a single permission budget before selecting the offered `allow_once` option.
+- Only correlated terminal native results count. Assistant prose, XML and claims of success do not.
+- `no_execution` means no verified operation; `unknown_outcome` means approval was issued but the result cannot be established. `retry: false` prohibits automatic replay. A native terminal error is `failed`.
+- Every invocation uses additional ACP model inference. Worker usage and elapsed time are returned separately; they are not DirectSDK usage.
 
-Enabling requires a host-provided trusted transport binding; users cannot select credentials, config directories, launchers, or arbitrary prompts. A missing native tool event or correlated raw output is `no_execution`, not success; only transport loss after an observed approval is `unknown_outcome`, retry disabled. Do not enable for live accounts until the parent adapter's session/call correlation, `rawInput`, `mcpServer.source == claudeai` metadata, and one-use permission behavior have been qualified against the pinned native runtime. A setup/init with no connector server and no native tool event is explicitly `no_execution`. No live qualification is claimed by unit tests.
+## Runtime and authority
+
+Uses the sibling `model-providers/claude-acp/client.py`, its reviewed executable guard, subscription launcher, own-profile `CLAUDE_CONFIG_DIR`, bounded transport and process cleanup. No caller-selected credential paths, launchers or environment. DirectSDK and ordinary ACP provider behavior are unchanged.
+
+The dedicated worker removes connector autoapprovals from `allowedTools` and supplies `permissions.ask: ["mcp__*"]`, preserving native and profile denies, user settings and disabled hooks/bypass. Ask takes precedence over allow per the Claude permission contract. A host controller rejects non-target, altered, repeated or uncorrelated permission requests and requires Claude.ai server provenance. Profile policy is re-read before an approval; unsupported rule syntax fails closed. Managed vendor denies remain enforced by Claude Code.
+
+These guarantees require qualification on the pinned native runtime. Posthoc result rejection is not proof of before-effect enforcement. Tests use a deterministic wire peer, not a model or external connector service.
+
+## Configuration after qualification
+
+Install beside the Fleet ACP provider. Explicit plugin settings are `enabled: true`, `model` (default `sonnet`; also `haiku`, `opus`, `opus[1m]`) and `timeout` (1–180 seconds, default 90). Registration reads settings through Hermes `ctx.get_config`; it never accepts a callable backend in configuration. The `claude_account_connectors` toolset must be selected for the intended surface. Enabling the plugin does not create connector grants or log in an account.
+
+## Verification
+
+Run the canonical repository unittest suite, including `tests/test_claude_account_connectors.py`, then `python scripts/verify-public-tree.py`. Authenticated read-only acceptance must separately prove real discovery, exact read results, nonempty arguments, altered/repeated/other-connector rejection and cancellation. No send/post is necessary for read qualification; writes require separately authorized acceptance.
