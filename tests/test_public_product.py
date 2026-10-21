@@ -214,6 +214,13 @@ class PublicProductTests(unittest.TestCase):
             if b"\0" in data:
                 continue
             text = data.decode("utf-8", errors="ignore").lower()
+            # Ordinary replay terminology is not a profile identity. Keep the
+            # substring guard for all other text, including compound names.
+            ordinary_words = r"(?<![a-z])(?:carrier|carriers|carried|carries)(?![a-z])"
+            identity = "car" + "rie"
+            for spelling in (identity, f"hermes-{identity}", f"profile_{identity}", f"{identity}bot"):
+                self.assertIn(identity, re.sub(ordinary_words, "", spelling))
+            text = re.sub(ordinary_words, "", text)
             for identity in prohibited:
                 with self.subTest(path=relative, identity=identity):
                     self.assertNotIn(identity, text)
