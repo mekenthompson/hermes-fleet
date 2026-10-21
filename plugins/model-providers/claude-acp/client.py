@@ -1139,6 +1139,10 @@ class ClaudeACPClient:
         )
         return completion
 
+    def _session_options(self, advertised_names: set[str]) -> dict[str, Any]:
+        """Build session settings; trusted subclasses may narrowly restrict them."""
+        return claude_code_session_options(advertised_names)
+
     def _new_native_controller(self):
         """Return a trusted internal native-tool controller, if configured."""
         return None
@@ -1537,7 +1541,7 @@ class ClaudeACPClient:
                         "args": proxy_args,
                     }
                 }
-            options = claude_code_session_options(advertised_names)
+            options = self._session_options(advertised_names)
             options["mcpServers"] = bridge_config
             session = request("session/new", {
                 "cwd": self._cwd,

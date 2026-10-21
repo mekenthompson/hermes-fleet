@@ -52,6 +52,17 @@ class NativeControllerTests(unittest.TestCase):
     def complete(self, client, model=None):
         return client.chat.completions.create(model=model, messages=[{"role": "user", "content": "fixture"}], timeout=3)
 
+    def test_trusted_session_options_override_is_used_without_changing_default(self):
+        base_options = self.module.claude_code_session_options
+        self.assertEqual(base_options(set()), self.module.ClaudeACPClient()._session_options(set()))
+        class Restricted(self.module.ClaudeACPClient):
+            def _session_options(self, advertised_names):
+                options = super()._session_options(advertised_names)
+                options["disallowedTools"] = [*options["disallowedTools"], "mcp__claude_ai_*"]
+                return options
+        client = Restricted()
+        self.assertIn("mcp__claude_ai_*", client._session_options(set())["disallowedTools"])
+
     def test_default_rejects_connector(self):
         result = self.complete(self.client({}))
         self.assertEqual(json.loads(result.choices[0].message.content)["optionId"], "no")
