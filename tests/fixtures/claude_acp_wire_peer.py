@@ -39,9 +39,11 @@ for line in sys.stdin:
     if pending_permission_id is not None and message.get("id") == pending_permission_id:
         outcome = (message.get("result") or {}).get("outcome") or {}
         assert outcome.get("outcome") == "selected", message
-        assert outcome.get("optionId") == "reject", message
+        expected = "allow-once" if mode == "permission_connector" else "reject"
+        assert outcome.get("optionId") == expected, message
         pending_permission_id = None
-        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "rejected-native-bash"}})
+        text = "allowed-native-connector" if mode == "permission_connector" else "rejected-native-bash"
+        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}})
         send({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": "end_turn"}})
         continue
     result: dict[str, object] = {}
@@ -55,7 +57,7 @@ for line in sys.stdin:
     elif method == "session/new":
         options = message["params"]["_meta"]["claudeCode"]["options"]
         assert options["allowDangerouslySkipPermissions"] is False
-        if mode in {"bridge", "forged", "permission_bash"}:
+        if mode in {"bridge", "forged", "permission_bash", "permission_connector"}:
             servers = message["params"].get("mcpServers")
             assert servers == [], (
                 "top-level mcpServers must stay empty; an untyped stdio entry "
@@ -77,13 +79,16 @@ for line in sys.stdin:
             result = {"configOptions": [dict(MODEL_OPTION, currentValue=applied)]}
     elif method == "session/prompt":
         prompt_id = message["id"]
-        if mode == "permission_bash":
+        if mode in {"permission_bash", "permission_connector"}:
             pending_permission_id = "perm-1"
             send({"jsonrpc": "2.0", "id": pending_permission_id, "method": "session/request_permission",
                   "params": {
                       "sessionId": session_id,
-                      "toolCall": {"toolCallId": "bash-1", "title": "Bash", "kind": "execute",
-                                   "rawInput": {"command": "gh pr view 1"}},
+                      "toolCall": {"toolCallId": "connector-1" if mode == "permission_connector" else "bash-1",
+                                   "title": "Connector action" if mode == "permission_connector" else "Bash",
+                                   "kind": "fetch" if mode == "permission_connector" else "execute",
+                                   "_meta": {"claudeCode": {"toolName": "mcp__claude_ai__search" if mode == "permission_connector" else "Bash"}},
+                                   "rawInput": {"query": "fixture"} if mode == "permission_connector" else {"command": "gh pr view 1"}},
                       "options": BASH_PERMISSION_OPTIONS,
                   }})
             continue
