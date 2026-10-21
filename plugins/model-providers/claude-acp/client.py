@@ -1139,6 +1139,10 @@ class ClaudeACPClient:
         )
         return completion
 
+    def _new_native_controller(self):
+        """Return a trusted internal native-tool controller, if configured."""
+        return None
+
     def _run(
         self,
         messages: list[dict[str, Any]],
@@ -1150,6 +1154,7 @@ class ClaudeACPClient:
         prepared: tuple[str, list[dict[str, str]]] | None = None,
     ) -> tuple[str, str, list[SimpleNamespace], dict[str, Any]]:
         del requirement  # The completion owns the shared absolute deadline.
+        controller = self._new_native_controller()
         assert_reviewed_claude_code_version(timeout=max(0.01, self._deadline - time.monotonic()))
         schema_path = ""
         bridge_dir = ""
@@ -1358,10 +1363,26 @@ class ClaudeACPClient:
                         permission_params = raw_params if isinstance(raw_params, dict) else {}
                         if permission_params.get("sessionId") != session_id:
                             raise RuntimeError("Claude ACP permission request does not match the active session")
+                        response = permission_response(permission_params)
+                        if controller is not None:
+                            if method != "session/prompt" or not prompt_active:
+                                raise RuntimeError("Claude ACP permission request outside an active prompt")
+                            try:
+                                decision = controller.on_permission(session_id, json.loads(json.dumps(permission_params)))
+                                options = permission_params.get("options")
+                                matches = [o for o in options if isinstance(o, dict)] if isinstance(options, list) else []
+                                selected = next((o for o in matches if (o.get("optionId") or o.get("id")) == decision.get("optionId") and o.get("kind") == decision.get("kind") and o.get("kind") in {"allow_once", "reject_once"}), None) if isinstance(decision, dict) else None
+                                if selected is None:
+                                    raise RuntimeError("Claude ACP controller selected an unoffered or unsafe permission option")
+                                response = {"outcome": {"outcome": "selected", "optionId": selected.get("optionId") or selected.get("id")}}
+                            except Exception:
+                                with contextlib.suppress(Exception):
+                                    self._send(proc, {"jsonrpc":"2.0", "id":message.get("id"), "result":{"outcome":{"outcome":"cancelled"}}})
+                                raise
                         self._send(proc, {
                             "jsonrpc": "2.0",
                             "id": message.get("id"),
-                            "result": permission_response(permission_params),
+                            "result": response,
                         })
                         continue
                     if server_method and message.get("id") is not None and server_method != "session/update":
@@ -1387,6 +1408,15 @@ class ClaudeACPClient:
                         update_type = update.get("sessionUpdate")
                         if update_type in {"tool_call", "tool_call_update"} and method != "session/prompt":
                             raise RuntimeError("Claude ACP emitted a tool event outside an active prompt")
+                        if update_type in {"tool_call", "tool_call_update"} and controller is not None:
+                            event_size = len(json.dumps(update, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+                            response_chars += event_size
+                            if response_chars > _MAX_RESPONSE_CHARS:
+                                raise RuntimeError("Claude ACP response exceeded the size limit")
+                            try:
+                                controller.on_tool_event(session_id, json.loads(json.dumps(update)))
+                            except Exception:
+                                raise RuntimeError("Claude ACP native tool event controller failed") from None
                         if update_type == "agent_message_chunk":
                             chunk = _content(update.get("content"))
                             response_chars += len(chunk)
