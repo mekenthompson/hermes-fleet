@@ -127,6 +127,44 @@ class GraphQLErrorDetailTests(unittest.TestCase):
         self.assertFalse(any("quota exhausted" in record.getMessage() for record in records))
         self.assertFalse(any(TOKEN in record.getMessage() for record in records))
 
+    def test_graphql_diagnostic_redacts_secrets_and_bounds_untrusted_text(self) -> None:
+        secret = "Bearer synthetic-bearer-token"
+        api_secret = "api_key=synthetic-api-key-value"
+        url = "https://alice:password@example.invalid/path"
+        message = f"bad input {secret} {api_secret} {url}\r\nforged log line " + ("x" * 5000)
+        api, _seen = self._client({"errors": [{"message": message,
+                                                  "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}]})
+        logger, handler, records, previous = self._records()
+        try:
+            with self.assertRaises(linear_api.LinearError) as caught:
+                api.graphql("query SafeName { viewer { id } }")
+        finally:
+            self._release(logger, handler, previous)
+
+        diagnostic = str(caught.exception)
+        self.assertIn("GRAPHQL_VALIDATION_FAILED", diagnostic)
+        self.assertIn("bad input", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("synthetic-api-key-value", diagnostic)
+        self.assertNotIn("alice:password", diagnostic)
+        self.assertNotIn("\\n", diagnostic)
+        self.assertNotIn("\\r", diagnostic)
+        self.assertLessEqual(len(diagnostic), 600)
+        self.assertTrue(records)
+        self.assertTrue(all(len(record.getMessage()) <= 600 for record in records))
+        self.assertFalse(any(secret in record.getMessage() or "alice:password" in record.getMessage()
+                             for record in records))
+
+    def test_transport_oserror_does_not_leak_exception_or_traceback(self) -> None:
+        secret = "synthetic-api-key-value"
+        def transport(*_args):
+            raise OSError(f"connect https://user:pass@example.invalid/ Bearer {secret}\r\nforged")
+        api = linear_api.LinearAPI(lambda: TOKEN, transport=transport)
+        with self.assertRaises(linear_api.LinearError) as caught:
+            api.graphql("query SafeName { viewer { id } }")
+        self.assertEqual(str(caught.exception), "Linear unreachable (OSError)")
+        self.assertIsNone(caught.exception.__cause__)
+
 
 if __name__ == "__main__":
     unittest.main()

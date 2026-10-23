@@ -49,7 +49,7 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
     raise LinearError(f"Linear {mutation} response did not confirm success")
 
 def _graphql_rejection(errors: Any) -> str:
-    """Log each GraphQL message and code, then keep them on the stable prefix."""
+    """Keep bounded, redacted GraphQL detail beside the stable error prefix."""
     parts: list[str] = []
     log = logging.getLogger("linear")
     for error in errors if isinstance(errors, list) else []:
@@ -59,13 +59,24 @@ def _graphql_rejection(errors: Any) -> str:
         raw_extensions = error.get("extensions")
         extensions = raw_extensions if isinstance(raw_extensions, dict) else {}
         code = extensions.get("code")
-        log.error("linear: GraphQL error message=%s code=%s", message, code)
-        text = message.strip() if isinstance(message, str) else ""
+        text = _safe_diagnostic_text(message, 360)
+        safe_code = _safe_diagnostic_text(code, 80)
+        log.error("linear: GraphQL error message=%s code=%s", text, safe_code)
         if text and code:
-            parts.append(f"{text} ({code})")
+            parts.append(f"{text} ({safe_code})")
         elif text or code:
-            parts.append(text or str(code))
+            parts.append(text or safe_code)
     return "Linear GraphQL error" + (f": {'; '.join(parts)}" if parts else "")
+
+def _safe_diagnostic_text(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", value).strip()
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", text)
+    text = re.sub(r"(?i)\b(?:api[_-]?key|token|secret)\s*[:=]\s*\S+", "[redacted]", text)
+    text = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", text)
+    text = text[:limit]
+    return re.sub(r"\s+", " ", text)
 
 def is_duplicate_create_error(errors: Any, client_id: str) -> bool:
     """True when Linear rejected a create because an entity with our client ``id`` exists.
@@ -275,7 +286,7 @@ class LinearAPI:
                 with guard() if guard else nullcontext():
                     status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
-                raise LinearError(f"Linear unreachable: {exc}") from exc
+                raise LinearError(f"Linear unreachable ({type(exc).__name__})") from None
             try:
                 payload = json.loads(raw or b"{}")
             except ValueError:
