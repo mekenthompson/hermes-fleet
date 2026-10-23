@@ -48,11 +48,12 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
         raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
     raise LinearError(f"Linear {mutation} response did not confirm success")
 
-def _graphql_rejection(errors: Any) -> str:
+def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
     """Keep bounded, redacted GraphQL detail beside the stable error prefix."""
     parts: list[str] = []
     log = logging.getLogger("linear")
-    for error in errors if isinstance(errors, list) else []:
+    entries = errors if isinstance(errors, list) else []
+    for error in entries[:3]:
         if not isinstance(error, dict):
             continue
         message = error.get("message")
@@ -60,12 +61,14 @@ def _graphql_rejection(errors: Any) -> str:
         extensions = raw_extensions if isinstance(raw_extensions, dict) else {}
         code = extensions.get("code")
         text = _safe_diagnostic_text(message, 360)
-        safe_code = _safe_diagnostic_text(code, 80)
-        log.error("linear: GraphQL error message=%s code=%s", text, safe_code)
-        if text and code:
+        safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", code) else ""
+        log.error("linear: GraphQL error request_kind=%s message=%s code=%s", request_kind, text, safe_code)
+        if text and safe_code:
             parts.append(f"{text} ({safe_code})")
-        elif text or code:
+        elif text or safe_code:
             parts.append(text or safe_code)
+    if len(entries) > 3:
+        parts.append("additional errors omitted")
     return "Linear GraphQL error" + (f": {'; '.join(parts)}" if parts else "")
 
 def _safe_diagnostic_text(value: Any, limit: int) -> str:
@@ -74,6 +77,9 @@ def _safe_diagnostic_text(value: Any, limit: int) -> str:
     text = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", value).strip()
     text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", text)
     text = re.sub(r"(?i)\b(?:api[_-]?key|token|secret)\s*[:=]\s*\S+", "[redacted]", text)
+    text = re.sub(
+        r'''(?i)(["']?(?:access[_-]?token|refresh[_-]?token|token|password|secret|api[_-]?key|authorization)["']?\s*[:=]\s*["']?)[^"'&\s,}]+''',
+        r"\1[redacted]", text)
     text = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[redacted]@", text)
     text = text[:limit]
     return re.sub(r"\s+", " ", text)
@@ -286,7 +292,8 @@ class LinearAPI:
                 with guard() if guard else nullcontext():
                     status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
-                raise LinearError(f"Linear unreachable ({type(exc).__name__})") from None
+                category = "network error" if isinstance(exc, TimeoutError) else "OS error"
+                raise LinearError(f"Linear unreachable ({category})") from None
             try:
                 payload = json.loads(raw or b"{}")
             except ValueError:
@@ -314,7 +321,10 @@ class LinearAPI:
         if status == 403:
             raise LinearError("Linear refused this app (HTTP 403); check its scopes", retryable=False)
         if errors:
-            raise LinearError(_graphql_rejection(errors), errors=errors, retryable=False)
+            request_kind = "mutation" if query.lstrip().startswith("mutation") else "query"
+            duplicate_check = request_kind == "mutation" and "mutation Create(" in query
+            raise LinearError(_graphql_rejection(errors, request_kind),
+                              errors=errors if duplicate_check else None, retryable=False)
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
         return payload["data"]

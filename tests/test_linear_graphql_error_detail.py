@@ -83,7 +83,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
             self._release(logger, handler, previous)
 
         self.assertFalse(caught.exception.retryable)
-        self.assertEqual(caught.exception.errors, payload["errors"])
+        self.assertIsNone(caught.exception.errors)  # raw payload is retained only for create deduplication
         self.assertTrue(str(caught.exception).startswith("Linear GraphQL error"))
         self.assertIn(MESSAGE, str(caught.exception))
         self.assertIn(CODE, str(caught.exception))
@@ -147,13 +147,51 @@ class GraphQLErrorDetailTests(unittest.TestCase):
         self.assertNotIn(secret, diagnostic)
         self.assertNotIn("synthetic-api-key-value", diagnostic)
         self.assertNotIn("alice:password", diagnostic)
-        self.assertNotIn("\\n", diagnostic)
-        self.assertNotIn("\\r", diagnostic)
+        self.assertNotIn("\n", diagnostic)
+        self.assertNotIn("\r", diagnostic)
         self.assertLessEqual(len(diagnostic), 600)
         self.assertTrue(records)
         self.assertTrue(all(len(record.getMessage()) <= 600 for record in records))
         self.assertFalse(any(secret in record.getMessage() or "alice:password" in record.getMessage()
                              for record in records))
+
+    def test_graphql_diagnostic_redacts_embedded_credentials_and_bounds_error_list(self) -> None:
+        secrets = ("synthetic-secret",)
+        messages = [
+            '{"token": "synthetic-secret"}',
+            "https://example.invalid/?access_token=synthetic-secret",
+            "ordinary validation detail",
+            "password=synthetic-secret",
+        ] + [f"extra benign error {i}" for i in range(200)]
+        errors = [{"message": message, "extensions": {"code": "SAFE_CODE"}} for message in messages]
+        api, _seen = self._client({"errors": errors})
+        logger, handler, records, previous = self._records()
+        try:
+            with self.assertRaises(linear_api.LinearError) as caught:
+                api.graphql("query UntrustedOperationName { viewer { id } }")
+        finally:
+            self._release(logger, handler, previous)
+        diagnostic = str(caught.exception)
+        logged = "\n".join(record.getMessage() for record in records)
+        for text in (diagnostic, logged):
+            for secret in secrets:
+                self.assertNotIn(secret, text)
+            self.assertNotIn("UntrustedOperationName", text)
+            self.assertIn("ordinary validation detail", text)
+            self.assertLessEqual(len(text), 1600)
+        self.assertLessEqual(len(records), 4)
+        self.assertLessEqual(diagnostic.count("SAFE_CODE"), 4)
+        self.assertIn("request_kind=query", logged)
+
+    def test_transport_diagnostic_uses_known_category_for_custom_oserror(self) -> None:
+        class CredentialBearingError(TimeoutError):
+            pass
+        def transport(*_args):
+            raise CredentialBearingError("secret diagnostic")
+        api = linear_api.LinearAPI(lambda: TOKEN, transport=transport)
+        with self.assertRaises(linear_api.LinearError) as caught:
+            api.graphql("query { viewer { id } }")
+        self.assertEqual(str(caught.exception), "Linear unreachable (network error)")
 
     def test_transport_oserror_does_not_leak_exception_or_traceback(self) -> None:
         secret = "synthetic-api-key-value"
@@ -162,7 +200,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
         api = linear_api.LinearAPI(lambda: TOKEN, transport=transport)
         with self.assertRaises(linear_api.LinearError) as caught:
             api.graphql("query SafeName { viewer { id } }")
-        self.assertEqual(str(caught.exception), "Linear unreachable (OSError)")
+        self.assertEqual(str(caught.exception), "Linear unreachable (OS error)")
         self.assertIsNone(caught.exception.__cause__)
 
 
