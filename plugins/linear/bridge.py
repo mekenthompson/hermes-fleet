@@ -681,6 +681,19 @@ class Bridge:
             elif retryable:
                 raise
             return False
+    def _request_current(self, issue_id: str, stamp: float, *, claim: bool = False,
+                         seen: str | None = None) -> bool:
+        """Recheck tracker business state after waits; native authority still admits the mutation."""
+        if self._queued_stop(issue_id, stamp):
+            raise LinearError("A newer Stop must be reconciled before this native request")
+        if claim:
+            issue = self._effect_issue(issue_id)
+            if seen == self.api.viewer_id() and not (issue.get("delegate") or {}).get("id"):
+                row = self.store.get(issue_id)
+                if row: self.release(row, "Delegation removed while native admission was pending")
+                return False
+            return self.may_write(issue, True, self.clock(), seen, stamp)
+        return self.may_execute_existing(issue_id, retryable=True, source_ms=stamp)
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
         if row and row.get("task_id") and not self.may_execute_existing(
@@ -802,10 +815,12 @@ class Bridge:
             reconcile_resume = resume and (needs_resume or resumed)
             body = "" if received else "\n\n".join(value for value in (note, context() if context else "") if value)
             def deliver() -> bool:
+                if not self._request_current(issue_id, stamp): return False
                 if not received:
                     self.kanban.comment(task.id, body, marker=key)
                 # Only verified assignment requests resumption; comments do not unblock.
-                return not needs_resume or self.kanban.unblock(task.id, marker=key, origin_comment_key=key)
+                return not needs_resume or (self._request_current(issue_id, stamp)
+                    and self.kanban.unblock(task.id, marker=key, origin_comment_key=key))
             if not self._require_effect(issue_id) or not self.store.activate_task(issue_id, task.id, deliver):
                 return False
             fields = {"last_updated_at": max(stamp, current["last_updated_at"])}
@@ -825,8 +840,8 @@ class Bridge:
                       if r["task_id"] == row["task_id"]), None)
         self.store.retire(row["issue_id"], row["task_id"], self.kanban.retirement(row["task_id"], prior))
     def _acknowledge(self, issue_id: str, session_id: str, stamp: float) -> None:
-        """Advisory: answer within seconds, before Kanban or ownership work. Ownership, not this receipt,
-        admits work; a rejected or lost acknowledgement never blocks the task."""
+        """Report receipt before native admission; an acknowledgement grants no execution authority.
+        A rejected or lost acknowledgement never blocks an already-authorized native task."""
         ack_id = stable_uuid4("linear-session-received", issue_id, session_id)
         self.store.enqueue("activity", {"id": ack_id, "issue_id": issue_id, "session_id": session_id,
                            "initial_ack": True, "source_ms": stamp, "requester_sessions": {issue_id: session_id},
@@ -963,6 +978,7 @@ class Bridge:
             return False
         def activate() -> bool:
             self.kanban.subscribe(task.id, issue_id)
+            if not self._request_current(issue_id, stamp, claim=True, seen=delegate): return False
             if not staged: return True
             anchor = self.kanban.initial_admission_event(task.id)
             return anchor is not None and self.kanban.unblock(task.id, marker=key + ":initial-admission",
@@ -974,7 +990,7 @@ class Bridge:
                                 "content": {"type": "thought", "body": "On it. Reading the ticket."},
                                 **route}),
                   ("status", {"issue_id": issue_id, "state": "in_progress", "claim": True,
-                              "seen": me, "source_ms": stamp, "terminal": False, **route})]
+                              "seen": delegate, "source_ms": stamp, "terminal": False, **route})]
         if not existing and not self.store.put(issue_id, "kanban", session_id, task_id=task.id,
                                                project_id=project, last_updated_at=stamp):
             self.kanban.archive(task.id)
@@ -1226,6 +1242,10 @@ class Bridge:
         me = self.api.viewer_id()
         seen = me if seen == "self" else seen
         delegate = issue.get("delegate") or {}
+        if delegate.get("id") not in (None, me):
+            row = self.store.get(issue["id"])
+            if row: self.takeover(row, issue)
+            return False
         started = (issue.get("state") or {}).get("type")
         fence = source_ms if source_ms is not None else queued_at * 1000
         updated = self.closure_ms(issue) if source_ms is not None and started in CLOSED else iso_ms(issue.get("updatedAt"))

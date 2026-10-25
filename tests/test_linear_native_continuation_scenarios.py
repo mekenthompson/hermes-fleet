@@ -620,6 +620,63 @@ class NativeContinuationScenarios(unittest.TestCase):
         self.assertEqual((after.status, after.current_run_id, after.claim_lock),
                          (before.status, before.current_run_id, before.claim_lock))
 
+    def test_human_change_during_thread_fetch_prevents_instruction_and_resume(self):
+        from linear_fake_api import OTHER
+        for request in ("assignment", "followup"):
+            for change in ("reassign", "close"):
+                with self.subTest(request=request, change=change):
+                    issue = f"thread-race-{request}-{change}"
+                    session = "session-" + issue
+                    self.remote.add_issue(issue, "THREAD-RACE")
+                    self.remote.set_delegate(issue, {"id": SELF})
+                    self.bridge.handle_webhook(self.remote.session_event("created", issue, session))
+                    self.bridge.flush()
+                    task_id = self.store.get(issue)["task_id"]
+                    self.assertTrue(self.board.block(task_id, "Awaiting an authorized continuation"))
+                    self.clock.now += 1
+                    event = self.remote.session_event("created" if request == "assignment" else "prompted",
+                        issue, "new-" + session if request == "assignment" else session,
+                        body="Continue the remaining work", activity_id="race-" + issue)
+                    inbox = self.queue(event, "delivery-" + issue)
+                    thread = self.bridge._thread
+                    def changed_thread(*args, **kwargs):
+                        result = thread(*args, **kwargs)  # retain the actual HTTP thread read
+                        self.clock.now += 1
+                        if change == "reassign": self.remote.set_delegate(issue, OTHER)
+                        else: self.remote.set_state(issue, "Done")
+                        return result
+                    with patch.object(self.bridge, "_thread", side_effect=changed_thread):
+                        self.bridge.drain_ingress(inbox)
+                    with self.board.conn() as conn:
+                        self.assertFalse(kb.claim_task(conn, task_id))
+                        self.assertEqual(kb.list_comments(conn, task_id), [])
+                    self.assertNotIn(self.board.get(task_id).status, ("ready", "running"))
+
+    def test_human_change_during_subscription_prevents_initial_native_activation(self):
+        from linear_fake_api import OTHER
+        for change in ("reassign", "close", "remove-delegate"):
+            with self.subTest(change=change):
+                issue, session = "initial-race-" + change, "initial-session-" + change
+                self.remote.add_issue(issue, "INITIAL-RACE")
+                self.remote.set_delegate(issue, {"id": SELF})
+                event = self.remote.session_event("created", issue, session)
+                subscribe = self.board.subscribe
+                def changed_subscribe(*args):
+                    subscribe(*args)
+                    self.clock.now += 1
+                    if change == "close": self.remote.set_state(issue, "Done")
+                    else: self.remote.set_delegate(issue, OTHER if change == "reassign" else None)
+                    # Current foreign assignment wins even if clocks/order stamps disagree.
+                    if change == "reassign": self.remote.issues[issue]["updatedAt"] = self.clock.iso(-10)
+                with patch.object(self.board, "subscribe", side_effect=changed_subscribe):
+                    self.bridge.handle_webhook(event)
+                with self.board.conn() as conn:
+                    task_id = conn.execute("SELECT id FROM tasks WHERE idempotency_key=?",
+                                           (f"linear:{issue}:{session}",)).fetchone()[0]
+                    task = kb.get_task(conn, task_id)
+                    self.assertNotIn(task.status, ("ready", "running"))
+                    self.assertFalse(kb.claim_task(conn, task.id))
+
 
 if __name__ == "__main__":
     unittest.main()
