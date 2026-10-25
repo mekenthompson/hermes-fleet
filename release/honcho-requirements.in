@@ -1,2 +1,3 @@
 honcho-ai==2.5.1
 honcho-cli==0.2.0
+certifi>=2026.10.19
