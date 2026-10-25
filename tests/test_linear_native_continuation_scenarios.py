@@ -461,7 +461,7 @@ class NativeContinuationScenarios(unittest.TestCase):
                         self.assertTrue(kb.complete_task(conn, task_id,
                             summary="Substantive retained findings needing reconciliation", metadata={}))
                     else:
-                        self.board.archive(task_id)
+                        kb.archive_task(conn, task_id)
                 # Exercise the actual additive migration, not a mocked provenance predicate.
                 with sqlite3.connect(self.store.path) as conn:
                     conn.execute("ALTER TABLE work DROP COLUMN linked_at")

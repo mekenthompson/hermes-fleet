@@ -61,7 +61,7 @@ class IngressBindingTests(unittest.TestCase):
         self.assertTrue(bridge._queued_stop("i", 0))
         self.assertFalse(bridge._queued_stop("other", 0))
         seen = []
-        with patch.object(bridge, "handle_webhook", side_effect=lambda event: seen.append(event["tag"])):
+        with patch.object(bridge, "handle_webhook", side_effect=lambda event, **context: seen.append(event["tag"])):
             bridge.drain_ingress(self.inbox, limit=1)
         self.assertEqual(seen, ["target-stop", "work"])
         self.assertEqual(self.statuses(), {"a-work": "imported", "z-stop": "imported", "foreign-stop": "pending"})
@@ -76,8 +76,10 @@ class IngressBindingTests(unittest.TestCase):
         bridge = Bridge(self.store, SimpleNamespace(), SimpleNamespace(executor_profile="default"),
                         profile="default", clock=lambda: now[0])
         seen = []
-        def handle(event):
+        retry_context = []
+        def handle(event, *, _attempted=False):
             seen.append(event["tag"])
+            retry_context.append(_attempted)
             if event["tag"].startswith("bad"): raise RuntimeError("synthetic failure")
         with patch.object(bridge, "handle_webhook", side_effect=handle):
             with self.assertLogs("linear", "ERROR"):
@@ -90,6 +92,7 @@ class IngressBindingTests(unittest.TestCase):
             self.assertTrue(all(r.levelname == "WARNING" and not r.exc_info for r in logs.records))
             bridge.drain_ingress(self.inbox)
             self.assertEqual(seen, ["bad-1", "bad-2", "good", "bad-1", "bad-2"])
+            self.assertEqual(retry_context, [False, False, False, True, True])
         with patch.object(bridge, "handle_webhook"):
             bridge.recover(self.inbox)  # a restart retries backed-off deliveries at once
         self.assertEqual(self.statuses(), {"bad-1": "imported", "bad-2": "imported", "good": "imported"})

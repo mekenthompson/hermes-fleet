@@ -220,7 +220,10 @@ class NativeGenerationScenarios(unittest.TestCase):
         self.clock.now += 10
         self.remote.set_state("issue-1", "Done")
         self.bridge.recheck(force=True)
-        self.assertEqual(self.board.get(self.task.id).status, "archived")
+        self.assertEqual(self.board.get(self.task.id).status, "blocked")
+        self.assertEqual(self.store.get("issue-1")["task_id"], self.task.id)
+        self.assertTrue(self.store.get("issue-1")["release_pending"])
+        self.assertEqual(self.store.retired("issue-1"), [])
 
     def test_human_reassignment_still_cancels_the_original_linear_execution(self):
         from linear_fake_api import OTHER
@@ -229,7 +232,10 @@ class NativeGenerationScenarios(unittest.TestCase):
         self.clock.now += 10
         self.remote.set_delegate("issue-1", OTHER)
         self.bridge.recheck(force=True)
-        self.assertEqual(self.board.get(self.task.id).status, "archived")
+        self.assertEqual(self.board.get(self.task.id).status, "blocked")
+        self.assertEqual(self.store.get("issue-1")["task_id"], self.task.id)
+        self.assertTrue(self.store.get("issue-1")["release_pending"])
+        self.assertEqual(self.store.retired("issue-1"), [])
 
     def test_new_native_completion_replaces_obsolete_queued_result_once(self):
         self.running()
@@ -393,7 +399,7 @@ class NativeGenerationScenarios(unittest.TestCase):
             self.remote.set_state("issue-1", "Done")
         else:
             self.remote.set_delegate("issue-1", OTHER)
-        with patch.object(self.board, "archive", side_effect=AssertionError("missing task must not be retired again")):
+        with patch.object(self.board.kb, "archive_task", side_effect=AssertionError("missing task must not be retired again")):
             self.bridge.recheck(force=True)
             self.bridge.recover()
             self.bridge.flush()

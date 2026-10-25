@@ -486,7 +486,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertNotIn('/private/', body)
                 self.assertNotIn('synthetic-secret', body)
 
-    def test_takeover_retains_original_requester_after_work_is_deleted(self):
+    def test_takeover_retains_original_requester_on_attempted_notice_and_native_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
             authority.sessions[SESSION]['appUser'] = {'id': VIEWER}
@@ -500,8 +500,14 @@ class DurableCloseoutTests(unittest.TestCase):
             store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
             bridge = Bridge(store, api, kanban, profile='synthetic')
             with api.requester_session(SESSION):
+                notice_id = bridge.comment(ISSUE, 'Historical reassignment notice', takeover=True)
+                store.retry(store.outbox_row(notice_id), 1, 'known prior delivery attempt')
                 bridge.takeover(store.get(ISSUE), authority.issues[ISSUE])
-            self.assertIsNone(store.get(ISSUE))
+            retained = store.get(ISSUE)
+            self.assertEqual(retained['task_id'], task.id)
+            self.assertTrue(retained['release_pending'])
+            self.assertEqual(kanban.get(task.id).status, 'ready')
+            self.assertEqual(store.retired(ISSUE), [])
             pending = Store(Path(directory) / 'state.db').pending(ISSUE)
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0]['payload'].get('requester_sessions'), {ISSUE: SESSION})

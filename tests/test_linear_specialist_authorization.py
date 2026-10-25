@@ -135,6 +135,13 @@ class FakeKanban:
     def get(self, task_id):
         return self.tasks.get(task_id)
 
+    def control_context(self, task_id):
+        task = self.get(task_id)
+        history = self.histories.get(task_id, [])
+        return {"event_id": history[-1].id if history else 1,
+                "run_id": getattr(task, "current_run_id", None), "assignee": getattr(task, "assignee", None),
+                "terminal": self.terminal_generation(task_id)} if task else None
+
     def terminal_generation(self, task_id):
         task = self.get(task_id)
         status = task.status if task else "missing"
@@ -193,7 +200,7 @@ class FakeKanban:
     def archive(self, task_id):
         self.tasks[task_id].status = "archived"
 
-    def block(self, task_id, _reason, *, marker=""):
+    def block(self, task_id, _reason, *, marker="", expected_event_id=None):
         if marker and (task_id, "block", marker) in self.lifecycle_receipts:
             return self.lifecycle_receipts[(task_id, "block", marker)]
         self.tasks[task_id].status = "blocked"
@@ -755,7 +762,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return task
         self.kanban.create = fenced_create
         self.bridge.handle_webhook(self.session_event())
-        self.assertEqual(self.kanban.tasks["task-1"].status, "archived")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertTrue(any("not reconciled" in body for _, body in self.kanban.comments))
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
         self.assertEqual(self.kanban.subscriptions, [])
@@ -767,7 +775,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return put(*args, **kwargs)
         self.store.put = fenced_put
         self.bridge.handle_webhook(self.session_event())
-        self.assertEqual(self.kanban.tasks["task-1"].status, "archived")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertTrue(any("not reconciled" in body for _, body in self.kanban.comments))
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
 
@@ -1338,17 +1347,29 @@ class SessionRequesterTests(unittest.TestCase):
 
     def test_recheck_takeover_keeps_original_requester_after_successor_reopens(self):
         task_id = LinearSpecialistAuthorizationTests.seed_kanban_work(self)
+        notice_id = self.bridge.comment(ISSUE, "Historical reassignment notice", takeover=True)
+        self.store.retry(self.store.outbox_row(notice_id), 1, "known prior delivery attempt")
         self.authority.issues[ISSUE]["delegate"] = {"id": "foreign", "name": "Other Agent"}
         self.bridge.recheck(force=True)
-        self.assertIsNone(self.store.get(ISSUE))
-        self.assertEqual(self.kanban.tasks[task_id].status, "archived")
-        [notice] = [row for row in self.store.pending(ISSUE) if row["kind"] == "comment"]
+        retained = self.store.get(ISSUE)
+        self.assertEqual(retained["task_id"], task_id)
+        self.assertTrue(retained["release_pending"])
+        self.assertEqual(self.kanban.tasks[task_id].status, "blocked")
+        notice = self.store.outbox_row(notice_id)
         self.assertEqual(notice["payload"]["requester_sessions"], {ISSUE: SESSION})
-        self.bridge.await_retired(ISSUE)
+        self.assertEqual(self.store.retired(ISSUE), [])
         successor = "successor-session"
         self.authority.sessions[successor] = {"id": successor, "issue": {"id": ISSUE},
                                              "creator": {"id": USER}, "appUser": {"id": VIEWER}}
-        self.assertTrue(self.store.put(ISSUE, "kanban", successor, task_id="successor-task", project_id=PROJECT, last_updated_at=1))
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        event = self.session_event()
+        event["agentSession"]["id"] = successor
+        event["createdAt"] = "2026-01-01T00:00:03Z"
+        self.bridge.handle_webhook(event)
+        self.assertEqual(self.store.get(ISSUE)["task_id"], task_id)
+        self.assertEqual(self.store.get(ISSUE)["owner_ref"], successor)
+        self.assertFalse(self.store.get(ISSUE)["release_pending"])
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready")
         self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
         reopened = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
                           self.kanban, profile="synthetic")
@@ -1358,6 +1379,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(reopened.store.outbox_row(notice["id"])["state"], "pending")
         self.assertTrue(reopened.store.scope_fenced(ISSUE))
+        self.assertEqual(self.kanban.tasks[task_id].status, "ready", "reporting denial cannot seize native execution")
 
     def test_post_ack_delegate_change_gates_worker_provisioning(self):
         cases = ((VIEWER, None, False, False), (None, None, False, True),
@@ -1381,7 +1403,7 @@ class SessionRequesterTests(unittest.TestCase):
                 self.assertEqual(len(self.kanban.creates), int(allowed))
                 self.assertEqual(self.store.get(ISSUE) is not None, allowed)
 
-    def test_recheck_retirement_continues_when_notice_authorization_refuses(self):
+    def test_recheck_native_cancellation_continues_when_notice_authorization_refuses(self):
         task_id = LinearSpecialistAuthorizationTests.seed_kanban_work(self)
         self.authority.issues[ISSUE]["delegate"] = {"id": "foreign"}
         original_issue, reads = self.api.issue, []
@@ -1392,8 +1414,10 @@ class SessionRequesterTests(unittest.TestCase):
             return original_issue(ref)
         self.api.issue = deny_notice
         self.bridge.recheck(force=True)
-        self.assertIsNone(self.store.get(ISSUE))
-        self.assertEqual(self.kanban.tasks[task_id].status, "archived")
+        self.assertEqual(self.store.get(ISSUE)["task_id"], task_id)
+        self.assertTrue(self.store.get(ISSUE)["release_pending"])
+        self.assertEqual(self.kanban.tasks[task_id].status, "blocked")
+        self.assertEqual(self.store.retired(ISSUE), [])
         self.assertEqual(self.store.pending(ISSUE), [])
 
     def test_session_claim_survives_a_later_issue_timestamp_without_a_delegate(self):

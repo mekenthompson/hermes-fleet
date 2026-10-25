@@ -513,6 +513,34 @@ class Store:
             if not self._effect_admitted(db, issue_id) or not db.execute(
                     "SELECT 1 FROM work WHERE issue_id=? AND task_id=?", (issue_id, task_id)).fetchone(): return False
             return action()
+    def native_request_context(self, request_id: str, capture: Callable[[], dict]) -> dict:
+        """Remember the original transport observation; native events authorize mutations."""
+        key = "native-request:" + request_id
+        with self._tx() as db:
+            saved = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if saved: return json.loads(saved["value"])
+            context = capture()
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?)", (key, json.dumps(context)))
+            return context
+    def native_issue_context(self, issue_id: str, identity: list, request_id: str, candidate: dict) -> tuple[str, dict]:
+        """Keep one observed remote change identity across unrelated timestamp updates."""
+        with self._tx() as db:
+            key = "native-issue-observation:" + issue_id
+            previous = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            saved = json.loads(previous["value"]) if previous else {}
+            if saved.get("identity") == identity:
+                request_id = saved["request_id"]
+            else:
+                db.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (key, json.dumps({"identity": identity, "request_id": request_id})))
+            return request_id, self.native_request_context(request_id, lambda: candidate)
+    def in_transaction(self) -> bool:
+        return getattr(self._local, "db", None) is not None
+    def invalidate_native_issue_observation(self, issue_id: str, request_id: str) -> None:
+        """A verified local mutation changed the observed remote business state."""
+        with self._tx() as db:
+            db.execute("DELETE FROM metadata WHERE key=? AND json_extract(value,'$.request_id')=?",
+                       ("native-issue-observation:" + issue_id, request_id))
     def fence_scope(self, issue_id: str, reason: str, *, at: float) -> None:
         """Persist a permanent authorization denial without deleting work or its evidence."""
         with self._tx() as db:

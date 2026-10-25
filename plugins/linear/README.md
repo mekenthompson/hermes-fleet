@@ -53,6 +53,11 @@ assignment may create a distinct increment only after predecessor effects and wo
 reconciled, using native task dependencies. Unknown legacy retirements or missing tasks retain
 their bindings and diagnostics until reconciliation; they never authorize archive or replay.
 
+Native control requests retain their original event expectation across external reads and lost
+responses. An old Stop or assignment cannot cancel or resume a newer run. A verified human
+cancellation requests native blocking and retains the task, reporting record and actual process
+state for reconciliation. Scope failures and failed reporting admission do not archive native work.
+
 Natural-language follow-ups are interpreted in the authenticated conversation and delivered once
 to the existing native task. Use stable native creation and comment request keys after lost
 responses. Status questions do not resume stopped work. Completed work returns status; additional

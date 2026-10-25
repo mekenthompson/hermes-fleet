@@ -383,32 +383,36 @@ class LinearKanbanScenarios(unittest.TestCase):
         task = self.bridge.kanban.create(title="Synthetic archive", assignee="alpha")
         self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.linear.set_delegate(ISSUE, {"id": SELF})
-        self.bridge.kanban.archive(task.id)
+        with self.bridge.kanban.conn() as conn:
+            self.assertTrue(kb.archive_task(conn, task.id))
         self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
         self.assertEqual(self.linear.activities, [])
         self.assertTrue(any("unfinished" in comment["body"].lower() for comment in self.linear.comments))
 
-    def test_session_free_worker_scope_fence_archives_worker(self):
+    def test_session_free_worker_scope_fence_preserves_native_execution(self):
         task = self.bridge.kanban.create(title="Synthetic scope", assignee="alpha", created_by="linear")
         self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.bridge.api.specialist_scope = object()
         self.bridge.store.fence_scope(ISSUE, "fixture scope revoked", at=self.clock())
         self.assertFalse(self.bridge.authorize_specialist_effect(ISSUE))
-        self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
+        self.assertEqual(self.bridge.kanban.get(task.id), task)
+        self.assertEqual(self.bridge.store.get(ISSUE)["task_id"], task.id)
+        self.assertFalse(self.bridge.store.retired(ISSUE))
         self.assertEqual(self.linear.activities, [])
         self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
 
-    def test_session_free_worker_cancellation_retires_worker_not_parent_chat(self):
+    def test_session_free_worker_cancellation_blocks_native_work_and_preserves_parent_chat(self):
         task = self.bridge.kanban.create(title="Synthetic cancel", assignee="alpha", created_by="linear")
         self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
+        before = self.bridge.store.get(ISSUE)
         self.linear.set_delegate(ISSUE, {"id": SELF})
         self.linear.set_state(ISSUE, "Canceled")
         self.bridge.recheck(force=True)
-        self.assertEqual(self.bridge.kanban.get(task.id).status, "archived")
-        self.assertTrue(self.bridge.store.retired(ISSUE))
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.bridge.kanban.get(task.id).status, "blocked")
+        retained = self.assert_retained_cancellation(before)
+        self.assertEqual(retained["owner_ref"], "parent-chat")
         self.assertEqual(self.injected, [])
         self.assertEqual(self.linear.activities, [])
 
@@ -513,6 +517,22 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def task_id(self) -> str:
         return self.bridge.store.get(ISSUE)["task_id"]
+
+    def assert_retained_cancellation(self, before):
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (before["task_id"], before["ownership_id"], before["linked_at"]))
+        self.assertTrue(retained["release_pending"])
+        self.assertIn("reconcil", retained["panel_note"].lower())
+        self.assertFalse(self.bridge.store.retired(ISSUE), "fresh cancellation creates no legacy retirement")
+        return retained
+
+    def seed_legacy_retirement(self, task_id, *, archived=True):
+        """Retained historical state, never produced by current Linear cancellation."""
+        self.bridge.store.retire(ISSUE, task_id, self.bridge.kanban.retirement(task_id))
+        if archived:
+            with self.bridge.kanban.conn() as conn:
+                self.assertTrue(kb.archive_task(conn, task_id))
 
     def complete(self, task_id: str, result: str) -> None:
         with self.bridge.kanban.conn() as conn:
@@ -870,18 +890,22 @@ class LinearKanbanScenarios(unittest.TestCase):
             conn.execute("UPDATE tasks SET worker_started_at=? WHERE id=?", (UNVERIFIED_WORKER_FINGERPRINT, task_id))
             conn.execute("UPDATE task_runs SET worker_started_at=? WHERE task_id=?", (UNVERIFIED_WORKER_FINGERPRINT, task_id))
 
-    def test_running_handoff_uses_core_archive_termination(self):
+    def test_running_handoff_uses_native_block_termination_and_preserves_history(self):
         self.delegate()
+        before = self.bridge.store.get(ISSUE)
         process = self._registered_child()
-        # Core escalates the verified worker from TERM to KILL.
+        # Native block escalates the verified worker from TERM to KILL.
         self.linear.set_delegate(ISSUE, OTHER)
         self.bridge.recheck(force=True)
         process.wait(timeout=10)
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.tasks(), [(before["task_id"], "blocked")])
+        retained = self.assert_retained_cancellation(before)
+        self.assertIn("external effects", retained["panel_note"])
         self.assertIsNotNone(process.poll())
 
     def test_blocked_handoff_fences_native_and_chat_until_worker_exit_across_restart(self):
         self.delegate()
+        before = self.bridge.store.get(ISSUE)
         old = self.task_id()
         process = self._registered_child()
         self._hold_unproven_worker(old)
@@ -890,19 +914,21 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.linear.set_delegate(ISSUE, OTHER)
         self.bridge.recheck(force=True)
         self.assertIsNone(process.poll())
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assert_retained_cancellation(before)
         self.bridge = self.make_bridge()
         self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
-        event = self.linear.session_event("created", ISSUE, "replacement")
+        event = self.linear.session_event("created", ISSUE, "resume-after-exit")
         with self.assertRaisesRegex(Exception, "still exiting"):
             self.bridge.handle_webhook(event)
-        self.assertEqual(self.tasks(), [(old, "archived")])
+        self.assertEqual(self.tasks(), [(old, "blocked")])
         reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, Context("other-chat", "chat")))
         self.assertFalse(reply["ok"])
         self.assertEqual(reply["code"], "native_execution_required")
         process.kill(); process.wait(timeout=10)
         self.deliver(event)
-        self.assertNotEqual(self.task_id(), old)
+        self.assertEqual(self.task_id(), old)
+        self.assertEqual(self.tasks(), [(old, "ready")])
+        self.assertFalse(self.bridge.store.get(ISSUE)["release_pending"])
         self.assertFalse(self.bridge.store.retired(ISSUE))
 
     def test_retirement_keeps_spawn_identity_after_core_task_delete(self):
@@ -912,8 +938,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self._hold_unproven_worker(old)
         with self.bridge.kanban.conn() as conn:
             kb.block_task(conn, old, reason="parked", kind="needs_input")
-        self.linear.set_delegate(ISSUE, OTHER)
-        self.bridge.recheck(force=True)
+        self.seed_legacy_retirement(old)
         with self.bridge.kanban.conn() as conn: kb.delete_archived_task(conn, old)
         self.bridge = self.make_bridge()
         with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
@@ -925,8 +950,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.delegate()
         task_id = self.task_id()
         with self.bridge.kanban.conn() as conn: self.assertTrue(kb.claim_task(conn, task_id))
-        self.linear.set_delegate(ISSUE, OTHER)
-        self.bridge.recheck(force=True)
+        self.seed_legacy_retirement(task_id)
         self.bridge = self.make_bridge()
         with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.await_retired(ISSUE)
         process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
@@ -940,24 +964,23 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.await_retired(ISSUE)
         self.assertFalse(self.bridge.store.retired(ISSUE))
 
-    def test_board_archive_before_snapshot_and_claim_after_snapshot_hold_replacements(self):
-        from unittest.mock import patch
+    def test_legacy_archive_and_late_claim_snapshots_hold_replacements(self):
         for interleaving in ("board_archive", "late_claim"):
             with self.subTest(interleaving=interleaving):
                 self.setUp(); self.delegate(); old = self.task_id()
                 if interleaving == "board_archive":
                     with self.bridge.kanban.conn() as conn:
                         self.assertTrue(kb.claim_task(conn, old))
-                        kb.archive_task(conn, old)
+                        self.assertTrue(kb.archive_task(conn, old))
                     self.bridge.pump_kanban()
+                    self.seed_legacy_retirement(old, archived=False)
                 else:
-                    original = self.bridge.kanban.archive
-                    def claim_before_archive(task):
-                        with self.bridge.kanban.conn() as conn: self.assertTrue(kb.claim_task(conn, task))
-                        original(task)
-                    self.linear.set_delegate(ISSUE, OTHER)
-                    with patch.object(self.bridge.kanban, "archive", side_effect=claim_before_archive):
-                        self.bridge.recheck(force=True)
+                    # Historical crash window: snapshot retained before a late claim,
+                    # then native archive before the worker registered its identity.
+                    self.seed_legacy_retirement(old, archived=False)
+                    with self.bridge.kanban.conn() as conn:
+                        self.assertTrue(kb.claim_task(conn, old))
+                        self.assertTrue(kb.archive_task(conn, old))
                 self.bridge = self.make_bridge(); self.bridge.recover()
                 self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
                 event = self.linear.session_event("created", ISSUE, "late-registration")
@@ -968,32 +991,29 @@ class LinearKanbanScenarios(unittest.TestCase):
                 process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
                 try:
                     with self.bridge.kanban.conn() as conn: dispatch._set_worker_pid(conn, old, process.pid)
-                    if interleaving == "board_archive":
-                        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.handle_webhook(event)
-                    else:
-                        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+                    with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+                    with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.handle_webhook(event)
                     self.assertEqual(self.tasks(), [(old, "archived")])
                     process.kill(); process.wait(timeout=10)
                     self.bridge.await_retired(ISSUE)
                     self.deliver(event)
-                    if interleaving == "board_archive":
-                        self.assertEqual(self.task_id(), old)
-                        self.assertEqual(self.tasks(), [(old, "archived")])
-                        self.assertIn("Native reconciliation", self.linear.activities[-1]["content"]["body"])
-                    else:
-                        self.assertNotEqual(self.task_id(), old)
+                    self.assertEqual(self.task_id(), old)
+                    self.assertEqual(self.tasks(), [(old, "archived")])
+                    self.assertFalse(self.bridge.store.retired(ISSUE))
+                    self.assertTrue(any("Native reconciliation" in a["content"]["body"]
+                                        for a in self.linear.activities))
                 finally:
                     if process.poll() is None: process.kill()
                     process.wait(timeout=10)
 
     def test_restart_fences_legacy_retirement_without_native_generation_proof(self):
-        from unittest.mock import patch
         self.delegate()
         old = self.task_id()
         process = self._registered_child()
+        # A historical snapshot survived a crash before retirement. Current
+        # recovery has no native generation proof and cannot complete that action.
+        self.seed_legacy_retirement(old, archived=False)
         self.linear.set_delegate(ISSUE, OTHER)
-        with patch.object(self.bridge.kanban, "archive", side_effect=RuntimeError("crash")):
-            with self.assertRaisesRegex(RuntimeError, "crash"): self.bridge.recheck(force=True)
         self.assertTrue(self.bridge.store.retired(ISSUE))
         before = self.bridge.kanban.get(old)
         self.bridge = self.make_bridge()
@@ -1016,8 +1036,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         process = self._registered_child()
         self._hold_unproven_worker(self.task_id())
         with self.bridge.kanban.conn() as conn: kb.block_task(conn, self.task_id(), reason="parked", kind="needs_input")
-        self.linear.set_delegate(ISSUE, OTHER)
-        self.bridge.recheck(force=True)
+        self.seed_legacy_retirement(self.task_id())
         with patch.object(dispatch, "_process_fingerprint", return_value=None):
             with self.assertRaisesRegex(Exception, "identity is unavailable"): self.bridge.await_retired(ISSUE)
         self.assertTrue(self.bridge.store.retired(ISSUE))
@@ -1067,24 +1086,27 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_takeover_by_delegate_change_is_pulled(self) -> None:
         self.delegate()
+        before = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         self.linear.set_delegate(ISSUE, OTHER)  # no webhook: pull-based
         self.clock.now += 6 * 60
         self.bridge.tick()
-        self.assertEqual(self.tasks(), [(task_id, "archived")])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
-        self.assertIn("Reassigned to Other Agent", self.linear.comments[-1]["body"])
+        self.assertEqual(self.tasks(), [(task_id, "blocked")])
+        retained = self.assert_retained_cancellation(before)
+        self.assertIn("Reassigned to Other Agent", retained["panel_note"])
+        self.assertEqual(self.linear.comments, [], "reassignment fences further remote reporting")
         self.assertEqual(self.linear.issues[ISSUE]["delegate"], OTHER)
 
     def test_pending_activity_does_not_hide_takeover(self) -> None:
         self.delegate()
+        before = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         self.bridge.activity(ISSUE, "s-1", "thought", "still working")
         self.linear.set_delegate(ISSUE, OTHER)
         self.clock.now += 6 * 60
         self.bridge.tick()
-        self.assertEqual(self.tasks(), [(task_id, "archived")])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.tasks(), [(task_id, "blocked")])
+        self.assert_retained_cancellation(before)
 
     def test_prompt_older_than_stop_never_unblocks(self) -> None:
         self.delegate()
@@ -1548,6 +1570,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         flush = self.bridge.flush
         with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
             self.delegate()  # receipt accepted, claim remains durably queued
+        before = self.bridge.store.get(ISSUE)
         self.linear.down = True
         self.clock.now += 600
         self.linear.set_state(ISSUE, "Canceled")  # a human cancels while our claim is still queued
@@ -1555,14 +1578,15 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 3600
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Canceled")
-        self.assertEqual([s for _, s in self.tasks()], ["archived"])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual([s for _, s in self.tasks()], ["blocked"])
+        self.assert_retained_cancellation(before)
 
     def test_queued_claim_never_undoes_a_later_delegate_removal(self) -> None:
         from unittest.mock import patch
         flush = self.bridge.flush
         with patch.object(self.bridge, "flush", side_effect=lambda **kw: flush(**kw) if kw.get("only_id") else 0):
             self.delegate()  # receipt accepted, claim remains durably queued
+        before = self.bridge.store.get(ISSUE)
         self.linear.down = True
         self.clock.now += 600
         self.linear.set_delegate(ISSUE, None)  # a human takes the agent off while our claim is queued
@@ -1570,8 +1594,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.clock.now += 3600
         self.bridge.tick()
         self.assertIsNone(self.linear.issues[ISSUE]["delegate"])
-        self.assertEqual([s for _, s in self.tasks()], ["archived"])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual([s for _, s in self.tasks()], ["blocked"])
+        self.assert_retained_cancellation(before)
 
     def test_late_stop_for_an_older_session_does_not_stop_newer_work(self) -> None:
         self.delegate()
@@ -2684,7 +2708,9 @@ class LinearKanbanScenarios(unittest.TestCase):
                            source_ms=fresh["webhookTimestamp"])
         self.bridge.flush()
         self.assertEqual(self.linear.state(ISSUE), "Canceled")
-        self.assertEqual(self.tasks(), [(task, "archived")])
+        self.assertEqual(self.tasks(), [(task, "blocked")])
+        self.assertTrue(self.bridge.store.get(ISSUE)["release_pending"])
+        self.assertFalse(self.bridge.store.retired(ISSUE))
 
         self.clock.now += 1
         cold_fresh = self.linear.session_event("created", ISSUE, "cold-fresh-session")
