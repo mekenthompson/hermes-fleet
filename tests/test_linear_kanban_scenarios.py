@@ -109,7 +109,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         bridge.handle_webhook({"type": "AgentSessionEvent", "action": "created",
             "createdAt": "2026-01-01T00:00:00Z", "agentSession": {
                 "id": SESSION, "creatorId": USER, "issue": {"id": scoped_issue}}})
-        task_id = store.get(scoped_issue)["task_id"]
+        binding = store.get(scoped_issue)
+        task_id = binding["task_id"]
         self.assertEqual(board.get(task_id).status, "ready")
         bridge.flush()
         with board.conn() as conn:
@@ -117,7 +118,10 @@ class LinearKanbanScenarios(unittest.TestCase):
                 conn, task_id, result="Findings: https://example.test/findings",
                 metadata={"issue_comment": "### Recommendation\nKeep the recorded findings.\n"}))
         bridge.pump_kanban()
-        self.assertIsNone(store.get(scoped_issue))
+        retained = store.get(scoped_issue)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertEqual(board.get(task_id).status, "done")
         authority.mutations.clear()
         reopened = Bridge(Store(store.path), authority.api(scope=policy), Kanban(), profile="alpha")
         self.assertEqual(reopened.flush(), 4)
@@ -678,6 +682,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     # -- flows ---------------------------------------------------------------
     def test_delegated_run_reaches_done_with_one_message(self) -> None:
         self.delegate()
+        binding = self.bridge.store.get(ISSUE)
         [(task_id, status)] = self.tasks()
         self.assertEqual(status, "ready")
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
@@ -691,7 +696,10 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.types(), ["thought", "thought", "response"])
         self.assertIn("https://docs.example/fix/7", self.linear.activities[-1]["content"]["body"])
         self.assertEqual(len(self.linear.project_updates), 1)
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "done")
 
     def test_duplicate_and_out_of_order_webhooks(self) -> None:
         from linear_ingress_fixture import IngressStore, Route
@@ -960,17 +968,25 @@ class LinearKanbanScenarios(unittest.TestCase):
                 process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
                 try:
                     with self.bridge.kanban.conn() as conn: dispatch._set_worker_pid(conn, old, process.pid)
-                    with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
+                    if interleaving == "board_archive":
+                        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.handle_webhook(event)
+                    else:
+                        with self.assertRaisesRegex(Exception, "still exiting"): self.bridge.await_retired(ISSUE)
                     self.assertEqual(self.tasks(), [(old, "archived")])
                     process.kill(); process.wait(timeout=10)
                     self.bridge.await_retired(ISSUE)
                     self.deliver(event)
-                    self.assertNotEqual(self.task_id(), old)
+                    if interleaving == "board_archive":
+                        self.assertEqual(self.task_id(), old)
+                        self.assertEqual(self.tasks(), [(old, "archived")])
+                        self.assertIn("Native reconciliation", self.linear.activities[-1]["content"]["body"])
+                    else:
+                        self.assertNotEqual(self.task_id(), old)
                 finally:
                     if process.poll() is None: process.kill()
                     process.wait(timeout=10)
 
-    def test_restart_finishes_retirement_committed_before_core_archive(self):
+    def test_restart_fences_legacy_retirement_without_native_generation_proof(self):
         from unittest.mock import patch
         self.delegate()
         old = self.task_id()
@@ -979,12 +995,20 @@ class LinearKanbanScenarios(unittest.TestCase):
         with patch.object(self.bridge.kanban, "archive", side_effect=RuntimeError("crash")):
             with self.assertRaisesRegex(RuntimeError, "crash"): self.bridge.recheck(force=True)
         self.assertTrue(self.bridge.store.retired(ISSUE))
+        before = self.bridge.kanban.get(old)
         self.bridge = self.make_bridge()
         self.bridge.recover()
-        process.wait(timeout=10)
         self.bridge.tick()
-        self.assertEqual(self.bridge.kanban.get(old).status, "archived")
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        task = self.bridge.kanban.get(old)
+        self.assertEqual((task.status, task.current_run_id, task.claim_lock, task.worker_pid),
+                         (before.status, before.current_run_id, before.claim_lock, process.pid))
+        self.assertIsNone(process.poll())
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual(retained["task_id"], old)
+        self.assertTrue(retained["release_pending"])
+        self.assertIn("native generation proof", retained["panel_note"])
+        with self.assertRaisesRegex(Exception, "native reconciliation"): self.bridge.await_retired(ISSUE)
+        self.assertEqual(self.tasks(), [(old, before.status)])
 
     def test_unreadable_retired_worker_fingerprint_fails_closed(self):
         from unittest.mock import patch
@@ -999,8 +1023,9 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertTrue(self.bridge.store.retired(ISSUE))
         self.assertFalse(self.bridge.store.put(ISSUE, "chat", "bypass"))
 
-    def test_archive_delete_before_tick_closes_unfinished_and_fences_unknown_identity(self):
+    def test_archive_delete_before_tick_reports_unfinished_and_retains_native_binding(self):
         self.delegate()
+        binding = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         with self.bridge.kanban.conn() as conn:
             kb.archive_task(conn, task_id)
@@ -1008,20 +1033,28 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge()
         self.bridge.recover()
         self.bridge.tick()
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertIsNone(self.bridge.kanban.get(task_id))
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
         self.assertIn("unfinished", self.linear.activities[-1]["content"]["body"])
         before = len(self.linear.activities)
         self.bridge.tick()
         self.assertEqual(len(self.linear.activities), before)
-        with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.await_retired(ISSUE)
+        self.assertFalse(self.bridge.store.retired(ISSUE))
+        self.assertEqual(self.tasks(), [])
 
     def test_archive_closeout_survives_outage_and_preserves_human_takeover(self):
         self.delegate()
+        binding = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         with self.bridge.kanban.conn() as conn: kb.archive_task(conn, task_id)
         self.bridge.pump_kanban()
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "archived")
         pending = self.bridge.store.pending(ISSUE)
         self.assertEqual([r["kind"] for r in pending], ["status", "activity"])
         self.assertTrue(all(r["payload"]["terminal"] for r in pending))
@@ -1064,6 +1097,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_claimed_completion_reconciles_from_task_after_crash(self) -> None:
         self.delegate()
+        binding = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         with self.bridge.kanban.conn() as conn:
             self.assertTrue(kb.complete_task(conn, task_id, result="Findings: https://docs.example/findings/2"))
@@ -1071,13 +1105,17 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge()
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Done")
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "done")
 
     def test_claimed_nonterminal_events_recover_after_restart(self) -> None:
         for kind in ("blocked", "gave_up", "unblocked", "archived"):
             with self.subTest(kind=kind):
                 self.setUp()
                 self.delegate()
+                binding = self.bridge.store.get(ISSUE)
                 task_id = self.task_id()
                 with self.bridge.kanban.conn() as conn:
                     if kind == "gave_up":
@@ -1097,7 +1135,10 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.bridge = self.make_bridge()
                 self.bridge.tick()
                 if kind == "archived":
-                    self.assertIsNone(self.bridge.store.get(ISSUE))
+                    retained = self.bridge.store.get(ISSUE)
+                    self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                                     (task_id, binding["ownership_id"], binding["linked_at"]))
+                    self.assertEqual(self.bridge.kanban.get(task_id).status, "archived")
                 else:
                     self.assertEqual(self.linear.state(ISSUE), "In Progress" if kind == "unblocked" else "Blocked")
                     self.assertEqual(len(self.linear.activities), before + (0 if kind == "unblocked" else 1))
@@ -2056,10 +2097,14 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_terminal_messages_are_suppressed_after_human_takeover(self) -> None:
         from unittest.mock import patch
         self.delegate()
+        binding = self.bridge.store.get(ISSUE)
         task_id = self.task_id()
         with patch.object(self.bridge, "flush", return_value=0):
             self.complete(task_id, "Findings: https://docs.example/findings/7")
-        self.assertIsNone(self.bridge.store.get(ISSUE))
+        retained = self.bridge.store.get(ISSUE)
+        self.assertEqual((retained["task_id"], retained["ownership_id"], retained["linked_at"]),
+                         (task_id, binding["ownership_id"], binding["linked_at"]))
+        self.assertEqual(self.bridge.kanban.get(task_id).status, "done")
         self.linear.set_delegate(ISSUE, OTHER)
         self.bridge.flush()
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
@@ -2678,8 +2723,11 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.clock.now += 1
                 self.bridge.handle_webhook(self.linear.session_event("created", issue_id, f"new-{case}"))
                 new_task = self.bridge.store.get(issue_id)["task_id"]
-                terminal_rows = [r for r in self.bridge.store.pending(issue_id) if r["kind"] == "status"
-                                 and r["payload"].get("terminal") and r["payload"].get("task_id") == old_task]
+                with self.bridge.store._tx() as db:
+                    captured = db.execute("SELECT id FROM outbox WHERE kind='status' AND "
+                        "json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=? AND "
+                        "json_extract(payload,'$.terminal')=1", (issue_id, old_task)).fetchall()
+                terminal_rows = [self.bridge.store.outbox_row(row["id"]) for row in captured]
                 self.assertTrue(terminal_rows, "The predecessor result must be captured before replacing its mapping")
                 terminal = terminal_rows[0]
                 self.clock.now += 61
@@ -2886,6 +2934,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                             conn.execute("UPDATE task_runs SET summary='' WHERE task_id=?", (task,))
                 self.bridge = self.make_bridge()
                 self.bridge.recover()
+                native_before = self.bridge.kanban.get(task)
                 self.bridge.handle_webhook(event)
                 self.bridge.tick()
                 expected = {"evidence": "Done", "summary": "Done", "missing": "Blocked",
@@ -2904,10 +2953,12 @@ class LinearKanbanScenarios(unittest.TestCase):
                 if outcome == "missing":
                     self.assertIn("without evidence", receipts[1]["content"]["body"])
                     self.assertFalse(any("CRASH-missing: Done" in u["body"] for u in self.linear.project_updates))
-                if outcome == "active":
-                    self.assertEqual(self.bridge.store.get(issue_id)["task_id"], task)
-                else:
-                    self.assertIsNone(self.bridge.store.get(issue_id))
+                retained = self.bridge.store.get(issue_id)
+                self.assertEqual(retained["task_id"], task)
+                self.assertEqual(retained["owner_ref"], f"creation-{outcome}")
+                self.assertGreater(retained["linked_at"], 0)
+                self.assertEqual(self.bridge.kanban.get(task).status,
+                                 "ready" if outcome == "active" else native_before.status)
                 before = len(self.tasks()), len(self.linear.activities), len(self.linear.project_updates)
                 self.bridge = self.make_bridge()
                 self.bridge.handle_webhook(event)
@@ -3014,6 +3065,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_terminal_admission_commit_is_the_scope_linearization(self) -> None:
         from contextlib import contextmanager
         from unittest.mock import patch
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
                                                        "write_started": False}, at=self.clock())
         store = self.bridge.store
@@ -3042,6 +3094,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_terminal_admission_denial_and_failed_marker_never_transport(self) -> None:
         from hermes_fleet_linear_plugin.bridge import ProjectUpdateDeferred
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
                                                        "write_started": False}, at=self.clock())
         before = sum("IssueUpdate" in q for q in self.linear.requests)
@@ -3051,6 +3104,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIs(self.bridge.store.outbox_row(row_id)["payload"]["write_started"], False)
         self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), before)
 
+        self.linear.add_issue("other-issue", "ABC-2")
+        self.linear.set_delegate("other-issue", {"id": SELF, "name": "This Agent"})
         other_id = self.bridge.store.enqueue("status", {"issue_id": "other-issue", "terminal": True,
                                                          "write_started": False}, at=self.clock())
         with sqlite3.connect(self.bridge.store.path) as db:
@@ -3058,11 +3113,12 @@ class LinearKanbanScenarios(unittest.TestCase):
                        "WHEN NEW.id='" + other_id + "' AND json_extract(NEW.payload, '$.write_started')=1 "
                        "BEGIN SELECT RAISE(ABORT, 'marker failed'); END")
         with self.assertRaises(sqlite3.DatabaseError):
-            self.bridge._mutate_outbox(other_id, lambda: self.bridge.api.update_issue(ISSUE, {}), terminal=True)
+            self.bridge._mutate_outbox(other_id, lambda: self.bridge.api.update_issue("other-issue", {}), terminal=True)
         self.assertIs(self.bridge.store.outbox_row(other_id)["payload"]["write_started"], False)
         self.assertEqual(sum("IssueUpdate" in q for q in self.linear.requests), before)
 
     def test_stalled_mutation_transport_does_not_hold_store_writer(self) -> None:
+        self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         row_id = self.bridge.store.enqueue("status", {"issue_id": ISSUE, "terminal": True,
                                                        "write_started": False}, at=self.clock())
         entered, release = threading.Event(), threading.Event()
@@ -3071,9 +3127,10 @@ class LinearKanbanScenarios(unittest.TestCase):
         original_transport = self.bridge.api.transport
 
         def stalled_transport(url, body, headers):
-            entered.set()
-            if not release.wait(10):
-                raise AssertionError("test transport was not released")
+            if "mutation IssueUpdate" in json.loads(body)["query"]:
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("test transport was not released")
             return original_transport(url, body, headers)
 
         def send():

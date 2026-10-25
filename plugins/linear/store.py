@@ -256,6 +256,13 @@ class Store:
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
+    def mutation_rejected(self, row_id: str, started_before) -> bool:
+        """A known HTTP rejection did not apply this attempt; credential retry revalidates it."""
+        if started_before is not False: return False
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('false')) "
+                       "WHERE id=? AND state='pending'", (row_id,))
+        return True
     def reconcile_terminal(self, row_id: str, *, outcome: str, evidence: str, at: float) -> bool:
         """Record an operator's verified remote outcome; keep the attempted receipt intact."""
         if outcome not in ("applied", "not_applied") or not evidence.strip():
@@ -512,7 +519,7 @@ class Store:
             db.execute("INSERT OR IGNORE INTO specialist_scope_fence (issue_id, reason, fenced_at) "
                        "VALUES (?, ?, ?)", (issue_id, reason[:500], at))
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float,
-               release: bool = False) -> bool:
+               release: bool = False, retain: bool = False) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             if not self._effect_admitted(db, issue_id): return False
@@ -546,6 +553,10 @@ class Store:
                     if existing and self._requester_conflict(json.loads(existing["payload"]), payload):
                         existing = None
                     if existing:
+                        prior_generation = json.loads(existing["payload"]).get("native_generation")
+                        if prior_generation and prior_generation != payload.get("native_generation"):
+                            existing = None  # each native generation keeps its own stable receipt
+                    if existing:
                         prior = json.loads(existing["payload"])
                         if existing["state"] in ("pending", "failed") and not prior.get("frozen"):
                             prior["lines"].update(payload["lines"])
@@ -562,7 +573,7 @@ class Store:
                            (row_id, kind, body, at + float(payload.get("quiet", 0))))
             if release:
                 db.execute("UPDATE work SET release_pending=1 WHERE issue_id=?", (issue_id,))
-            else:
+            elif not retain:
                 db.execute("DELETE FROM work WHERE issue_id = ?", (issue_id,))
             return True
     def capture_event(self, issue_id: str, event_id: int, writes: list[tuple[str, dict[str, Any]]],
@@ -603,12 +614,54 @@ class Store:
             normalized = (body or "").replace("Reply here to unblock.", BLOCK_REPLY)
             captured[kind, normalized] += count
         return captured
-    def terminal_captured(self, task_id: str) -> bool:
+    def terminal_captured(self, task_id: str, *, generation: dict | None = None) -> bool:
         with self._tx() as db:
             return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
-                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id,)).fetchone())
+                                   "json_extract(payload, '$.admission_id') IS NULL AND "
+                                   "(? IS NULL OR json_extract(payload, '$.native_generation')=json(?)) LIMIT 1",
+                                   (task_id, json.dumps(generation) if generation else None,
+                                    json.dumps(generation) if generation else None)).fetchone())
+    def terminal_reported(self, issue_id: str, generation: dict, *, complete: bool = False) -> bool:
+        with self._tx() as db:
+            rows = db.execute("SELECT kind,state,payload FROM outbox WHERE "
+                "json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.native_generation')=json(?)",
+                (issue_id, json.dumps(generation))).fetchall()
+        status = any(row["kind"] == "status" and row["state"] == "sent" and json.loads(row["payload"]).get("applied")
+                     for row in rows)
+        return status and (not complete or all(row["state"] == "sent" for row in rows))
+    def prepare_native_increment(self, issue_id: str, generation: dict) -> bool:
+        """Retire only proven unsent closeout intent; retain unknown external effects."""
+        with self._tx() as db:
+            rows = db.execute("SELECT * FROM outbox WHERE json_extract(payload,'$.issue_id')=? "
+                "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.terminal')=1",
+                (issue_id, generation["task_id"])).fetchall()
+            decoded = [(row, json.loads(row["payload"])) for row in rows]
+            if any(not payload.get("native_generation") or self.uncertain(row, payload) for row, payload in decoded): return False
+            statuses = [(row, payload) for row, payload in decoded if row["kind"] == "status" and payload.get("native_generation") == generation]
+            if not statuses: return False
+            for row, payload in statuses:
+                if row["state"] == "sent" and payload.get("applied"): continue
+                if (payload.get("reconciliation") or {}).get("outcome") in ("applied", "not_applied"):
+                    continue  # preserve the attempted receipt and its verified resolution
+                if payload.get("write_started") or (row["attempts"] and payload.get("write_started") is not False): return False
+                db.execute("UPDATE outbox SET state='sent',payload=? WHERE id=?",
+                    (json.dumps({**payload, "superseded": True, "applied": 0, "write_started": False}), row["id"]))
+            return True
+    def roll_native_binding(self, issue_id: str, predecessor: dict, *, task_id: str, owner_ref: str,
+                            project_id: str | None, stamp: float, generation: dict) -> bool:
+        """Replace a reconciled delivery association; native dependencies own execution."""
+        with self._tx() as db:
+            work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            if (not work or work["ownership_id"] != predecessor["ownership_id"] or
+                    work["task_id"] != generation["task_id"] or not self._effect_admitted(db, issue_id) or
+                    not self.prepare_native_increment(issue_id, generation)):
+                return False
+            db.execute("UPDATE work SET task_id=?,owner_ref=?,linear_session_id=NULL,project_id=?,last_updated_at=?,"
+                       "linked_at=?,last_event_id=0,stop_requested_at=0,resume_fence_at=0,release_pending=0,ownership_id=? WHERE issue_id=?",
+                       (task_id, owner_ref, project_id, stamp, stamp, str(uuid.uuid4()), issue_id))
+            return True
     def assessment_comment_id(self, issue_id: str, body: str) -> str | None:
         with self._tx() as db:
             row = db.execute("SELECT id FROM outbox WHERE kind='comment' AND "

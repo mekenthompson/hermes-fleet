@@ -135,6 +135,17 @@ class FakeKanban:
     def get(self, task_id):
         return self.tasks.get(task_id)
 
+    def terminal_generation(self, task_id):
+        task = self.get(task_id)
+        status = task.status if task else "missing"
+        if status not in ("done", "archived", "missing"): return None
+        history = self.histories.get(task_id, [])
+        return {"task_id": task_id, "status": status, "run_id": getattr(task, "current_run_id", None),
+                "event_id": history[-1].id if history else None}
+
+    def has_terminal_history(self, task_id):
+        return any(event.kind in ("completed", "archived") for event in self.histories.get(task_id, []))
+
     def events(self, task_id, issue_id):
         self.event_calls.append((task_id, issue_id))
         return []
@@ -1532,7 +1543,7 @@ class SessionRequesterTests(unittest.TestCase):
         task.status, task.result = "done", "Synthetic result"
         self.kanban.evidence_text = lambda task: "https://example.test/findings"
         self.bridge.pump_kanban()
-        self.assertIsNone(self.store.get(ISSUE))
+        self.assertEqual(self.store.get(ISSUE)["task_id"], task.id)
         self.authority.mutations.clear()
         bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
                         self.kanban, profile="synthetic")

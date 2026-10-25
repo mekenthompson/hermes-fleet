@@ -46,6 +46,13 @@ when one is bound, otherwise to issue comments. Legacy `kanban_chat` and `kanban
 that execution path; their reporting address is the only distinction. A coordinator may supervise
 distinct children but must not also execute their claimed work.
 
+A reporting binding survives native completion. Terminal updates carry the native run and event
+identity and recheck it before every remote mutation, including credential retries. Reopening a
+task keeps the same association; an old completion cannot close the new run. A verified new
+assignment may create a distinct increment only after predecessor effects and worker exit are
+reconciled, using native task dependencies. Unknown legacy retirements or missing tasks retain
+their bindings and diagnostics until reconciliation; they never authorize archive or replay.
+
 Natural-language follow-ups are interpreted in the authenticated conversation and delivered once
 to the existing native task. Use stable native creation and comment request keys after lost
 responses. Status questions do not resume stopped work. Completed work returns status; additional
