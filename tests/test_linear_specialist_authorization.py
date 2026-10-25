@@ -1011,6 +1011,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_stop_refuses_task_block_when_fence_precedes_work_update(self):
         task_id = self.seed_kanban_work()
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         row = self.store.get(ISSUE)
         before = self.store.get(ISSUE)
         update = self.store.update

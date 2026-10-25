@@ -988,6 +988,15 @@ class Bridge:
         if row["origin"] == "chat" and row.get("stop_requested_at") and stamp <= row["stop_requested_at"]:
             return
         if row["origin"] in ("kanban", "kanban_chat"):
+            if not self._binding_reconciled(row): return
+            # An event's old delivery address cannot cancel independently admitted
+            # work after a human changes its reporting assignment or closes it.
+            issue = self._effect_issue(row["issue_id"])
+            claim = next((p["payload"] for p in self.store.pending(row["issue_id"])
+                          if p["kind"] == "status" and p["payload"].get("claim")), None)
+            allowed = (self.may_write(issue, True, claim["enqueued_at"], claim.get("seen"), claim.get("source_ms"))
+                       if claim else self.may_write(issue, False))
+            if not allowed: return
             with self.store.guard_issue(row["issue_id"]) as admitted:
                 current = self.store.get(row["issue_id"])
                 if current and not self._binding_reconciled(current):

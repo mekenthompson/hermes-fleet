@@ -270,6 +270,35 @@ class TaskTrackingScenarios(unittest.TestCase):
         self.assertEqual(self.remote.state("issue-1"), state)
         self.assertEqual(self.board.get(self.task.id).status, "done")
 
+    def test_stop_rereads_human_change_before_native_cancellation_without_recheck(self):
+        from linear_fake_api import OTHER
+        from linear_ingress_fixture import IngressStore, Route
+
+        self.assertTrue(self.invoke(self.context("manual-before-stop"))["ok"])
+        self.bridge.flush()
+        self.assertTrue(self.board.unblock(self.task.id))
+        with self.board.conn() as conn:
+            self.assertTrue(self.board.kb.claim_task(conn, self.task.id))
+        before = self.board.get(self.task.id)
+        self.clock.now += 1
+        self.remote.set_delegate("issue-1", OTHER)
+        self.remote.set_state("issue-1", "Done")
+        event = self.remote.session_event("prompted", "issue-1", "old-session",
+            activity_id="stale-stop-before-recheck", signal="stop")
+        inbox = self.home / "fresh-stop-inbox.db"
+        IngressStore(inbox).enqueue(Route("default", "default", "/webhook/default", inbox, inbox),
+                                   "fresh-stop", json.dumps(event).encode())
+        with sqlite3.connect(inbox) as conn:
+            conn.execute("UPDATE deliveries SET received_at=?", (self.clock(),))
+        self.bridge.drain_ingress(inbox)
+        after = self.board.get(self.task.id)
+        self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                         (before.status, before.current_run_id, before.claim_lock))
+        self.assertTrue(self.store.get("issue-1")["release_pending"])
+        self.bridge.flush()
+        self.assertEqual(self.remote.state("issue-1"), "Done")
+        self.assertEqual(self.remote.issues["issue-1"]["delegate"], OTHER)
+
     def test_linked_task_completion_reports_project_without_an_agent_session(self):
         self.assertTrue(self.invoke(self.context("desktop-project"))["ok"])
         self.bridge.flush()
