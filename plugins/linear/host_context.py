@@ -45,4 +45,3 @@ def bound_to_live_turn(runtime, context):
         return row is not None and row[0] is None
     except (AttributeError, OSError, ValueError, sqlite3.Error):
         return False
-
