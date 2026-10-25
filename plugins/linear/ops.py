@@ -64,7 +64,8 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     row["state"] == "ambiguous")
             for row in _rows(db, "SELECT issue_id, last_updated_at FROM work WHERE release_pending = 1"):
                 add(row["issue_id"], "release", (row["last_updated_at"] or now * 1000) / 1000,
-                    "chat release is waiting for Linear to read back no delegate", "Retried each tick; check Linear.")
+                    "retained release requires native reconciliation",
+                    "Read native execution and external effects; reporting cannot retire independently admitted work.", True)
             for row in _rows(db, "SELECT issue_id, owner_ref, last_updated_at FROM work WHERE origin='chat'"):
                 add(row["issue_id"], row["owner_ref"], (row["last_updated_at"] or now * 1000) / 1000,
                     "retained legacy chat record; no restart execution is scheduled",

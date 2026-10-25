@@ -444,6 +444,94 @@ class NativeContinuationScenarios(unittest.TestCase):
         self.assertTrue(any(item["why"] == "legacy continuation requires reconciliation"
                             for item in ops.stuck(self.store.path, self.home / "inbox.db", "default")))
 
+    def test_migrated_binding_cannot_release_or_report_terminal_work(self):
+        for state in ("running", "done", "archived"):
+            with self.subTest(state=state):
+                issue = "migrated-" + state
+                self.remote.add_issue(issue, "MIG-" + state)
+                self.remote.set_delegate(issue, {"id": SELF})
+                self.bridge.handle_webhook(self.remote.session_event("created", issue, "session-" + state))
+                self.bridge.flush()
+                row = self.store.get(issue)
+                task_id = row["task_id"]
+                with self.board.conn() as conn:
+                    if state == "running":
+                        self.assertTrue(kb.claim_task(conn, task_id))
+                    elif state == "done":
+                        self.assertTrue(kb.complete_task(conn, task_id,
+                            summary="Substantive retained findings needing reconciliation", metadata={}))
+                    else:
+                        self.board.archive(task_id)
+                # Exercise the actual additive migration, not a mocked provenance predicate.
+                with sqlite3.connect(self.store.path) as conn:
+                    conn.execute("ALTER TABLE work DROP COLUMN linked_at")
+                self.bridge = self.reopen()
+                saved = self.store.get(issue)
+                pending = self.store.pending(issue)
+                self.remote.set_delegate(issue, {"id": "different-human"})
+                self.bridge.recheck(force=True)
+                self.bridge.recover()
+                self.bridge.release(saved, "reassigned")
+                self.bridge.flush()
+                self.assertEqual(self.store.get(issue), saved)
+                self.assertEqual(self.store.pending(issue), pending)
+                self.assertEqual(self.board.get(task_id).status, state)
+                self.assertEqual(self.remote.state(issue), "In Progress")
+                self.assertFalse(self.store.retired(issue))
+
+    def test_assignment_inbox_reconciles_crash_after_binding_or_activation(self):
+        for boundary in ("before-activation", "after-activation", "reporting"):
+            with self.subTest(boundary=boundary):
+                issue, session = "crash-" + boundary, "session-" + boundary
+                self.remote.add_issue(issue, "CRASH-" + boundary)
+                self.remote.set_delegate(issue, {"id": SELF})
+                event = self.remote.session_event("created", issue, session)
+                inbox = self.queue(event, delivery=boundary)
+                activate = self.bridge.store.activate_task
+                def crash_activate(*args):
+                    if boundary == "after-activation": activate(*args)
+                    raise RuntimeError("process interrupted at native admission")
+                target = "enqueue_many" if boundary == "reporting" else "activate_task"
+                with patch.object(self.bridge.store, target, side_effect=(
+                        RuntimeError("reporting capture interrupted") if boundary == "reporting" else crash_activate)):
+                    self.bridge.drain_ingress(inbox)
+                row = self.store.get(issue)
+                self.assertIsNotNone(row)
+                task_id = row["task_id"]
+                self.assertEqual(self.board.get(task_id).status,
+                                 "blocked" if boundary == "before-activation" else "ready")
+                self.bridge = self.reopen()
+                self.clock.now += 5
+                self.bridge.drain_ingress(inbox)
+                self.bridge.drain_ingress(inbox)
+                self.bridge.recover()
+                self.bridge.recheck(force=True)
+                self.bridge.flush()
+                self.assertEqual(self.store.get(issue)["task_id"], task_id)
+                self.assertEqual(self.board.get(task_id).status, "ready")
+                self.assertEqual(self.remote.state(issue), "In Progress")
+                with self.board.conn() as conn:
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+                        (f"linear:{issue}:{session}",)).fetchone()[0], 1)
+
+    def test_assignment_retry_does_not_resume_native_stop_after_staging_crash(self):
+        issue, session = "stopped-initial", "stopped-session"
+        self.remote.add_issue(issue, "STOP-INITIAL")
+        self.remote.set_delegate(issue, {"id": SELF})
+        event = self.remote.session_event("created", issue, session)
+        with patch.object(self.bridge.store, "activate_task", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                self.bridge.handle_webhook(event)
+        task_id = self.store.get(issue)["task_id"]
+        self.assertTrue(self.board.unblock(task_id))
+        self.assertTrue(self.board.block(task_id, "Explicit native Stop after interrupted admission"))
+        self.bridge = self.reopen()
+        self.bridge.handle_webhook(event)
+        self.bridge.recover()
+        self.bridge.flush()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertFalse(self.store.has_start_ack(issue, task_id))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -365,8 +365,9 @@ class Store:
                        (issue_id, origin, owner_ref, task_id, project_id, last_updated_at, run_generation,
                         str(uuid.uuid4()), last_updated_at if task_id else 0))
             return True
-    def link_task(self, issue_id: str, task_id: str, project_id: str | None, stamp: float) -> bool:
-        """Bind reporting without replacing existing work or claiming its native execution."""
+    def link_task(self, issue_id: str, task_id: str, project_id: str | None, stamp: float, *,
+                  reporting: dict[str, Any] | None = None, at: float | None = None) -> bool:
+        """Commit the binding and its initial report together, without claiming native execution."""
         with self._tx() as db:
             if (not self._effect_admitted(db, issue_id) or self.retired(issue_id)
                     or db.execute("SELECT 1 FROM work WHERE issue_id=? OR task_id=?",
@@ -375,7 +376,18 @@ class Store:
             db.execute("INSERT INTO work (issue_id, origin, owner_ref, task_id, project_id, "
                        "last_updated_at, linked_at, ownership_id) VALUES (?, 'kanban', '', ?, ?, ?, ?, ?)",
                        (issue_id, task_id, project_id, stamp, stamp, str(uuid.uuid4())))
+            if reporting is not None:
+                if not self.enqueue("status", {**reporting, "issue_id": issue_id, "task_id": task_id}, at=at):
+                    raise ValueError("The initial task report was not admitted; the binding was not saved.")
             return True
+    def task_link_report_captured(self, issue_id: str, task_id: str) -> bool:
+        """A retained binding cannot manufacture a missing initial claim on retry."""
+        with self._tx() as db:
+            return bool(db.execute("SELECT 1 FROM outbox o JOIN work w ON w.issue_id=? AND w.task_id=? "
+                "WHERE o.kind='status' AND json_extract(o.payload, '$.issue_id')=w.issue_id "
+                "AND json_extract(o.payload, '$.task_id')=w.task_id AND json_extract(o.payload, '$.claim')=1 "
+                "AND json_extract(o.payload, '$.work_owner')=w.ownership_id LIMIT 1",
+                (issue_id, task_id)).fetchone())
     def capture_chat_stop(self, issue_id: str, linear_session_id: str, activity_id: str,
                           profile: str, *, at: float, stamp: float = 0.0) -> dict[str, Any] | None:
         """Commit the exact target and stable Linear activity id before any core request."""

@@ -5,8 +5,10 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -120,6 +122,153 @@ class TaskTrackingScenarios(unittest.TestCase):
         with self.board.conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
         self.assertEqual(self.board.get(self.task.id).status, "blocked")
+
+    def claims(self):
+        with sqlite3.connect(self.store.path) as conn:
+            return conn.execute("SELECT id FROM outbox WHERE kind='status' AND "
+                "json_extract(payload, '$.issue_id')='issue-1' AND json_extract(payload, '$.claim')=1").fetchall()
+
+    def subscriptions(self):
+        with self.board.conn() as conn:
+            return [row for row in self.board.kn.list_notify_subs(conn, self.task.id)
+                    if row["platform"] == "linear" and row["chat_id"] == "issue-1"]
+
+    def test_track_captures_binding_and_reporting_atomically_across_capture_crash(self):
+        for after_capture in (False, True):
+            with self.subTest(after_capture=after_capture):
+                context = self.context("capture-crash-" + str(after_capture))
+                enqueue = self.store.enqueue
+
+                def crash(kind, payload, **kwargs):
+                    if after_capture:
+                        enqueue(kind, payload, **kwargs)
+                    raise RuntimeError("simulated crash during durable reporting capture")
+
+                with patch.object(self.store, "enqueue", side_effect=crash):
+                    self.assertFalse(self.invoke(context)["ok"])
+                self.assertIsNone(self.store.get("issue-1"), "capture failure cannot commit a reporting-only binding")
+                self.assertEqual(self.claims(), [])
+                self.assertEqual(self.subscriptions(), [])
+                self.assertTrue(self.invoke(context)["ok"])
+                self.assertEqual(len(self.claims()), 1)
+                self.assertEqual(len(self.subscriptions()), 1)
+                self.bridge.flush()
+                self.assertEqual(self.remote.state("issue-1"), "Blocked")
+                # Start the next independent crash case with another task/outcome.
+                self.assertTrue(self.store.delete("issue-1"))
+                with sqlite3.connect(self.store.path) as conn:
+                    conn.execute("DELETE FROM outbox")
+                with self.board.conn() as conn:
+                    self.board.kn.remove_notify_sub(conn, task_id=self.task.id, platform="linear", chat_id="issue-1")
+
+    def test_retry_repairs_subscription_after_crash_without_another_claim_or_executor(self):
+        self.assertTrue(self.board.unblock(self.task.id))
+        with self.board.conn() as conn:
+            self.assertTrue(self.board.kb.claim_task(conn, self.task.id))
+        before = self.board.get(self.task.id)
+        for after_subscribe in (False, True):
+            with self.subTest(after_subscribe=after_subscribe):
+                context = self.context("subscribe-crash-" + str(after_subscribe))
+                subscribe = self.board.subscribe
+
+                def crash(*args):
+                    if after_subscribe:
+                        subscribe(*args)
+                    raise RuntimeError("simulated native subscription response loss")
+
+                with patch.object(self.board, "subscribe", side_effect=crash):
+                    self.assertFalse(self.invoke(context)["ok"])
+                binding = self.store.get("issue-1")
+                self.assertIsNotNone(binding)
+                self.assertEqual(len(self.claims()), 1, "binding and initial reporting intent commit together")
+                self.bridge.recheck(force=True)
+                self.assertTrue(self.invoke(context)["ok"])
+                self.assertEqual(self.store.get("issue-1"), binding)
+                self.assertEqual(len(self.claims()), 1)
+                self.assertEqual(len(self.subscriptions()), 1)
+                after = self.board.get(self.task.id)
+                self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                                 (before.status, before.current_run_id, before.claim_lock))
+
+    def test_simultaneous_track_and_lost_response_reuse_one_reporting_intent(self):
+        contexts = [self.context("concurrent-" + str(i)) for i in range(2)]
+        barrier = threading.Barrier(2)
+        issue = self.bridge.api.issue
+
+        def concurrent_read(ref):
+            result = issue(ref)
+            if ref == "ABC-1":
+                barrier.wait(timeout=10)
+            return result
+
+        with patch.object(self.bridge.api, "issue", side_effect=concurrent_read):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                replies = list(pool.map(self.invoke, contexts))
+        self.assertTrue(all(reply["ok"] for reply in replies), replies)
+        self.remote.lose_next_response = True
+        self.bridge.flush()
+        self.assertTrue(self.invoke(contexts[0])["ok"])
+        self.assertEqual(len(self.claims()), 1)
+        self.assertEqual(len(self.subscriptions()), 1)
+        with self.board.conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+    def test_retry_does_not_reclaim_a_later_human_reassignment_or_closure(self):
+        from linear_fake_api import OTHER
+
+        context = self.context("later-human-decision")
+        self.assertTrue(self.invoke(context)["ok"])
+        claim = self.claims()
+        self.clock.now += 10
+        self.remote.set_delegate("issue-1", OTHER)
+        self.remote.set_state("issue-1", "Done")
+        self.assertTrue(self.invoke(context)["ok"])
+        self.assertEqual(self.claims(), claim)
+        self.bridge.flush()
+        self.assertEqual(self.remote.issues["issue-1"]["delegate"], OTHER)
+        self.assertEqual(self.remote.state("issue-1"), "Done")
+        self.assertEqual(self.board.get(self.task.id).status, "blocked")
+        self.assertTrue(self.store.get("issue-1")["release_pending"])
+        self.assertTrue(self.invoke(context, action="status")["legacy_reconciliation_required"])
+        self.assertEqual(self.invoke(context)["code"], "legacy_reconciliation_required")
+        self.assertEqual(self.claims(), claim)
+
+    def test_incomplete_prior_binding_requires_reconciliation_without_a_fresh_claim(self):
+        self.assertTrue(self.store.link_task("issue-1", self.task.id, "proj-1", self.clock() * 1000))
+        before = self.store.get("issue-1")
+        reply = self.invoke(self.context("incomplete-prior-binding"))
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], "tracking_reconciliation_required")
+        self.assertEqual(self.store.get("issue-1"), before)
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(self.subscriptions(), [])
+
+    def test_retained_manual_release_fences_followups_stop_and_terminal_reporting(self):
+        from linear_fake_api import OTHER, SELF
+
+        self.assertTrue(self.invoke(self.context("manual-release"))["ok"])
+        self.bridge.flush()
+        self.remote.set_delegate("issue-1", OTHER)
+        self.bridge.recheck(force=True)
+        saved = self.store.get("issue-1")
+        self.assertTrue(saved["release_pending"])
+        self.remote.set_delegate("issue-1", {"id": SELF})
+        self.assertTrue(self.board.unblock(self.task.id))  # a separately authorized native action
+        for signal in (None, "stop"):
+            self.clock.now += 1
+            self.bridge.handle_webhook(self.remote.session_event("prompted", "issue-1", "new-session",
+                body="A later instruction", activity_id="later-" + str(signal), signal=signal))
+        self.assertEqual(self.board.get(self.task.id).status, "ready")
+        with self.board.conn() as conn:
+            self.assertEqual(self.board.kb.list_comments(conn, self.task.id), [])
+            self.assertTrue(self.board.kb.complete_task(conn, self.task.id,
+                result="Native findings retained independently of the old tracking binding"))
+        state = self.remote.state("issue-1")
+        self.bridge.recover()
+        self.bridge.flush()
+        self.assertEqual(self.store.get("issue-1"), saved)
+        self.assertEqual(self.remote.state("issue-1"), state)
+        self.assertEqual(self.board.get(self.task.id).status, "done")
 
     def test_linked_task_completion_reports_project_without_an_agent_session(self):
         self.assertTrue(self.invoke(self.context("desktop-project"))["ok"])

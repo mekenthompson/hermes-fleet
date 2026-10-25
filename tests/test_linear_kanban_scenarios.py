@@ -397,7 +397,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
 
     def test_session_free_worker_cancellation_retires_worker_not_parent_chat(self):
-        task = self.bridge.kanban.create(title="Synthetic cancel", assignee="alpha")
+        task = self.bridge.kanban.create(title="Synthetic cancel", assignee="alpha", created_by="linear")
         self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.linear.set_delegate(ISSUE, {"id": SELF})
         self.linear.set_state(ISSUE, "Canceled")
@@ -410,7 +410,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_session_free_worker_completion_projects_comment_not_native_activity(self):
         task = self.bridge.kanban.create(title="ABC-1: session-free work", assignee="default")
-        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id)
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.bridge.api.update_issue(ISSUE, {"delegateId": SELF})
         self.complete(task.id, "Findings: https://docs.example/findings/session-free")
         self.assertEqual(self.linear.state(ISSUE), "Done")
@@ -422,7 +422,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_session_free_worker_block_projects_comment_without_agent_activity(self):
         task = self.bridge.kanban.create(title="ABC-1: session-free work", assignee="default")
-        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id)
+        self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.bridge.api.update_issue(ISSUE, {"delegateId": SELF})
         with self.bridge.kanban.conn() as conn:
             self.assertTrue(kb.block_task(conn, task.id, kind="capability", reason="Missing runtime capability"))
@@ -1105,7 +1105,12 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.assertEqual(len(self.linear.activities), before + (0 if kind == "unblocked" else 1))
 
     def _migrate_old_work_row(self) -> None:
-        """Recreate the pre-cursor work table, then let Store upgrade it on restart."""
+        """Exercise cursor compatibility after explicit provenance reconciliation.
+
+        Unknown provenance remains fenced in the dedicated migration scenarios;
+        these cases independently prove retained notification deduplication.
+        """
+        linked_at = self.bridge.store.get(ISSUE)["linked_at"]
         with sqlite3.connect(self.bridge.store.path) as db:
             db.execute("CREATE TABLE old_work AS SELECT issue_id, origin, owner_ref, task_id, project_id, "
                        "last_updated_at, linear_session_id, panel_note, stop_requested_at FROM work")
@@ -1113,6 +1118,8 @@ class LinearKanbanScenarios(unittest.TestCase):
             db.execute("ALTER TABLE old_work RENAME TO work")
         self.bridge = self.make_bridge()
         self.assertEqual(self.bridge.store.get(ISSUE)["last_event_id"], 0)
+        self.assertEqual(self.bridge.store.get(ISSUE)["linked_at"], 0)
+        self.assertTrue(self.bridge.store.update(ISSUE, linked_at=linked_at))
 
     def test_upgraded_work_does_not_replay_old_give_up_after_retry(self) -> None:
         self.delegate()

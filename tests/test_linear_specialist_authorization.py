@@ -666,7 +666,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self._assert_issue_webhook_redirect_preserves_other(True)
 
     def test_issue_webhook_scope_denial_precedes_any_existing_work_effect(self):
-        self.store.put(ISSUE, "kanban", "session-1", task_id="task-1")
+        self.store.put(ISSUE, "kanban", "session-1", task_id="task-1", last_updated_at=1)
         self.authority.issues[ISSUE] = issue_record(project={"id": "project-foreign"})
         self.bridge.handle_webhook({"type": "Issue", "updatedFrom": {"delegateId": "other"},
                                     "data": {"id": ISSUE}})
@@ -685,7 +685,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
         other = "issue-existing"
         self.authority.issues[other] = issue_record(id=other)
-        self.store.put(other, "kanban", SESSION, task_id="existing", project_id=PROJECT)
+        self.store.put(other, "kanban", SESSION, task_id="existing", project_id=PROJECT, last_updated_at=1)
         self.kanban.tasks["existing"] = SimpleNamespace(id="existing", status="ready")
         before = self.store.get(other)
         self.store.fence_scope(other, "permanent denial", at=1)
@@ -795,7 +795,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         pending_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved"}, at=1)
         pending = self.store.outbox_row(pending_id)
         self.store.fence_scope(ISSUE, "permanent denial", at=2)
-        self.assertFalse(self.store.put(ISSUE, "kanban", SESSION, task_id="task", project_id=PROJECT))
+        self.assertFalse(self.store.put(ISSUE, "kanban", SESSION, task_id="task", project_id=PROJECT, last_updated_at=1))
         self.assertFalse(self.store.update(ISSUE, owner_ref="changed", last_event_id=9))
         self.assertFalse(self.store.enqueue("status", {"issue_id": ISSUE, "state": "done"}, at=3))
         self.assertFalse(self.store.enqueue_once("comment", {"issue_id": ISSUE}, "marker", at=3))
@@ -1144,7 +1144,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 issue_id = f"{ISSUE}-{accepted}"
                 self.authority.issues[issue_id] = issue_record(id=issue_id)
                 self.kanban.tasks["task"] = SimpleNamespace(id="task", status="done", completion_contract="https://docs.example/findings/1", result="Done", title="OPS-1: task")
-                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT)
+                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT, last_updated_at=1)
                 before = self.store.get(issue_id)
                 def evidence_checked(_links, _contract, **_ignored):
                     self.authority.issues[issue_id] = issue_record(id=issue_id, project={"id": "project-foreign"})
@@ -1160,7 +1160,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         for forget in (False, True):
             with self.subTest(archived=forget):
                 issue_id = f"{ISSUE}-{forget}"
-                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT)
+                self.store.put(issue_id, "kanban", SESSION, task_id="task", project_id=PROJECT, last_updated_at=1)
                 self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved"}, at=1)
                 before, pending = self.store.get(issue_id), self.store.pending(issue_id)
                 self.store.fence_scope(issue_id, "permanent denial", at=1.0)
@@ -1189,7 +1189,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                                                          completion_contract=None, result="", title="OPS-1: task", assignee="synthetic", created_by="linear")
             self.kanban.histories[task_id] = [SimpleNamespace(id=1, kind="blocked",
                                                               payload={"reason": "needs input"})]
-            self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
+            self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT, last_updated_at=1)
 
         self.bridge.pump_kanban()
 
@@ -1311,7 +1311,7 @@ class SessionRequesterTests(unittest.TestCase):
         successor = "successor-session"
         self.authority.sessions[successor] = {"id": successor, "issue": {"id": ISSUE},
                                              "creator": {"id": USER}, "appUser": {"id": VIEWER}}
-        self.assertTrue(self.store.put(ISSUE, "kanban", successor, task_id="successor-task", project_id=PROJECT))
+        self.assertTrue(self.store.put(ISSUE, "kanban", successor, task_id="successor-task", project_id=PROJECT, last_updated_at=1))
         self.authority.sessions[SESSION]["creator"] = {"id": "foreign"}
         reopened = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
                           self.kanban, profile="synthetic")
@@ -1716,7 +1716,7 @@ class SessionRequesterTests(unittest.TestCase):
         def provider():
             if getattr(self.api._graphql_permit, 'issue_targets', ()) and not changed:
                 changed.append(True)
-                self.store.put(ISSUE, 'kanban', SESSION, task_id='successor-task', project_id=PROJECT)
+                self.store.put(ISSUE, 'kanban', SESSION, task_id='successor-task', project_id=PROJECT, last_updated_at=1)
             return 'synthetic'
         self.api.token = provider
         self.bridge.flush()
@@ -1813,7 +1813,7 @@ class SessionRequesterTests(unittest.TestCase):
                     self.authority.issues[other] = issue_record(id=other, identifier="OPS-2", delegate={"id": VIEWER})
                     self.authority.sessions[session] = {"id": session, "issue": {"id": other},
                                                        "creator": {"id": USER}, "appUser": {"id": VIEWER}}
-                    self.store.put(other, "kanban", session, task_id="second-task", project_id=PROJECT)
+                    self.store.put(other, "kanban", session, task_id="second-task", project_id=PROJECT, last_updated_at=1)
                     self.kanban.tasks["second-task"] = SimpleNamespace(id="second-task", status="ready",
                         completion_contract=None, result="", title="OPS-2: second")
                     task = self.kanban.tasks["task-1"]

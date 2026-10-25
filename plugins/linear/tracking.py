@@ -32,7 +32,7 @@ def handle(bridge, args, context):
                 task = bridge.kanban.get(row["task_id"]) if row and row.get("task_id") else None
                 return _reply(True, "Native task state; no execution was changed.",
                               task_id=task.id if task else None, state=task.status if task else "unbound",
-                              legacy_reconciliation_required=bool(row and (row["origin"] == "chat"
+                              legacy_reconciliation_required=bool(row and (row["origin"] == "chat" or row.get("release_pending")
                                   or (row.get("task_id") and not row.get("linked_at")))))
             task_id = args.get("task_id")
             if not isinstance(task_id, str) or not task_id.strip():
@@ -49,6 +49,12 @@ def handle(bridge, args, context):
             if task is None or task.assignee != executor:
                 return _reply(False, "The task does not belong to this native execution profile.")
             if row:
+                if row.get("release_pending"):
+                    return _reply(False, "The tracker changed; reconcile the retained native work before tracking.",
+                                  code="legacy_reconciliation_required", task_id=task_id)
+                if not bridge.store.task_link_report_captured(issue_id, task_id):
+                    return _reply(False, "The retained binding has no initial reporting receipt; reconcile it before tracking.",
+                                  code="tracking_reconciliation_required", task_id=task_id)
                 if not row.get("linked_at"):
                     if (row.get("pending_resume") or row.get("release_pending")
                             or bridge.store.issue_reconciliation_blocked(issue_id) or bridge.store.retired(issue_id)):
@@ -56,6 +62,9 @@ def handle(bridge, args, context):
                                       code="legacy_reconciliation_required")
                     if not bridge.store.update(issue_id, linked_at=bridge.clock() * 1000):
                         return _reply(False, "The retained binding remains fenced; execution is unchanged.")
+                # Native subscription insertion is idempotent, including response loss.
+                # Reuse the captured reporting intent so a later human decision wins.
+                bridge.kanban.subscribe(task.id, issue_id)
                 return _reply(True, "Already linked to the same native task; execution is unchanged.",
                               task_id=task.id, state=task.status)
             me = bridge.api.viewer_id()
@@ -65,13 +74,14 @@ def handle(bridge, args, context):
             watermark = iso_ms(issue.get("updatedAt"))
             if watermark <= 0:
                 return _reply(False, "Linear ordering timestamp is unavailable; native execution is unchanged.")
+            state = "in_progress" if task.status in ("running", "ready", "review") else "blocked"
+            route = bridge._alert_route({"issue_id": issue_id, "origin": "kanban", "owner_ref": "", "task_id": task.id})
+            reporting = {"state": state, "claim": True, "seen": (issue.get("delegate") or {}).get("id"),
+                         "terminal": False, "source_ms": watermark, **route}
             if not bridge.store.link_task(issue_id, task.id, (issue.get("project") or {}).get("id"),
-                                          max(watermark, bridge.clock() * 1000)):
+                                          max(watermark, bridge.clock() * 1000), reporting=reporting, at=bridge.clock()):
                 return _reply(False, "An existing binding or unresolved effect needs reconciliation.")
             bridge.kanban.subscribe(task.id, issue_id)
-            # Reporting is queued after native work already exists. Delivery never gates its worker.
-            state = "in_progress" if task.status in ("running", "ready", "review") else "blocked"
-            bridge.status(issue_id, state, claim=True, seen=(issue.get("delegate") or {}).get("id"))
             return _reply(True, "Linked native task; Linear reporting is queued and execution is unchanged.",
                           task_id=task.id, state=task.status)
     except LinearError as exc:

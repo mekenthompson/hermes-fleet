@@ -512,6 +512,7 @@ class Bridge:
     def _park_fenced(self, issue_id: str) -> None:
         row = self.store.get(issue_id)
         if row and row["origin"] in ("kanban", "kanban_chat") and row.get("task_id"):
+            if not self._binding_reconciled(row): return
             task = self.kanban.get(row["task_id"])
             if task and task.status != "archived" and getattr(task, "created_by", None) == "linear":
                 self.kanban.archive(task.id)
@@ -530,6 +531,13 @@ class Bridge:
         if self.authorize_specialist_effect(issue_id): return True
         if not self.store.scope_fenced(issue_id): raise LinearError("Linear authorization temporarily unavailable")
         return False
+    @staticmethod
+    def _binding_reconciled(row: dict | None) -> bool:
+        if row and row.get("task_id") and (not row.get("linked_at") or row.get("release_pending")):
+            log.warning("linear: retained native binding %s needs provenance or release reconciliation",
+                        row["issue_id"])
+            return False
+        return True
     def _outbox_scope_issue_ids(self, row: dict[str, Any]) -> list[str]:
         payload = row["payload"]
         if row["kind"] != "project_update":
@@ -690,12 +698,20 @@ class Bridge:
             if row and row["origin"] == "chat" and row.get("panel_note"):
                 self.activity(issue_id, session_id, "elicitation", row["panel_note"])
         elif row:
-            if not row.get("linked_at"):
+            if not self._binding_reconciled(row):
                 self.activity(issue_id, session_id, "response", "The retained native binding needs provenance "
                               "and effect reconciliation before another assignment; no worker was created or resumed.")
                 return
             if stamp < max(row["linked_at"], row["resume_fence_at"]): return
             task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
+            if (task and not row.get("stop_requested_at") and not row.get("pending_resume")
+                    and row["owner_ref"] == session_id
+                    and getattr(task, "idempotency_key", None) == f"linear:{issue_id}:{session_id}"
+                    and getattr(task, "created_by", None) == "linear" and not self.store.has_start_ack(issue_id, task.id)):
+                # Reconcile the original native admission, including a lost activation
+                # response. Later blocked work and Stop are never initial staging.
+                self._start(event, issue, session_id, stamp, task.idempotency_key, existing=row)
+                return
             if task and task.status == "done":
                 # A verified new assignment may request a new increment only after
                 # the predecessor's native result and effect fence are reconciled.
@@ -763,8 +779,8 @@ class Bridge:
             current = self.store.get(issue_id)
             if not admitted or not current or current.get("task_id") != row.get("task_id"):
                 return False
-            if not current.get("linked_at"):
-                self.activity(issue_id, session_id, "response", "The retained native binding has unknown provenance. "
+            if not self._binding_reconciled(current):
+                self.activity(issue_id, session_id, "response", "The retained native binding needs provenance or release reconciliation. "
                               "Reconcile the existing task and effects, then explicitly revalidate tracking; no instruction was executed.")
                 return True
             if current.get("pending_resume"):
@@ -865,6 +881,8 @@ class Bridge:
                                                     else "Waiting to resume", "Still working", ephemeral=True)
             self.store.enqueue(kind, payload, at=self.clock())
     def await_retired(self, issue_id: str) -> None:
+        if not self._binding_reconciled(self.store.get(issue_id)):
+            raise LinearError("Retained native binding provenance needs reconciliation")
         for retired in self.store.retired(issue_id):
             task_id = retired["task_id"]
             task = self.kanban.get(task_id)
@@ -874,6 +892,7 @@ class Bridge:
             self.kanban.await_retirement(snapshot)
             self.store.clear_retirement(task_id, json.dumps(snapshot))
     def _unfinished(self, row: dict) -> None:
+        if not self._binding_reconciled(row): return
         self._retire_task(row)
         issue_id = row["issue_id"]
         body = "Kanban task archived or deleted without accepted completion evidence. Work remains unfinished."
@@ -933,6 +952,8 @@ class Bridge:
         staged = task.status == "blocked" and all(
             e.kind != "blocked" or (e.payload or {}).get("reason") == "initial_status"
             for e in self.kanban.history(task.id, 0))
+        if existing and task.status == "blocked" and not staged:
+            return False
         def activate() -> bool:
             self.kanban.subscribe(task.id, issue_id)
             return not staged or self.kanban.unblock(task.id)
@@ -969,7 +990,7 @@ class Bridge:
         if row["origin"] in ("kanban", "kanban_chat"):
             with self.store.guard_issue(row["issue_id"]) as admitted:
                 current = self.store.get(row["issue_id"])
-                if current and not current.get("linked_at"):
+                if current and not self._binding_reconciled(current):
                     self.activity(row["issue_id"], session_id, "error", "Native binding provenance is unknown; "
                                   "use supported native Stop and reconcile the retained binding before event delivery.")
                     return
@@ -1009,6 +1030,7 @@ class Bridge:
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
+                if not self._binding_reconciled(row): continue
                 if not self.authorize_specialist_effect(row["issue_id"]):
                     continue
                 # Our cursor moves with outbox writes independently of core's claim cursor.
@@ -1033,6 +1055,7 @@ class Bridge:
                         break
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
+        if not self._binding_reconciled(row): return
         payload, issue_id = event.payload or {}, row["issue_id"]
         if not self.authorize_specialist_effect(issue_id):
             return
@@ -1102,6 +1125,7 @@ class Bridge:
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     def _finish_work(self, issue_id: str, writes: list, *, at: float) -> bool:
         row = self.store.get(issue_id)
+        if not self._binding_reconciled(row): return False
         if row and not self.linear_session(row):
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                     "body": _visible_activity(payload.get("content") or {})}) if kind == "activity" else (kind, payload)
@@ -1110,6 +1134,7 @@ class Bridge:
             writes = [(kind, {**payload, **self._alert_route(row)}) for kind, payload in writes]
         return self.store.finish(issue_id, writes, at=at)
     def _finished(self, row: dict[str, Any]) -> None:
+        if not self._binding_reconciled(row): return
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
         if self.store.terminal_captured(row["task_id"]):
@@ -1171,6 +1196,7 @@ class Bridge:
                                      for kind, payload in writes], at=self.clock())
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
                   source_ms: float | None = None) -> bool:
+        if not self._binding_reconciled(self.store.get(issue["id"])): return False
         me = self.api.viewer_id()
         seen = me if seen == "self" else seen
         delegate = issue.get("delegate") or {}
@@ -1195,12 +1221,21 @@ class Bridge:
             self.takeover(row, issue)
         return False
     def takeover(self, row: dict[str, Any], issue: dict[str, Any]) -> None:
+        if not self._binding_reconciled(row): return
         name = (issue.get("delegate") or {}).get("name") or "nobody"
         with self._outbox_requester_scope({"payload": self._alert_route(row)}):
             self.comment(row["issue_id"], f"Reassigned to {name}; local retirement requested. New work here waits for the prior worker to exit.", row=row, takeover=True)
         self.release(row, f"Reassigned to {name} in Linear")
     def release(self, row: dict[str, Any], reason: str) -> None:
+        if not self._binding_reconciled(row): return
         if row["origin"] in ("kanban", "kanban_chat"):
+            task = self.kanban.get(row["task_id"])
+            if task and getattr(task, "created_by", None) != "linear":
+                # Linking an existing task authorized reporting, not retirement of
+                # independently admitted work. Preserve its claim and checkpoint.
+                self.store.update(row["issue_id"], release_pending=1)
+                log.warning("linear: %s; native task %s retained for reconciliation", reason, task.id)
+                return
             self._retire_task(row)
             self.kanban.archive(row["task_id"])
         else:
@@ -1225,6 +1260,7 @@ class Bridge:
         self._last_recheck = now
         for row in self.store.active():
             with self.lock(row["issue_id"]):
+                if not self._binding_reconciled(row): continue
                 if self._specialist_scope_active() and self.store.scope_fenced(row["issue_id"]):
                     continue
                 try:
@@ -1258,6 +1294,8 @@ class Bridge:
             for row in self.store.due(self.clock()):
                 if only_id is not None and row["id"] != only_id: continue
                 with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row), self._one_try(row):
+                    if any(not self._binding_reconciled(self.store.get(issue_id))
+                           for issue_id in self._outbox_scope_issue_ids(row)): continue
                     if not self._authorize_outbox_effect(row):
                         if advisory(row): continue
                         payload = row["payload"]
@@ -1329,6 +1367,8 @@ class Bridge:
         def guard():
             row = self.store.outbox_row(row_id)
             payload = (row or {}).get("payload", {})
+            if row and any(not self._binding_reconciled(self.store.get(issue_id))
+                           for issue_id in self._outbox_scope_issue_ids(row)): raise ProjectUpdateDeferred
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row, issue_ids): raise ProjectUpdateDeferred
             if payload.get("initial_ack"):
@@ -1599,6 +1639,7 @@ class Bridge:
         log.error("linear: gave up on %s write for %s after retries: %s",
                   row["kind"], payload.get("issue_id"), exc)
         work = self.store.get(str(payload.get("issue_id")))
+        if not self._binding_reconciled(work): return False
         cause = payload.get("last_error") or str(exc)
         note = f"Linear has not accepted {row['kind']} update {row['id']} for this issue: {cause}. " + (
             "It will be retried after the next successful write." if getattr(exc, "retryable", True)
@@ -1618,6 +1659,7 @@ class Bridge:
     def _alert_uncertain_terminal(self, row: dict[str, Any]) -> None:
         """A failed status attempt cannot prove who set Done; ask for reconciliation."""
         payload = row["payload"]
+        if not self._binding_reconciled(self.store.get(payload["issue_id"])): return
         note = ("A prior status attempt failed, so its remote outcome is uncertain. Reconcile who closed it "
                 "and the exact evidence before reporting this work complete.")
         log.error("linear: uncertain terminal status for %s", payload["issue_id"])

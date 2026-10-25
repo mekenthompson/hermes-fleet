@@ -151,6 +151,10 @@ work. Explicit verified assignments may request native resumption, whose retirem
 checks still apply. Unverifiable events admit no work.
 
 Human reassignment or closure is reread before affected execution requests and status writes.
+For independently created tasks linked only for reporting, it fences the reporting binding and
+preserves the native task, claim and checkpoint for reconciliation. Linking never authorizes
+Linear to archive that work. Unknown migrated bindings likewise remain visible and fenced,
+including terminal reporting and release paths, until their provenance and effects are reconciled.
 Native cancellation records Stop and reconciles worker/process teardown; acknowledgement does
 not prove external effects ended. Old workers retain no authority to write or close a replacement
 run. A missing or expired background completion grant produces a diagnostic before effectful

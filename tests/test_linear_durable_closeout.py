@@ -177,7 +177,7 @@ class DurableCloseoutTests(unittest.TestCase):
             path = Path(directory) / 'state.db'
             store = Store(path)
             old = store.enqueue('comment', {'issue_id': ISSUE, 'body': 'Old retirement', 'takeover': True}, at=1)
-            store.put(ISSUE, 'kanban', SESSION, task_id='new-task')
+            store.put(ISSUE, 'kanban', SESSION, task_id='new-task', last_updated_at=1)
             bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 0)
             saved = Store(path).outbox_row(old)
@@ -272,7 +272,7 @@ class DurableCloseoutTests(unittest.TestCase):
             bridge = Bridge(store, Authority().api(), kanban, profile='synthetic', clock=lambda: now[0])
             task = kanban.create(initial_status='running')
             kanban.tasks[task.id].status = 'running'
-            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
             row = store.get(ISSUE)
             bridge._keepalive(row)
             [alive] = [r for r in store.pending(ISSUE) if r['kind'] == 'activity']
@@ -403,7 +403,7 @@ class DurableCloseoutTests(unittest.TestCase):
             bridge = Bridge(store, Authority().api(), kanban, profile='synthetic', clock=lambda: 10_000)
             task = kanban.create(initial_status='running')
             kanban.tasks[task.id].status = 'running'
-            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
             other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': 'other-session',
                                                'content': {'type': 'response', 'body': 'elsewhere'}}, at=9_990)
             store.mark_sent(other, True)
@@ -428,7 +428,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 summary=summary, metadata={'artifacts': ['/private/findings.md']}))
             kanban.evidence_text = adapter.evidence_text
             kanban.completion_summary = adapter.completion_summary
-            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
             bridge = Bridge(store, api, kanban, profile='synthetic')
             bridge._finished(store.get(ISSUE))
             responses = [row['payload']['content'] for row in store.pending(ISSUE)
@@ -472,7 +472,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 task = kanban.create(title='OPS-1: review')
                 task.status, task.result, task.completion_contract = 'done', result, contract
                 kanban.evidence_text = lambda task: evidence_text or task.result
-                store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+                store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
                 bridge = Bridge(store, authority.api(), kanban, profile='synthetic')
                 with patch.object(bridge, 'accepted_evidence', return_value=contract == 'local-only'):
                     bridge._finished(store.get(ISSUE))
@@ -497,7 +497,7 @@ class DurableCloseoutTests(unittest.TestCase):
             store = Store(Path(directory) / 'state.db')
             kanban = FakeKanban()
             task = kanban.create(title='OPS-1: review')
-            store.put(ISSUE, 'kanban', SESSION, task_id=task.id)
+            store.put(ISSUE, 'kanban', SESSION, task_id=task.id, last_updated_at=1)
             bridge = Bridge(store, api, kanban, profile='synthetic')
             with api.requester_session(SESSION):
                 bridge.takeover(store.get(ISSUE), authority.issues[ISSUE])
