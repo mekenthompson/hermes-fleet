@@ -433,11 +433,12 @@ class TaskTrackingScenarios(unittest.TestCase):
             runtime = SimpleNamespace(profile_home=service_home, profile_name="default", gateway=object(), stop_event=stop)
             await services["linear"](runtime)
 
-        with patch.object(kanban_db, "add_comment", legacy_comment), \
-                patch.object(plugin, "token_provider", side_effect=AssertionError("credential lookup reached")) as tokens:
-            with self.assertRaisesRegex(RuntimeError, "native task authority/idempotent-comment runtime"):
-                asyncio.run(run_service())
-            tokens.assert_not_called()
+        for name in ("add_comment", "block_task", "unblock_task", "lifecycle_request_received"):
+            with self.subTest(api=name), patch.object(kanban_db, name, legacy_comment), \
+                    patch.object(plugin, "token_provider", side_effect=AssertionError("credential lookup reached")) as tokens:
+                with self.assertRaisesRegex(RuntimeError, "native task authority/idempotent-comment runtime"):
+                    asyncio.run(run_service())
+                tokens.assert_not_called()
         self.assertFalse(state_path.exists())
         self.assertFalse((service_home / "linear").exists())
         self.assertEqual(list(service_home.iterdir()), [], "incompatible runtime cannot create profile state")

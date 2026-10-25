@@ -147,8 +147,8 @@ class NativeContinuationScenarios(unittest.TestCase):
         inbox = self.queue(event, "resume-lost-response")
         unblock = self.board.unblock
 
-        def lost_response(task_id):
-            self.assertTrue(unblock(task_id))
+        def lost_response(task_id, **request):
+            self.assertTrue(unblock(task_id, **request))
             raise OSError("native unblock committed, response lost")
 
         with patch.object(self.board, "unblock", side_effect=lost_response):
@@ -531,6 +531,94 @@ class NativeContinuationScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertFalse(self.store.has_start_ack(issue, task_id))
+
+    def test_lost_assignment_receipt_cannot_undo_a_later_native_stop(self):
+        self.bridge.handle_webhook(self.prompt("", "before-lost-assignment", signal="stop"))
+        self.clock.now += 1
+        event = self.remote.session_event("created", ISSUE, "lost-assignment")
+        inbox = self.queue(event, "lost-assignment")
+        unblock = self.board.unblock
+        def lose_receipt(task_id, **request):
+            self.assertTrue(unblock(task_id, **request))
+            raise OSError("unblock receipt lost")
+        with patch.object(self.board, "unblock", side_effect=lose_receipt):
+            self.bridge.drain_ingress(inbox)
+        with self.board.conn() as conn:
+            self.assertTrue(kb.block_task(conn, self.task_id, reason="Later explicit native Stop"))
+        self.bridge = self.reopen()
+        self.clock.now += 5
+        with patch.object(self.board, "unblock", side_effect=AssertionError("old assignment replayed")):
+            self.bridge.drain_ingress(inbox)
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+
+    def test_lost_stop_receipt_cannot_block_a_newer_native_resumption(self):
+        event = self.prompt("", "lost-stop", signal="stop")
+        inbox = self.queue(event, "lost-stop")
+        block = self.board.block
+        def lose_receipt(task_id, reason, **request):
+            self.assertTrue(block(task_id, reason, **request))
+            raise OSError("block receipt lost")
+        with patch.object(self.board, "block", side_effect=lose_receipt):
+            self.bridge.drain_ingress(inbox)
+        self.assertTrue(self.board.unblock(self.task_id))
+        before = self.board.get(self.task_id)
+        self.bridge = self.reopen()
+        self.clock.now += 5
+        with patch.object(self.board, "block", side_effect=AssertionError("old Stop replayed")):
+            self.bridge.drain_ingress(inbox)
+        after = self.board.get(self.task_id)
+        self.assertEqual((after.status, after.block_recurrences), (before.status, before.block_recurrences))
+        self.assertEqual(after.status, "ready")
+
+    def test_native_stop_after_assignment_comment_fences_first_unblock(self):
+        self.bridge.handle_webhook(self.prompt("", "before-comment-race", signal="stop"))
+        self.clock.now += 1
+        event = self.remote.session_event("created", ISSUE, "comment-stop-race")
+        inbox = self.queue(event, "comment-stop-race")
+        unblock = self.board.unblock
+        def stop_before_unblock(task_id, **request):
+            with self.board.conn() as conn:
+                self.assertFalse(kb.block_task(conn, task_id, reason="Native Stop while already blocked"))
+            return unblock(task_id, **request)
+        with patch.object(self.board, "unblock", side_effect=stop_before_unblock):
+            self.bridge.drain_ingress(inbox)
+        self.bridge = self.reopen()
+        self.clock.now += 5
+        self.bridge.drain_ingress(inbox)
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+
+    def test_native_stop_while_initially_blocked_fences_staged_admission_retry(self):
+        issue, session = "staged-noop-stop", "staged-noop-session"
+        self.remote.add_issue(issue, "STAGED-NOOP")
+        self.remote.set_delegate(issue, {"id": SELF})
+        event = self.remote.session_event("created", issue, session)
+        with patch.object(self.bridge.store, "activate_task", side_effect=RuntimeError("staging crash")):
+            with self.assertRaisesRegex(RuntimeError, "staging crash"):
+                self.bridge.handle_webhook(event)
+        task_id = self.store.get(issue)["task_id"]
+        with self.board.conn() as conn:
+            self.assertFalse(kb.block_task(conn, task_id, reason="Native Stop before initial activation"))
+        self.bridge = self.reopen()
+        self.bridge.handle_webhook(event)
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.store.get(issue)["task_id"], task_id)
+        self.assertFalse(self.store.has_start_ack(issue, task_id))
+
+    def test_assignment_creation_key_cannot_adopt_independently_created_work(self):
+        issue, session = "manual-key-collision", "manual-key-session"
+        self.remote.add_issue(issue, "MANUAL-KEY")
+        self.remote.set_delegate(issue, {"id": SELF})
+        task = self.board.create(title="Independent native work", assignee="default", created_by="default",
+                                 idempotency_key=f"linear:{issue}:{session}")
+        with self.board.conn() as conn:
+            self.assertTrue(kb.claim_task(conn, task.id))
+        before = self.board.get(task.id)
+        inbox = self.queue(self.remote.session_event("created", issue, session), "manual-key")
+        self.bridge.drain_ingress(inbox)
+        self.assertIsNone(self.store.get(issue))
+        after = self.board.get(task.id)
+        self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                         (before.status, before.current_run_id, before.claim_lock))
 
 
 if __name__ == "__main__":

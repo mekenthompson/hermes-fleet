@@ -118,12 +118,15 @@ class FakeKanban:
         self.histories = {}
         self.event_calls = []
         self.comments = []
+        self.comment_keys = set()
+        self.lifecycle_receipts = {}
 
     def create(self, **fields):
         self.creates.append(fields)
         task = SimpleNamespace(id="task-1", status="blocked" if fields.get("initial_status") == "blocked" else "ready", completion_contract=None,
                                result="", title=fields.get("title", "Synthetic task"),
-                               assignee=fields.get("assignee", "synthetic"), created_by=fields.get("created_by", "linear"))
+                               assignee=fields.get("assignee", "synthetic"), created_by=fields.get("created_by", "linear"),
+                               idempotency_key=fields.get("idempotency_key"))
         self.tasks[task.id] = task
         if task.status == "blocked":
             self.histories[task.id] = [SimpleNamespace(id=1, kind="blocked", payload={"reason": "initial_status"})]
@@ -149,10 +152,27 @@ class FakeKanban:
         self.subscriptions.append((task_id, issue_id))
 
     def comment(self, task_id, body, *, marker=""):
+        if marker and (task_id, marker) in self.comment_keys: return
+        if marker: self.comment_keys.add((task_id, marker))
         self.comments.append((task_id, body))
 
-    def unblock(self, task_id):
+    def comment_received(self, task_id, marker):
+        return (task_id, marker) in self.comment_keys
+
+    def resumption_received(self, task_id, marker):
+        return self.lifecycle_receipts.get((task_id, "unblock", marker)) is True
+
+    def cancellation_received(self, task_id, marker):
+        return (task_id, "block", marker) in self.lifecycle_receipts
+
+    def initial_admission_event(self, task_id):
+        return 1
+
+    def unblock(self, task_id, *, marker="", origin_comment_key="", expected_event_id=None):
+        if marker and (task_id, "unblock", marker) in self.lifecycle_receipts:
+            return self.lifecycle_receipts[(task_id, "unblock", marker)]
         self.tasks[task_id].status = "ready"
+        if marker: self.lifecycle_receipts[(task_id, "unblock", marker)] = True
         return True
 
     def retirement(self, task_id, prior=None):
@@ -162,8 +182,12 @@ class FakeKanban:
     def archive(self, task_id):
         self.tasks[task_id].status = "archived"
 
-    def block(self, task_id, _reason):
+    def block(self, task_id, _reason, *, marker=""):
+        if marker and (task_id, "block", marker) in self.lifecycle_receipts:
+            return self.lifecycle_receipts[(task_id, "block", marker)]
         self.tasks[task_id].status = "blocked"
+        if marker: self.lifecycle_receipts[(task_id, "block", marker)] = True
+        return True
 
 
 class LinearSpecialistAuthorizationTests(unittest.TestCase):
@@ -703,7 +727,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_replayed_create_keeps_an_existing_human_block(self):
         task = SimpleNamespace(id="task-existing", status="blocked", completion_contract=None,
-                               result="", title="OPS-1: task")
+                               result="", title="OPS-1: task", assignee="synthetic", created_by="linear",
+                               idempotency_key=f"linear:{ISSUE}:{SESSION}")
         self.kanban.tasks[task.id] = task
         self.kanban.histories[task.id] = [SimpleNamespace(id=1, kind="blocked", payload={"reason": "waiting"})]
         self.kanban.create = lambda **_fields: task
@@ -815,11 +840,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_work_is_durable_before_task_becomes_executable(self):
         unblock = self.kanban.unblock
-        def checked_unblock(task_id):
+        def checked_unblock(task_id, **request):
             with sqlite3.connect(self.store.path) as db:
                 self.assertEqual(db.execute("SELECT task_id FROM work WHERE issue_id=?", (ISSUE,)).fetchone()[0],
                                  task_id)
-            return unblock(task_id)
+            return unblock(task_id, **request)
         self.kanban.unblock = checked_unblock
         self.bridge.handle_webhook(self.session_event())
         self.assertEqual(self.kanban.tasks["task-1"].status, "ready")

@@ -150,6 +150,12 @@ comments are saved with native idempotent comment keys and do not automatically 
 work. Explicit verified assignments may request native resumption, whose retirement and claim
 checks still apply. Unverifiable events admit no work.
 
+Native block/unblock requests use durable request receipts and native event fences. A retry after
+a lost response cannot undo a later Stop or stop a newer resumed run. Initial admission is anchored
+to the native staging event; a later native Stop also fences a not-yet-applied admission. These
+keys order already-authorized requests and supply no identity or permission. The plugin does not
+infer resumption from unrelated events or reset triage from a reason string.
+
 Human reassignment or closure is reread before affected execution requests and status writes.
 For independently created tasks linked only for reporting, it fences the reporting binding and
 preserves the native task, claim and checkpoint for reconciliation. Linking never authorizes

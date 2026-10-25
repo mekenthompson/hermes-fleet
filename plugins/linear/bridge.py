@@ -254,20 +254,22 @@ class Kanban:
         metadata = run.metadata if run else None
         body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
         return body if isinstance(body, str) else ""
-    def block(self, task_id: str, reason: str) -> bool:
+    def block(self, task_id: str, reason: str, *, marker: str = "") -> bool:
         with self.conn() as conn:
-            return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input")
-    def unblock(self, task_id: str) -> bool:
+            return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input", idempotency_key=marker or None)
+    def unblock(self, task_id: str, *, marker: str = "", origin_comment_key: str = "",
+                expected_event_id: int | None = None) -> bool:
         with self.conn() as conn:
+            if marker:
+                result = self.kb.lifecycle_request_received(conn, task_id, "unblock", marker)
+                if result is not None: return result
             self._await_worker_exit(conn, task_id)
-            task = self.kb.get_task(conn, task_id)
-            if task and task.status == "triage":
-                event = next((e for e in reversed(self.kb.list_events(conn, task_id))
-                              if e.kind == "block_loop_detected"), None)
-                if event and str(event.payload.get("reason") or "").startswith(OWN + " stopped by "):
-                    return self.kb.specify_triage_task(conn, task_id, author="linear")
-                return False
-            return self.kb.unblock_task(conn, task_id)
+            return self.kb.unblock_task(conn, task_id, idempotency_key=marker or None,
+                origin_comment_key=origin_comment_key or None, expected_event_id=expected_event_id)
+    def initial_admission_event(self, task_id: str) -> int | None:
+        with self.conn() as conn:
+            return next((e.id for e in reversed(self.kb.list_events(conn, task_id))
+                         if e.kind == "blocked" and (e.payload or {}).get("reason") == "initial_status"), None)
     def retirement(self, task_id: str, prior: dict | None = None) -> dict:
         prior = prior or {"workers": [], "pending": [], "missing": False}
         with self.conn() as conn, self.kb.write_txn(conn):
@@ -305,12 +307,12 @@ class Kanban:
                                 "AND json_extract(payload, '$.idempotency_key')=? LIMIT 1",
                                 (task_id, marker)).fetchone() is not None
     def resumption_received(self, task_id: str, marker: str) -> bool:
-        """Reconcile an unblock's native history after losing its return value."""
+        """Only this native request's mutation receipt proves it was handled."""
         with self.conn() as conn:
-            return conn.execute("SELECT 1 FROM task_events u WHERE u.task_id=? AND u.kind='unblocked' "
-                "AND u.id>(SELECT MAX(c.id) FROM task_events c WHERE c.task_id=u.task_id "
-                "AND c.kind='commented' AND json_extract(c.payload, '$.idempotency_key')=?) LIMIT 1",
-                (task_id, marker)).fetchone() is not None
+            return self.kb.lifecycle_request_received(conn, task_id, "unblock", marker) is True
+    def cancellation_received(self, task_id: str, marker: str) -> bool:
+        with self.conn() as conn:
+            return self.kb.lifecycle_request_received(conn, task_id, "block", marker) is not None
     def comment(self, task_id: str, body: str, *, marker: str = "") -> None:
         with self.conn() as conn:
             self.kb.add_comment(conn, task_id, "linear", body, idempotency_key=marker or None)
@@ -793,18 +795,17 @@ class Bridge:
             if task is None or task.status in ("done", "archived"):
                 self.say(current, "The native task has ended. Status queries do not create another executor.")
                 return True
-            needs_resume = resume and task.status == "blocked"
             key = f"linear:{issue_id}:{session_id}:{marker or stamp}"
-            received = getattr(self.kanban, "comment_received", lambda _task, _key: False)(task.id, key)
-            resumed = (received and getattr(self.kanban, "resumption_received",
-                       lambda _task, _key: bool(current["stop_requested_at"]))(task.id, key))
+            received = self.kanban.comment_received(task.id, key)
+            resumed = received and self.kanban.resumption_received(task.id, key)
+            needs_resume = resume and task.status == "blocked" and not resumed
             reconcile_resume = resume and (needs_resume or resumed)
             body = "" if received else "\n\n".join(value for value in (note, context() if context else "") if value)
             def deliver() -> bool:
                 if not received:
                     self.kanban.comment(task.id, body, marker=key)
                 # Only verified assignment requests resumption; comments do not unblock.
-                return not needs_resume or self.kanban.unblock(task.id)
+                return not needs_resume or self.kanban.unblock(task.id, marker=key, origin_comment_key=key)
             if not self._require_effect(issue_id) or not self.store.activate_task(issue_id, task.id, deliver):
                 return False
             fields = {"last_updated_at": max(stamp, current["last_updated_at"])}
@@ -813,6 +814,8 @@ class Bridge:
             if reconcile_resume and self.kanban.get(task.id).status in ("ready", "running", "review"):
                 fields.update(stop_requested_at=0, resume_fence_at=stamp)
             self.store.update(issue_id, **fields)
+            if resumed and task.status == "blocked":
+                receipt = "This assignment was already handled. The task is now blocked; its later native state is unchanged."
             self.store.enqueue_once("activity", {"issue_id": issue_id, "session_id": session_id,
                 "content": {"type": "response", "body": receipt}, **self._alert_route(current)},
                 key + ":receipt", at=self.clock())
@@ -944,6 +947,10 @@ class Bridge:
                 idempotency_key=key, completion_contract=self.contracts.get(project),
                 initial_status="blocked")
         if task is None: return False
+        if (getattr(task, "created_by", None) != "linear" or task.assignee != (
+                getattr(self.kanban, "executor_profile", None) or self.profile)):
+            self._decline(issue_id, session_id, "The native creation key belongs to independently admitted work; reconcile it first.")
+            return False
         if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(task.id)):
             return False
         if not self._require_effect(issue_id):
@@ -956,7 +963,10 @@ class Bridge:
             return False
         def activate() -> bool:
             self.kanban.subscribe(task.id, issue_id)
-            return not staged or self.kanban.unblock(task.id)
+            if not staged: return True
+            anchor = self.kanban.initial_admission_event(task.id)
+            return anchor is not None and self.kanban.unblock(task.id, marker=key + ":initial-admission",
+                expected_event_id=anchor)
         route = {"task_id": task.id}
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             route["requester_sessions"] = {issue_id: session_id}
@@ -974,7 +984,9 @@ class Bridge:
             return True
         try:
             if not self.store.activate_task(issue_id, task.id, activate):
-                self.kanban.archive(task.id)
+                retained = self.store.get(issue_id)
+                if retained:
+                    self.say(retained, "Native admission was not resumed; reconcile its current Stop and task state.", "error")
                 return False
             if not self.store.enqueue_many(writes, at=self.clock()):
                 raise LinearError("Native task admitted; reporting capture needs reconciliation")
@@ -1015,11 +1027,16 @@ class Bridge:
                 if not admitted or not current or current["stop_requested_at"] != stamp: return
                 row = current
                 row = {**row, "owner_ref": session_id}
+                key = f"native-stop:{row['issue_id']}:{session_id}:{activity_id or stamp}"
                 task = self.kanban.get(row["task_id"])
-                if not self.kanban.block(row["task_id"], f"{OWN} stopped by {who}") and (
+                if self.kanban.cancellation_received(row["task_id"], key):
+                    if task and task.status not in ("blocked", "triage"): return
+                elif not self.kanban.block(row["task_id"], f"{OWN} stopped by {who}", marker=key) and (
                         task and task.status) != "blocked":
                     self.say(row, f"Could not stop the task (it is {task and task.status}); stop it on the board.", "error")
                     return
+                actual = self.kanban.get(row["task_id"])
+                if not actual or actual.status not in ("blocked", "triage"): return
         else:
             self.store.capture_chat_stop(row["issue_id"], session_id, activity_id,
                                          self.profile, at=self.clock(), stamp=stamp)

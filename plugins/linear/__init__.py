@@ -365,9 +365,15 @@ def validate_native_task_runtime(_gateway: Any = None) -> None:
     from hermes_cli import kanban_db
     from tools import approval_context
     if ("idempotency_key" not in inspect.signature(kanban_db.add_comment).parameters
+            or "idempotency_key" not in inspect.signature(kanban_db.block_task).parameters
+            or not {"idempotency_key", "origin_comment_key", "expected_event_id"}.issubset(
+                inspect.signature(kanban_db.unblock_task).parameters)
+            or not callable(getattr(kanban_db, "lifecycle_request_received", None))
+            or not {"task_id", "operation", "idempotency_key"}.issubset(
+                inspect.signature(kanban_db.lifecycle_request_received).parameters)
             or not all(callable(getattr(approval_context, name, None))
                        for name in ("background_task_refusal", "revoked_task_tool_error", "require_live_task_setup"))):
-        raise RuntimeError("Linear tracking requires the native task authority/idempotent-comment runtime; "
+        raise RuntimeError("Linear tracking requires the native task authority/idempotent-comment runtime with lifecycle request fencing; "
                            "publish and deploy the approved native prerequisite before activating this bundle.")
 
 
