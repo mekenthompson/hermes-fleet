@@ -65,6 +65,14 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
             for row in _rows(db, "SELECT issue_id, last_updated_at FROM work WHERE release_pending = 1"):
                 add(row["issue_id"], "release", (row["last_updated_at"] or now * 1000) / 1000,
                     "chat release is waiting for Linear to read back no delegate", "Retried each tick; check Linear.")
+            for row in _rows(db, "SELECT issue_id, owner_ref, last_updated_at FROM work WHERE origin='chat'"):
+                add(row["issue_id"], row["owner_ref"], (row["last_updated_at"] or now * 1000) / 1000,
+                    "retained legacy chat record; no restart execution is scheduled",
+                    "Reconcile native execution/effects, then release the record and explicitly link remaining work to a native task.")
+            for row in _rows(db, "SELECT issue_id, task_id, last_updated_at FROM work WHERE pending_resume IS NOT NULL"):
+                add(row["issue_id"], row["task_id"] or "legacy-continuation",
+                    (row["last_updated_at"] or now * 1000) / 1000, "legacy continuation requires reconciliation",
+                    "Read native task and external effect state; the plugin will not replay this continuation.", True)
             for row in _rows(db, "SELECT task_id, issue_id FROM retirement"):
                 add(row["issue_id"], row["task_id"], now, f"waiting for Kanban task {row['task_id']} to exit",
                     "Stop the worker in Kanban if it is still running.")

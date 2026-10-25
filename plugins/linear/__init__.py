@@ -439,26 +439,10 @@ def register(ctx: Any) -> None:
         bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
                         await asyncio.to_thread(Kanban, settings.get("board"), profile=runtime.profile_name,
                                                 profile_home=home), profile=runtime.profile_name,
-                        settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
-        from . import admission
-        bridge.validate_chat_admission = lambda context: admission.bound_to_live_turn(runtime, context)
+                        settings=settings)
+        from . import host_context
+        bridge.validate_chat_admission = lambda context: host_context.bound_to_live_turn(runtime, context)
         bridge.profile_home = home.resolve(strict=True)
-        try:
-            from gateway.chat_execution_recovery import ChatExecutionStore
-            if (callable(getattr(ChatExecutionStore, "retire_for_handoff", None))
-                    and callable(getattr(ChatExecutionStore, "lineage_keys", None))):
-                bridge.retire_chat = lambda key, generation, request_id: ChatExecutionStore(
-                    bridge.profile_home).retire_for_handoff(key, generation, request_id)
-                bridge.chat_lineage = lambda key: ChatExecutionStore(bridge.profile_home).lineage_keys(key)
-        except ImportError:
-            pass  # Older Agent images refuse transfer before preparing any intent.
-        def native_transfer_message(context):
-            if not admission.bound_to_live_turn(runtime, context):
-                return ""
-            # Agent stamps the committed original human text only for this exact
-            # native turn. The mutable event text can be rewritten during a turn.
-            return context.user_message if isinstance(context.user_message, str) else ""
-        bridge.transfer_user_message = native_transfer_message
         ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
         running["bridge"] = bridge
         server = None

@@ -74,7 +74,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
             with self.assertRaises(linear_api.LinearError) as caught:
                 api.graphql("query Marked { viewer { id } }")
             lookup = json.loads(chat.handle(
-                _Bridge(api), {"action": "start", "issue": "ABC-1"}, _Context()))
+                _Bridge(api), {"action": "blocked", "issue": "ABC-1"}, _Context()))
             created = json.loads(chat.handle(
                 _Bridge(api),
                 {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "HF"},
@@ -115,7 +115,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
         logger, handler, records, previous = self._records()
         try:
             reply = json.loads(chat.handle(
-                _Bridge(api), {"action": "start", "issue": "ABC-1"}, _Context()))
+                _Bridge(api), {"action": "blocked", "issue": "ABC-1"}, _Context()))
         finally:
             self._release(logger, handler, previous)
 

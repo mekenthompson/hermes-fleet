@@ -87,8 +87,7 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.store.put('issue-1', 'chat', 'chat', run_generation=1)
         self.notes: list[tuple[str, str]] = []
         self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
-        self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock,
-                             inject=lambda key, text: self.notes.append((key, text)) or True)
+        self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock)
         self.context = SimpleNamespace(session_key='chat', session_id='session', profile='alpha',
                                        platform='slack', run_generation=1)
         self.request_id = str(uuid.uuid4())
@@ -154,17 +153,17 @@ class DescriptionSettlementTests(unittest.TestCase):
 
     def test_uncertain_notice_names_operation_cause_and_resolution(self):
         self.wedge()
-        self.assertEqual(len(self.notes), 1)
-        text = self.notes[0][1]
+        self.assertEqual(self.notes, [], "an uncertain-effect notification cannot start execution")
+        text = ops.report(ops.stuck(self.path, self.ingress, 'alpha', now=self.clock()))
         self.assertIn(self.request_id, text)
-        self.assertIn('remote description differs', text)
+        self.assertIn('may or may not have reached Linear', text)
+        self.assertIn('remote description differs', self.row()['payload']['last_error'])
         self.assertIn(f'hermes linear resolve {self.request_id}', text)
         self.assertNotIn('delivery failed', text)
 
     def test_held_issue_refusals_name_the_write_and_supported_resolution(self):
         self.wedge()
         replies = [self.invoke('add_comment', request_id=str(uuid.uuid4())),
-                   json.loads(chat.handle(self.bridge, {'action': 'start', 'issue': 'ABC-1'}, self.context)),
                    json.loads(chat.handle(self.bridge, {'action': 'done', 'issue': 'ABC-1',
                                                          'evidence': 'https://example.test/deploy'}, self.context))]
         for reply in replies:

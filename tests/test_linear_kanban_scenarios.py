@@ -53,6 +53,23 @@ class Context:
         self.run_generation, self.profile = generation, profile
 
 
+def legacy_chat_fixture(bridge, args, context):
+    """Historical migration fixture only: production cannot create these claims anymore."""
+    from hermes_fleet_linear_plugin.bridge import iso_ms
+    issue = bridge.api.issue(args["issue"])
+    existing = bridge.store.get(issue["id"])
+    if existing:
+        raise AssertionError("legacy fixture cannot adopt or resume existing work")
+    project = (issue.get("project") or {}).get("id")
+    assert bridge.store.put(issue["id"], "chat", context.session_key, project_id=project,
+                            run_generation=context.run_generation, last_updated_at=iso_ms(issue["updatedAt"]))
+    assert bridge.status(issue["id"], "in_progress", claim=True,
+                         seen=(issue.get("delegate") or {}).get("id"))
+    assert bridge.project_update(context.session_id, project, issue["identifier"], "In progress",
+                                 session_key=context.session_key, issue_id=issue["id"])
+    return json.dumps({"ok": True, "message": "Historical fixture seeded"})
+
+
 @unittest.skipIf(CORE is not None, f"integration: pinned Agent source unavailable ({CORE})")
 class LinearKanbanScenarios(unittest.TestCase):
     def setUp(self) -> None:
@@ -72,7 +89,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     def make_bridge(self, settings: dict | None = None) -> Bridge:
         api = LinearAPI(lambda: "synthetic-token", endpoint=self.linear.url, clock=self.clock)
         return Bridge(Store(self.dir / "state.db"), api, Kanban(), profile="alpha", settings=settings or {},
-                      inject=self.inject, clock=self.clock)
+                      clock=self.clock)
 
     def inject(self, key: str, text: str) -> bool:
         self.injected.append((key, text))
@@ -315,8 +332,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
         from tools import registry
-        from hermes_fleet_linear_plugin import admission
-        validator = getattr(admission, "bound_to_live_turn", None)
+        from hermes_fleet_linear_plugin import host_context
+        validator = getattr(host_context, "bound_to_live_turn", None)
         self.assertTrue(callable(validator), "production live-turn validator is missing")
         context = registry.ToolInvocationContext(profile="alpha", platform="telegram", chat_id="chat", chat_type="dm",
             session_key="parent-chat", session_id="parent-session", run_generation=7)
@@ -352,205 +369,11 @@ class LinearKanbanScenarios(unittest.TestCase):
                 db.execute("UPDATE sessions SET ended_at=1")
             self.assertFalse(validator(runtime, context))
 
-    def test_registered_service_delegate_accepts_host_turn_and_refuses_serialized_rpc(self):
-        import asyncio
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        from tools import registry
-        from hermes_fleet_linear_plugin import transport
-        self.bridge.kanban.profile_home = self.dir
-        context = registry.ToolInvocationContext(profile="alpha", platform="telegram", chat_id="chat", chat_type="dm",
-            session_key="parent-chat", session_id="parent-session", run_generation=7)
-        source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="chat", thread_id="",
-            chat_type="dm", user_id="", scope_id="")
-        turn = SimpleNamespace(session_key=context.session_key, session_id=context.session_id, run_generation=7,
-                               _run_still_current=lambda: True)
-        state = SimpleNamespace(persistent=SimpleNamespace(run_generation=7),
-            turn=SimpleNamespace(agent=object(), ctx=turn, event=SimpleNamespace(source=source)))
-        gateway = SimpleNamespace(_peek_session_state=lambda key: state,
-            _chat_stop_profile_matches=lambda key, home: True, _is_user_authorized_for_source=lambda source: True)
-        with sqlite3.connect(self.dir / "state.db") as db:
-            db.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, ended_at REAL)")
-            db.execute("INSERT INTO sessions VALUES('parent-session', NULL)")
-        class Registration:
-            def get_config(self, key, default=None): return True if key == "enabled" else default
-            def register_tool(self, **kwargs): self.tool = kwargs
-            def register_hook(self, *args): pass
-            def register_profile_service(self, name, factory): self.service = factory
-        registration = Registration()
-        plugin.register(registration)
-        self.assertTrue(registration.tool["inject_invocation_context"])
-        self.assertIn("delegate", registration.tool["schema"]["parameters"]["properties"]["action"]["enum"])
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        captured = []
-        def at_recover(*_):
-            captured.append(json.loads(registration.tool["handler"](args, context)))
-        async def run_service():
-            stop = asyncio.Event()
-            stop.set()
-            runtime = SimpleNamespace(gateway=gateway, profile_home=self.dir, profile_name="alpha", stop_event=stop)
-            await registration.service(runtime)
-        with patch.object(plugin, "BoundLinearAPI", return_value=self.bridge.api), \
-                patch.object(plugin, "token_provider", return_value=lambda: "synthetic-token"), \
-                patch.object(plugin, "Store", return_value=self.bridge.store), \
-                patch.object(plugin, "Kanban", return_value=self.bridge.kanban), \
-                patch.object(plugin, "Bridge", return_value=self.bridge), \
-                patch.object(self.bridge, "chat_profile_matches", return_value=True), \
-                patch.object(self.bridge, "recover", side_effect=at_recover), \
-                patch.object(registry, "_current_tool_invocation_context", return_value=context):
-            asyncio.run(run_service())
-        self.assertEqual(len(captured), 1)
-        self.assertTrue(captured[0]["ok"], captured)
-        before = sum("mutation" in request for request in self.linear.requests)
-        server = transport.Server(self.dir, "alpha", lambda args, host: chat.handle(self.bridge, args, host), lambda _: None)
-        try:
-            with patch.object(self.bridge, "chat_profile_matches", return_value=True):
-                result = json.loads(transport.chat_request(self.dir, args, context))
-            self.assertFalse(result["ok"], result)
-            self.assertIn("live gateway-owned", result["message"])
-        finally:
-            server.close()
-        self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
-        self.assertEqual(len(self.tasks()), 1)
 
-    def test_chat_delegate_admits_one_session_free_real_core_task(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        self.bridge.kanban.profile_home = self.dir
-        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
-                                  session_id="parent-session", run_generation=7, chat_id="chat", thread_id="",
-                                  chat_type="dm", user_id="user", scope_id="")
-        self.bridge.validate_chat_admission = lambda value: value is context
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        # Exercise the registered chat handler's action, not an invented native event.
-        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
-            result = json.loads(chat.handle(self.bridge, args, context))
-            self.assertTrue(result["ok"], result)
-            again = json.loads(chat.handle(self.bridge, args, context))
-            self.assertTrue(again["ok"], again)
-            before = sum("mutation" in request for request in self.linear.requests)
-            for field, value in (("run_generation", 8), ("chat_id", "other-chat")):
-                with self.subTest(field=field):
-                    old = getattr(context, field)
-                    setattr(context, field, value)
-                    rejected = json.loads(chat.handle(self.bridge, args, context))
-                    self.assertFalse(rejected["ok"], rejected)
-                    setattr(context, field, old)
-            self.linear.set_state(ISSUE, "Canceled")
-            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
-            self.linear.set_state(ISSUE, "In Progress")
-            self.linear.set_delegate(ISSUE, OTHER)
-            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
-            self.linear.set_delegate(ISSUE, {"id": SELF})
-            self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
-        row = self.bridge.store.get(ISSUE)
-        self.assertEqual(row["origin"], "kanban_chat")
-        self.assertEqual(row["owner_ref"], "parent-chat")
-        self.assertEqual(self.bridge.kanban.get(row["task_id"]).status, "ready")
-        self.assertEqual(self.bridge.kanban.get(row["task_id"]).max_retries, 0)
-        self.assertEqual(self.linear.activities, [])
-        self.assertEqual(len(self.tasks()), 1)
-        self.deliver(self.linear.session_event("created", ISSUE, "genuine-native-session"))
-        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "parent-chat")
-        self.assertEqual(self.bridge.store.get(ISSUE)["task_id"], row["task_id"])
-        self.assertEqual(len(self.tasks()), 1)
-        activity_count = len(self.linear.activities)
-        with self.bridge.kanban.conn() as conn:
-            self.assertTrue(kb.block_task(conn, row["task_id"], reason="reconcile worker", kind="capability"))
-        self.clock.now += 1
-        self.deliver(self.linear.session_event("prompted", ISSUE, "genuine-native-session", body="continue"))
-        self.assertEqual(self.bridge.kanban.get(row["task_id"]).status, "blocked")
-        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "parent-chat")
-        self.assertEqual(len(self.linear.activities), activity_count)
-        self.complete(row["task_id"], "Findings: https://docs.example/findings/admitted")
-        self.assertEqual(self.linear.state(ISSUE), "Done")
-        self.assertEqual(len(self.linear.activities), activity_count)
 
-    def test_chat_delegate_task_create_response_loss_preserves_blocked_idempotent_task(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        self.bridge.kanban.profile_home = self.dir
-        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
-            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
-            user_id="user", scope_id="")
-        self.bridge.validate_chat_admission = lambda value: value is context
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        original = self.bridge.kanban.create
-        def lose_response(**fields):
-            original(**fields)
-            raise OSError("local create response lost")
-        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
-            with patch.object(self.bridge.kanban, "create", side_effect=lose_response):
-                self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
-            tasks = self.tasks()
-            self.assertEqual(len(tasks), 1)
-            self.assertEqual(tasks[0][1], "blocked")
-            self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
-            self.assertTrue(json.loads(chat.handle(self.bridge, args, context))["ok"])
-            self.assertEqual(len(self.tasks()), 1)
 
-    def test_chat_admission_turn_invalidated_at_transport_boundary_sends_nothing(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        self.bridge.kanban.profile_home = self.dir
-        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
-            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
-            user_id="user", scope_id="")
-        live = [True]
-        self.bridge.validate_chat_admission = lambda value: live[0] and value is context
-        original = self.bridge._mutate_outbox
-        def invalidate(row_id, action, **kwargs):
-            live[0] = False
-            return original(row_id, action, **kwargs)
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        with patch.object(self.bridge, "chat_profile_matches", return_value=True), \
-                patch.object(self.bridge, "_mutate_outbox", side_effect=invalidate):
-            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
-        self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
-        self.assertEqual(self.tasks()[0][1], "blocked")
 
-    def test_chat_delegate_binding_refusal_retains_fenced_task(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        self.bridge.kanban.profile_home = self.dir
-        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
-            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
-            user_id="user", scope_id="")
-        self.bridge.validate_chat_admission = lambda value: value is context
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        with patch.object(self.bridge, "chat_profile_matches", return_value=True), \
-                patch.object(self.bridge.store, "bind_chat_admission", return_value=False), \
-                patch.object(self.bridge.kanban, "archive", side_effect=OSError("archive failed")):
-            self.assertFalse(json.loads(chat.handle(self.bridge, args, context))["ok"])
-        admission = self.bridge.store.chat_admission(args["id"])
-        self.assertEqual(admission["state"], "ambiguous")
-        self.assertEqual(admission["task_id"], self.tasks()[0][0])
-        self.assertEqual(self.tasks()[0][1], "blocked")
-        self.assertEqual(sum("mutation" in request for request in self.linear.requests), 0)
 
-    def test_chat_delegate_response_loss_keeps_task_blocked_across_restart(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        self.bridge.kanban.profile_home = self.dir
-        context = SimpleNamespace(profile="alpha", platform="telegram", session_key="parent-chat",
-            session_id="parent-session", run_generation=7, chat_id="chat", thread_id="", chat_type="dm",
-            user_id="user", scope_id="")
-        self.bridge.validate_chat_admission = lambda value: value is context
-        args = {"action": "delegate", "issue": "ABC-1", "id": "b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-        self.linear.lose_next_response = True
-        with patch.object(self.bridge, "chat_profile_matches", return_value=True):
-            result = json.loads(chat.handle(self.bridge, args, context))
-        self.assertFalse(result["ok"])
-        admission = self.bridge.store.chat_admission(args["id"])
-        self.assertEqual(admission["state"], "ambiguous")
-        self.assertEqual(self.bridge.kanban.get(admission["task_id"]).status, "blocked")
-        before = sum("mutation" in request for request in self.linear.requests)
-        self.bridge = self.make_bridge()
-        self.bridge.recover()
-        self.bridge.flush()
-        self.assertEqual(sum("mutation" in request for request in self.linear.requests), before)
-        self.assertEqual(len(self.tasks()), 1)
-        self.assertEqual(self.bridge.kanban.get(admission["task_id"]).status, "blocked")
 
     def test_session_free_worker_archive_projects_unfinished_comment_not_activity(self):
         task = self.bridge.kanban.create(title="Synthetic archive", assignee="alpha")
@@ -564,7 +387,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertTrue(any("unfinished" in comment["body"].lower() for comment in self.linear.comments))
 
     def test_session_free_worker_scope_fence_archives_worker(self):
-        task = self.bridge.kanban.create(title="Synthetic scope", assignee="alpha")
+        task = self.bridge.kanban.create(title="Synthetic scope", assignee="alpha", created_by="linear")
         self.bridge.store.put(ISSUE, "kanban_chat", "parent-chat", task_id=task.id, last_updated_at=self.clock() * 1000)
         self.bridge.api.specialist_scope = object()
         self.bridge.store.fence_scope(ISSUE, "fixture scope revoked", at=self.clock())
@@ -593,7 +416,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(self.linear.activities, [])
         self.assertTrue(any("Findings" in comment["body"] for comment in self.linear.comments))
-        self.assertEqual(self.linear.project_updates, [])
+        self.assertEqual(len(self.linear.project_updates), 1)
+        self.assertIn("https://docs.example/findings/session-free", self.linear.project_updates[0]["body"])
         self.assertFalse(any(row["kind"] == "project_update" for row in self.bridge.store.pending()))
 
     def test_session_free_worker_block_projects_comment_without_agent_activity(self):
@@ -651,7 +475,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                              Kanban(profile="default", profile_home=get_profile_dir("default")),
                              profile="default", settings={"ingress_profile": "worker-a"}, clock=self.clock)
         owner = Context("owner-key", "owner-transcript", 7, profile="default")
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, owner))["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-1"}, owner))["ok"])
         self.bridge.flush()
         producer.enqueue(route, "echo", json.dumps(self.linear.session_event("created", ISSUE, "echo-session")).encode())
         self.bridge.tick(inbox)
@@ -662,155 +486,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         with sqlite3.connect(inbox) as db:
             self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("imported", 1))
 
-    def test_standalone_chat_uses_default_context_and_retains_stop_generation(self):
-        from hermes_cli.profiles import get_profile_dir
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                       Context("chat-owner", "chat-transcript", 7, profile="default")))
-        self.assertTrue(reply["ok"], reply)
-        row = self.bridge.store.get(ISSUE)
-        self.assertEqual(row["origin"], "chat")
-        self.assertEqual(row["run_generation"], 7)
-        self.assertIsNone(row["task_id"])
 
-    def test_same_executor_name_from_foreign_home_cannot_claim_chat(self):
-        from hermes_cli.profiles import get_profile_dir
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        token = set_hermes_home_override(str(self.dir))
-        try:
-            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                           Context("foreign", "foreign-transcript", 7, profile="default")))
-        finally:
-            reset_hermes_home_override(token)
-        self.assertFalse(reply["ok"])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
 
-    def test_standalone_chat_without_generation_explains_stop_limit(self):
-        from hermes_cli.profiles import get_profile_dir
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                       Context("chat-owner", "chat-transcript", profile="default")))
-        self.assertTrue(reply["ok"])
-        self.assertIn("Linear Stop cannot interrupt", reply["message"])
-        self.assertIsNone(self.bridge.store.get(ISSUE)["run_generation"])
 
-    def test_real_default_api_context_can_track_and_complete_without_a_worker(self):
-        from hermes_cli.profiles import get_profile_dir
-        from gateway.platforms.api_server import APIServerAdapter
-        from gateway.session_context import clear_session_vars
-        from tools.registry import _current_tool_invocation_context
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        tokens = APIServerAdapter._bind_api_server_session(
-            chat_id="api-chat", session_key="api-owner", session_id="api-transcript", profile="")
-        try:
-            context = _current_tool_invocation_context()
-            self.assertEqual(context.profile, "")
-            self.assertEqual(context.platform, "api_server")
-            start = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))
-            self.assertTrue(start["ok"], start)
-            self.assertIn("Linear Stop cannot interrupt", start["message"])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["run_generation"])
-            done = json.loads(chat.handle(self.bridge, {
-                "action": "done", "issue": "ABC-1", "note": "Verified result",
-                "evidence": "https://git.example/org/repo/commit/abc"}, context))
-            self.assertTrue(done["ok"], done)
-            self.bridge.flush()
-            self.assertEqual(self.linear.state(ISSUE), "Done")
-            self.assertIsNone(self.bridge.store.get(ISSUE))
-            self.assertEqual(self.tasks(), [])
-        finally:
-            clear_session_vars(tokens)
 
-    def test_blank_api_context_cannot_claim_from_a_foreign_home(self):
-        from hermes_cli.profiles import get_profile_dir
-        from gateway.platforms.api_server import APIServerAdapter
-        from gateway.session_context import clear_session_vars
-        from tools.registry import _current_tool_invocation_context
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        tokens = APIServerAdapter._bind_api_server_session(
-            session_key="foreign", session_id="foreign-transcript", profile="")
-        override = set_hermes_home_override(self.dir)
-        try:
-            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                           _current_tool_invocation_context()))
-            self.assertFalse(reply["ok"])
-            self.assertIsNone(self.bridge.store.get(ISSUE))
-            self.assertEqual(self.tasks(), [])
-        finally:
-            reset_hermes_home_override(override)
-            clear_session_vars(tokens)
 
-    def test_blank_non_api_context_and_named_executor_remain_refused(self):
-        from hermes_cli.profiles import get_profile_dir
-        from types import SimpleNamespace
-        self.bridge.kanban = Kanban(profile="alpha", profile_home=get_profile_dir("default"))
-        for platform in ("", "slack", "telegram"):
-            context = SimpleNamespace(profile="", platform=platform, session_key="owner", session_id="sid")
-            reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))
-            self.assertFalse(reply["ok"])
-        self.bridge.kanban.executor_profile = "alpha"
-        context = SimpleNamespace(profile="", platform="api_server", session_key="owner", session_id="sid")
-        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, context))["ok"])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
-        self.assertEqual(self.tasks(), [])
 
-    def test_named_chat_matches_its_scoped_home_and_retains_generation(self):
-        from unittest.mock import patch
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        home = self.dir / "profiles" / "alpha"
-        home.mkdir(parents=True)
-        (home / "config.yaml").write_text("{}\n")
-        with patch.dict(os.environ, {"HERMES_HOME": str(self.dir)}):
-            self.bridge.kanban = Kanban(profile="alpha", profile_home=home)
-            token = set_hermes_home_override(home)
-            try:
-                reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("named-owner", "named-transcript", 8, profile="alpha")))
-            finally:
-                reset_hermes_home_override(token)
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(self.bridge.store.get(ISSUE)["run_generation"], 8)
 
-    def test_desktop_handler_without_local_service_uses_single_gateway_owner(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        from hermes_fleet_linear_plugin import transport
-        home = self.dir / "profiles" / "alpha"
-        home.mkdir(parents=True)
-        (home / "config.yaml").write_text("{}\n")
-        class Registration:
-            def get_config(self, key, default=None):
-                return True if key == "enabled" else default
-            def register_tool(self, **kwargs): self.tool = kwargs["handler"]
-            def register_hook(self, *args): pass
-            def register_profile_service(self, *args): self.service = args
-        with patch.dict(os.environ, {"HERMES_HOME": str(self.dir)}):
-            self.bridge.kanban = Kanban(profile="alpha", profile_home=home)
-            token = set_hermes_home_override(home)
-            server = None
-            try:
-                server = transport.Server(home, "alpha", lambda args, context: chat.handle(self.bridge, args, context),
-                                          lambda session: chat.on_turn_end(self.bridge, session))
-                client = Registration()
-                plugin.register(client)
-                context = SimpleNamespace(profile="alpha", platform="api_server", session_key="desktop-owner",
-                                          session_id="desktop-transcript", run_generation=12)
-                reply = json.loads(client.tool({"action": "start", "issue": "ABC-1"}, context))
-                self.assertTrue(reply["ok"], reply)
-                row = self.bridge.store.get(ISSUE)
-                self.assertEqual((row["owner_ref"], row["run_generation"], row["task_id"]), ("desktop-owner", 12, None))
-                with self.bridge.kanban.conn() as conn:
-                    self.assertEqual(kb.list_tasks(conn), [])
-                foreign = SimpleNamespace(**{**vars(context), "session_key": "other-chat"})
-                refusal = json.loads(client.tool({"action": "start", "issue": "ABC-1"}, foreign))
-                self.assertFalse(refusal["ok"])
-                self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "desktop-owner")
-            finally:
-                if server is not None: server.close()
-                reset_hermes_home_override(token)
 
     # -- helpers -------------------------------------------------------------
     def deliver(self, event: dict) -> None:
@@ -834,12 +516,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.tick()
 
     def chat(self, action: str, session: str = "chat-key", **args) -> dict:
-        out = chat.handle(self.bridge, {"action": action, "issue": "ABC-1", **args}, Context(session, session + "-id"))
+        invoke = legacy_chat_fixture if action == "seed_legacy" else chat.handle
+        out = invoke(self.bridge, {"action": action, "issue": "ABC-1", **args}, Context(session, session + "-id"))
         self.bridge.tick()
         return json.loads(out)
 
     def test_chat_mutations_require_the_exact_recorded_owner(self) -> None:
-        self.assertTrue(self.chat("start", session="owner-chat")["ok"])
+        self.assertTrue(self.chat("seed_legacy", session="owner-chat")["ok"])
 
         def snapshot():
             with sqlite3.connect(self.dir / "state.db") as db:
@@ -933,11 +616,13 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.api.identity.pop("projects", None)
         self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-2", body="authorized continue"))
-        self.assertEqual(self.tasks(), [(task, "ready")])
+        self.assertEqual(self.tasks(), [(task, "blocked")], "a followup is data, not native resumption")
+        with self.bridge.kanban.conn() as conn:
+            self.assertEqual(sum("authorized continue" in c.body for c in kb.list_comments(conn, task)), 1)
 
     def test_chat_followup_requires_current_owner_identity_and_scope(self) -> None:
         self.bind_identity()
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         original_issue = self.bridge.api.issue
         before = self.bridge.store.get(ISSUE)
         for refusal in ("delegate", "unassigned", "actor", "scope", "read"):
@@ -964,7 +649,11 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.api.identity.pop("projects", None)
         self.linear.set_delegate(ISSUE, {"id": SELF, "name": "This Agent"})
         self.bridge.handle_webhook(self.linear.session_event("prompted", ISSUE, "s-9", body="authorized follow-up"))
-        self.assertTrue(any("authorized follow-up" in body for _, body in self.injected))
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.bridge.store.get(ISSUE), before)
+        replies = [row["payload"].get("content", {}).get("body", "") for row in self.bridge.store.pending(ISSUE)]
+        self.assertTrue(any("legacy chat record" in body for body in replies))
+        self.assertEqual(self.tasks(), [])
 
     def test_existing_redelegation_refuses_owner_replacement_after_takeover(self) -> None:
         self.bind_identity()
@@ -980,7 +669,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_chat_recovery_does_not_resume_after_authoritative_takeover(self) -> None:
         self.bind_identity()
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.linear.set_delegate(ISSUE, OTHER)
         before = list(self.injected), self.bridge.store.get(ISSUE)
         self.bridge.recover()
@@ -1031,20 +720,20 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(len(self.tasks()), 2)
 
     def test_loop_guard_on_our_own_chat_start_echo(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         # Self-delegation fires 'created' at our own webhook (phase 0 finding).
         self.deliver(self.linear.session_event("created", ISSUE, "s-echo", creator=SELF))
         self.deliver(self.linear.session_event("created", ISSUE, "s-human"))
         self.assertEqual(self.tasks(), [])
         self.assertEqual(self.types(), ["response", "response"])
-        self.assertTrue(all("Already in progress from Hermes chat" in a["content"]["body"] for a in self.linear.activities))
+        self.assertTrue(all("legacy chat record" in a["content"]["body"] for a in self.linear.activities))
 
     def test_chat_closeout_receipt_fences_late_native_echo_and_prompt_across_restart(self):
         from unittest.mock import patch
         for action in ("done", "release"):
             with self.subTest(action=action):
                 self.setUp()
-                self.assertTrue(self.chat("start")["ok"])
+                self.assertTrue(self.chat("seed_legacy")["ok"])
                 old_echo = self.linear.session_event("created", ISSUE, "s-echo", creator=None)
                 old_prompt = self.linear.session_event("prompted", ISSUE, "s-echo", body="Older instruction")
                 self.clock.now += 1
@@ -1070,7 +759,10 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.assertEqual(self.tasks(), [])
                 self.clock.now += 1
                 if action == "release": self.linear.set_delegate(ISSUE, {"id": SELF})
-                self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Explicit new work"))
+                self.deliver(self.linear.session_event("prompted", ISSUE, "s-new", body="Additional requested work"))
+                self.assertEqual(self.tasks(), [], "an unbound tracker prompt cannot admit new work")
+                self.clock.now += 1
+                self.deliver(self.linear.session_event("created", ISSUE, "s-new"))
                 self.assertEqual(len(self.tasks()), 1)
 
     def test_follow_up_brings_the_thread_since_the_last_update_once(self) -> None:
@@ -1099,13 +791,17 @@ class LinearKanbanScenarios(unittest.TestCase):
             comments = [c.body for c in kb.list_comments(conn, self.task_id())]
         self.assertTrue(any("update the changelog" in c for c in comments))
         self.assertEqual(len(self.tasks()), 1)
-        # Chat-owned work: the follow-up is injected into the owning chat session.
+        # Retained legacy chat work cannot gain execution from a tracker notification.
         self.linear.add_issue("iss-2", "ABC-2")
-        chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-id"))
+        legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-id"))
         self.bridge.flush()  # Work-bearing steering waits for the queued claim to be confirmed.
         self.assertEqual(self.linear.issues["iss-2"]["delegate"]["id"], SELF)
         self.deliver(self.linear.session_event("prompted", "iss-2", "s-9", body="Use the staging data"))
-        self.assertIn(("chat-key", "[Linear follow-up on ABC-2] Use the staging data"), self.injected)
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.bridge.store.get("iss-2")["owner_ref"], "chat-key")
+        self.assertTrue(any("legacy chat record" in activity["content"].get("body", "")
+                            for activity in self.linear.activities))
+        self.assertEqual(len(self.tasks()), 1)
 
     def test_stop_blocks_and_stays_stopped_after_restart(self) -> None:
         self.delegate()
@@ -1114,7 +810,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [(task_id, "blocked")])
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
         self.assertEqual(self.linear.issues[ISSUE]["delegate"]["id"], SELF)
-        self.assertIn("Stopped by Pat Example", self.linear.activities[-1]["content"]["body"])
+        self.assertIn("Stop recorded from Pat Example", self.linear.activities[-1]["content"]["body"])
         messages = len(self.linear.bodies(ISSUE))
         # Restart: a fresh bridge over the same state, a dispatcher pass, and ticks.
         self.bridge = self.make_bridge()
@@ -1195,7 +891,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [(old, "archived")])
         reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, Context("other-chat", "chat")))
         self.assertFalse(reply["ok"])
-        self.assertIn("still exiting", reply["message"])
+        self.assertEqual(reply["code"], "native_execution_required")
         process.kill(); process.wait(timeout=10)
         self.deliver(event)
         self.assertNotEqual(self.task_id(), old)
@@ -1259,7 +955,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                 event = self.linear.session_event("created", ISSUE, "late-registration")
                 with self.assertRaisesRegex(Exception, "identity is unknown"): self.bridge.handle_webhook(event)
                 reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"}, Context("new-chat", "chat")))
-                self.assertFalse(reply["ok"]); self.assertIn("identity is unknown", reply["message"])
+                self.assertFalse(reply["ok"]); self.assertEqual(reply["code"], "native_execution_required")
                 self.assertEqual(self.tasks(), [(old, "archived")])
                 process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
                 try:
@@ -1579,7 +1275,7 @@ class LinearKanbanScenarios(unittest.TestCase):
             for boundary in ("status", "comment", "project_update", "project_update_insert", "ownership_capture"):
                 with self.subTest(action=action, boundary=boundary):
                     self.setUp()
-                    self.assertTrue(self.chat("start")["ok"])
+                    self.assertTrue(self.chat("seed_legacy")["ok"])
                     if boundary == "project_update_insert":
                         with sqlite3.connect(self.bridge.store.path) as db:
                             db.execute("DELETE FROM outbox WHERE kind = 'project_update'")
@@ -1614,14 +1310,14 @@ class LinearKanbanScenarios(unittest.TestCase):
                                         for body in self.linear.bodies(ISSUE)))
 
     def test_failed_chat_stop_injection_keeps_work_and_reports_uncertainty(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.inject_ok = False
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
         self.assertIsNotNone(self.bridge.store.get(ISSUE))
         self.assertNotIn("Stopped by", " ".join(self.linear.bodies(ISSUE)))
 
     def test_unbound_chat_stop_reports_unsupported_without_core_target(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
         self.deliver(self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop"))
         self.assertEqual(self.bridge.store.stop_intents(), [])
@@ -1630,7 +1326,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_bound_chat_stop_runs_on_gateway_loop_after_durable_capture(self) -> None:
         from hermes_fleet_linear_plugin import process_chat_stops
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-1"},
                                                Context("chat-key", "chat-id", 7)))["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
         event = self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop", activity_id="stop-a")
@@ -1666,7 +1362,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_stop_crash_before_receipt_does_not_claim_success_or_retarget(self) -> None:
         from hermes_fleet_linear_plugin import process_chat_stops
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-1"},
                                                Context("chat-key", "chat-id", 7)))["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
         self.deliver(self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop"))
@@ -1693,7 +1389,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_accepted_pending_becomes_visible_unknown_after_restart(self) -> None:
         from hermes_fleet_linear_plugin import process_chat_stops
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-1"},
                                                Context("chat-key", "chat-id", 7)))["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
         self.deliver(self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop"))
@@ -1718,7 +1414,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_stop_ack_lost_response_retries_same_linear_activity_id(self) -> None:
         from hermes_fleet_linear_plugin import process_chat_stops
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-1"},
                                                Context("chat-key", "chat-id", 7)))["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
         self.deliver(self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop"))
@@ -1739,38 +1435,9 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(second, first)
         self.assertFalse(any(r["kind"] == "activity" for r in self.bridge.store.pending(ISSUE)))
 
-    def test_new_chat_turn_does_not_retarget_saved_stop_and_wrong_session_is_ignored(self) -> None:
-        from hermes_fleet_linear_plugin import process_chat_stops
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("chat-key", "chat-id", 7)))["ok"])
-        self.deliver(self.linear.session_event("created", ISSUE, "linear-s", creator=SELF))
-        self.deliver(self.linear.session_event("prompted", ISSUE, "other-s", signal="stop"))
-        self.assertEqual(self.bridge.store.stop_intents(), [])
-        self.deliver(self.linear.session_event("prompted", ISSUE, "linear-s", signal="stop", activity_id="stop-a"))
-        self.assertEqual(self.bridge.store.stop_intents()[0]["run_generation"], 7)
-        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                                Context("chat-key", "chat-id", 7)))["ok"])
-        self.assertNotEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], 0)
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("chat-key", "chat-id", 8)))["ok"])
-        self.assertEqual(self.bridge.store.get(ISSUE)["run_generation"], 8)
-        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                                Context("chat-key", "chat-id", 9, "wrong")))["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("chat-key", "chat-id", 7)))["ok"])
-        self.assertEqual(self.bridge.store.get(ISSUE)["run_generation"], 8)
-        class Gateway:
-            async def get_chat_run_stop_observation(inner, **kwargs):
-                return {"status": "unknown"}
-            async def request_chat_run_stop(inner, **kwargs):
-                self.assertEqual(kwargs["expected_run_generation"], 7)
-                return {"status": "stale", "worker_completion": "unknown"}
-        runtime = type("Runtime", (), {"gateway": Gateway(), "profile_home": str(self.dir)})()
-        asyncio.run(process_chat_stops(self.bridge, runtime))
-        self.assertEqual(self.bridge.store.stop_intents()[0]["status"], "stale")
 
     def test_chat_stop_cannot_be_marked_done_after_restart_until_newer_prompt(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
         self.assertFalse(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         self.bridge = self.make_bridge()
@@ -1778,28 +1445,30 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertFalse(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         self.clock.now += 60
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Resume this work"))
-        self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
+        self.assertFalse(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
+        self.assertNotEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], 0)
 
-    def test_restart_comment_is_fenced_if_chat_issue_changes_before_flush(self) -> None:
+    def test_restart_preserves_legacy_claim_without_automatic_closeout(self) -> None:
         for change in ("takeover", "closure"):
             with self.subTest(change=change):
                 self.setUp()
-                self.assertTrue(self.chat("start")["ok"])
-                self.inject_ok = False
+                self.assertTrue(self.chat("seed_legacy")["ok"])
+                before = self.bridge.store.get(ISSUE)
                 self.bridge = self.make_bridge()
                 self.bridge.recover()
-                self.assertIsNone(self.bridge.store.get(ISSUE))
-                comment = next(p for p in self.bridge.store.pending(ISSUE) if p["kind"] == "comment")
-                self.assertEqual(comment["payload"].get("session_key"), "chat-key")
+                self.assertEqual(self.bridge.store.get(ISSUE), before)
                 if change == "takeover":
                     self.linear.set_delegate(ISSUE, OTHER)
                 else:
                     self.linear.set_state(ISSUE, "Done")
                 self.bridge.flush()
+                self.assertEqual(self.bridge.store.get(ISSUE), before)
+                self.assertEqual(self.tasks(), [])
                 self.assertFalse(any("Interrupted by a restart" in c["body"] for c in self.linear.comments))
 
+
     def test_project_update_is_once_even_after_first_was_sent(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.clock.now += 31 * 60
         self.bridge.tick()
         self.assertEqual(len(self.linear.project_updates), 1)
@@ -1903,30 +1572,41 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(len(self.tasks()), 1)
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
 
-    def test_revoked_refresh_token_alerts_chat_on_first_failed_write(self) -> None:
+    def test_revoked_refresh_token_logs_notice_on_first_failed_write(self) -> None:
         from hermes_fleet_linear_plugin.oauth import ReauthorizationRequired
-        self.assertTrue(self.chat("start")["ok"])
+        from unittest.mock import patch
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.bridge.comment(ISSUE, "queued progress")
         def revoked():
             raise ReauthorizationRequired("reauthorize this profile's app")
         self.bridge.api.token = revoked
-        self.bridge.comment(ISSUE, "queued progress")
-        self.bridge.tick()
-        alerts = [message for key, message in self.injected if key == "chat-key" and "reauthoriz" in message.lower()]
-        self.assertEqual(len(alerts), 1)
+        with self.assertLogs("linear", "ERROR") as logged:
+            self.bridge.tick()
+            self.bridge.tick()
+        self.assertEqual(sum("reauthorization required" in line for line in logged.output), 1)
+        self.assertTrue(self.bridge.store.pending())
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.tasks(), [])
 
-    def test_revoked_token_on_terminal_row_alerts_after_work_deletion(self) -> None:
+
+    def test_revoked_token_on_terminal_row_logs_notice_after_work_deletion(self) -> None:
         from hermes_fleet_linear_plugin.oauth import ReauthorizationRequired
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         self.assertIsNone(self.bridge.store.get(ISSUE))
         def revoked():
             raise ReauthorizationRequired("reauthorize this profile's app")
         self.bridge.api.token = revoked
-        self.bridge.tick()
-        alerts = [message for key, message in self.injected if key == "chat-key" and "reauthoriz" in message.lower()]
-        self.assertEqual(len(alerts), 1)
+        with self.assertLogs("linear", "ERROR") as logged:
+            self.bridge.tick()
+            self.bridge.tick()
+        self.assertEqual(sum("reauthorization required" in line for line in logged.output), 1)
+        self.assertTrue(self.bridge.store.pending())
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.tasks(), [])
+
 
     def test_parked_inbox_failure_posts_one_issue_alert(self) -> None:
         import sqlite3
@@ -2076,7 +1756,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_refused_terminal_mutation_keeps_recovery_rows_and_truthful_receipt(self) -> None:
         from hermes_fleet_linear_plugin.store import Store
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         original = self.linear._apply
         def rejected(query, variables):
             for mutation in ("issueUpdate", "commentCreate", "projectUpdateCreate"):
@@ -2102,7 +1782,9 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.linear.comments, [])
         self.assertEqual(self.linear.project_updates, [])
-        notices = [message for _, message in self.injected if status_id in message]
+        from hermes_fleet_linear_plugin import ops
+        notices = [ops.report(ops.stuck(self.bridge.store.path, self.dir / "missing-inbox", "alpha", now=self.clock()))]
+        self.assertEqual(self.injected, [])
         self.assertTrue(notices)
         self.assertTrue(any("may or may not have reached Linear" in message for message in notices))
         self.assertTrue(any(f"hermes linear resolve {status_id} applied|not_applied" in message
@@ -2111,7 +1793,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertFalse(any("will be retried" in message for message in notices))
 
     def test_give_up_after_a_day_is_loud_and_retried_later(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         done = chat.handle(self.bridge, {"action": "done", "issue": "ABC-1", "note": "Merged",
                                          "evidence": "https://git.example/org/repo/commit/abc"},
                            Context("chat-key", "chat-key-id"))
@@ -2121,39 +1803,46 @@ class LinearKanbanScenarios(unittest.TestCase):
             for _ in range(26):
                 self.clock.now += 3600
                 self.bridge.tick()
-        self.assertTrue(any("has not accepted" in text for _, text in self.injected))
+        from hermes_fleet_linear_plugin import ops
+        self.assertTrue(ops.stuck(self.bridge.store.path, self.dir / "missing-inbox", "alpha", now=self.clock()))
+        self.assertEqual(self.injected, [])
         self.linear.down = False
         self.linear.add_issue("iss-2", "ABC-2")
-        chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-id"))
+        legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-id"))
         self.bridge.tick()  # a successful write revives the given-up rows
         self.bridge.tick()
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.assertEqual(len([c for c in self.linear.comments if c["issueId"] == ISSUE]), 1)
 
     def test_lost_terminal_status_response_reports_uncertainty_once(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.linear.lose_next_response = True
         self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         self.assertEqual(self.linear.state(ISSUE), "Done")
         self.clock.now += 61
         self.bridge.tick()
         self.bridge.tick()
-        alerts = [message for key, message in self.injected if key == "chat-key" and "prior status attempt failed" in message]
-        self.assertEqual(len(alerts), 1)
+        from hermes_fleet_linear_plugin import ops
+        held = [item for item in ops.stuck(self.bridge.store.path, self.dir / "missing-inbox", "alpha", now=self.clock())
+                if item["act"] and "may or may not have reached Linear" in item["why"]]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(self.injected, [])
         self.assertEqual(self.linear.comments, [])
         self.assertEqual(self.linear.project_updates, [])
 
     def test_terminal_write_alert_retains_chat_destination_after_work_deletion(self) -> None:
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         self.assertIsNone(self.bridge.store.get(ISSUE))
         status = next(p for p in self.bridge.store.pending(ISSUE) if p["kind"] == "status" and
                       p["payload"]["state"] == "done")
-        self.bridge._loud(status, LinearError("synthetic outage"))
-        self.assertTrue(any(key == "chat-key" and "has not accepted" in message for key, message in self.injected))
+        self.assertFalse(self.bridge._loud(status, LinearError("synthetic outage")))
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.bridge.store.outbox_row(status["id"]), status)
+        self.assertEqual(status["payload"].get("session_key"), "chat-key")
 
     def test_terminal_write_alert_retains_kanban_destination_after_work_deletion(self) -> None:
         from hermes_fleet_linear_plugin.api import LinearError
@@ -2276,7 +1965,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_chat_pr_requires_exact_head_acceptance_before_deleting_work(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch("hermes_fleet_linear_plugin.bridge.pr_acceptance", return_value=False) as acceptance:
             result = self.chat("done", evidence="https://github.com/example/repo/pull/8")
         acceptance.assert_called_once_with("https://github.com/example/repo/pull/8")
@@ -2293,14 +1982,14 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_sentence_period_after_pr_link_does_not_hide_acceptance_check(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch("hermes_fleet_linear_plugin.bridge.pr_acceptance", return_value=False) as acceptance:
             result = self.chat("done", evidence="PR: https://github.com/example/repo/pull/8.")
         acceptance.assert_called_once_with("https://github.com/example/repo/pull/8")
         self.assertFalse(result["ok"])
 
     def test_unverified_other_host_pr_links_cannot_mark_chat_done(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         for url in ("https://gitlab.com/example/repo/-/merge_requests/7",
                     "https://bitbucket.org/example/repo/pull-requests/7",
                     "https://dev.azure.com/acme/project/_git/repo/pullrequest/7"):
@@ -2314,55 +2003,37 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "Blocked")
         self.assertIn("PR acceptance", self.linear.activities[-1]["content"]["body"])
 
-    def test_explicit_chat_resume_fences_equal_timestamp_duplicate_stop(self) -> None:
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("chat-key", "chat-key-id", 7)))["ok"])
-        stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
-        self.deliver(stop)
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
-                                               Context("chat-key", "chat-key-id", 8)))["ok"])
-        self.deliver(stop)
-        self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], 0)
-        self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
 
     def test_legacy_stop_cannot_be_resumed_from_an_unverified_chat_turn(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
         self.assertFalse(self.chat("start")["ok"])
         self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-1"},
                                                 Context("chat-key", "chat-key-id", 9)))["ok"])
         self.assertFalse(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
 
-    def test_prompt_chat_resume_fences_equal_timestamp_duplicate_stop(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
-        stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
-        self.deliver(stop)
-        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Resume work"))
-        self.deliver(stop)
-        self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], 0)
-        self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
 
-    def test_failed_exhaustion_alert_remains_retryable(self) -> None:
+    def test_failed_legacy_write_stays_visible_without_execution_notification(self) -> None:
+        from hermes_fleet_linear_plugin import ops
         from unittest.mock import patch
-        def unreported() -> list[tuple[str]]:
-            with sqlite3.connect(self.bridge.store.path) as db:
-                return db.execute("SELECT kind FROM outbox WHERE state = 'failed' AND "
-                                  "COALESCE(json_extract(payload, '$.reported'), 0) = 0").fetchall()
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
-        self.assertIsNone(self.bridge.store.get(ISSUE))
-        self.inject_ok = False
         self.linear.down = True
         self.clock.now += 86_401
         self.bridge.tick()
-        failed = [r for r in unreported() if r[0] == "status"]
-        self.assertEqual(len(failed), 1)
+        with self.bridge.store._tx() as db:
+            failed = db.execute("SELECT id, kind FROM outbox WHERE state='failed'").fetchall()
+        self.assertTrue(failed)
         self.bridge = self.make_bridge()
-        self.inject_ok = True
         self.bridge.tick()
-        self.assertEqual(unreported(), [])
-        self.assertTrue(any("has not accepted" in text for _, text in self.injected))
+        with self.bridge.store._tx() as db:
+            self.assertEqual(db.execute("SELECT id, kind FROM outbox WHERE state='failed'").fetchall(), failed)
+        report = ops.report(ops.stuck(self.bridge.store.path, self.dir / "missing-inbox", "alpha", now=self.clock()))
+        self.assertTrue(all(row["id"] in report for row in failed))
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.tasks(), [])
+
 
     def test_takeover_fences_queued_progress_at_send_time(self) -> None:
         from unittest.mock import patch
@@ -2449,20 +2120,22 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.types(), ["thought", "thought"])
 
-    def test_chat_start_refused_when_another_agent_holds_it(self) -> None:
+    def test_retired_chat_start_cannot_seize_another_agents_execution(self) -> None:
         self.linear.set_delegate(ISSUE, OTHER)
         self.linear.set_state(ISSUE, "In Progress")
         reply = self.chat("start")
         self.assertFalse(reply["ok"])
-        self.assertIn("taken by Other Agent", reply["message"])
-        self.assertIn("https://linear.example/issue/ABC-1", reply["message"])
+        self.assertEqual(reply["code"], "native_execution_required")
+        self.assertEqual(self.linear.issues[ISSUE]["delegate"], OTHER)
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
         self.assertIsNone(self.bridge.store.get(ISSUE))
         self.assertEqual(self.linear.issues[ISSUE]["delegate"], OTHER)
 
     def test_project_update_once_per_session_after_quiet_period(self) -> None:
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-key-id"))
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"}, Context("chat-key", "chat-key-id"))
         for _ in range(4):  # turns keep the session busy
             self.clock.now += 20 * 60
             chat.on_turn_end(self.bridge, "chat-key-id")
@@ -2478,7 +2151,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("ABC-2: In progress", body)
 
     def test_pending_project_update_drops_taken_over_issue_at_send(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.linear.set_delegate(ISSUE, OTHER)
         self.clock.now += 31 * 60
         self.bridge.flush()
@@ -2487,8 +2160,8 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_project_update_retains_owned_lines_and_terminal_line(self) -> None:
         from unittest.mock import patch
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                                               Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         with patch.object(self.bridge, "flush", return_value=0):
@@ -2504,8 +2177,8 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_terminal_takeover_does_not_drop_other_project_line(self) -> None:
         from unittest.mock import patch
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                                               Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         with patch.object(self.bridge, "flush", return_value=0):
@@ -2555,7 +2228,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_project_update_send_uses_terminal_merge_after_due_snapshot(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.clock.now += 31 * 60
         due = self.bridge.store.due
         merged = False
@@ -2587,7 +2260,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
         with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("synthetic outage")):
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
             self.clock.now += 31 * 60
             self.bridge.flush()
         self.assertEqual(self.linear.project_updates, [])
@@ -2601,7 +2274,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
         with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("synthetic outage")):
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
         claim = next(p for p in self.bridge.store.pending(ISSUE) if p["kind"] == "status" and
                      p["payload"].get("claim"))
         self.clock.now += 86_401
@@ -2620,8 +2293,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                                                Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         resolve_state = self.bridge.state_name
@@ -2658,7 +2331,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.linear.add_issue("iss-2", "ABC-2")
         self.linear.add_issue("iss-3", "ABC-3")
         for ident in ("ABC-1", "ABC-2", "ABC-3"):
-            self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ident},
+            self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": ident},
                                                    Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         with patch.object(self.bridge, "flush", return_value=0):
@@ -2697,7 +2370,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.linear.add_issue("iss-2", "ABC-2")
         self.linear.add_issue("iss-3", "ABC-3")
         for ident in ("ABC-1", "ABC-2", "ABC-3"):
-            self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ident},
+            self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": ident},
                                                    Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         with patch.object(self.bridge, "flush", return_value=0):
@@ -2745,8 +2418,8 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                                                Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("synthetic outage")):
@@ -2766,7 +2439,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
         with patch.object(self.bridge.api, "update_issue", side_effect=LinearError("synthetic outage")):
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
             self.clock.now += 31 * 60
             self.bridge.flush()
         done = chat.handle(self.bridge, {"action": "done", "issue": "ABC-1",
@@ -2781,7 +2454,7 @@ class LinearKanbanScenarios(unittest.TestCase):
     def test_failed_unfrozen_update_absorbs_terminal_line_before_revival(self) -> None:
         from hermes_fleet_linear_plugin.api import LinearError
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.clock.now += 31 * 60
         with patch.object(self.bridge.api, "issue", side_effect=LinearError("synthetic read outage")):
             self.bridge.flush()
@@ -2803,7 +2476,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_project_update_respects_quiet_extension_during_send_preflight(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.clock.now += 31 * 60
         freeze = self.bridge.store.freeze_project_update
         delayed = False
@@ -2825,12 +2498,12 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_unpublished_takeover_batch_allows_later_owned_work(self) -> None:
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.linear.set_delegate(ISSUE, OTHER)
         self.clock.now += 31 * 60
         self.bridge.flush()
         self.assertEqual(self.linear.project_updates, [])
-        started = chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        started = legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                               Context("chat-key", "chat-key-id"))
         self.assertTrue(json.loads(started)["ok"])
         self.bridge.tick()
@@ -2841,8 +2514,8 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_uncertain_create_retry_does_not_change_body_after_takeover(self) -> None:
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        started = chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        started = legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                               Context("chat-key", "chat-key-id"))
         self.assertTrue(json.loads(started)["ok"])
         self.bridge.tick()
@@ -2860,7 +2533,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_quiet_extension_after_send_starts_does_not_move_frozen_batch(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.clock.now += 31 * 60
         create = self.bridge.api.create_project_update
 
@@ -2876,13 +2549,13 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_reclaimed_issue_replaces_unpublished_terminal_dependency(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/9")["ok"])
         self.linear.set_delegate(ISSUE, OTHER)
         self.bridge.flush()  # terminal status is declined; quiet update remains queued
         self.linear.set_delegate(ISSUE, None)
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         update = self.bridge.store.project_update("chat-key-id", "proj-1")["payload"]
         self.assertEqual(update["lines"], {"ABC-1": "In progress"})
         self.assertNotIn("ABC-1", update.get("terminal_lines", {}))
@@ -2899,7 +2572,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.delegate()
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
         self.assertEqual(self.linear.state(ISSUE), "In Progress")  # unchanged, not an error
-        self.assertIn("Stopped by", self.linear.activities[-1]["content"]["body"])
+        self.assertIn("Stop recorded", self.linear.activities[-1]["content"]["body"])
         self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="carry on"))
         self.complete(self.task_id(), "Findings: https://docs.example/findings/3")
         self.assertEqual(self.linear.state(ISSUE), "In Review")
@@ -2909,16 +2582,18 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.bridge = self.make_bridge({"team_states": {"ABC": {"blocked": None}}})
         self.linear.issues[ISSUE]["team"]["states"]["nodes"] = [
             s for s in self.linear.issues[ISSUE]["team"]["states"]["nodes"] if s["name"] != "Blocked"]
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "chat-linear-session", creator=SELF))
-        self.assertTrue(self.chat("start")["ok"])  # idempotent start must preserve the session binding
+        before = self.bridge.store.get(ISSUE)
+        self.assertFalse(self.chat("start")["ok"])  # retired action cannot rewrite the historical binding
+        self.assertEqual(self.bridge.store.get(ISSUE), before)
         self.assertTrue(self.chat("blocked", note="Need a human decision")["ok"])
         self.assertEqual(self.linear.state(ISSUE), "In Progress")
         self.assertEqual(self.linear.activities[-1]["content"]["type"], "elicitation")
         self.assertIn("Need a human decision", self.linear.activities[-1]["content"]["body"])
 
     def test_older_created_and_stop_cannot_replace_chat_panel_session(self) -> None:
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         self.deliver(self.linear.session_event("created", ISSUE, "chat-new", creator=SELF, at=10))
         self.deliver(self.linear.session_event("created", ISSUE, "chat-old", creator=SELF, at=-10))
         self.assertEqual(self.bridge.store.get(ISSUE)["linear_session_id"], "chat-new")
@@ -3092,8 +2767,8 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_uncertain_terminal_does_not_widen_shared_project_batch(self) -> None:
         self.linear.add_issue("iss-2", "ABC-2")
-        self.assertTrue(self.chat("start")["ok"])
-        self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": "ABC-2"},
+        self.assertTrue(self.chat("seed_legacy")["ok"])
+        self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": "ABC-2"},
                                                Context("chat-key", "chat-key-id")))["ok"])
         self.bridge.tick()
         self.linear.lose_next_response = True
@@ -3111,126 +2786,9 @@ class LinearKanbanScenarios(unittest.TestCase):
                             for row in self.bridge.store.pending() if row["kind"] == "project_update"))
 
 
-    def test_interrupted_resume_replays_core_unblock_after_restart(self) -> None:
-        from unittest.mock import patch
-        from linear_ingress_fixture import IngressStore, Route
-        self.bind_identity()
-        inbox = self.dir / "resume-ingress.db"
-        producer = IngressStore(inbox)
-        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
-        for action in ("created", "prompted"):
-            with self.subTest(action=action):
-                issue_id = f"resume-issue-{action}"
-                self.linear.add_issue(issue_id, f"RESUME-{action}")
-                self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
-                self.deliver(self.linear.session_event("created", issue_id, f"start-{action}"))
-                task = self.bridge.store.get(issue_id)["task_id"]
-                self.clock.now += 1
-                stop = self.linear.session_event("prompted", issue_id, "s-1", signal="stop")
-                self.deliver(stop)
-                self.clock.now += 1
-                session = f"resume-{action}"
-                event = self.linear.session_event(action, issue_id, session, body="Continue the same work")
-                producer.enqueue(route, session, json.dumps(event).encode())
-                with sqlite3.connect(inbox) as db:
-                    db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
-                with patch.object(self.bridge.kanban, "unblock", side_effect=RuntimeError("interrupted before core unblock")):
-                    self.bridge.drain_ingress(inbox)
-                with sqlite3.connect(inbox) as db:
-                    self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id=?", (session,)).fetchone()[0], "pending")
-                self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-                self.assertEqual(self.bridge.store.get(issue_id)["owner_ref"], session)
-                self.bridge = self.make_bridge()
-                self.bind_identity()
-                self.bridge.recover()
-                self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
-                self.bridge.tick(inbox)
-                self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-                with self.bridge.kanban.conn() as conn:
-                    notes = "\n".join(c.body for c in kb.list_comments(conn, task))
-                    self.assertEqual(notes.count("Continue the same work"), 1 if action == "prompted" else 0)
-                self.assertEqual(self.linear.state(issue_id), "In Progress")
-                self.assertFalse(self.bridge.store.get(issue_id)["stop_requested_at"])
-                with sqlite3.connect(inbox) as db:
-                    self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id=?", (session,)).fetchone()[0], "imported")
-                receipt_count = len(self.linear.activities)
-                self.bridge = self.make_bridge()
-                self.bind_identity()
-                with self.bridge.kanban.conn() as conn:
-                    kb.recompute_ready(conn)  # mirror core's scheduler after reopening the board
-                self.bridge.tick(inbox)
-                self.bridge.handle_webhook(stop)  # stale Stop cannot undo the recovered resume
-                self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-                self.assertEqual(len(self.linear.activities), receipt_count)
 
-    def test_false_unblock_retains_resume_intent_while_core_is_blocked(self) -> None:
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        self.delegate()
-        task = self.task_id()
-        self.clock.now += 1
-        self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-        self.clock.now += 1
-        event = self.linear.session_event("prompted", ISSUE, "s-1", body="Continue")
-        with patch.object(self.bridge.kanban, "unblock", return_value=False):
-            with self.assertRaises(LinearError):
-                self.bridge.handle_webhook(event)
-        self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-        self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-        self.bridge = self.make_bridge()
-        self.bridge.recover()
-        self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
-    def test_repeated_stop_resume_uses_supported_same_task_triage_transition(self):
-        self.delegate()
-        task = self.task_id()
-        for cycle in range(3):
-            self.clock.now += 1
-            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked" if cycle == 0 else "triage")
-            self.clock.now += 1
-            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body=f"Resume cycle {cycle}"))
-            self.bridge = self.make_bridge()
-            self.bridge.recover()
-            self.assertEqual(self.tasks(), [(task, "ready")])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-        with self.bridge.kanban.conn() as conn:
-            self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "specified"]), 2)
-            self.assertEqual(self.bridge.kanban.get(task).block_recurrences, 3)
 
-    def test_other_core_triage_preserves_instruction_and_reports_blocker_once(self):
-        self.delegate()
-        task = self.task_id()
-        with self.bridge.kanban.conn() as conn:
-            self.assertTrue(kb.block_task(conn, task, kind="capability", reason="Missing required capability"))
-            self.assertTrue(kb.unblock_task(conn, task))
-            self.assertTrue(kb.block_task(conn, task, kind="capability", reason="Still missing capability"))
-        self.bridge.tick()
-        self.assertEqual(self.linear.state(ISSUE), "Blocked")
-        self.assertIn("Kanban triage", self.linear.activities[-1]["content"]["body"])
-        self.assertEqual(self.linear.activities[-1]["content"]["type"], "error")
-        self.assertNotIn("Reply here to unblock", self.linear.activities[-1]["content"]["body"])
-        self.clock.now += 1
-        event = self.linear.session_event("prompted", ISSUE, "s-1", body="Keep this instruction")
-        self.deliver(event)
-        self.assertEqual(self.bridge.kanban.get(task).status, "triage")
-        self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-        self.assertEqual(self.linear.state(ISSUE), "Blocked")
-        self.assertIn("Kanban triage", self.linear.activities[-1]["content"]["body"])
-        count = len(self.linear.activities)
-        self.bridge = self.make_bridge()
-        self.bridge.recover()
-        self.deliver(event)
-        self.assertEqual(len(self.linear.activities), count)
-        with self.bridge.kanban.conn() as conn:
-            self.assertFalse(any(e.kind == "specified" for e in kb.list_events(conn, task)))
-            self.assertTrue(kb.specify_triage_task(conn, task, author="operator"))
-        self.bridge.tick()
-        self.assertEqual(self.tasks(), [(task, "ready")])
-        self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-        self.assertEqual(self.linear.state(ISSUE), "In Progress")
-        with self.bridge.kanban.conn() as conn:
-            self.assertEqual(sum(c.body.count("Keep this instruction") for c in kb.list_comments(conn, task)), 1)
 
     def test_named_board_init_registers_a_database_stub_without_dropping_work(self):
         slug = "specialist-linear"
@@ -3261,36 +2819,6 @@ class LinearKanbanScenarios(unittest.TestCase):
         self.assertIn("hello", thoughts)
         self.assertEqual(thoughts.count("hello"), 1)
 
-    def test_stop_caused_triage_holds_live_worker_across_restart(self):
-        from hermes_fleet_linear_plugin.api import LinearError
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            process.terminate(); process.wait(timeout=10)
-            self.deliver(event)
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            with self.bridge.kanban.conn() as conn:
-                self.assertTrue(kb.claim_task(conn, task, claimer=kb._claimer_id()))
-                dispatch._set_worker_pid(conn, task, process.pid)
-            self._hold_unproven_worker(task)
-            self.clock.now += 1
-            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-            self.assertEqual(self.bridge.kanban.get(task).status, "triage")
-            self.clock.now += 1
-            with self.assertRaises(LinearError):
-                self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Resume same task"))
-            self.bridge = self.make_bridge()
-            self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "triage")
-            self.assertIsNone(process.poll())
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            process.terminate(); process.wait(timeout=10)
-            self.bridge.recover()
-            self.assertEqual(self.tasks(), [(task, "ready")])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-        finally:
-            if process.poll() is None: process.terminate()
-            process.wait(timeout=10)
 
     @contextmanager
     def stopped_worker(self, *, unproven=False):
@@ -3313,328 +2841,18 @@ class LinearKanbanScenarios(unittest.TestCase):
             if process.poll() is None: process.terminate()
             process.wait(timeout=10)
 
-    def test_proven_stop_halts_worker_and_resume_applies_once(self):
-        with self.stopped_worker() as (process, task, event):
-            self.assertEqual(process.poll(), -15)
-            self.deliver(event)
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            with self.bridge.kanban.conn() as conn:
-                notes = "\n".join(comment.body for comment in kb.list_comments(conn, task))
-            self.assertEqual(notes.count("Resume this task"), 1)
-            self.deliver(event)
-            with self.bridge.kanban.conn() as conn:
-                notes = "\n".join(comment.body for comment in kb.list_comments(conn, task))
-            self.assertEqual(notes.count("Resume this task"), 1)
 
-    def test_pending_resume_waits_for_stopped_worker_exit_across_recovery(self):
-        from hermes_fleet_linear_plugin.api import LinearError
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.bridge.kanban.conn() as conn:
-                before = len([e for e in kb.list_events(conn, task) if e.kind == "commented"])
-            with self.assertRaises(LinearError): self.deliver(event)
-            self.bridge = self.make_bridge()
-            self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            self.assertIsNone(process.poll())
-            with self.bridge.kanban.conn() as conn:
-                self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before)
-            process.terminate(); process.wait(timeout=10)
-            self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            self.bridge.recover()
-            with self.bridge.kanban.conn() as conn:
-                self.assertEqual(len([e for e in kb.list_events(conn, task) if e.kind == "commented"]), before + 1)
 
-    def test_newer_stop_fence_survives_core_failure_and_ingress_retries(self):
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        from linear_ingress_fixture import IngressStore, Route
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.assertRaises(LinearError): self.deliver(event)
-            self.clock.now += 1
-            stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
-            stamp = self.clock() * 1000
-            inbox = self.dir / "stop-retry.db"
-            producer = IngressStore(inbox)
-            producer.enqueue(Route("alpha", "alpha", "/webhook/alpha", inbox, inbox), "new-stop", json.dumps(stop).encode())
-            with sqlite3.connect(inbox) as db:
-                db.execute("UPDATE deliveries SET received_at=?", (self.clock(),))
-            with patch.object(self.bridge.kanban, "block", side_effect=LinearError("Temporary core failure")):
-                self.bridge.drain_ingress(inbox)
-            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stamp)
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            process.terminate(); process.wait(timeout=10)
-            self.bridge = self.make_bridge()
-            with patch.object(self.bridge.kanban, "block", side_effect=RuntimeError("Interrupted core call")):
-                self.bridge.recover(inbox)
-            self.assertEqual(self.tasks(), [(task, "blocked")])
-            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stamp)
-            self.clock.now += 15  # startup retried it; the next retry is due 15 s after receipt
-            self.bridge.tick(inbox)
-            self.assertEqual(self.tasks(), [(task, "blocked")])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            with sqlite3.connect(inbox) as db:
-                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "imported")
 
-    def test_startup_processes_owned_stop_beyond_normal_inbox_batch_before_resume(self):
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        from linear_ingress_fixture import IngressStore, Route
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.assertRaises(LinearError): self.deliver(event)
-            inbox = self.dir / "startup-stop.db"
-            producer = IngressStore(inbox)
-            route = Route("alpha", "alpha", "/webhook/alpha", inbox, inbox)
-            for i in range(101): producer.enqueue(route, f"older-{i:03}", b'{"type":"Unknown"}')
-            self.clock.now += 1
-            stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
-            producer.enqueue(route, "new-stop", json.dumps(stop).encode())
-            with sqlite3.connect(inbox) as db:
-                db.execute("UPDATE deliveries SET received_at=?", (self.clock()-1,))
-                db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='new-stop'", (self.clock(),))
-            process.terminate(); process.wait(timeout=10)
-            self.bridge = self.make_bridge()
-            with patch.object(self.bridge.kanban, "unblock", wraps=self.bridge.kanban.unblock) as unblock:
-                self.bridge.recover(inbox)
-                unblock.assert_not_called()
-            self.assertEqual(self.tasks(), [(task, "blocked")])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            with sqlite3.connect(inbox) as db:
-                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "imported")
-                self.assertEqual(db.execute("SELECT count(*) FROM deliveries WHERE status='pending'").fetchone()[0], 51)
 
-    def test_pending_resume_waits_for_stop_beyond_prioritized_batch(self):
-        from hermes_fleet_linear_plugin.api import LinearError
-        from linear_ingress_fixture import IngressStore, Route
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.assertRaises(LinearError): self.deliver(event)
-            inbox = self.dir / "batched-stops.db"
-            producer = IngressStore(inbox)
-            route = Route("alpha", "alpha", "/webhook/alpha", inbox, inbox)
-            self.clock.now -= 1
-            old_stop = self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")
-            self.clock.now += 1
-            for i in range(50): producer.enqueue(route, f"older-{i:03}", json.dumps(old_stop).encode())
-            self.clock.now += 1
-            producer.enqueue(route, "new-stop", json.dumps(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop")).encode())
-            with sqlite3.connect(inbox) as db:
-                db.execute("UPDATE deliveries SET received_at=?", (self.clock()-1,))
-                db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='new-stop'", (self.clock(),))
-            process.terminate(); process.wait(timeout=10)
-            self.bridge = self.make_bridge()
-            self.bridge.tick(inbox)
-            self.assertEqual(self.tasks(), [(task, "blocked")])
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            with sqlite3.connect(inbox) as db:
-                self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='new-stop'").fetchone()[0], "pending")
-            self.bridge.tick(inbox)
-            self.assertEqual(self.tasks(), [(task, "blocked")])
-            self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
 
-    def test_newer_stop_cancels_pending_resume_across_worker_exit_and_recovery(self):
-        from hermes_fleet_linear_plugin.api import LinearError
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.assertRaises(LinearError): self.deliver(event)
-            stale = self.bridge.store.get(ISSUE)
-            intent = json.loads(stale["pending_resume"])
-            self.clock.now += 1
-            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-            stopped = self.bridge.store.get(ISSUE)
-            self.assertIsNone(stopped["pending_resume"])
-            process.terminate(); process.wait(timeout=10)
-            self.bridge = self.make_bridge()
-            self.bridge.recover()
-            self.bridge._resume(stale, intent["note"], intent["session_id"], intent["stamp"], intent["receipt"])
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertEqual(self.bridge.store.get(ISSUE)["stop_requested_at"], stopped["stop_requested_at"])
-            with self.bridge.kanban.conn() as conn:
-                self.assertFalse(kb.claim_task(conn, task, claimer=kb._claimer_id()))
-            self.clock.now += 1
-            self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Now resume explicitly"))
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-            self.assertEqual(self.task_id(), task)
 
-    def test_recovery_deduplicates_completed_followups_before_pending_ingress_replay(self):
-        from linear_ingress_fixture import IngressStore, Route
-        self.bind_identity()
-        inbox = self.dir / "queued-followup-ingress.db"
-        producer = IngressStore(inbox)
-        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
-        with self.stopped_worker() as (process, task, first):
-            second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope", activity_id="act-2")
-            for delivery, event in (("first", first), ("second", second)):
-                producer.enqueue(route, delivery, json.dumps(event).encode())
-            with sqlite3.connect(inbox) as db:
-                db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
-            self.bridge.drain_ingress(inbox)
-            process.terminate(); process.wait(timeout=10)
-            self.bridge = self.make_bridge()
-            self.bind_identity()
-            self.bridge.recover()
-            self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
-            self.bridge.tick(inbox)
-            self.bridge = self.make_bridge()
-            self.bind_identity()
-            self.bridge.recover()
-            self.bridge.tick(inbox)
-            with self.bridge.kanban.conn() as conn:
-                notes = "\n".join(c.body for c in kb.list_comments(conn, task))
-            self.assertEqual(notes.count("Resume this task"), 1)
-            self.assertEqual(notes.count("Use the updated scope"), 1)
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-            self.assertEqual(self.task_id(), task)
-            with sqlite3.connect(inbox) as db:
-                self.assertEqual(db.execute("SELECT status FROM deliveries ORDER BY delivery_id").fetchall(),
-                                 [("imported",), ("imported",)])
 
-    def test_newer_prompt_after_uncertain_comment_commit_preserves_each_instruction_once(self):
-        from unittest.mock import patch
-        with self.stopped_worker() as (process, task, first):
-            process.terminate(); process.wait(timeout=10)
-            add = kb.add_comment
-            def lose_reply(*args, **kwargs):
-                add(*args, **kwargs)
-                raise RuntimeError("reply lost after core comment commit")
-            with patch.object(kb, "add_comment", side_effect=lose_reply):
-                with self.assertRaises(RuntimeError): self.deliver(first)
-            self.clock.now += 1
-            second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope")
-            self.deliver(second)
-            self.bridge = self.make_bridge()
-            self.bridge.recover()
-            self.deliver(second)
-            with self.bridge.kanban.conn() as conn:
-                notes = "\n".join(c.body for c in kb.list_comments(conn, task))
-            self.assertEqual(notes.count("Resume this task"), 1)
-            self.assertEqual(notes.count("Use the updated scope"), 1)
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
-    def test_newer_pending_prompt_preserves_both_instructions_without_retry_duplicates(self):
-        from hermes_fleet_linear_plugin.api import LinearError
-        for exit_before_prompt in (False, True):
-            with self.subTest(exit_before_prompt=exit_before_prompt):
-                self.setUp()
-                with self.stopped_worker(unproven=True) as (process, task, first):
-                    with self.assertRaises(LinearError): self.deliver(first)
-                    if exit_before_prompt: process.terminate(); process.wait(timeout=10)
-                    self.clock.now += 1
-                    second = self.linear.session_event("prompted", ISSUE, "s-1", body="Use the updated scope")
-                    if exit_before_prompt:
-                        self.deliver(second)
-                    else:
-                        for _ in range(2):
-                            with self.assertRaises(LinearError): self.deliver(second)
-                        self.bridge = self.make_bridge()
-                        self.bridge.recover()
-                        saved = json.loads(self.bridge.store.get(ISSUE)["pending_resume"])
-                        self.assertEqual(saved["note"].count("Resume this task"), 1)
-                        self.assertEqual(saved["note"].count("Use the updated scope"), 1)
-                        process.terminate(); process.wait(timeout=10)
-                        self.bridge.recover()
-                    self.deliver(first)  # An older ingress retry cannot overwrite the later instruction.
-                    self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-                    self.assertIsNone(self.bridge.store.get(ISSUE)["pending_resume"])
-                    with self.bridge.kanban.conn() as conn:
-                        notes = "\n".join(comment.body for comment in kb.list_comments(conn, task))
-                    self.assertEqual(notes.count("Resume this task"), 1)
-                    self.assertEqual(notes.count("Use the updated scope"), 1)
 
-    def test_recycled_stopped_worker_pid_does_not_hold_resume_or_signal_stranger(self):
-        from unittest.mock import patch
-        self.delegate()
-        task = self.task_id()
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            with self.bridge.kanban.conn() as conn:
-                self.assertTrue(kb.claim_task(conn, task, claimer=kb._claimer_id()))
-                dispatch._set_worker_pid(conn, task, process.pid)
-            self.clock.now += 1
-            with patch.object(dispatch, "_process_fingerprint", return_value="different-instance|0"):
-                self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-                self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-                self.assertIsNone(process.poll())
-            self.clock.now += 1
-            with patch.object(dispatch, "_process_fingerprint", return_value="different-instance|0"):
-                self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", body="Resume this task"))
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-            self.assertIsNone(process.poll())
-        finally:
-            if process.poll() is None: process.terminate()
-            process.wait(timeout=10)
 
-    def test_unreadable_stopped_worker_identity_keeps_resume_pending(self):
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with patch.object(dispatch, "_process_fingerprint", return_value=None):
-                with self.assertRaises(LinearError): self.deliver(event)
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            self.assertIsNone(process.poll())
 
-    def test_terminal_sweep_cannot_erase_live_worker_resume_witness(self):
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        self.delegate()
-        task = self.task_id()
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            with self.bridge.kanban.conn() as conn:
-                self.assertTrue(kb.claim_task(conn, task, claimer=kb._claimer_id()))
-                dispatch._set_worker_pid(conn, task, process.pid)
-            self.clock.now += 1
-            with patch.object(dispatch, "_process_fingerprint", return_value="different-instance|0"):
-                self.deliver(self.linear.session_event("prompted", ISSUE, "s-1", signal="stop"))
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertIsNone(process.poll())
-            self.clock.now += 1
-            event = self.linear.session_event("prompted", ISSUE, "s-1", body="Resume this task")
-            with patch.object(dispatch, "_process_fingerprint", return_value=None):
-                with self.bridge.kanban.conn() as conn:
-                    conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?",
-                                 (int(time.time()) - 121, task))
-                    dispatch.reap_terminal_workers(conn)
-                    self.assertIsNone(conn.execute("SELECT worker_pid FROM task_runs WHERE task_id=?",
-                                                   (task,)).fetchone()[0])
-                with self.assertRaises(LinearError): self.deliver(event)
-                self.bridge = self.make_bridge()
-                self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            self.assertIsNone(process.poll())
-            with self.bridge.kanban.conn() as conn:
-                self.assertFalse(kb.claim_task(conn, task, claimer=kb._claimer_id()))
-            process.terminate(); process.wait(timeout=10)
-            self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
-        finally:
-            if process.poll() is None: process.terminate()
-            process.wait(timeout=10)
 
-    def test_fluctuating_worker_identity_cannot_release_a_live_stopped_worker(self):
-        from unittest.mock import patch
-        from hermes_fleet_linear_plugin.api import LinearError
-        with self.stopped_worker(unproven=True) as (process, task, event):
-            with self.bridge.kanban.conn() as conn:
-                fingerprint = conn.execute("SELECT worker_started_at FROM task_runs WHERE task_id=? AND worker_pid=?",
-                                           (task, process.pid)).fetchone()[0]
-            with patch.object(dispatch, "_process_fingerprint", side_effect=[fingerprint, None]) as probe:
-                with self.assertRaises(LinearError): self.deliver(event)
-                self.assertEqual(probe.call_count, 1)
-            with patch.object(dispatch, "_process_fingerprint", side_effect=[fingerprint, None]) as probe:
-                with self.assertRaises(LinearError): self.bridge.kanban.unblock(task)
-                self.assertEqual(probe.call_count, 1)
-            self.assertEqual(self.bridge.kanban.get(task).status, "blocked")
-            self.assertIsNotNone(self.bridge.store.get(ISSUE)["pending_resume"])
-            self.assertIsNone(process.poll())
-            process.terminate(); process.wait(timeout=10)
-            self.bridge.recover()
-            self.assertEqual(self.bridge.kanban.get(task).status, "ready")
 
 
     def test_task_creation_crash_recovers_mapping_and_existing_terminal_evidence_once(self) -> None:
@@ -3695,7 +2913,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
                    return_value={"ok": True, "head_sha": "a" * 40}):
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
             result = chat.handle(self.bridge, {"action": "done", "issue": "ABC-1",
                                 "evidence": "https://github.com/example/repo/pull/8"},
                                  Context("chat-key", "chat-key-id"))
@@ -3714,7 +2932,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         url = "https://github.com/example/repo/pull/8"
         with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
                    return_value={"ok": True, "head_sha": "a" * 40}) as check:
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
             with patch.object(self.bridge, "flush", return_value=0):
                 self.assertTrue(self.chat("done", evidence=url)["ok"])
             terminal = next(r for r in self.bridge.store.pending(ISSUE)
@@ -3741,7 +2959,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.api import LinearError
         self.bind_identity()
         self.bridge.api.identity["teams"] = ["team-1"]
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         terminal = next(r for r in self.bridge.store.pending(ISSUE)
@@ -3763,7 +2981,7 @@ class LinearKanbanScenarios(unittest.TestCase):
 
     def test_terminal_transport_requires_durable_started_marker(self) -> None:
         from unittest.mock import patch
-        self.assertTrue(self.chat("start")["ok"])
+        self.assertTrue(self.chat("seed_legacy")["ok"])
         with patch.object(self.bridge, "flush", return_value=0):
             self.assertTrue(self.chat("done", evidence="https://docs.example/findings/1")["ok"])
         terminal = next(r for r in self.bridge.store.pending(ISSUE)
@@ -3892,7 +3110,7 @@ class LinearKanbanScenarios(unittest.TestCase):
         url = "https://github.com/example/repo/pull/8"
         with patch("hermes_cli.kanban_pr_acceptance.collect_acceptance",
                    return_value={"ok": True, "head_sha": "a" * 40}):
-            self.assertTrue(self.chat("start")["ok"])
+            self.assertTrue(self.chat("seed_legacy")["ok"])
             self.linear.lose_next_response = True
             self.assertTrue(self.chat("done", evidence=url)["ok"])
             self.assertEqual(self.linear.state(ISSUE), "Done")
@@ -3931,7 +3149,7 @@ class LinearKanbanScenarios(unittest.TestCase):
                 self.linear.add_issue(issue_id, f"PR-{origin}-{change}")
                 self.linear.set_delegate(issue_id, {"id": SELF, "name": "This Agent"})
                 if origin == "chat":
-                    self.assertTrue(json.loads(chat.handle(self.bridge, {"action": "start", "issue": issue_id},
+                    self.assertTrue(json.loads(legacy_chat_fixture(self.bridge, {"action": "start", "issue": issue_id},
                                                           Context(session, session)))["ok"])
                     self.bridge.tick()
                 else:
@@ -3986,76 +3204,6 @@ class LinearKanbanScenarios(unittest.TestCase):
                                              for a in self.linear.activities))
 
 
-    def test_chat_followup_ordering_replay_and_failed_or_uncertain_injection_are_durable(self) -> None:
-        from unittest.mock import patch
-        from linear_ingress_fixture import IngressStore, Route
-        self.bind_identity()
-        self.assertTrue(self.chat("start")["ok"])
-        self.deliver(self.linear.session_event("created", ISSUE, "chat-linear", creator=SELF))
-        self.clock.now += 1
-        old = self.linear.session_event("prompted", ISSUE, "chat-linear", body="OLD destination A", activity_id="old")
-        self.clock.now += 1
-        new = self.linear.session_event("prompted", ISSUE, "chat-linear", body="NEW destination B", activity_id="new")
-        self.deliver(new)
-        self.deliver(old)
-        self.assertFalse(any("OLD destination A" in body for _, body in self.injected))
-        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], new["webhookTimestamp"])
-        count = len(self.injected)
-        self.bridge = self.make_bridge()
-        self.bind_identity()
-        self.deliver(new)
-        self.assertEqual(len(self.injected), count)
-
-        inbox = self.dir / "chat-followup-ingress.db"
-        producer = IngressStore(inbox)
-        route = Route("alpha", "alpha", "/webhook/alpha", self.dir / "unused-secret", inbox)
-        self.clock.now += 1
-        retry = self.linear.session_event("prompted", ISSUE, "chat-linear", body="Retry destination C", activity_id="retry")
-        producer.enqueue(route, "retry", json.dumps(retry).encode())
-        with sqlite3.connect(inbox) as db:
-            db.execute("UPDATE deliveries SET received_at=?", (int(self.clock()),))
-        self.inject_ok = False  # a definitive refusal is safe to retry
-        self.bridge.tick(inbox)
-        with sqlite3.connect(inbox) as db:
-            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='retry'").fetchone()[0], "pending")
-        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], new["webhookTimestamp"])
-        self.bridge = self.make_bridge()
-        self.bind_identity()
-        self.inject_ok = True
-        self.clock.now += 5  # a failed delivery's first retry is due 5 s after receipt
-        self.bridge.tick(inbox)
-        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], retry["webhookTimestamp"])
-        with sqlite3.connect(inbox) as db:
-            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='retry'").fetchone()[0], "imported")
-        count = len(self.injected)
-        self.deliver(retry)
-        self.assertEqual(len(self.injected), count)
-
-        self.clock.now += 1
-        unknown = self.linear.session_event("prompted", ISSUE, "chat-linear", body="Uncertain destination D", activity_id="unknown")
-        producer.enqueue(route, "unknown", json.dumps(unknown).encode())
-        with sqlite3.connect(inbox) as db:
-            db.execute("UPDATE deliveries SET received_at=? WHERE delivery_id='unknown'", (int(self.clock()),))
-        def interrupted(key, body):
-            self.injected.append((key, body))
-            raise RuntimeError("response lost after chat accepted")
-        with patch.object(self.bridge, "inject", side_effect=interrupted):
-            self.bridge.tick(inbox)
-        count = len(self.injected)
-        self.bridge = self.make_bridge()
-        self.bind_identity()
-        self.bridge.tick(inbox)
-        self.assertEqual(len(self.injected), count)  # uncertain injection must not be repeated
-        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], retry["webhookTimestamp"])
-        self.assertTrue(any("unknown" in a["content"]["body"].lower() for a in self.linear.activities))
-        self.clock.now += 86_401
-        self.bridge.tick(inbox)
-        with sqlite3.connect(inbox) as db:
-            self.assertEqual(db.execute("SELECT status FROM deliveries WHERE delivery_id='unknown'").fetchone()[0], "failed")
-        self.clock.now += 1
-        self.deliver(self.linear.session_event("prompted", ISSUE, "chat-linear", body="Fresh explicit destination E", activity_id="fresh"))
-        self.assertIn("Fresh explicit destination E", self.injected[-1][1])
-        self.assertEqual(self.bridge.store.get(ISSUE)["last_updated_at"], self.clock() * 1000)
 
 
     def test_native_review_and_rework_are_milestones_not_completion(self) -> None:

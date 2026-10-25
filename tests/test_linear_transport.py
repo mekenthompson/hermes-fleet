@@ -95,7 +95,7 @@ class LinearTransportTests(unittest.TestCase):
             home=Path(tmp);token=scope.set('alpha')
             server=transport.Server(home,'alpha',lambda args,ctx:scope.get(),lambda session:None)
             scope.reset(token)
-            try:self.assertEqual(transport.chat_request(home,{},SimpleNamespace()),'alpha')
+            try:self.assertEqual(transport.chat_request(home,{'action':'start'},SimpleNamespace()),'alpha')
             finally:server.close()
 
     def test_unsafe_paths_and_missing_service_do_not_create_an_executor(self):

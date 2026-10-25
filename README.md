@@ -55,7 +55,7 @@ Optional, **disabled by default**. They exist so isolation does not mean a dumb 
 
 ### Linear
 
-`plugins/linear/` provides native Linear tracking and execution through Kanban. Linear stays the human record, and each profile's own Kanban board runs the work. The Linear delegate is the only cross-agent state. Nothing is shared between containers. Native sessions receive a durable early acknowledgement, and saved local review summaries can be delivered without an external URL. Bound ordinary-chat work uses core's generation-fenced Stop API; a receipt does not prove external effects ended. An authenticated user can transfer a journaled chat claim to another thread when that predecessor chat owns no other issue and has no compressed physical successor; successor execution waits for explicit reconciliation, and a later Stop remains durable even without a native successor generation. It remains disabled until an operator enables it with a reviewed overlay settings block; identities, routes and state names are config only. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
+`plugins/linear/` links meaningful human outcomes to native Hermes durable tasks. Ordinary chat needs no issue. Native identity, scope, worker claims and execution generations own execution, continuation, recovery and Stop; Linear reports through a durable outbox. Authorized conversations can follow the same task across surfaces without moving its executor or using continuation phrases. Retained legacy records stay visible for native reconciliation. The plugin remains disabled until explicitly configured. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
 
 ### Browser handoff
 

@@ -1,0 +1,336 @@
+"""Verified tracker requests use native admission/idempotency; reporting never recovers a worker."""
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from linear_fake_api import Clock, FakeLinear, SELF, load_plugin
+from linear_ingress_fixture import IngressStore, Route
+
+SOURCE = os.environ.get("HERMES_AGENT_SRC", "")
+try:
+    if not SOURCE:
+        raise ImportError("HERMES_AGENT_SRC is not set")
+    sys.path.insert(0, SOURCE)
+    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    CORE = None
+except ImportError as exc:
+    CORE = str(exc)
+
+load_plugin()
+from hermes_fleet_linear_plugin.api import LinearAPI, LinearError
+from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
+from hermes_fleet_linear_plugin.store import Store
+
+ISSUE = "native-issue"
+
+
+@unittest.skipIf(CORE is not None, f"integration: native source unavailable ({CORE})")
+class NativeContinuationScenarios(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        env = patch.dict(os.environ, {"HERMES_KANBAN_HOME": str(self.home / "kanban")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.clock = Clock()
+        self.remote = FakeLinear(self.clock)
+        self.addCleanup(self.remote.close)
+        self.remote.add_issue(ISSUE, "NATIVE-1")
+        self.remote.set_delegate(ISSUE, {"id": SELF})
+        self.board = Kanban()
+        self.store = Store(self.home / "tracking.db")
+        self.bridge = self.reopen()
+        self.bridge.handle_webhook(self.remote.session_event("created", ISSUE, "original-session"))
+        self.bridge.flush()
+        self.task_id = self.store.get(ISSUE)["task_id"]
+
+    def reopen(self):
+        return Bridge(Store(self.home / "tracking.db"),
+                      LinearAPI(lambda: "fixture", endpoint=self.remote.url, clock=self.clock),
+                      self.board, profile="default", clock=self.clock)
+
+    def notes(self):
+        with self.board.conn() as conn:
+            return [comment.body for comment in kb.list_comments(conn, self.task_id)]
+
+    def prompt(self, body, marker, *, signal=None):
+        self.clock.now += 1
+        return self.remote.session_event("prompted", ISSUE, "original-session", body=body,
+                                         activity_id=marker, signal=signal)
+
+    def queue(self, event, delivery="followup"):
+        inbox = self.home / "inbox.db"
+        IngressStore(inbox).enqueue(Route("default", "default", "/webhook/default", inbox, inbox),
+                                   delivery, json.dumps(event).encode())
+        with sqlite3.connect(inbox) as conn:
+            conn.execute("UPDATE deliveries SET received_at=?", (self.clock(),))
+        return inbox
+
+    def test_lost_native_comment_receipt_retries_original_inbox_once(self):
+        event = self.prompt("Keep the checkpoint and continue remaining work", "comment-1")
+        inbox = self.queue(event)
+        add = kb.add_comment
+
+        def lost_receipt(*args, **kwargs):
+            add(*args, **kwargs)
+            raise OSError("native comment receipt lost")
+
+        with patch.object(kb, "add_comment", side_effect=lost_receipt):
+            self.bridge.drain_ingress(inbox)
+        self.assertEqual(sum("Keep the checkpoint" in body for body in self.notes()), 1)
+        saved = list(self.notes())
+        self.remote.comments.append({"issueId": ISSUE, "id": "late-thread", "body": "Thread edited after delivery",
+                                     "createdAt": self.clock.iso(), "author": "Pat Example"})
+        self.assertIsNone(self.store.get(ISSUE)["pending_resume"])
+        self.bridge = self.reopen()
+        self.bridge.recover()  # reporting alone cannot replay the instruction
+        self.clock.now += 5
+        self.bridge.drain_ingress(inbox)
+        self.bridge.drain_ingress(inbox)
+        self.assertEqual(sum("Keep the checkpoint" in body for body in self.notes()), 1)
+        self.assertEqual(self.notes(), saved, "a receipt retry cannot reconstruct a different thread snapshot")
+        with sqlite3.connect(inbox) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+        with self.board.conn() as conn:
+            self.assertEqual(len(kb.list_tasks(conn)), 1)
+
+    def test_simultaneous_followups_share_one_native_execution(self):
+        with self.board.conn() as conn:
+            self.assertTrue(kb.claim_task(conn, self.task_id))
+        before = self.board.get(self.task_id)
+        events = [self.prompt("First remaining instruction", "first"),
+                  self.prompt("Second remaining instruction", "second")]
+        # Equal source time permits both distinct serialized requests rather than making one stale.
+        events[0]["agentActivity"]["createdAt"] = events[1]["agentActivity"]["createdAt"]
+        events[0]["createdAt"] = events[1]["createdAt"]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+            list(workers.map(self.bridge.handle_webhook, events))
+        text = "\n".join(self.notes())
+        self.assertEqual(text.count("First remaining instruction"), 1)
+        self.assertEqual(text.count("Second remaining instruction"), 1)
+        after = self.board.get(self.task_id)
+        self.assertEqual((after.current_run_id, after.claim_lock), (before.current_run_id, before.claim_lock))
+        with self.board.conn() as conn:
+            self.assertEqual(len(kb.list_tasks(conn)), 1)
+
+    def test_distinct_out_of_order_followups_are_not_lost_to_a_reporting_watermark(self):
+        older = self.prompt("First authorized instruction", "older-distinct")
+        newer = self.prompt("Second authorized instruction", "newer-distinct")
+        self.bridge.handle_webhook(newer)
+        watermark = self.store.get(ISSUE)["last_updated_at"]
+        self.bridge.handle_webhook(older)
+        self.bridge.handle_webhook(older)
+        self.bridge.handle_webhook(newer)
+        text = "\n".join(self.notes())
+        self.assertEqual(text.count("First authorized instruction"), 1)
+        self.assertEqual(text.count("Second authorized instruction"), 1)
+        self.assertGreaterEqual(self.store.get(ISSUE)["last_updated_at"], watermark)
+        with self.board.conn() as conn:
+            self.assertEqual(len(kb.list_tasks(conn)), 1)
+
+    def test_stop_and_explicit_resume_fence_prior_instructions(self):
+        stale = self.prompt("Instruction before Stop", "before-stop")
+        self.bridge.handle_webhook(self.prompt("", "stop-generation", signal="stop"))
+        self.bridge.handle_webhook(stale)
+        self.assertEqual(self.notes(), [])
+        self.clock.now += 1
+        assignment = self.remote.session_event("created", ISSUE, "resumed-assignment")
+        self.bridge.handle_webhook(assignment)
+        self.assertEqual(self.board.get(self.task_id).status, "ready")
+        self.bridge.handle_webhook(stale)
+        self.assertEqual(sum("Instruction before Stop" in body for body in self.notes()), 0)
+        self.clock.now += 1
+        fresh = self.remote.session_event("prompted", ISSUE, "resumed-assignment",
+                                          body="Freshly authorized instruction", activity_id="after-resume")
+        self.bridge.handle_webhook(fresh)
+        self.assertEqual(sum("Freshly authorized instruction" in body for body in self.notes()), 1)
+
+    def test_new_native_increment_rejects_prior_task_generation_followup(self):
+        stale = self.prompt("Instruction for completed work", "old-task-generation")
+        old_task = self.task_id
+        with self.board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, old_task,
+                result="Verified findings https://example.test/findings/old"))
+        self.clock.now += 1
+        self.bridge.handle_webhook(self.remote.session_event("created", ISSUE, "new-native-increment"))
+        new_task = self.store.get(ISSUE)["task_id"]
+        self.assertNotEqual(new_task, old_task)
+        self.bridge.handle_webhook(stale)
+        with self.board.conn() as conn:
+            self.assertFalse(any("Instruction for completed work" in comment.body
+                                 for comment in kb.list_comments(conn, new_task)))
+            self.assertEqual(len(kb.list_tasks(conn)), 2)
+        self.assertEqual(self.board.get(old_task).status, "done")
+        self.assertEqual(self.board.get(new_task).status, "ready")
+
+    def test_newer_comment_cannot_hide_an_older_distinct_stop_request(self):
+        stop = self.prompt("", "delayed-stop", signal="stop")
+        comment = self.prompt("Additional context does not resume work", "newer-comment")
+        self.bridge.handle_webhook(comment)
+        watermark = self.store.get(ISSUE)["last_updated_at"]
+        self.assertEqual(self.board.get(self.task_id).status, "ready")
+        self.bridge.handle_webhook(stop)
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+        recorded_stop = self.store.get(ISSUE)["stop_requested_at"]
+        self.assertGreater(recorded_stop, 0)
+        self.assertLess(recorded_stop, watermark)
+        newer_stop = self.prompt("", "later-stop", signal="stop")
+        self.bridge.handle_webhook(newer_stop)
+        latest_stop = self.store.get(ISSUE)["stop_requested_at"]
+        self.assertGreater(latest_stop, recorded_stop)
+        self.bridge.handle_webhook(stop)
+        self.assertEqual(self.store.get(ISSUE)["stop_requested_at"], latest_stop)
+        with self.board.conn() as conn:
+            self.assertIsNone(kb.claim_task(conn, self.task_id))
+
+    def test_equal_time_stop_after_initial_assignment_wins(self):
+        stop = self.remote.session_event("prompted", ISSUE, "original-session",
+                                         signal="stop", activity_id="same-time-stop")
+        self.bridge.handle_webhook(stop)
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+        self.assertGreater(self.store.get(ISSUE)["stop_requested_at"], 0)
+        with self.board.conn() as conn:
+            self.assertIsNone(kb.claim_task(conn, self.task_id))
+        self.bridge = self.reopen()
+        self.bridge.recover()
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+
+    def test_prompt_and_reporting_restart_do_not_resume_stopped_work(self):
+        self.bridge.handle_webhook(self.prompt("", "stop", signal="stop"))
+        task = self.board.get(self.task_id)
+        self.assertEqual(task.status, "blocked")
+        self.bridge.handle_webhook(self.prompt("Resume with this extra context", "context"))
+        self.bridge = self.reopen()
+        self.bridge.recover()
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+        self.assertEqual(sum("extra context" in body for body in self.notes()), 1)
+        self.assertIsNone(self.store.get(ISSUE)["pending_resume"])
+
+    def test_new_stop_preserves_unknown_legacy_instruction_delivery(self):
+        legacy = json.dumps({"note": "Unknown prior delivery", "session_id": "original-session"})
+        self.store.update(ISSUE, pending_resume=legacy)
+        self.bridge.handle_webhook(self.prompt("", "new-stop", signal="stop"))
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+        self.assertEqual(self.store.get(ISSUE)["pending_resume"], legacy)
+        self.bridge = self.reopen()
+        self.bridge.recover()
+        self.assertEqual(self.store.get(ISSUE)["pending_resume"], legacy)
+        self.assertFalse(any("Unknown prior delivery" in body for body in self.notes()))
+
+    def test_reconnect_keeps_healthy_worker_claim_and_process(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.board.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, self.task_id))
+                dispatch._set_worker_pid(conn, self.task_id, process.pid)
+            before = self.board.get(self.task_id)
+            self.bridge = self.reopen()
+            self.bridge.recover()
+            self.bridge.handle_webhook(self.prompt("Use the existing checkpoint", "live-followup"))
+            after = self.board.get(self.task_id)
+            self.assertEqual((after.current_run_id, after.claim_lock), (before.current_run_id, before.claim_lock))
+            self.assertIsNone(process.poll())
+            self.assertEqual(sum("existing checkpoint" in body for body in self.notes()), 1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)
+
+    def test_stop_terminates_proven_native_process_before_explicit_resumption(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.board.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, self.task_id))
+                dispatch._set_worker_pid(conn, self.task_id, process.pid)
+            self.bridge.handle_webhook(self.prompt("", "stop-proven", signal="stop"))
+            self.assertEqual(process.poll(), -15)
+            self.assertEqual(self.board.get(self.task_id).status, "blocked")
+            event = self.prompt("Preserve this instruction", "after-stop")
+            self.bridge.handle_webhook(event)
+            self.bridge.handle_webhook(event)
+            self.assertEqual(self.board.get(self.task_id).status, "blocked")
+            self.assertTrue(self.board.unblock(self.task_id))  # supported explicit native action after reconciliation
+            self.assertEqual(self.board.get(self.task_id).status, "ready")
+            self.assertEqual(sum("Preserve this instruction" in body for body in self.notes()), 1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)
+
+    def test_unknown_process_identity_remains_fenced_after_restart_and_terminal_sweep(self):
+        from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.board.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, self.task_id))
+                dispatch._set_worker_pid(conn, self.task_id, process.pid)
+                conn.execute("UPDATE tasks SET worker_started_at=? WHERE id=?",
+                             (UNVERIFIED_WORKER_FINGERPRINT, self.task_id))
+                conn.execute("UPDATE task_runs SET worker_started_at=? WHERE task_id=?",
+                             (UNVERIFIED_WORKER_FINGERPRINT, self.task_id))
+            self.bridge.handle_webhook(self.prompt("", "stop-unknown", signal="stop"))
+            self.assertIsNone(process.poll(), "an unverified process must not be signalled")
+            self.bridge.handle_webhook(self.prompt("Additional context", "unknown-followup"))
+            self.bridge = self.reopen()
+            self.bridge.recover()
+            with patch.object(dispatch, "_process_fingerprint", return_value=None):
+                with self.board.conn() as conn:
+                    conn.execute("UPDATE task_runs SET ended_at=1 WHERE task_id=?", (self.task_id,))
+                    dispatch.reap_terminal_workers(conn)
+                with self.assertRaises(LinearError):
+                    self.board.unblock(self.task_id)
+            self.assertEqual(self.board.get(self.task_id).status, "blocked")
+            self.assertIsNone(process.poll())
+            process.terminate()
+            process.wait(timeout=10)
+            self.bridge.recover()
+            self.assertEqual(self.board.get(self.task_id).status, "blocked", "reporting cannot infer resumption")
+            self.assertTrue(self.board.unblock(self.task_id))
+            self.assertEqual(self.board.get(self.task_id).status, "ready")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)
+
+    def test_native_resumption_refusal_never_creates_a_replacement_executor(self):
+        self.bridge.handle_webhook(self.prompt("", "stop-existing", signal="stop"))
+        self.clock.now += 1
+        assignment = self.remote.session_event("created", ISSUE, "new-assignment")
+        with patch.object(self.board, "unblock", return_value=False):
+            self.bridge.handle_webhook(assignment)
+        self.assertEqual(self.store.get(ISSUE)["task_id"], self.task_id)
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+        with self.board.conn() as conn:
+            self.assertEqual(len(kb.list_tasks(conn)), 1)
+        self.bridge = self.reopen()
+        self.bridge.recover()
+        self.assertEqual(self.board.get(self.task_id).status, "blocked")
+
+    def test_legacy_pending_instruction_remains_fenced_and_visible(self):
+        from hermes_fleet_linear_plugin import ops
+        legacy = json.dumps({"note": "Maybe delivered", "session_id": "original-session"})
+        self.store.update(ISSUE, pending_resume=legacy)
+        self.bridge.handle_webhook(self.prompt("Additional instruction", "new-context"))
+        self.bridge = self.reopen()
+        self.bridge.recover()
+        self.assertEqual(self.store.get(ISSUE)["pending_resume"], legacy)
+        self.assertEqual(self.notes(), [])
+        self.assertTrue(any(item["why"] == "legacy continuation requires reconciliation"
+                            for item in ops.stuck(self.store.path, self.home / "inbox.db", "default")))
+
+
+if __name__ == "__main__":
+    unittest.main()

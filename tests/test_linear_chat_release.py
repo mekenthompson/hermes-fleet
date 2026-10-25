@@ -162,16 +162,16 @@ class ChatReleaseTests(unittest.TestCase):
         self.assertTrue(self.store.reconcile_terminal(row_id, outcome="not_applied",
             evidence="Synthetic rejected mutation and exact original delegate/state", at=self.clock()))
         self.assertEqual(self.store.get("i")["release_pending"], 0)
-        self.assertTrue(json.loads(handle(self.bridge, {"action": "start", "issue": "ABC-1"}, self.context))["ok"])
+        self.assertFalse(json.loads(handle(self.bridge, {"action": "start", "issue": "ABC-1"}, self.context))["ok"])
         self.bridge.flush()
         self.assertEqual(self.issue["delegate"]["id"], SELF)
         self.assertFalse(self.remote.comments)
 
     def test_restart_recovery_does_not_resume_pending_release(self):
         handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
-        with patch.object(self.bridge, "inject", return_value=True) as inject:
-            self.bridge._recover_chats()
-        inject.assert_not_called()
+        before = self.store.get("i")
+        self.bridge.recover()
+        self.assertEqual(self.store.get("i"), before)
         self.assertEqual(self.store.get("i")["release_pending"], 1)
 
     def test_native_response_is_sent_after_verified_release(self):
@@ -186,10 +186,11 @@ class ChatReleaseTests(unittest.TestCase):
 
     def test_pending_release_does_not_accept_linear_chat_followup(self):
         handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)
-        with patch.object(self.bridge, "inject", return_value=True) as inject:
-            self.bridge._chat_followup(self.store.get("i"), "ls", "a", self.clock() * 1000,
-                                       "ABC-1", "resume")
-        inject.assert_not_called()
+        before = self.store.get("i")
+        pending = self.store.pending()
+        self.bridge._chat_followup(before, "ls", "a", self.clock() * 1000, "ABC-1", "resume")
+        self.assertEqual(self.store.get("i"), before)
+        self.assertEqual(self.store.pending(), pending)
 
     def test_success_false_does_not_delete_owner_or_emit_closeout(self):
         handle(self.bridge, {"action": "release", "issue": "ABC-1"}, self.context)

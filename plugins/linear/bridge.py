@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 from .api import markdown_matches, LinearAPI, LinearError, RateLimited, state_id
 from .oauth import ReauthorizationRequired
-from .store import Store, advisory
+from .store import BLOCK_REPLY, Store, advisory
 from .ops import held
 log = logging.getLogger("linear")
 EVENT_KINDS = ("completed", "blocked", "block_loop_detected", "gave_up", "unblocked", "archived",
@@ -228,13 +228,6 @@ class Kanban:
     def subscribe(self, task_id: str, issue_id: str) -> None:
         with self.conn() as conn:
             self.kn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=issue_id)
-    def subscribe_parent(self, task_id: str, profile: str, route: dict) -> None:
-        with self.conn() as conn:
-            self.kn.add_notify_sub(conn, task_id=task_id, platform=route["platform"], chat_id=route["chat_id"],
-                thread_id=route.get("thread_id") or "", notifier_profile=profile,
-                delivery_mode="notify+wake", chat_type=route.get("chat_type") or "dm",
-                user_id=route.get("user_id") or None,
-                delivery_metadata={"scope_id": route.get("scope_id") or ""})
     def events(self, task_id: str, issue_id: str) -> list:
         with self.conn() as conn:
             return self.kn.claim_unseen_events_for_sub(
@@ -305,26 +298,24 @@ class Kanban:
                 raise LinearError("Prior core worker is still exiting; retry after retirement")
     def _await_worker_exit(self, conn, task_id: str) -> None:
         self.await_retirement(self.retirement(task_id))
+    def comment_received(self, task_id: str, marker: str) -> bool:
+        """Native receipt survives response loss; no plugin retry intent or second ledger."""
+        with self.conn() as conn:
+            return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='commented' "
+                                "AND json_extract(payload, '$.idempotency_key')=? LIMIT 1",
+                                (task_id, marker)).fetchone() is not None
     def comment(self, task_id: str, body: str, *, marker: str = "") -> None:
         with self.conn() as conn:
-            task = self.kb.get_task(conn, task_id)
-            if task and task.status in ("blocked", "triage"): self._await_worker_exit(conn, task_id)
-            author = "linear:" + hashlib.sha256(marker.encode()).hexdigest() if marker else "linear"
-            if marker:
-                for comment in self.kb.list_comments(conn, task_id):
-                    if comment.author != author: continue
-                    if comment.body != body.strip(): raise LinearError("Applied follow-up changed; reconcile the task", retryable=False)
-                    return
-            self.kb.add_comment(conn, task_id, author, body)
+            self.kb.add_comment(conn, task_id, "linear", body, idempotency_key=marker or None)
     def archive(self, task_id: str) -> None:
         with self.conn() as conn:
             self.kb.archive_task(conn, task_id)
 class Bridge:
     def __init__(self, store: Store, api: LinearAPI, kanban: Kanban, *, profile: str,
-                 settings: dict[str, Any] | None = None, inject: Callable[[str, str], bool] = lambda k, t: False,
+                 settings: dict[str, Any] | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         settings = settings or {}
-        self.store, self.api, self.kanban, self.profile, self.inject, self.clock = store, api, kanban, profile, inject, clock
+        self.store, self.api, self.kanban, self.profile, self.clock = store, api, kanban, profile, clock
         self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
         self._ingress = Path(settings["ingress_database"]) if settings.get("ingress_database") else None
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
@@ -399,10 +390,8 @@ class Bridge:
                 continue
             log.error("linear: reauthorization required for profile %s", self.profile)
             try:
-                if kind == "chat" and not self.inject(target, note):
-                    continue
                 if kind != "chat":
-                    self.kanban.comment(target, note)
+                    self.kanban.comment(target, note, marker="linear-reauthorization")
             except Exception:  # noqa: BLE001 - keep other alert routes available
                 log.exception("linear: reauthorization alert delivery failed")
                 continue
@@ -442,6 +431,10 @@ class Bridge:
         if row["origin"] == "chat":
             return {"session_key": row["owner_ref"], **binding}
         return {**({"task_id": row["task_id"]} if row.get("task_id") else {}), **binding}
+    @staticmethod
+    def linear_session(row: dict[str, Any]) -> str:
+        """An Agent Session is a reporting address, never the native execution owner."""
+        return row.get("linear_session_id") or (row["owner_ref"] if row["origin"] == "kanban" else "")
     def _progress_activity(self, row: dict[str, Any], route: dict[str, Any], action: str, parameter: str,
                            *, ephemeral: bool = False) -> tuple[str, dict[str, Any]]:
         payload = {"issue_id": row["issue_id"], "session_id": row["owner_ref"],
@@ -466,8 +459,8 @@ class Bridge:
                                         **self._alert_route(row or self.store.get(issue_id))}, at=self.clock())
     def say(self, row: dict[str, Any], body: str, kind: str = "response") -> None:
         """One visible message: an agent-session activity for Linear-origin work, else a comment."""
-        if row["origin"] == "kanban":
-            self.activity(row["issue_id"], row["owner_ref"], kind, body, row=row)
+        if self.linear_session(row):
+            self.activity(row["issue_id"], self.linear_session(row), kind, body, row=row)
         else:
             self.comment(row["issue_id"], body, row=row)
     def project_update(self, session_id: str, project_id: str | None, ident: str, line: str,
@@ -505,7 +498,8 @@ class Bridge:
         row = self.store.get(issue_id)
         if row and row["origin"] in ("kanban", "kanban_chat") and row.get("task_id"):
             task = self.kanban.get(row["task_id"])
-            if task and task.status != "archived": self.kanban.archive(task.id)
+            if task and task.status != "archived" and getattr(task, "created_by", None) == "linear":
+                self.kanban.archive(task.id)
     def authorize_specialist_effect(self, issue_id: str) -> bool:
         """Freshly resolve the authoritative issue before specialist work/effect admission."""
         if not self._specialist_scope_active(): return True
@@ -637,9 +631,9 @@ class Bridge:
             if event.get("action") == "created":
                 self._delegated(event, issue, session_id, row)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
-                if row and (event_ms(event) < float(row["last_updated_at"]) or
-                            event_ms(event) <= float(row.get("resume_fence_at") or 0)):
-                    return  # a late Stop for an older session must not stop newer work
+                if row and (event_ms(event) <= float(row.get("resume_fence_at") or 0)
+                            or (row["origin"] == "chat" and event_ms(event) < float(row["last_updated_at"]))):
+                    return  # reporting comments cannot hide native Stop; actual resumption fences old signals
                 if row and row["origin"] == "chat" and row.get("linear_session_id") not in (None, session_id):
                     return  # a different Linear session cannot target this chat turn
                 self._stop(row, session_id, ((activity.get("user") or {}).get("name")) or "a Linear user",
@@ -664,13 +658,7 @@ class Bridge:
             return False
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         issue_id, stamp = issue["id"], event_ms(event)
-        if row and row["origin"] == "kanban_chat":
-            self.activity(issue_id, session_id, "response",
-                          "Already delegated from Hermes chat to the existing Kanban task; no second executor was created.")
-            return
-        incomplete = bool(row and row["origin"] == "kanban" and
-                          not self.store.has_start_ack(issue_id, row["task_id"]))
-        if row and row["origin"] == "kanban" and not incomplete and not self.may_execute_existing(
+        if row and row.get("task_id") and not self.may_execute_existing(
                 issue_id, retryable=self._specialist_scope_active(), source_ms=stamp):
             return self._decline_existing(issue_id, session_id)
         session = event.get("agentSession") or {}
@@ -683,36 +671,41 @@ class Bridge:
                 if not self.store.update(issue_id, linear_session_id=session_id, panel_note=None,
                                          last_updated_at=stamp): return
             self.activity(issue_id, session_id, "response",
-                          "Already in progress from Hermes chat. Reply here to steer that work.")
+                          "A legacy chat record is retained. Native reconciliation is required before further execution.")
             if row and row["origin"] == "chat" and row.get("panel_note"):
                 self.activity(issue_id, session_id, "elicitation", row["panel_note"])
         elif row:
-            if stamp < float(row["last_updated_at"]): return
-            if incomplete:
-                if row["owner_ref"] != session_id and not self.store.update(
-                        issue_id, owner_ref=session_id, last_updated_at=stamp): return
-                self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}", existing=row)
+            if stamp < max(row["linked_at"], row["resume_fence_at"]): return
+            task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
+            if task and task.status == "done":
+                # A verified new assignment may request a new increment only after
+                # the predecessor's native result and effect fence are reconciled.
+                self._finished(row)
+                if self.store.get(issue_id) is None:
+                    self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
+                return
+            if not self.linear_session(row) or echo:
+                self.store.update(issue_id, linear_session_id=session_id, owner_ref=session_id)
+                self.activity(issue_id, session_id, "response",
+                              "Linked to the existing native task. Its execution and Stop state are unchanged.")
                 return
             if row["owner_ref"] == session_id and not row.get("pending_resume"): return
             self._acknowledge(issue_id, session_id, stamp)  # ownership was just read; Kanban comes next
             if not self._resume(row, "Re-delegated in Linear; continue the existing work.",
                                 session_id, stamp, "Resuming the existing task.",
-                                context=lambda: self._thread(issue_id, since_ms=float(row["last_updated_at"]), until_ms=stamp)):
-                self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
+                                context=lambda: self._thread(issue_id, since_ms=float(row["last_updated_at"]), until_ms=stamp), resume=True):
+                self.activity(issue_id, session_id, "response",
+                              "The existing native task needs reconciliation; no replacement was created.")
         else:
             self._start(event, issue, session_id, stamp, f"linear:{issue_id}:{session_id}")
     def _prompted(self, event, issue, session_id, row, activity) -> None:
-        if row and event_ms(event) < float(row["last_updated_at"]):
+        if row and row["origin"] == "chat" and event_ms(event) < float(row["last_updated_at"]):
             return
         if row and not self.may_execute_existing(issue["id"], retryable=self._specialist_scope_active(),
                                                  source_ms=event_ms(event)):
             return self._decline_existing(issue["id"], session_id)
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         ident = issue.get("identifier") or issue["id"]
-        if row and row["origin"] == "kanban_chat":
-            self.comment(issue["id"], "Native Linear follow-up did not resume this chat-admitted worker. "
-                         "Reconcile the retained task in the owning chat; no new executor was created.", row=row)
-            return
         if row and row["origin"] == "chat":
             self._chat_followup(row, session_id, str(activity.get("id") or ""), event_ms(event), ident, body)
             return
@@ -722,133 +715,66 @@ class Bridge:
                             context=lambda: self._thread(issue["id"], since_ms=float(row["last_updated_at"]),
                                                          until_ms=event_ms(event))):
                 return
-        # The session key comes first so an out-of-order prompt and created event share a task.
-        stamp = event_ms(event)
-        if not self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}", body) and \
-                self._require_effect(issue["id"]):
-            self._start(event, issue, session_id, stamp, f"linear:{issue['id']}:{session_id}:{activity.get('id')}", body)
+        self.activity(issue["id"], session_id, "response",
+                      "No active native task is linked. This comment has not created or resumed execution.")
     def _chat_followup(self, row: dict[str, Any], session_id: str, activity_id: str, stamp: float,
                        ident: str, body: str) -> None:
-        issue_id = row["issue_id"]
-        if self.store.transfer_control_stopped(issue_id): return
-        if (self.store.get(issue_id) or {}).get("release_pending"): return
-        if self.store.issue_reconciliation_blocked(issue_id): return
-        marker = f"{issue_id}:{session_id}:{activity_id}:{stamp}"
-        if self.store.followup_captured(marker): return
-        pending = json.loads(row["pending_resume"]) if row.get("pending_resume") else {}
-        if pending and stamp < pending["stamp"]: return
-        route = self._alert_route(row)
-        error = {"issue_id": issue_id, "session_id": session_id, "content": {"type": "error", "body":
-                 "Chat follow-up delivery outcome is unknown; reconcile the owning chat before repeating it."}, **route}
-        if pending.get("attempting") and stamp <= pending["stamp"]:
-            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
-            raise LinearError("Chat follow-up outcome unknown; reconcile instead of repeating injection", retryable=False)
-        intent = {"marker": marker, "stamp": stamp, "attempting": True}
-        if not self.store.update(issue_id, pending_resume=json.dumps(intent)): return
-        failure = None
-        with self.store.guard_issue_work(issue_id) as admitted:
-            if not admitted or (self.store.get(issue_id) or {}).get("release_pending") or not self._require_effect(issue_id): return
-            try: ok = self.inject(row["owner_ref"], f"[Linear follow-up on {ident}] {body}")
-            except Exception as exc:
-                failure, ok = exc, False
-            if ok:
-                writes = [("activity", {"issue_id": issue_id, "session_id": session_id, "followup_marker": marker,
-                                        "content": {"type": "thought", "body": "Passed to the chat session working on this."}, **route})]
-                if row.get("stop_requested_at"):
-                    writes.insert(0, ("status", {"issue_id": issue_id, "state": "in_progress", **route}))
-                if not self.store.complete_resume(issue_id, stamp, writes, at=self.clock()): return
-                return
-        if failure:
-            self.store.enqueue_once("activity", error, f"followup-unknown:{marker}", at=self.clock())
-            raise failure
-        error["content"]["body"] = "Could not reach the owning chat; this follow-up remains queued for retry."
-        self.store.update(issue_id, pending_resume=json.dumps({**intent, "attempting": False}))
-        self.store.enqueue_once("activity", error, f"followup-refused:{marker}", at=self.clock())
-        raise LinearError("Owning chat refused injection; retry the durable ingress delivery")
+        # The authenticated Linear event remains in its inbox/thread. A legacy chat
+        # address is not task authority, and a notice must never start a model turn.
+        if (row.get("release_pending") or row.get("stop_requested_at")
+                or self.store.issue_reconciliation_blocked(row["issue_id"])
+                or not self._require_effect(row["issue_id"])):
+            return
+        self.store.enqueue_once("activity", {"issue_id": row["issue_id"], "session_id": session_id,
+            "content": {"type": "response", "body": "This outcome retains a legacy chat record. "
+                        "Reconcile its native execution before linking a durable task; no work was resumed."},
+            **self._alert_route(row)}, f"legacy-followup:{row['issue_id']}:{activity_id}", at=self.clock())
     def _resume(self, row: dict[str, Any], note: str, session_id: str | None = None,
-                stamp: float | None = None, receipt: str = "Resuming the existing task.", marker: str = "",
-                context: Callable[[], str] | None = None) -> bool:
-        """Steer the existing task: a comment, and unblock it if it was waiting. False if it has ended."""
-        if self.store.issue_reconciliation_blocked(row["issue_id"]): return False
-        if not self._require_effect(row["issue_id"]): return False
-        session_id = session_id or row["owner_ref"]
-        stamp = stamp if stamp is not None else float(row["last_updated_at"])
-        if self._queued_stop(row["issue_id"], stamp):
-            raise LinearError("Newer Stop is queued in ingress; process it before resuming")
-        task = self.kanban.get(row["task_id"])
-        if task is None or task.status in ("done", "archived"):
-            if task and task.status == "done": self._finished(row)
-            else: self._unfinished(row)
+                stamp: float | None = None, receipt: str = "Instruction saved on the existing task.", marker: str = "",
+                context: Callable[[], str] | None = None, *, resume: bool = False) -> bool:
+        """Deliver once to the native task; comments alone never resume stopped work."""
+        issue_id = row["issue_id"]
+        if self.store.issue_reconciliation_blocked(issue_id) or not self._require_effect(issue_id):
             return False
-        with self.store.guard_issue_work(row["issue_id"]) as admitted:
-            current = self.store.get(row["issue_id"])
-            if not admitted or not current or current["task_id"] != task.id: return False
-            if stamp < current["last_updated_at"] or (current["stop_requested_at"] and
-                                                      stamp <= current["stop_requested_at"]): return True
-            if not self.store.activate_task(row["issue_id"], task.id, lambda: True): return False
-            intent = json.loads(current["pending_resume"]) if current.get("pending_resume") else None
-            incoming = note
-            key = f"{session_id}:{stamp}:{marker or incoming}"
-            if self.store.followup_captured(key): return True
-            markers = []
-            messages = []
-            if intent and intent.get("kind") == "kanban":
-                markers = intent.get("markers", [f"{intent['session_id']}:{intent['stamp']}:{intent['note']}"])
-                messages = intent.get("messages", [{"key": markers[0], "note": intent["note"]}])
-            if key not in markers:
-                markers.append(key)
-                # The thread is read only for a new instruction and kept out of the key, so a redelivery still dedupes.
-                message = {"key": key, "note": "\n\n".join(x for x in (incoming, context() if context else "") if x)}
-                if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
-                    message.update(activity_id=marker, session_id=session_id,
-                                   provenance="activity" if marker else "delegation")
-                messages.append(message)
-            note = "\n\n".join(message["note"] for message in messages)
-            saved = json.dumps({"kind": "kanban", "note": note, "last_note": incoming, "marker": marker,
-                                "markers": markers, "messages": messages, "session_id": session_id,
-                                "stamp": stamp, "receipt": receipt})
-            if not self.store.update(row["issue_id"], owner_ref=session_id, last_updated_at=stamp,
-                                     pending_resume=saved): return False
-        with self.store.guard_issue_work(row["issue_id"]) as admitted:
-            current = self.store.get(row["issue_id"])
-            if not admitted or not current: return False
-            if current["pending_resume"] != saved: return True  # A newer instruction or Stop superseded this attempt.
-            def steer() -> bool:
-                if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
-                    for message in messages:
-                        session = self.api.agent_session(message.get("session_id"))
-                        if session["issue"]["id"] != row["issue_id"]:
-                            raise LinearError("Saved specialist reply session changed issue", retryable=False)
-                        if message.get("provenance") == "activity" and message.get("activity_id"):
-                            self.api.agent_activity(message["activity_id"], message["session_id"])
-                        elif message.get("provenance") != "delegation" or message.get("activity_id"):
-                            raise LinearError("Saved specialist reply lacks actor provenance", retryable=False)
-                for message in messages:
-                    self.kanban.comment(task.id, message["note"], marker=message["key"])
-                waiting = self.kanban.get(task.id)
-                if waiting and (waiting.status == "blocked" or
-                                (waiting.status == "triage" and current["stop_requested_at"])) and not self.kanban.unblock(task.id):
-                    latest = self.kanban.get(task.id)
-                    if latest and latest.status == "blocked":
-                        raise LinearError("Core task remains blocked; retry the saved resume transition")
+        session_id = session_id or row.get("linear_session_id") or row["owner_ref"]
+        stamp = stamp if stamp is not None else float(row["last_updated_at"])
+        if self._queued_stop(issue_id, stamp):
+            raise LinearError("A newer Stop must be reconciled before this native request")
+        with self.store.guard_issue_work(issue_id) as admitted:
+            current = self.store.get(issue_id)
+            if not admitted or not current or current.get("task_id") != row.get("task_id"):
+                return False
+            if current.get("pending_resume"):
+                self.say(current, "A legacy continuation has an unresolved delivery. Reconcile it through "
+                         "native task state before another continuation.", "error")
                 return True
-            if not self.store.activate_task(row["issue_id"], task.id, steer): return False
-            route = self._alert_route(current)
-            latest = self.kanban.get(task.id)
-            if latest and latest.status == "triage":
-                payload = {"issue_id": row["issue_id"], "work_owner": current["ownership_id"], **route}
-                prefix = f"resume-triage:{row['issue_id']}:{stamp}"
-                self.store.enqueue_once("status", {**payload, "state": "blocked", "source_ms": stamp},
-                                        prefix + ":status", at=self.clock())
-                self.store.enqueue_once("activity", {**payload, "session_id": session_id, "content": {
-                    "type": "error", "body": "Instruction saved. Resolve this task's Kanban triage on the board "
-                    "before it can resume."}}, prefix + ":activity", at=self.clock())
-                return True  # Keep the durable intent until core's human triage transition.
-            return self.store.complete_resume(row["issue_id"], stamp, [
-                ("status", {"issue_id": row["issue_id"], "state": "in_progress", "claim": True,
-                            "source_ms": stamp, "seen": "self", **route}),
-                ("activity", {"issue_id": row["issue_id"], "session_id": session_id, "followup_markers": markers,
-                              "content": {"type": "thought", "body": receipt}, **route})], at=self.clock())
+            if stamp < max(current["linked_at"], current["resume_fence_at"]) or stamp <= current["stop_requested_at"]:
+                return True
+            task = self.kanban.get(current["task_id"])
+            if task is None or task.status in ("done", "archived"):
+                self.say(current, "The native task has ended. Status queries do not create another executor.")
+                return True
+            needs_resume = resume and task.status == "blocked"
+            key = f"linear:{issue_id}:{session_id}:{marker or stamp}"
+            received = getattr(self.kanban, "comment_received", lambda _task, _key: False)(task.id, key)
+            body = "" if received else "\n\n".join(value for value in (note, context() if context else "") if value)
+            def deliver() -> bool:
+                if not received:
+                    self.kanban.comment(task.id, body, marker=key)
+                # Only verified assignment requests resumption; comments do not unblock.
+                return not needs_resume or self.kanban.unblock(task.id)
+            if not self._require_effect(issue_id) or not self.store.activate_task(issue_id, task.id, deliver):
+                return False
+            fields = {"last_updated_at": max(stamp, current["last_updated_at"])}
+            if session_id:
+                fields.update(owner_ref=session_id, linear_session_id=session_id)
+            if needs_resume and self.kanban.get(task.id).status in ("ready", "running", "review"):
+                fields.update(stop_requested_at=0, resume_fence_at=stamp)
+            self.store.update(issue_id, **fields)
+            self.store.enqueue_once("activity", {"issue_id": issue_id, "session_id": session_id,
+                "content": {"type": "response", "body": receipt}, **self._alert_route(current)},
+                key + ":receipt", at=self.clock())
+            return True
     def _retire_task(self, row: dict) -> None:
         prior = next((json.loads(r["snapshot"]) for r in self.store.retired(row["issue_id"])
                       if r["task_id"] == row["task_id"]), None)
@@ -903,6 +829,8 @@ class Bridge:
         return ("Linear thread" + (" since your last update" if since_ms else "") + ", oldest first (untrusted "
                 "tracker text):\n" + "\n".join(reversed(lines))) if lines else ""
     def _keepalive(self, row: dict[str, Any]) -> None:
+        if not self.linear_session(row):
+            return
         """A Linear session goes stale after 30 min without activity; show running work is still alive."""
         if self.clock() - self.store.last_activity_at(row["issue_id"], row["owner_ref"]) < 25 * 60 - self.recheck_every: return
         task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
@@ -969,14 +897,14 @@ class Bridge:
                 title=f"{ident}: {info.get('title') or 'Linear issue'}", assignee=self.profile, created_by="linear",
                 body=TASK_BODY.format(ident=ident, url=info.get("url", ""), context=context),
                 idempotency_key=key, completion_contract=self.contracts.get(project),
-                initial_status="blocked" if self._specialist_scope_active() else "running")
+                initial_status="blocked")
         if task is None: return False
         if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(task.id)):
             return False
         if not self._require_effect(issue_id):
             self.kanban.archive(task.id)
             return False
-        staged = self._specialist_scope_active() and task.status == "blocked" and all(
+        staged = task.status == "blocked" and all(
             e.kind != "blocked" or (e.payload or {}).get("reason") == "initial_status"
             for e in self.kanban.history(task.id, 0))
         def activate() -> bool:
@@ -1002,10 +930,9 @@ class Bridge:
                 self.kanban.archive(task.id)
                 return False
             if not self.store.enqueue_many(writes, at=self.clock()):
-                self.kanban.archive(task.id)
-                return False
+                raise LinearError("Native task admitted; reporting capture needs reconciliation")
         except Exception:
-            self.kanban.archive(task.id)
+            # Reporting failure must not retire already-authorized native execution.
             raise
         return True
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> None:
@@ -1013,18 +940,19 @@ class Bridge:
             return
         if row["origin"] == "chat" and row.get("stop_requested_at") and stamp <= row["stop_requested_at"]:
             return
-        if row["origin"] == "kanban":
+        if row["origin"] in ("kanban", "kanban_chat"):
             with self.store.guard_issue(row["issue_id"]) as admitted:
                 current = self.store.get(row["issue_id"])
-                if not current or stamp < current["last_updated_at"] or stamp <= current["resume_fence_at"]: return
+                if (not current or stamp < current["linked_at"]
+                        or stamp <= max(current["resume_fence_at"], current["stop_requested_at"])): return
                 row = current
                 if not admitted or not self.store.update(
                         row["issue_id"], last_updated_at=max(stamp, float(row["last_updated_at"])),
-                        stop_requested_at=stamp, pending_resume=None): return
+                        stop_requested_at=stamp): return
             # Commit the Stop fence before any core failure or process exit can occur.
             with self.store.guard_issue(row["issue_id"]) as admitted:
                 current = self.store.get(row["issue_id"])
-                if not admitted or not current or current["stop_requested_at"] != stamp or current["pending_resume"]: return
+                if not admitted or not current or current["stop_requested_at"] != stamp: return
                 row = current
                 row = {**row, "owner_ref": session_id}
                 task = self.kanban.get(row["task_id"])
@@ -1037,8 +965,8 @@ class Bridge:
                                          self.profile, at=self.clock(), stamp=stamp)
             return
         self.status(row["issue_id"], "blocked")
-        self.say(row, f"Stopped by {who}: the task is blocked and its proven worker is stopped now. "
-                      "An unproven worker stays running until its identity is verified. Re-delegate or reply here to resume.")
+        self.say(row, f"Stop recorded from {who}; the native task is blocked. "
+                      "Reconcile worker/process teardown and external effects before requesting native resumption.")
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
@@ -1085,7 +1013,7 @@ class Bridge:
             internal_block = payload.get("kind") in {"capability", "transient"}
             instruction = ("Resolve Kanban triage on the board." if task_status == "triage" else
                            "Reconcile the runtime failure before resuming the existing task; no user input is requested."
-                           if internal_block else "Reply here to unblock.")
+                           if internal_block else BLOCK_REPLY)
             block_type, block_label = (("error", f"Blocked ({payload['kind']})") if internal_block else ("elicitation", "Blocked"))
             writes = [status("blocked"), message(block_type, f"{block_label}: {payload.get('reason') or 'needs input'}. {instruction}")]
         elif event.kind == "gave_up":
@@ -1122,21 +1050,23 @@ class Bridge:
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
             if captured.get(key, 0):
                 captured[key] -= 1; writes = []
+        if event.kind == "blocked" and payload.get("reason") == "initial_status":
+            writes = []  # staged native admission is not an operator blocker, including cursor upgrades
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
                 (event.kind == "block_loop_detected" and task_status != "triage") or
                 (event.kind == "unblocked" and task_status not in ("todo", "ready", "review", "running"))): writes = []
         # A durable Linear Stop fences older native milestones as well as its worker.
         if row.get("stop_requested_at") and task_status in ("blocked", "triage"): writes = []
-        if row["origin"] == "kanban_chat":
+        if not self.linear_session(row):
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}}, "body": _visible_activity(payload.get("content") or {})}) if kind == "activity" else (kind, payload)
                       for kind, payload in writes]
         self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     def _finish_work(self, issue_id: str, writes: list, *, at: float) -> bool:
         row = self.store.get(issue_id)
-        if row and row["origin"] == "kanban_chat":
+        if row and not self.linear_session(row):
             writes = [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                     "body": _visible_activity(payload.get("content") or {})}) if kind == "activity" else (kind, payload)
-                      for kind, payload in writes if kind != "project_update"]
+                      for kind, payload in writes]
         if row:
             writes = [(kind, {**payload, **self._alert_route(row)}) for kind, payload in writes]
         return self.store.finish(issue_id, writes, at=at)
@@ -1169,7 +1099,7 @@ class Bridge:
             return
         assessment = ""
         reader = getattr(self.kanban, "issue_comment", None)
-        if (callable(reader) and row.get("origin") == "kanban" and
+        if (callable(reader) and self.linear_session(row) and
                 (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
             raw = reader(task)
             assessment = _fit_assessment(raw if isinstance(raw, str) else "")
@@ -1235,7 +1165,16 @@ class Bridge:
             self._retire_task(row)
             self.kanban.archive(row["task_id"])
         else:
-            self.inject(row["owner_ref"], f"[Linear] {reason}. Stop working on that issue.")
+            # Legacy work stays visible until the native Stop observation is reconciled.
+            # Prose injection cannot retire a worker or revoke its authority.
+            if row.get("run_generation") is not None:
+                self.store.capture_chat_stop(row["issue_id"], row.get("linear_session_id") or "",
+                    "tracking-release:" + row["ownership_id"], self.profile, at=self.clock(),
+                    stamp=self.clock() * 1000)
+            else:
+                log.warning("linear: legacy issue %s has no native Stop generation; reconciliation required",
+                            row["issue_id"])
+            return
         self.store.delete(row["issue_id"])
         for pending in self.store.pending(row["issue_id"]):
             if pending["kind"] == "status":
@@ -1258,7 +1197,7 @@ class Bridge:
                     if pending_claim and self.may_write(issue, True, pending_claim["enqueued_at"],
                                                         pending_claim.get("seen"), pending_claim.get("source_ms")):
                         continue
-                    if self.may_write(issue, claim=False) and row["origin"] == "kanban":
+                    if self.may_write(issue, claim=False) and self.linear_session(row):
                         self._keepalive(row)
                 except LinearError as exc:
                     if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
@@ -1267,64 +1206,11 @@ class Bridge:
                         self._fence_scope_denial(row["issue_id"], exc)
                     continue
     def recover(self, ingress: Path | None = None) -> None:
-        """After a restart: Kanban workers are respawned by core; chat work is asked to reconcile."""
+        """Recover reporting only. Native task admission owns execution recovery."""
         for issue_id in {row["issue_id"] for row in self.store.retired()}:
             with suppress(LinearError): self.await_retired(issue_id)
         if ingress is not None: self.drain_ingress(ingress, retry_now=True)  # a restart retries backed-off deliveries
-        self._recover_kanban()
-        self._recover_chats()
-    def _recover_kanban(self) -> None:
-        for row in self.store.active("kanban"):
-            if not row.get("pending_resume"): continue
-            try:
-                intent = json.loads(row["pending_resume"])
-                if (intent.get("kind") == "kanban" and self.may_execute_existing(
-                        row["issue_id"], source_ms=intent["stamp"])):
-                    with self.lock(row["issue_id"]):
-                        self._resume(row, intent.get("last_note", intent["note"]), intent["session_id"],
-                                     intent["stamp"], intent["receipt"], intent.get("marker", ""))
-            except (LinearError, ValueError, KeyError):
-                continue
-    def _recover_chats(self) -> None:
-        for row in self.store.active("chat"):
-            if row.get("release_pending") or self.store.issue_reconciliation_blocked(row["issue_id"]):
-                continue
-            if not self.authorize_specialist_effect(row["issue_id"]):
-                continue
-            if row.get("stop_requested_at"):
-                with self.store.guard_issue(row["issue_id"]) as admitted:
-                    if admitted and not self.store.recovery_delivered(
-                            row["issue_id"], row.get("ownership_id"), row.get("run_generation"), "stop"):
-                        if self.inject(row["owner_ref"], "[Linear] Stop was requested before the restart. Do not resume this "
-                                                       "issue until a newer instruction explicitly reopens it."):
-                            self.store.mark_recovery_delivered(
-                                row["issue_id"], row.get("ownership_id"), row.get("run_generation"), "stop")
-                continue
-            if not self.may_execute_existing(row["issue_id"]):
-                continue
-            with self.store.guard_issue_work(row["issue_id"]) as admitted:
-                if not admitted or (self.store.get(row["issue_id"]) or {}).get("release_pending"): continue
-                if self._restart_notice_settled(row): continue
-                injected = self.inject(row["owner_ref"], "[Linear] The gateway restarted while you were working on a "
-                                       "Linear issue. Reconcile what already happened, then continue; finish "
-                                       "with `linear done` or `linear blocked`.")
-                if injected:
-                    latest = self.store.latest_status(row["issue_id"])
-                    self.store.mark_recovery_delivered(
-                        row["issue_id"], row.get("ownership_id"), row.get("run_generation"),
-                        None if latest is None else latest.get("id"))
-            if not injected:
-                self.store.delete(row["issue_id"])
-                self.status(row["issue_id"], "blocked")
-                self.comment(row["issue_id"], "Interrupted by a restart, and the chat session did not survive. "
-                                              "Re-delegate or start it again from chat.", row=row)
-    def _restart_notice_settled(self, row: dict) -> bool:
-        """A blocked closeout, or a notice already delivered for this execution, is not a new restart."""
-        latest = self.store.latest_status(row["issue_id"])
-        if latest and latest.get("state") == "blocked": return True
-        return self.store.recovery_delivered(
-            row["issue_id"], row.get("ownership_id"), row.get("run_generation"),
-            None if latest is None else latest.get("id"))
+        self.pump_kanban()
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
         sent, progress = 0, True
@@ -1692,9 +1578,9 @@ class Bridge:
         chat = work["owner_ref"] if work and work["origin"] == "chat" else payload.get("session_key")
         task = work["task_id"] if work and work["origin"] != "chat" else payload.get("task_id")
         if chat:
-            return bool(self.inject(chat, "[Linear] " + note))
+            return False  # ops reports the durable write; never start a model turn to report it
         if task:
-            self.kanban.comment(task, note)
+            self.kanban.comment(task, note, marker="linear-write-alert:" + row["id"])
             return True
         return False
     def _alert_uncertain_terminal(self, row: dict[str, Any]) -> None:
@@ -1703,10 +1589,8 @@ class Bridge:
         note = ("A prior status attempt failed, so its remote outcome is uncertain. Reconcile who closed it "
                 "and the exact evidence before reporting this work complete.")
         log.error("linear: uncertain terminal status for %s", payload["issue_id"])
-        if payload.get("session_key"):
-            self.inject(payload["session_key"], "[Linear] " + note)
-        elif payload.get("task_id"):
-            self.kanban.comment(payload["task_id"], note)
+        if payload.get("task_id"):
+            self.kanban.comment(payload["task_id"], note, marker="linear-uncertain:" + row["id"])
     def _hold_terminal(self, row: dict[str, Any], message: str) -> None:
         self.store.hold_terminal(row["id"])
         row["payload"]["reconcile_required"] = True
@@ -1772,7 +1656,6 @@ class Bridge:
     def tick(self, ingress: Path | None = None) -> None:
         if ingress is not None:
             self.drain_ingress(ingress)
-        self._recover_kanban()
         self.pump_kanban()
         self.recheck()
         self.flush()

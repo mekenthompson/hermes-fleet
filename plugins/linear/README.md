@@ -1,62 +1,62 @@
-# Linear plugin
+# Linear outcome tracking with native Hermes execution
 
-Linear is the human record of work. This profile's Kanban board runs the work. The plugin translates
-between them. Core owns execution; the plugin retains admission and effect receipts, not a second worker runtime.
+Ordinary chat, questions, short commands and bounded investigations require no Linear issue.
+Use native durable tasks when remaining work must survive a process, wait asynchronously, or
+continue through implementation, review and release. Link meaningful human outcomes to Linear.
 
-- **Linear** owns status, the delegate (which agent owns an issue, visible to every agent), comments,
-  agent-session activity and project updates.
-- **Kanban** (core, per container) owns execution: durable tasks, restart-safe workers, orphan
-  reclaim, the retry breaker, and `blocked(needs_input)` as a durable stop.
-- **The plugin** turns Linear events into Kanban calls, and Kanban events into Linear writes.
+## Architecture
 
-A specialist Agent Session (`requester_basis: agent_session`) must finish with
-`metadata.issue_comment`: the human issue comment, Linear markdown, 40 to 12000
-characters, with a newline, and no Project status update heading. Text over 12000
-characters is trimmed to the last fitting line and still posted. The bridge
-posts that text once on the issue, using the session it already bound. The same
-text on a later card is not posted again. Missing text, or revoked authority,
-does not report Done and does not publish a comment. The worker must not call
-the `linear` tool to post it. Session activities never name a Kanban task.
-A heartbeat note becomes an ephemeral Working action. A Kanban comment
-becomes a thought. The specialist session close says the assessment is on
-the issue. A direct agent and a worker use that same activity vocabulary.
-Native review requests, requested changes, review reopening, scheduling, and
-dependency waits are projected as work milestones. Scheduled work and unmet
-dependencies appear Blocked in Linear; native promotion returns them to In
-Progress. Unblocking keeps them Blocked if a dependency still gates the task.
-Review requests keep the issue In Progress and never close
-the Agent Session. Session-owned work uses Agent Session activity; chat-owned
-Kanban work uses issue comments. Native event replay is captured with the
-Linear outbox so a bridge restart does not repeat delivered milestones.
+| Concern | Authority |
+|---|---|
+| Authenticated user, allowed scope and permissions | Native Hermes |
+| Short interactive work | Current native conversation |
+| Durable execution, recovery, Stop and stale workers | Native task, worker claim and execution generation |
+| Human outcome, evidence and blockers | Linked Linear issue |
+| Progress destination | Authorized native subscriber |
+| Remote reporting and uncertain delivery | Plugin durable outbox |
 
-It is off by default. It shares nothing across containers: the Linear delegate is the only
-cross-agent record.
+Previously the plugin claimed chats, parsed continuation phrases, injected restart instructions,
+and maintained chat-to-worker claim/transfer/resume protocols. New work uses one existing native
+task and one issue/task reporting binding. The plugin does not create a chat execution owner,
+start chat turns on restart, or decide whether ordinary tools may run. Legacy records remain
+visible and fenced; they are not silently adopted, deleted or replayed.
 
-Kanban uses the executor name that resolves to the service's own home. A standalone
-container uses `default`; a named-profile gateway uses its matching named profile.
-Activation refuses an executor that resolves to a different home.
+A channel change never moves a worker. A conversation reference is a delivery address, and an
+issue identifier, delegate field or comment is not a tool-execution grant. Verified Linear
+assignments and cancellation signals become native execution requests. Duplicate deliveries use
+native request keys and the existing outbox. No additional scheduler or recovery daemon exists.
 
-Chat tools accept that same executor identity only from the service's exact home.
-Standalone API-server turns that omit their profile are accepted only when core's
-active profile and default executor both resolve to that exact home. Blank identities
-from other adapters or named profiles remain refused.
-Adapters without a core chat-run generation can track work, but cannot be interrupted
-by Linear Stop. Start makes that limitation explicit; use the chat's Stop control.
+## Track existing work
 
-## Ownership refusals are not execution observations
+Create and control durable work with native Hermes task actions. Then link it:
 
-A retained chat claim or a task binding does not prove that work is running.
-Tracking refusals include a stable `code` (`chat_ownership_conflict`,
-`task_ownership_conflict`, or `release_pending`) and an `ownership` object with
-its chat owner or task, Linear workflow name, Stop and release flags, and
-`execution_state: unknown`. An idle chat, an open session-catalog row, or a
-workflow named Blocked must not be reported as a competing active executor.
+```json
+{"action":"track","issue":"EXAMPLE-123","task_id":"existing-native-task"}
+{"action":"status","issue":"EXAMPLE-123"}
+```
 
-Reconcile current evidence in the recorded owning chat, then finish or release
-through the supported lifecycle. Old comments describe earlier failures, not
-current verifier results. There is no automatic idle-time takeover; an
-unreachable owner needs guarded recovery, not direct database edits, duplicate
-issues, or a raw delegate change.
+`track` validates the authenticated host and profile, issue/workspace/specialist scope, and native
+task identity. Linking never creates, starts, unblocks, transfers or replaces a task. It queues
+reporting after native work already exists; Linear delivery does not gate that worker. Retrying
+a link from another authorized conversation returns the same binding and leaves its claim and
+execution generation unchanged. Linking does not subscribe another channel or broadcast progress.
+
+The native task owns completion, blocking, Stop and review. Its events project to an Agent Session
+when one is bound, otherwise to issue comments. Legacy `kanban_chat` and `kanban` records share
+that execution path; their reporting address is the only distinction. A coordinator may supervise
+distinct children but must not also execute their claimed work.
+
+Natural-language follow-ups are interpreted in the authenticated conversation and delivered once
+to the existing native task. Use stable native creation and comment request keys after lost
+responses. Status questions do not resume stopped work. Completed work returns status; additional
+requested work is a new increment. Reconcile recoverable native state and external effects before
+resuming; a stale heartbeat alone does not prove death. Another agent's executor requires the
+supported native handoff. Merely opening another conversation interrupts nothing.
+
+The retired `start`, `delegate`, `transfer` and `resume_transfer` protocols refuse new execution.
+Compatibility `done`, `blocked` and `release` exist only for retained legacy chat records. No exact
+sentence or user-authored JSON grants continuation. Unknown legacy continuation deliveries remain
+visible in `hermes linear status` and are not replayed on restart.
 
 ## Enable it
 
@@ -67,7 +67,7 @@ plugins:
   enabled: [linear]  # append to the existing list; preserve other enabled plugins
   entries:
     linear:
-      allow_gateway_injection: true   # lets follow-ups and stop requests reach chat sessions
+      allow_gateway_injection: false
       settings:
         enabled: true
         identity:
@@ -96,7 +96,7 @@ Optional: `state_database` (default `<profile home>/linear/state.db`), `board` (
 `api_url`, `tick_seconds` (default 2). `ingress_profile` optionally selects the exact profile identifier
 written into this private inbox by its trusted ingress route. It defaults to the runtime profile;
 set it explicitly when a standalone `default` executor has a separately named inbox route. Only
-the inbox selector changes, including Stop priority and resume checks. Chat authorization, executor
+the inbox selector changes, including Stop priority and resume checks. Native authorization, executor
 identity, board, app/workspace credentials and scope do not change. The override must contain only
 ASCII letters, digits, underscores or hyphens; malformed values refuse startup before credentials
 or state admission. This does not enable the plugin or replay imported deliveries. Changing an
@@ -132,12 +132,9 @@ mismatches rather than falling back to a delegate. Optional `identity.teams` and
 specialist authorization boundary for Agent Session activity or arbitrary GraphQL calls.
 Keep specialist activation disabled until its separate scope contract is accepted.
 
-Existing work has the same authorization requirement: delegation-driven task resumption,
-work-bearing follow-ups, and chat recovery re-read the bound actor/workspace, applicable
-issue scope and current delegate before scheduling or injection. A failed read, foreign
-or absent delegate, or identity/scope mismatch leaves the existing work and owner unchanged.
-A queued chat claim is not confirmation of delegation. Stop remains a separate fail-safe
-control path and does not depend on permission to resume.
+Already-authorized native work continues safely while Linear is unavailable. New Linear-origin
+assignments require fresh app/workspace and requester authorization before native admission.
+No reporting outage or queued claim grants execution, and no chat is restarted to repair reporting.
 
 Webhooks: the host ingress verifies the HMAC signature and the one-minute `webhookTimestamp`
 window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Delivery` header, not
@@ -145,438 +142,76 @@ window (`api.verify_webhook` is the same check). It dedupes by the `Linear-Deliv
 `deliveries(logical_agent, delivery_id, profile, payload, payload_sha256, received_at, status,
 attempts)`. The plugin reads pending rows for its profile and marks them `imported`.
 
-## Who owns an issue
+## Linear-origin events and native lifecycle
 
-Three locks. Do not treat them as one.
+Verified assignments request one native task using the event's stable idempotency key. Existing
+bindings route requests to that task; no second worker is created to repair status. Follow-up
+comments are saved with native idempotent comment keys and do not automatically unblock stopped
+work. Explicit verified assignments may request native resumption, whose retirement and claim
+checks still apply. Unverifiable events admit no work.
 
-- **Linear delegate** is the agent app. Changing it is the agent-to-agent handoff. `start` and `transfer` do not move it.
-- **Chat claim** is one session of that agent. Desktop and Telegram are different claims of the same agent. `start` adopts the other claim when the user asked to continue this issue here. A heartbeat cannot. Stop, a pending release, and a Kanban binding still refuse.
-- **Kanban task** owns worker execution. A chat cannot adopt it.
+Human reassignment or closure is reread before affected execution requests and status writes.
+Native cancellation records Stop and reconciles worker/process teardown; acknowledgement does
+not prove external effects ended. Old workers retain no authority to write or close a replacement
+run. A missing or expired background completion grant produces a diagnostic before effectful
+background work; no unscoped approval fallback is permitted.
 
-`transfer` remains the heavy predecessor-retirement path. It is not a channel switch. The exact phrase `Transfer ABC-1 to this chat` still uses that path. A looser "continue this chat here" is `start`.
+Core owns restart recovery and process liveness. The plugin recovers reporting only. Notifications
+must never start a chat turn to manufacture execution authority. Native task subscribers receive
+progress on their authorized destinations. A notification recipient change is not executor change.
 
-## Chat work and detached workers
+## Durable reporting and uncertain effects
 
-The native `linear` tool is chat-only. Detached Kanban workers intentionally receive
-no authenticated chat session or run generation. They must not call `linear start`,
-`done`, `blocked`, `release`, or `delegate`, copy the originating chat identity, or infer it from
-`HERMES_PROFILE=default`. The plugin does not offer this tool in worker processes.
+Every remote update uses the profile-local durable outbox. Creates retain stable UUIDv4 IDs across
+retries; issue writes reread current ownership and human edits. Read-before-write/readback is
+best-effort rather than remote compare-and-swap. Advisory thoughts/actions get one try and do not
+hold other writes. Native event cursors and outbox capture deduplicate completion and milestone
+notifications across restarts.
 
-- A task created by the Linear bridge has a persisted issue/task ownership binding.
-  Its worker uses Kanban lifecycle tools and supplies evidence; the gateway bridge
-  projects those events to Linear through its durable outbox.
-- A manually created Kanban task, even with an issue URL in its body, has no native
-  Linear binding. Its Kanban completion does not update the issue. Do not invent an
-  adoption path for it. The only supported chat-to-worker handoff is the authenticated
-  in-process admission below, and only for a strictly unowned issue.
-- Do not release chat tracking and then require a manual worker to claim the issue.
-  Keep chat execution and bounded assistance under the owning chat, or arrange an
-  authorized native Linear session through the supported operator route after the
-  predecessor has stopped and its release is verified. Do not duplicate an existing
-  task merely to obtain tracking.
-- For an already stranded manual task, preserve its workspace, run history and
-  evidence, stop competing execution, and escalate exact owner/task reconciliation.
-  Do not edit the bridge database, spoof chat fields, redelegate blindly, or unblock
-  the task until a supported ownership path is established.
+A lost status or description response is reconciled against external state before retrying.
+Neither a remote Done nor a newer reopen proves an uncertain predecessor's outcome. Earlier
+receipts, task history, checkpoints, workspaces and PRs remain available. A PR already merged or
+a deployment already completed is read back and continued from, never replayed from stale prose.
+Ordinary chat and unrelated native work continue while reporting waits.
 
-Task acceptance must describe capabilities available to the executor. A detached
-worker cannot satisfy a chat-only Linear claim. Separate product evidence from the
-tracking integration blocker; never treat a rejected review as permission to skip
-product or destination acceptance. Goal-mode workers currently accept external
-blocks only as `dependency` or `needs_input`; do not mislabel a capability failure
-as a human product decision or claim completion to escape the judge. Preserve the
-precise failure and request supervisor reconciliation without repeated tool retries.
+Failed writes, revoked permissions and missing historical requester provenance remain visible.
+No revoked state is cleared, command guard disabled, or newer session used as old authority.
+Queued reporting is not remote delivery; source tests, merge, publication, deployment and live
+acceptance are separate claims.
 
-## Human-readable descriptions and progress
+## Migration and operation
 
-Write for the person reviewing the outcome. Use short headings, bullets and
-acceptance checklists in issue descriptions, concise progress comments and project
-updates. A long single paragraph gets a formatting warning, not an automatic
-rewrite. The submitted Markdown, code and URLs are preserved.
+Inventory existing chat-owned, task-owned, manual and stopped work before migration. Reconcile
+actual workers, authorizations and unknown effects through supported native controls. Explicitly
+link only remaining work after overlapping execution has retired; preserve its authorization and
+effect history. Unresolved records stay visible and fenced. Never edit ownership databases,
+automatically adopt manual tasks, delete checkpoints or create duplicate executors.
 
-Creation is planning, not tracking. Use `start` for work the current chat executes,
-then verify the exact issue's delegate and workflow status. Installing automation
-is a milestone, not completion while replies or decisions remain.
-
-The chat tool exposes two nonterminal content actions for its existing owning chat:
-
-```json
-{"action":"add_comment","issue":"ABC-1","id":"10b73a80-4dda-4994-a46d-6a30f4c2e654","body":"### Progress\n- Setup verified.\n\n### Remaining\n- [ ] Await written replies."}
-{"action":"update_description","issue":"ABC-1","id":"7f5a19f7-10da-4c49-9ca6-97c485c24cdd","expected_description":"Exact current description","description":"### Outcome\nCompare written offers.\n\n### Remaining\n- [ ] Resolve the decision."}
-```
-
-Use a canonical UUID and reuse the exact issue/content/expected-text request when
-reconciling a lost response. A conflicting ID reuse is refused. Both actions use
-the existing outbox, profile identity, specialist scope, local owning claim and
-remote delegate/closed-state checks. Stop, pending release or replaced ownership
-suppress content mutations. They never start another executor or change status.
-
-`update_description` replaces the description, so preserve human-authored scope
-and acceptance. Its expected-text preflight is **not atomic compare-and-swap**:
-a concurrent human edit can still race the external write. A durable send marker
-survives restart; an uncertain replacement is only reconciled by matching desired
-remote content, never blindly resent. A different remote value retains an
-unresolved receipt and fences new writes for operator reconciliation.
-
-Successful delivery verifies the exact issue/comment ID and Markdown content.
-Readback tolerates bullet-marker canonicalization, checked-task `[X]` case,
-blank lines after headings, and angle brackets around an unchanged link destination.
-It also accepts an expected plain ASCII host such as `example.com` becoming
-`[example.com](<http://example.com>)` in prose. This exception is directional:
-removing an authored link, changing its scheme/host/path, or rewriting code does
-not match. Ambiguous Markdown contexts are deliberately not autolink candidates:
-lines containing code/escapes/authored links, multiline open delimiters, or source
-text containing `<` remain conservative. Inline/indented code lines compare exactly.
-Create, description replacement/recovery, and comment verification share this
-comparison; retry a landed create with the original caller ID, never a fresh ID.
-A queued receipt is not remote delivery, source tests are not live activation, and the
-bridge's automatic closeout must not be duplicated with manual comments.
-
-## Chat-to-worker admission
-
-### Transfer chat ownership to another thread
-
-An authenticated user turn in the destination chat may explicitly ask to transfer an
-existing issue to that chat. Read the current `ownership_id` from a conflicting `linear
-start` receipt, then call the registered `linear` tool with the same issue and exact
-predecessor ownership:
-
-```json
-{"action":"transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","expected_owner":"the-current-ownership-id"}
-```
-
-An issue may be Blocked; its status alone never supplies permission or retirement
-proof. A negated transfer or resume instruction refuses before a control change.
-
-Reuse the same UUID and payload after a lost response or restart. The user instruction
-must name the issue and the destination chat. The Agent core must support durable
-`retire_for_handoff` and physical chat lineage; an older image refuses before creating a pending intent. A
-recorded predecessor generation is required. New Desktop turns receive a real core
-journal generation, but claims created before that producer existed remain unsupported.
-Core retirement fences the whole predecessor chat. If its local work store also has
-another issue owned by that chat, transfer refuses before saving intent or fencing core;
-finish or release the other work first. This is a refusal, not a partial handoff.
-If the predecessor chat was compressed into a new physical session key, transfer
-also refuses before intent or fencing: the later segment may own another issue.
-The refusal does not transfer ownership or stop work in that later segment.
-
-The plugin saves intent and fences old issue writes before it asks core to retire the
-predecessor. Core checks every recorded worker and detached resource, fences future old
-turns, and keeps historical tool effects `unknown`. A successful receipt moves the
-same issue's local chat owner; it does not change the human assignee, Linear delegate,
-workspace, project, checkpoints, or approved scope. It starts no new task and replays
-no work. Pending predecessor outbox rows remain available for reconciliation and cannot
-send after the successor resumes.
-
-The successor may inspect the retained receipts and external outcomes while execution
-is blocked. A human who created or is assigned the issue, or an allowed specialist requester, must
-review those effects and add a later comment on the same Linear issue. The comment's
-body is a JSON decision bound to the exact issue, transfer UUID, predecessor
-ownership id from the original transfer request, and the digest of the core
-retirement receipt returned by the ownership transfer. For example:
-
-```json
-{"kind":"chat-transfer-reconciliation/v1","issue_id":"issue-1","transfer_id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","predecessor_owner":"original-ownership-id","retirement_sha256":"sha256-from-ownership-receipt","decision":"resume_after_review","evidence":"https://example.test/reconciled"}
-```
-
-The human then sends a fresh instruction in the owning chat naming the issue, saying
-to reconcile and continue, and including that same `https://` evidence link. The
-tool call uses the same transfer UUID:
-
-```json
-{"action":"resume_transfer","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64","evidence":"https://example.test/reconciled"}
-```
-
-The link must appear in the authenticated user instruction. A bare URL, a model claim,
-an app-authored comment, or an earlier or mismatched decision cannot admit work.
-The plugin still records
-predecessor core effects as `unknown`; the human reconciliation admits *new* successor
-work and never relabels old effects or replays a prior action. Unresolved local outbox
-receipts must first be reconciled through the existing `hermes linear resolve` path.
-Stop, release, closed/canceled issues, human reassignment, profile or requester-scope
-changes, another owner, and an uncertain physical worker keep the transfer fenced.
-After transfer, a Linear Stop for the issue's exact saved Linear session records a
-durable control Stop and fences further work even when the successor has no native
-run generation. Its receipt says cancellation is unsupported; it does not claim a
-worker was stopped. A Stop after reconciliation also revokes the previous resume;
-the issue stays fenced for a guarded operator reconciliation. This control-only Stop
-cannot be cleared by retrying `resume_transfer` or presenting a chat generation.
-Native gateway turns bind the validated requester and Agent's stamped original
-message alongside the existing in-process live-turn validator. Desktop uses its
-server-stamped authenticated WebSocket identity and user instruction over the profile's
-private serialized transport; it does not acquire the gateway's live-turn delegation
-grant. A Desktop tab retains the same transfer across transcript compression. Authenticated
-API `/v1/runs` turns can use the same serialized path when a valid profile Bearer key and
-an addressable conversation are present; requests without that proof refuse the transfer.
-A same-UID process remains inside the documented local trust boundary.
-
-### Delegate chat work to Kanban
-
-`linear start` tracks work performed by the current chat. It is not a detached-worker
-identity grant. Detached Kanban workers must not call chat `start` or inherit a previous
-chat's routing/environment to manufacture authority.
-
-For a new, strictly unowned issue, an in-process live gateway chat turn may call:
-
-```json
-{"action":"delegate","issue":"ABC-1","id":"b1fd8472-cf47-4c4c-9d0a-04fca61b6d64"}
-```
-
-Use a new canonical UUID for the request, and reuse that exact request only within its
-original live turn. The saved profile/home, session, generation and subscriber route
-must match. Existing delegates or chat/native work are refused, including this app's
-own delegate. The issue and parent-session admission are retained rather than reopened.
-The gateway retains a blocked idempotent Kanban task, subscribes the originating chat
-with `notify+wake`, and captures a guarded one-shot ownership claim before activation.
-The worker executes; the chat remains the subscriber. No native Linear Agent Session
-is fabricated. Worker progress, internal capability/transient blockers and completion
-use guarded status/comment projection rather than AgentActivities or credential requests.
-
-Serialized Desktop/API RPC callers cannot acquire this live in-process admission grant.
-Use the gateway chat or keep the chat itself as executor; do not bypass the refusal.
-The validator checks the host-injected context against the live gateway turn and session
-catalog, including exact profile, route, session and generation. It checks again at the
-transport boundary and before activation. This is not a sandbox against arbitrary
-same-UID code, nor a remote CAS against concurrent human Linear writes.
-
-This route requires the companion core no-auto-replay policy for explicit
-`max_retries=0` tasks. A fresh task may start once; a recorded or ambiguous attempt
-must remain capability-blocked for operator reconciliation across reclaim/restart.
-Known-unsent local creation retries reuse the blocked task. Uncertain ownership writes
-retain an ambiguous admission and are not automatically resent. Reconcile worker identity,
-retained runs and remote effects before authorizing new execution; blocked/archived status
-alone does not prove a process physically stopped. Native follow-up prompts do not unblock
-these chat-admitted tasks. Cancellation and takeover retire the worker, not its parent chat.
-Source tests are not authorization to activate this route, replay old tasks or repair
-existing product ownership. Acceptance uses a fresh disposable issue after separate live approval.
-
-## What happens
-
-| Event | Kanban | Linear |
-|---|---|---|
-| Delegated to this agent | `create_task`, key `linear:<issue>:<session>` | A receipt thought, sent after the first ownership read and before any Kanban wait, so it meets Linear's 10 s limit. Then task progress and the claim. The receipt is advisory: ownership admits the work, and a lost or refused receipt never blocks it |
-| Delegation or follow-up we will not act on | none | One `response` saying why, once Linear confirms the issue is closed or delegated elsewhere, so the session is not left unresponsive. A failed read retries the delivery instead |
-| Work runs about 20 minutes with no activity accepted on its session | none | An ephemeral "Working" (or "Waiting to resume") action, so the session does not go stale at 30 minutes. Never while waiting for input |
-| Claiming an issue | none | Delegate = self. Status moves to the configured `in_progress` state unless the issue already sits in another `started` state (the configured `blocked` state does move). Re-delegating a closed issue reopens it. A team without that state name uses its first `started` state by position, with a warning |
-| `linear start ABC-1` in chat | none; chat stays the executor | Refused with a link if another agent is delegate and it is started. Otherwise delegate = self and In Progress |
-| Delegation while chat owns it, including our own start echo | none (loop guard) | One "already in progress from Hermes chat" response |
-| Follow-up prompt | Task comment with the message and every Linear comment since the agent's last update, unblock if blocked; chat: injected into the owning session | Thought "passed to ..." |
-| Any new or resumed Kanban task | The task includes the Linear thread: Linear's `promptContext` for new work (fetched by the plugin when absent), and comments between the last update and the event for re-delegation and follow-ups. Under `specialist_scope` only allowed requesters' and this app's comments are included. Detached workers cannot read Linear themselves | none |
-| Worker completes with a saved local summary or accepted external evidence | task done | Done state, one response with the saved summary and any links, one project update |
-| Worker completes without an accepted result | task done | Blocked state, one error: unfinished |
-| Worker blocks (`needs_input`) | task blocked | Blocked state, one elicitation |
-| Retry breaker trips | task blocked (`gave_up`) | Blocked state, one error |
-| Stop (a prompt with `signal: stop`) | `block_task(needs_input)`, which survives restarts; bound chat: generation-fenced core chat Stop | Kanban: Blocked and "Stopped by ...". Chat: Blocked with a Stop receipt activity; the delegate is kept |
-| Re-delegate or prompt after a stop or block | same task unblocked | In Progress |
-| Re-delegate after Done | new task (new session, new key) | as delegation |
-| Delegate moved to someone else (seen on re-read) | task blocked and archived; chat: told to stop | "Reassigned to ..." comment |
-| Human moves the issue to Done or Canceled | task blocked and archived | nothing; the human wins |
-
-Chat can also create an issue or project, or link two existing issues, as this profile's own app.
-Those actions do not assign, delegate, set a lead, or start tracking. The caller supplies a UUID
-and reuses it if the response is lost. Configured `identity.teams` and `identity.projects` are
-checked before the mutation, including that a project belongs to the selected team and that a parent issue is in scope.
-
-**Done needs an accepted result.** A saved local review summary can satisfy local-only work without
-an external URL when safe text remains after redaction. The minimum-content guard rejects empty
-or redaction-only text, ASCII single-character placeholders, and bare `Done`, `Complete`,
-`Completed`, or `OK` (ignoring case and punctuation). It does not prove a report's truth or
-substance; short findings and non-English text remain eligible. A GitHub PR link is checked
-against the exact head and required checks before either a Kanban result or chat command marks
-Linear Done, including projects without a configured contract. Set `completion_contracts` to
-make core enforce that check before Kanban completion too. A non-GitHub pull-request link is
-not accepted as completion evidence. Other work may use a destination link such as a merged
-commit, deploy check, or findings.
-
-Chat closeout receipts acknowledge durable local queuing, not remote acceptance.
-Named mutations require literal `success: true`; refusals retain failed recovery rows and
-alert the owning destination. New execution requires a fresh issue ownership read as well
-as verified actor identity. An API outage delays new delegation rather than admitting stale work.
-
-**Restart.** Core respawns Kanban workers. The task body starts with a reconcile step, so a retry
-checks what already happened before continuing. When the breaker trips, the issue goes to Blocked.
-The bridge records each Kanban event and its queued Linear writes in one local transaction;
-after a crash it replays events beyond that local cursor even if core's notification claim advanced.
-Rows upgraded from the older work schema reconcile historical transitions against the current
-task state, so an old breaker event cannot block a task that has since resumed.
-Chat work is asked to reconcile once for that execution. A Blocked closeout, including one
-still queued or failed, is not asked again. A paused Stop notice is delivered once. If its
-session cannot be reached, it becomes Blocked with "interrupted by restart".
-
-**Ownership.** Before every status write, and every `recheck_minutes` for active work, the plugin
-re-reads the issue. An Issue webhook that changes the delegate triggers an immediate re-read.
-Session events older than the newest one handled for that issue are ignored, so a delayed
-delegation cannot take work back. Ordering uses the session and activity `createdAt`. The issue's
-`updatedAt` is not used, because Linear creates the session before it updates the issue.
-
-**Project updates.** For chat, normally one per project per session, sent `quiet_minutes` after the
-last observed turn. If a terminal status is still retrying, owned nonterminal lines can publish
-first; the terminal line stays queued and can publish in a second update after the status succeeds.
-Later turns in the same session cannot edit an update already sent. For
-Kanban, one per finished task. At send time each issue's line is checked against its current
-delegate and state; a taken-over issue is omitted without dropping other owned lines. The
-batch is frozen from the latest committed rows before its first send, so a concurrent terminal
-capture cannot disappear behind a stale outbox snapshot. A pending or retryable failed claim
-holds its issue's line until ownership is decided. An unpublished batch with no owned lines is
-forgotten, leaving the session able to publish later valid work. The quiet deadline stops moving
-when the first send begins.
-
-## Delivery guarantees
-
-Every Linear write goes through a local outbox. Everything except Agent Activity thoughts and
-actions goes out oldest first per issue. Thoughts and actions are advisory progress: they never wait
-for, or hold back, another write, and each gets one try. One that fails, or is held by
-authorization or an unresolved write, is logged and dropped, never retried, alerted, revived or used
-to fence work, so a late thought cannot land after a Stop, question or result. A Linear quota pause
-only delays it: nothing is written during the pause, so order is kept.
-
-- **Creates** (comment, activity, project update) carry a UUID v4 client `id`, stored when the
-  write is queued. Linear rejects a repeat with `INPUT_ERROR` "conflict on insert of ..." naming that
-  id, and `api.is_duplicate_create_error` treats that as sent. A retry after a lost response
-  therefore never duplicates a comment.
-- **Status and delegate writes** are set-to-value, preceded by the ownership re-read. A queued
-  claim that meets a newer human edit (a close, or another delegate) is dropped rather than
-  reopening the issue. A late Stop for an older session does not stop newer work.
-- **Uncertain terminal status** holds fresh work and queued writes for that issue, including after
-  restart. An operator verifies the remote outcome in Linear and records it with
-  `hermes linear resolve <row> applied|not_applied --evidence "..."` (see [Operate it](#operate-it)).
-  An uncertain description replacement is resolved the same way.
-  The original receipt and dependent writes remain available; neither a remote Done nor a newer
-  reopen proves the predecessor's outcome. A failed lookup before send (`write_started=False`)
-  remains retryable and can yield to a successor. Other issues in a shared project update proceed.
-- **Unfinished chat release** retains the owning row and fences restart/followup admission until
-  the parked state and null native delegate are read back on the exact issue. The human assignee
-  is not changed. A verified `applied` reconciliation of this release finalizes matching local
-  ownership and permits its receipt-bound closeout; `not_applied` restores the original claim
-  without replaying the failed release. Record neither outcome from a failed lookup or a later
-  unrelated edit. A successor ownership generation suppresses old release comments, responses
-  and project-update lines. Read-before-write plus readback is best-effort, not remote CAS.
-- **Backoff** starts at 1 minute and doubles to a 1 hour cap. After 24 hours the write is marked
-  failed. For an issue write this is loud: an error log, a message in the owning chat (or a
-  comment on the Kanban task), and one more try after the next successful write. A failed chat alert remains due until
-  injection succeeds. A superseded status write never replays.
-- **Historical requester gaps** quarantine the original outbox row as failed with a durable authorization reason.
-  They require reconciliation with the original session; a newer session never supplies authority
-  for the old write. A fresh session receipt can pass an unrelated unsent predecessor, while an
-  uncertain terminal mutation still fences later effects.
-- **Rate limits**: when Linear answers `RATELIMITED`, all calls pause until the
-  `X-RateLimit-*-Reset` time (epoch milliseconds).
-- **Credential or permission failures**: a token failure (Connect or refresh) is retried like any
-  outage. A failing inbox delivery is retried 5 seconds after receipt, then with doubling gaps up
-  to every 15 minutes (every 15 seconds for a Stop), and is tried once more after a day, then
-  parked. Retries never hold newer deliveries back, and a restart retries them all once. The first
-  failure and the parking each log a traceback; retries in between log one line. HTTP 403 fails
-  loudly at once.
-- **Missing states**: a configured state name that does not exist on the team fails loudly. Set a
-  team's state to `null` to skip that status change. The comment or activity still posts.
-
-State: `work` holds the active issue, including nullable `run_generation`; upgrades never infer a
-generation for earlier chat work. `chat_stop` retains the original profile, issue, Linear session,
-activity, session key and generation across crashes. Its Stop receipt and worker observation may
-be accepted, pending, completed, unknown, stale, not running or unsupported. The receipt means
-core accepted an interrupt request; worker completion never proves external effects stopped.
-The outbox keeps each activity ID stable across retries; the initial session receipt uses a
-deterministic issue/session ID in UUIDv4 form, so duplicate deliveries do not create another receipt.
-Linear refuses other UUID versions. Receipts queued by the earlier UUIDv5 build are refused on their
-next send and dropped like any refused thought; they never hold a session or an issue.
-`outbox` has pending, sent and failed states.
-
-## Operate it
-
-Every fence has a visible reason and one supported way out. Run these in the profile's container;
-they read the same state and inbox as the gateway and never need it stopped.
+The reporting binding records `linked_at` as its source provenance. It is separate from the
+native resumption fence: a same-timestamp initial Stop wins, and an out-of-order distinct comment
+cannot hide Stop or another instruction. Existing records receive only the additive default of
+zero; migration does not infer a new binding, native grant or execution generation.
 
 ```bash
-hermes linear status          # everything held, oldest first, with the next step; --json for scripts
-hermes linear resolve <row> applied|not_applied --evidence "Issue shows Done at 14:02"
-hermes linear replay <delivery>   # one more try for a parked inbox delivery
+hermes linear status --json
+hermes linear resolve <row> applied|not_applied --evidence "verified external state"
+hermes linear replay <delivery>
 ```
 
-`/linear-status` shows the same report from any chat surface. It is read-only and is not offered
-under `specialist_scope`, where other requesters can reach the same chat.
+These operator actions reconcile reporting receipts and parked inbox deliveries. They do not grant
+execution or resume stopped tasks. A queued legacy release is not relinquishment: verify remote
+readback and local removal before a handoff. The historical transfer metadata is read only to
+preserve fences; no transfer/resume protocol writes new ownership records.
 
-`status` marks with `ACT` the items only an operator can clear, and exits 1 while any exist, so a
-health check can alert on it without flapping on work the gateway is still settling. It lists:
+## Tests and release
 
-| Held item | Next step |
-|---|---|
-| `ACT` Status or description write the gateway stopped trying, outcome unknown, with any writes held behind it | Check Linear, then `resolve` |
-| Status or description write still being sent; `ACT` once held unsent for an hour | None at first; it settles or escalates on its next send |
-| Issue write Linear refused (`ACT`) or timed out on, in the last 7 days; it then drops off the list | Redo the step, or wait for the retry after the next successful write |
-| `ACT` Parked inbox delivery; a delivery still backing off | Fix the logged cause, then `replay`; a restart retries backing-off ones |
-| `ACT` Ambiguous chat-to-worker admission | Confirm the task and delegate before new work |
-| Specialist scope fence, claiming admission, unfinished release, worker still exiting | Approved recovery only for fences; the gateway retries the rest each tick |
-
-`resolve` records what you saw; it never writes to Linear, and it refuses a write that is still
-being sent. `applied` and `not_applied` both release the issue for new work; writes held behind the
-receipt stay held. The CLI reads the inbox for the same profile as the gateway: `ingress_profile`,
-else `HERMES_PROFILE`, else `HERMES_AGENT_PROFILE`, else `default`. A replayed delivery that fails
-again parks again without a second alert.
-
-## Known limits
-
-- **Stop halts a proven worker now.** A supervisor block ends the fingerprinted host-local
-  worker immediately: SIGTERM, then SIGKILL if it ignores TERM. An unverified or recycled
-  identity is never signalled. A worker that survives stays fenced until it exits. The Stop
-  reply says so.
-
-- **Chat Stop is scoped to a bound ordinary chat run.** The plugin saves the host-provided session
-  key and run generation at `linear start`. A Linear Stop records that exact target durably before
-  calling core on the gateway loop. A restarted or late request can only retry that generation;
-  it cannot stop a successor. Legacy and unbound chat rows report unsupported and stay Blocked
-  until a newer Linear prompt; chat start cannot prove a newer turn without a saved generation.
-  An ambiguous response stays visible as unknown or stale, never as proof of cancellation.
-  `linear done` stays fenced until a newer prompt or explicit chat start resumes it. Stop does not
-  undo tools, child processes or external effects that already ran; reconcile before resuming.
-  A transferred successor with no native generation records a durable control Stop
-  for its exact Linear session, without sending a core cancellation request.
-- **Chat commands need Linear reachable** to resolve an identifier. When it is not, the tool says
-  so and asks the agent to retry.
-  Chat closeout receipts fence older delegation echoes and prompts, including after restart;
-  delayed events cannot create a second executor while closeout is still being delivered.
-- **Stop acts on queued or running tasks.** A task in `review` or `todo` cannot be blocked by core;
-  the plugin says so in Linear instead of claiming it stopped.
-  Core owns worker teardown. A prompt received while a worker that could not be halted is still
-  exiting stays queued durably; the task becomes ready only after that fingerprinted worker has
-  exited. A proven worker is already gone when Stop returns, so that resume is not held.
-  Core's immutable spawn history preserves this guard even after terminal cleanup clears a run's PID.
-  A newer Stop cancels that pending resume. Newer follow-ups are retained together while teardown waits.
-  Its fence commits before core is called, so a core failure cannot revive an older instruction.
-  Startup and normal ticks prioritize queued Stops for owned work; saved resumes also check for
-  newer Stops beyond the current inbox batch before making a task executable.
-  Core comments and completion receipts retain each instruction's identity across recovery and ingress retries.
-  Repeated Stop cycles can enter core triage. A newer human instruction reopens Stop-caused triage
-  through core's specification API, preserving recurrence counters and parent gating. Other triage
-  keeps the instruction pending and reports the required board action instead of claiming a resume.
-- **A human edit racing an agent status write** is accepted. The re-read narrows the window.
-- **An uncertain project-update send keeps its original UUID and body.** The body freezes before
-  the create call, including a possible crash just before the call. If Linear accepted the create
-  but its response was lost, changing a retry could not change the update already published.
-  A later terminal result remains on the issue status and evidence comment, but may not appear in
-  that session's project update. If ownership changes before retry, the write holds for remote
-  reconciliation instead of publishing a changed body under the same UUID.
-
-## Tests
-
-`tests/test_linear_plugin.py` needs no Agent source.
-
-`tests/test_linear_kanban_scenarios.py` runs every rule against a fake Linear over HTTP and a real
-Kanban board from the pinned Agent:
-
-```bash
-python3 -m venv .venv-linear
-.venv-linear/bin/python -m pip install --require-hashes --only-binary=:all: \
-  -r release/linear-scenario-requirements.txt
-.venv-linear/bin/python scripts/run-linear-scenarios.py \
-  --agent-source /path/to/manifest-pinned/hermes-agent
-```
-
-Run from this repository with Python 3.14.7 and a separate process from general unit discovery.
-The runner checks the source Git HEAD against `release/agent-image-manifest.json`, then fails for
-missing source, import errors, zero tests, failures, or any skipped scenario. CI checks out that
-exact revision and runs this lane on every pull request and main push. The scenarios use fake
-Linear traffic and local Kanban state; they do not enable the runtime plugin. Unit tests and this
-scenario lane prove source behavior, while image publication and deployment require their own gates.
+Run `python3 -m unittest discover -s tests -p 'test_*.py'` and
+`python3 scripts/verify-public-tree.py`. The native boundary suite uses
+`scripts/run-linear-scenarios.py --agent-source <manifest-pinned-clean-source>` and refuses skips.
+It exercises registered producer, real private transport/host journal, native task store and HTTP
+outbox, alongside native admission/delegation/completion and Stop tests. Helper-only tests do not
+establish deployed acceptance. Independent review, required exact-head CI, published immutable
+release and deployed Desktop/messaging checks are required before claiming completion.
 
 ## Specialist authorization
 
@@ -611,10 +246,7 @@ in the existing durable work row. Queued effects retain their exact issue/sessio
 bindings in the outbox payload, so closeout remains authorized after that work
 row is deleted and cannot borrow a successor's authority. Every transport attempt,
 including a credential-refresh retry, rechecks authority after credential resolution.
-Saved reply messages retain their activity and session IDs for actor verification
-before restart delivery. Each saved session is independently resolved and each
-reply requires nonempty activity provenance; delegation resumes carry an explicit
-delegation provenance type. Incompatible requester bindings remain separate project
+Reply events are revalidated against their exact activity and session before delivery to native work. Incompatible requester bindings remain separate project
 update batches, and transport admission independently checks superseded ownership.
 Legacy effects or reply intents lacking those bindings
 fail closed and require reconciliation instead of borrowing current work authority.
@@ -643,19 +275,4 @@ before the bridge reports a successful start.
 Transient resolution failures retain delivery work for retry. Arbitrary GraphQL
 is disabled in specialist mode; only the bounded operations are available.
 General-mode behavior is unchanged. Specialist chat actions obey the same issue
-boundary and still require the owning session for terminal actions.
-
-Review production growth through the ordinary PR diff and architecture review, not a
-blocking physical-line budget. Comments, readable safety branches and necessary contract
-repairs must not require a cap increase or code compression. The explicit file-inventory
-check in `tests/test_linear_plugin.py` remains; authorization, Stop, recovery and native
-Kanban scenario tests remain mandatory. Review changes for a thin adapter with native
-Kanban as the sole scheduler, not a second execution or retry engine.
-
-Ownership loss archives directly through core so a running worker retains its termination identity.
-A durable issue fence blocks native and chat replacements until every recorded predecessor exits.
-Unreadable identities, launch windows without a registered PID, and deleted tasks without worker
-receipts stay fenced for reconciliation. Archive/delete closeout queues a durable unfinished
-Blocked status and session error; current Linear ownership and human closure still win at send time.
-
-Desktop/API and gateway chats use the same gateway-owned bridge. A separate desktop/API process forwards its host-bound tool context through a profile-private Unix socket; it does not start another scheduler. If the gateway is unavailable before submission, the tool reports that explicitly. A lost response after submission requires ownership reconciliation before retrying. Restarting a chat cannot replace a missing gateway service.
+boundary; retained legacy chat terminal actions stay fenced to their historical owner.

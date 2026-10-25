@@ -131,8 +131,8 @@ class LinearPluginUnitTests(unittest.TestCase):
 
     def test_production_file_inventory(self) -> None:
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "chat_transfer.py", "oauth.py", "ops.py", "plugin.yaml",
-                          "store.py", "transport.py"])
+                         ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "host_context.py", "oauth.py", "ops.py", "plugin.yaml",
+                          "store.py", "tracking.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:
         cid = "0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b"
@@ -411,9 +411,6 @@ class ConnectOAuthTests(unittest.TestCase):
             linear_api.LinearAPI(broken, transport=lambda *a: (200, {}, b"{}")).viewer_id()
         self.assertTrue(caught.exception.retryable)
 
-RESTART = "[Linear] The gateway restarted while you were working on a Linear issue."
-
-
 class ChatRestartRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -428,7 +425,7 @@ class ChatRestartRecoveryTests(unittest.TestCase):
         self.injected: list[str] = []
         self.inject_ok = True
         api = linear_api.LinearAPI(lambda: "synthetic-token", endpoint=self.linear.url, clock=self.clock)
-        self.bridge = Bridge(self.store, api, None, profile="alpha", inject=self._inject, clock=self.clock)
+        self.bridge = Bridge(self.store, api, None, profile="alpha", clock=self.clock)
 
     def _inject(self, _key: str, text: str) -> bool:
         self.injected.append(text)
@@ -446,66 +443,46 @@ class ChatRestartRecoveryTests(unittest.TestCase):
             self.store.mark_sent(row_id, True)
         return row_id
 
-    def _restarts(self) -> list[str]:
-        return [text for text in self.injected if text.startswith(RESTART)]
+    def assert_reporting_recovery_preserves_claim(self):
+        before = self.store.get("iss-1")
+        self.bridge.recover()
+        self.bridge.recover()
+        self.assertEqual(self.injected, [], "reporting recovery cannot manufacture execution authority")
+        self.assertEqual(self.store.get("iss-1"), before)
 
     def test_blocked_closeout_is_not_reinjected_across_restarts(self) -> None:
         self._own()
         self._status("in_progress", 10)
         for at, sent, failed in ((20, False, False), (30, True, False), (40, False, True)):
-            self.injected.clear()
             self._status("blocked", at, sent=sent, failed=failed)
-            self.bridge._recover_chats()
-            self.bridge._recover_chats()
             with self.subTest(at=at, sent=sent, failed=failed):
-                self.assertEqual(self._restarts(), [])
-                self.assertIsNotNone(self.store.get("iss-1"))
-                self.assertEqual(self.store.get("iss-1")["owner_ref"], "chat-key")
+                self.assert_reporting_recovery_preserves_claim()
 
-    def test_successful_restart_notice_is_delivered_once_per_execution(self) -> None:
+    def test_active_legacy_claim_is_not_reinjected_or_adopted(self) -> None:
         self.linear.set_state("iss-1", "In Progress")
         self._own()
         self._status("in_progress", 10)
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 1)
-        self._status("in_progress", 20)
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 2)
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 2)
+        self.assert_reporting_recovery_preserves_claim()
 
-    def test_lost_session_is_not_retried_after_the_row_is_released(self) -> None:
+    def test_unreachable_legacy_session_is_preserved_for_reconciliation(self) -> None:
         self.linear.set_state("iss-1", "In Progress")
         self._own()
         self._status("in_progress", 10)
         self.inject_ok = False
-        self.bridge._recover_chats()
-        self.assertIsNone(self.store.get("iss-1"))
-        delivered = len(self.injected)
-        self.inject_ok = True
-        self.bridge._recover_chats()
-        self.assertEqual(len(self.injected), delivered)
+        self.assert_reporting_recovery_preserves_claim()
 
-    def test_new_execution_after_blocked_closeout_notifies_once(self) -> None:
+    def test_new_status_after_blocked_closeout_does_not_start_execution(self) -> None:
         self._own()
         self._status("blocked", 10)
-        self.bridge._recover_chats()
-        self.assertEqual(self._restarts(), [])
+        self.assert_reporting_recovery_preserves_claim()
         self.linear.set_state("iss-1", "In Progress")
         self._status("in_progress", 20)
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 1)
+        self.assert_reporting_recovery_preserves_claim()
 
-    def test_paused_stop_notice_is_delivered_once(self) -> None:
+    def test_stopped_legacy_claim_remains_stopped_without_execution_notice(self) -> None:
         self._own()
         self.assertTrue(self.store.update("iss-1", stop_requested_at=5))
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        stops = [text for text in self.injected if text.startswith("[Linear] Stop was requested")]
-        self.assertEqual(len(stops), 1)
-        self.assertEqual(self._restarts(), [])
+        self.assert_reporting_recovery_preserves_claim()
 
 
 if __name__ == "__main__":

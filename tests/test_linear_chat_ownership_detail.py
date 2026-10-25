@@ -44,7 +44,7 @@ class ChatOwnershipDetailTests(unittest.TestCase):
 
     def test_conflict_names_the_claim_without_asserting_active_work(self):
         before = self.snapshot()
-        reply = self.invoke('start')
+        reply = self.invoke('blocked')
         self.assertFalse(reply['ok'])
         self.assertEqual(reply.get('code'), 'chat_ownership_conflict')
         self.assertEqual(reply['ownership']['owner_session_key'], 'owner-chat')
@@ -62,7 +62,7 @@ class ChatOwnershipDetailTests(unittest.TestCase):
             'evidence': 'https://docs.example/accepted', 'note': 'verified'}, self.context))
         self.assertTrue(closeout['ok'])
         self.context.session_key = 'new-chat'
-        self.assertTrue(self.invoke('start')['ok'])
+        self.assertTrue(self.store.put('issue-1', 'chat', 'new-chat', run_generation=4))
         self.remote.set_state('issue-1', 'In Progress')
         queued = next(row for row in self.store.pending('issue-1') if row['kind'] == 'status'
                       and row['payload']['state'] == 'blocked')
@@ -98,105 +98,15 @@ class ChatOwnershipDetailTests(unittest.TestCase):
     def test_pending_release_is_distinct_from_competing_execution(self):
         self.store.update('issue-1', release_pending=1)
         before = self.snapshot()
-        reply = self.invoke('start')
+        reply = self.invoke('blocked')
         self.assertEqual(reply.get('code'), 'release_pending')
         self.assertTrue(reply['ownership']['release_pending'])
         self.assertEqual(reply['ownership']['execution_state'], 'unknown')
         self.assertEqual(self.snapshot(), before)
 
-    def test_task_binding_does_not_assert_that_the_task_is_running(self):
-        self.store.update('issue-1', origin='kanban', owner_ref='linear-session', task_id='task-1')
-        before = self.snapshot()
-        reply = self.invoke('start')
-        self.assertEqual(reply.get('code'), 'task_ownership_conflict')
-        self.assertEqual(reply['ownership']['task_id'], 'task-1')
-        self.assertIsNone(reply['ownership']['owner_session_key'])
-        self.assertNotIn('already running', reply['message'])
-        self.assertEqual(self.snapshot(), before)
-
     def test_stop_fence_is_visible_but_never_released(self):
         self.store.update('issue-1', stop_requested_at=self.clock() * 1000)
         before = self.snapshot()
-        reply = self.invoke('start')
+        reply = self.invoke('blocked')
         self.assertTrue(reply['ownership']['stop_requested'])
         self.assertEqual(self.snapshot(), before)
-
-    def test_same_agent_channel_continue_adopts_the_claim(self):
-        self.context.user_message = "Transfer the chat to here and continue it"
-        reply = self.invoke("start")
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
-        self.assertTrue(any(row["kind"] == "status" and row["payload"]["state"] == "in_progress"
-                            for row in self.store.pending("issue-1")))
-
-    def test_named_issue_continue_adopts_without_the_heavy_phrase(self):
-        self.bridge.transfer_user_message = lambda _context: "continue ABC-1 here"
-        reply = self.invoke("start")
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
-
-    def test_loose_wording_uses_start_not_transfer(self):
-        self.context.user_message = "please continue ABC-1 in this thread"
-        refused = json.loads(chat.handle(self.bridge, {"action": "transfer", "issue": "ABC-1"}, self.context))
-        self.assertFalse(refused["ok"], refused)
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
-        reply = self.invoke("start")
-        self.assertTrue(reply["ok"], reply)
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "new-chat")
-
-    def test_exact_heavy_transfer_wording_does_not_adopt_on_start(self):
-        self.context.user_message = "Transfer ABC-1 to this chat"
-        before = self.snapshot()
-        reply = self.invoke("start")
-        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
-        self.assertEqual(self.snapshot(), before)
-        self.context.user_message = "Do not transfer ABC-1 to this chat"
-        before = self.snapshot()
-        reply = self.invoke("start")
-        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
-        self.assertEqual(self.snapshot(), before)
-
-    def test_heartbeat_cannot_adopt_another_chat(self):
-        self.context.user_message = "[Heartbeat — recurring instruction] continue the chat here"
-        before = self.snapshot()
-        reply = self.invoke("start")
-        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
-        self.assertEqual(self.snapshot(), before)
-
-    def test_stop_fence_blocks_channel_continue(self):
-        self.store.update("issue-1", stop_requested_at=self.clock() * 1000)
-        self.context.user_message = "continue ABC-1 here"
-        reply = self.invoke("start")
-        self.assertEqual(reply.get("code"), "chat_ownership_conflict")
-        self.assertTrue(reply["ownership"]["stop_requested"])
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
-
-    def test_kanban_binding_is_not_a_channel_continue(self):
-        self.store.update("issue-1", origin="kanban", owner_ref="linear-session", task_id="task-1")
-        self.context.user_message = "continue ABC-1 here"
-        reply = self.invoke("start")
-        self.assertEqual(reply.get("code"), "task_ownership_conflict")
-        self.assertEqual(self.store.get("issue-1")["task_id"], "task-1")
-
-    def test_other_agent_delegate_is_not_a_channel_continue(self):
-        from linear_fake_api import OTHER
-        self.remote.set_delegate("issue-1", OTHER)
-        self.context.user_message = "continue ABC-1 here"
-        reply = self.invoke("start")
-        self.assertFalse(reply["ok"], reply)
-        self.assertIn("Other Agent", reply["message"])
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
-
-    def test_other_agent_delegate_blocks_continue_when_issue_is_not_started(self):
-        from linear_fake_api import OTHER
-        self.remote.set_delegate("issue-1", OTHER)
-        self.remote.set_state("issue-1", "Todo")
-        self.context.user_message = "continue ABC-1 here"
-        reply = self.invoke("start")
-        self.assertFalse(reply["ok"], reply)
-        self.assertIn("delegated to Other Agent", reply["message"])
-        self.assertEqual(self.store.get("issue-1")["owner_ref"], "owner-chat")
-
-
-if __name__ == '__main__':
-    unittest.main()

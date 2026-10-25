@@ -18,9 +18,9 @@ from typing import Any, Callable
 
 MAX_BYTES = 65536
 CONTEXT_FIELDS = ('profile', 'platform', 'session_key', 'session_id', 'run_generation')
-TRANSFER_FIELDS = ('browser_control_provider', 'browser_control_subject', 'user_message',
+HOST_FIELDS = ('browser_control_provider', 'browser_control_subject', 'user_message',
                    'ui_session_id', 'api_control_principal', 'api_control_transport_family',
-                   'api_conversation_key')
+                   'api_conversation_key', 'user_id', 'chat_id', 'chat_type', 'thread_id', 'scope_id')
 
 class Unavailable(RuntimeError):
     pass
@@ -104,10 +104,10 @@ class Server:
                 context = payload.get('context'); args = payload.get('args')
                 if not isinstance(context, dict) or set(context) != set(CONTEXT_FIELDS) or not isinstance(args, dict):
                     raise ValueError('Linear request has no bound invocation context')
-                transfer_auth = payload.get('transfer_auth')
-                if args.get('action') in ('transfer', 'resume_transfer'):
-                    if not isinstance(transfer_auth, dict) or set(transfer_auth) != set(TRANSFER_FIELDS):
-                        raise ValueError('Linear transfer has no host instruction and identity')
+                host = payload.get('host')
+                if args.get('action') not in ('start', 'delegate', 'transfer', 'resume_transfer'):
+                    if not isinstance(host, dict) or set(host) != set(HOST_FIELDS):
+                        raise ValueError('Linear tracking has no validated host identity')
                     try:
                         from gateway.chat_execution_recovery import ChatExecutionStore
                     except ImportError:
@@ -120,8 +120,16 @@ class Server:
                     if not verifier(context.get('session_key'), context.get('run_generation'),
                                     context.get('session_id'), peer_pid):
                         return json.dumps({'ok': False, 'code': 'unverified_host_turn',
-                                           'message': 'Transfer needs a current Agent worker in this profile.'})
-                    context = {**context, **transfer_auth, '_serialized_transport': True}
+                                           'message': 'Tracking needs a current native worker in this profile.'})
+                    platform = context.get('platform')
+                    desktop = (platform == 'desktop' and host.get('ui_session_id') and
+                               host.get('browser_control_provider') and host.get('browser_control_subject'))
+                    api = (platform == 'api_server' and host.get('api_control_principal') and
+                           host.get('api_control_transport_family') and host.get('api_conversation_key'))
+                    if not (desktop or api):
+                        return json.dumps({'ok': False, 'code': 'unverified_host_turn',
+                                           'message': 'Native host identity is unavailable for this transport.'})
+                    context = {**context, **host, '_serialized_transport': True, '_native_host_verified': True}
                 else:
                     context = dict(context)
                 return chat(args, SimpleNamespace(**context))
@@ -177,6 +185,5 @@ def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
     snapshot = {field: getattr(context, field, None) for field in CONTEXT_FIELDS}
     payload = {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
                'args': args, 'context': snapshot}
-    if args.get('action') in ('transfer', 'resume_transfer'):
-        payload['transfer_auth'] = {field: getattr(context, field, '') for field in TRANSFER_FIELDS}
+    payload['host'] = {field: getattr(context, field, '') for field in HOST_FIELDS}
     return request(home, payload)

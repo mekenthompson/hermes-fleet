@@ -122,7 +122,8 @@ class FakeKanban:
     def create(self, **fields):
         self.creates.append(fields)
         task = SimpleNamespace(id="task-1", status="blocked" if fields.get("initial_status") == "blocked" else "ready", completion_contract=None,
-                               result="", title=fields.get("title", "Synthetic task"))
+                               result="", title=fields.get("title", "Synthetic task"),
+                               assignee=fields.get("assignee", "synthetic"), created_by=fields.get("created_by", "linear"))
         self.tasks[task.id] = task
         if task.status == "blocked":
             self.histories[task.id] = [SimpleNamespace(id=1, kind="blocked", payload={"reason": "initial_status"})]
@@ -174,11 +175,12 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.store = Store(Path(self.tmp.name) / "state.db")
         self.api = self.authority.api()
         self.bridge = Bridge(self.store, self.api, self.kanban, profile="synthetic")
+        self.bridge.validate_chat_admission = lambda context: context.profile == "synthetic"
 
     def seed_kanban_work(self, issue_id=ISSUE, *, task_status="ready", events=()):
         task_id = f"task-{issue_id}"
         self.kanban.tasks[task_id] = SimpleNamespace(id=task_id, status=task_status,
-                                                     completion_contract=None, result="", title="OPS-1: task")
+                                                     completion_contract=None, result="", title="OPS-1: task", assignee="synthetic", created_by="linear")
         self.kanban.histories[task_id] = list(events)
         self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
         return task_id
@@ -223,6 +225,21 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
         self.assertEqual(self.store.outbox_row(row_id)["state"], "pending")
+
+    def test_linear_scope_denial_does_not_archive_independently_authorized_native_work(self):
+        task_id = "native-user-task"
+        task = SimpleNamespace(id=task_id, status="running", assignee="synthetic", created_by="principal",
+                               current_run_id=7, completion_contract=None, result="", title="native work")
+        self.kanban.tasks[task_id] = task
+        self.store.link_task(ISSUE, task_id, PROJECT, 1)
+        before = self.store.get(ISSUE)
+        self.authority.issues[ISSUE]["project"] = {"id": "foreign-project"}
+        self.bridge.pump_kanban()
+        self.assertTrue(self.store.scope_fenced(ISSUE))
+        self.assertEqual((task.status, task.current_run_id), ("running", 7))
+        self.assertEqual(self.store.get(ISSUE), before)
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.authority.mutations, [])
 
     def test_created_scope_denial_fences_authoritative_issue_across_replay(self):
         self.authority.issues[ISSUE] = issue_record(project={"id": "foreign-project"})
@@ -350,7 +367,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
         original = self.api.issue
         self.api.issue = lambda ref: original(ISSUE)
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": other}, context))
+        reply = json.loads(chat.handle(self.bridge, {"action": "track", "issue": other, "task_id": "native-existing"}, context))
         self.assertFalse(reply["ok"])
         self.assertFalse(self.store.scope_fenced(other))
         self.assertFalse(self.store.scope_fenced(ISSUE))
@@ -362,10 +379,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         from hermes_fleet_linear_plugin import chat
         context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
         self.authority.issues[ISSUE] = issue_record(project={"id": "foreign-project"})
-        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))["ok"])
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "track", "issue": ISSUE, "task_id": "native-existing"}, context))["ok"])
         self.assertTrue(self.store.scope_fenced(ISSUE))
         self.authority.issues[ISSUE] = issue_record()
-        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))["ok"])
+        self.assertFalse(json.loads(chat.handle(self.bridge, {"action": "track", "issue": ISSUE, "task_id": "native-existing"}, context))["ok"])
         self.assertEqual(self.store.active(), [])
         self.assertEqual(self.store.pending(), [])
 
@@ -375,7 +392,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         task_id = self.seed_kanban_work(other)
         self.authority.issues[ISSUE] = issue_record(id=other, project={"id": "foreign-project"})
         context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))
+        reply = json.loads(chat.handle(self.bridge, {"action": "track", "issue": ISSUE, "task_id": "native-existing"}, context))
         self.assertFalse(reply["ok"])
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
@@ -385,8 +402,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def test_chat_identifier_alias_resolves_only_its_own_canonical_issue(self):
         from hermes_fleet_linear_plugin import chat
         self.authority.issues["OPS-1"] = issue_record()
+        self.kanban.tasks["native-existing"] = SimpleNamespace(
+            id="native-existing", assignee="synthetic", status="running", current_run_id=7)
         context = SimpleNamespace(profile="synthetic", session_key="chat-key", session_id="chat-session")
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": "OPS-1"}, context))
+        reply = json.loads(chat.handle(self.bridge, {"action": "track", "issue": "OPS-1", "task_id": "native-existing"}, context))
         self.assertTrue(reply["ok"])
         self.assertIsNotNone(self.store.get(ISSUE))
 
@@ -715,15 +734,17 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
 
-    def test_fence_before_ack_commit_archives_admitted_task_without_false_ack(self):
+    def test_reporting_fence_preserves_admitted_native_task_without_false_ack(self):
         enqueue = self.store.enqueue_many
         def fenced_enqueue(*args, **kwargs):
             self.store.fence_scope(ISSUE, "permanent denial", at=1)
             return enqueue(*args, **kwargs)
         self.store.enqueue_many = fenced_enqueue
-        self.bridge.handle_webhook(self.session_event())
-        self.assertEqual(self.kanban.tasks["task-1"].status, "archived")
+        with self.assertRaisesRegex(LinearError, "Native task admitted; reporting capture needs reconciliation"):
+            self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(self.kanban.tasks["task-1"].status, "ready")
         self.assertIsNotNone(self.store.get(ISSUE))
+        self.assertTrue(self.store.scope_fenced(ISSUE))
         self.assertEqual(self.store.pending(), [])
 
     def test_transient_failure_after_task_create_keeps_blocked_task_for_retry(self):
@@ -762,7 +783,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             self.store.fence_scope(ISSUE, "permanent denial", at=1)
             return activate(*args, **kwargs)
         self.store.activate_task = fenced_activate
-        self.assertFalse(self.bridge._resume(row, "continue"))
+        self.assertFalse(self.bridge._resume(row, "continue", stamp=1))
         self.assertEqual(self.kanban.tasks[task_id].status, "blocked")
         self.assertEqual(self.kanban.comments, [])
         self.assertEqual(self.store.get(ISSUE), row)
@@ -802,7 +823,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.bridge.handle_webhook(self.session_event())
         self.assertEqual(self.kanban.tasks["task-1"].status, "ready")
 
-    def test_created_delivery_replays_incomplete_start_without_new_task(self):
+    def test_created_delivery_preserves_incomplete_native_start_without_replay(self):
         for stage in ("before_activation", "before_ack"):
             with self.subTest(stage=stage):
                 self.store = Store(Path(self.tmp.name) / f"{stage}.db")
@@ -818,10 +839,19 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 self.assertIsNotNone(self.store.get(ISSUE))
                 self.assertEqual(self.store.pending(), [])
                 setattr(self.store, method, original)
+                before = self.store.get(ISSUE)
+                status = self.kanban.tasks["task-1"].status
                 self.bridge.handle_webhook(self.session_event())
+                self.bridge.recover()
                 self.assertEqual(len(self.kanban.creates), 1)
-                self.assertEqual(self.kanban.tasks["task-1"].status, "ready")
-                self.assertEqual([row["kind"] for row in self.store.pending(ISSUE)], ["activity", "status"])
+                self.assertEqual(status, "blocked" if stage == "before_activation" else "ready")
+                self.assertEqual(self.kanban.tasks["task-1"].status, status)
+                after = self.store.get(ISSUE)
+                self.assertEqual({k: v for k, v in after.items() if k != "last_event_id"},
+                                 {k: v for k, v in before.items() if k != "last_event_id"})
+                self.assertFalse(any(row["kind"] == "status" and
+                                     (row["payload"].get("claim") or row["payload"].get("state") == "in_progress")
+                                     for row in self.store.pending(ISSUE)), "recovery may report, never claim execution")
 
     def test_fence_preserves_pending_and_uncertain_outbox_maintenance(self):
         pending_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "pending"}, at=1)
@@ -1032,12 +1062,14 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def test_fence_between_chat_authorization_and_start_or_blocked_commit(self):
         from hermes_fleet_linear_plugin import chat
         context = SimpleNamespace(session_key="owner", session_id="owner", profile="synthetic")
-        put = self.store.put
-        def fenced_put(*args, **kwargs):
+        self.kanban.tasks["native-existing"] = SimpleNamespace(
+            id="native-existing", assignee="synthetic", status="running", current_run_id=7)
+        link = self.store.link_task
+        def fenced_link(*args, **kwargs):
             self.store.fence_scope(ISSUE, "permanent denial", at=1)
-            return put(*args, **kwargs)
-        self.store.put = fenced_put
-        reply = json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))
+            return link(*args, **kwargs)
+        self.store.link_task = fenced_link
+        reply = json.loads(chat.handle(self.bridge, {"action": "track", "issue": ISSUE, "task_id": "native-existing"}, context))
         self.assertFalse(reply["ok"])
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
@@ -1063,7 +1095,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
         self.authority.issues[ISSUE] = issue_record(creator={"id": "user-foreign"})
         context = SimpleNamespace(session_key="chat-1", session_id="chat-1", profile="synthetic")
-        result = json.loads(chat.handle(self.bridge, {"action": "start", "issue": ISSUE}, context))
+        result = json.loads(chat.handle(self.bridge, {"action": "track", "issue": ISSUE, "task_id": "native-existing"}, context))
         self.assertFalse(result["ok"])
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.authority.mutations, [])
@@ -1072,11 +1104,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def test_chat_actions_refuse_persisted_specialist_fence_without_changing_history(self):
         from hermes_fleet_linear_plugin import chat
         context = SimpleNamespace(session_key="owner", session_id="owner", profile="synthetic")
-        for action in ("start", "done", "blocked", "release"):
+        for action in ("track", "done", "blocked", "release"):
             with self.subTest(action=action):
                 issue_id = f"{ISSUE}-{action}"
                 self.authority.issues[issue_id] = issue_record(id=issue_id)
-                if action != "start":
+                if action != "track":
                     self.store.put(issue_id, "chat", "owner", project_id=PROJECT)
                 before = self.store.get(issue_id)
                 self.store.fence_scope(issue_id, "permanent denial", at=1.0)
@@ -1153,7 +1185,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             issue_id, task_id = f"{ISSUE}-{suffix}", f"task-{suffix}"
             self.authority.issues[issue_id] = issue_record(id=issue_id, **change)
             self.kanban.tasks[task_id] = SimpleNamespace(id=task_id, status="blocked",
-                                                         completion_contract=None, result="", title="OPS-1: task")
+                                                         completion_contract=None, result="", title="OPS-1: task", assignee="synthetic", created_by="linear")
             self.kanban.histories[task_id] = [SimpleNamespace(id=1, kind="blocked",
                                                               payload={"reason": "needs input"})]
             self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
@@ -1504,25 +1536,27 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(self.authority.mutations, [])
 
-    def test_pending_reply_actor_rechecked_after_restart(self):
+    def test_inbox_retry_rechecks_reply_actor_after_restart_without_plugin_replay(self):
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         original = self.kanban.comment
         def crash(*args, **kwargs): raise RuntimeError("interrupted before delivery")
         self.kanban.comment = crash
+        event = self.session_event("prompted")
         with self.assertRaises(RuntimeError):
-            self.bridge.handle_webhook(self.session_event("prompted"))
-        self.assertTrue(self.store.get(ISSUE)["pending_resume"])
+            self.bridge.handle_webhook(event)
+        self.assertIsNone(self.store.get(ISSUE)["pending_resume"], "native idempotency replaces plugin retry state")
         self.kanban.comment = original
         self.authority.activities[ACTIVITY]["user"] = {"id": "foreign"}
         bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
                         self.kanban, profile="synthetic")
-        bridge._recover_kanban()
+        bridge.recover()
+        self.assertEqual(self.kanban.comments, [], "restart reporting does not replay an instruction")
+        bridge.handle_webhook(event)  # the authenticated inbox retries its original event
         self.assertEqual(self.kanban.comments, [])
-        self.assertTrue(bridge.store.get(ISSUE)["pending_resume"])
         self.assertFalse(bridge.store.scope_fenced(ISSUE))
         self.authority.activities[ACTIVITY]["user"] = {"id": USER}
-        bridge._recover_kanban()
+        bridge.handle_webhook(event)
         self.assertTrue(self.kanban.comments)
 
     def test_direct_mutation_retry_rechecks_requester(self):
@@ -1573,7 +1607,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.authority.mutations, [])
 
-    def test_saved_each_session(self):
+    def test_retried_instruction_keeps_its_own_session_authority(self):
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
         self.bridge.flush()
@@ -1582,7 +1616,8 @@ class SessionRequesterTests(unittest.TestCase):
         self.authority.activities['successor-activity'] = {'id': 'successor-activity', 'user': {'id': USER}, 'agentSession': {'id': successor}}
         old = self.kanban.comment
         self.kanban.comment = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('before delivery'))
-        with self.assertRaises(RuntimeError): self.bridge.handle_webhook(self.session_event('prompted'))
+        prior = self.session_event('prompted')
+        with self.assertRaises(RuntimeError): self.bridge.handle_webhook(prior)
         event = self.session_event('prompted')
         event['agentSession']['id'] = successor
         event['agentActivity']['id'] = 'successor-activity'
@@ -1591,8 +1626,12 @@ class SessionRequesterTests(unittest.TestCase):
         self.kanban.comment = old
         self.authority.sessions[SESSION]['appUser'] = {'id': 'foreign-app'}
         bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'}), self.kanban, profile='synthetic')
-        bridge._recover_kanban()
-        self.assertEqual(self.kanban.comments, [], 'old saved session wrong app must prevent every delivery')
+        bridge.recover()
+        bridge.handle_webhook(prior)
+        self.assertEqual(self.kanban.comments, [], 'old session wrong app cannot borrow successor authority')
+        self.assertTrue(bridge.store.scope_fenced(ISSUE), 'verified app revocation fences this outcome')
+        bridge.handle_webhook(event)
+        self.assertEqual(self.kanban.comments, [], 'a successor cannot silently clear an existing scope fence')
 
     def test_blank_legacy_provenance(self):
         self.bridge.handle_webhook(self.session_event())
@@ -1603,8 +1642,16 @@ class SessionRequesterTests(unittest.TestCase):
         key = f'{SESSION}:{stamp}:{note}'
         intent = {'kind': 'kanban', 'note': note, 'last_note': note, 'marker': '', 'markers': [key], 'messages': [{'key': key, 'note': note, 'activity_id': '', 'session_id': SESSION}], 'session_id': SESSION, 'stamp': stamp, 'receipt': 'receipt'}
         self.store.update(ISSUE, pending_resume=json.dumps(intent), last_updated_at=stamp)
-        self.bridge._recover_kanban()
+        before = self.store.get(ISSUE)
+        self.bridge.recover()
         self.assertEqual(self.kanban.comments, [], 'empty activity id is missing provenance, not authority')
+        after = self.store.get(ISSUE)
+        self.assertEqual({k: v for k, v in after.items() if k != 'last_event_id'},
+                         {k: v for k, v in before.items() if k != 'last_event_id'},
+                         'legacy unresolved delivery stays fenced and visible')
+        from hermes_fleet_linear_plugin import ops
+        self.assertTrue(any(item['why'] == 'legacy continuation requires reconciliation'
+                            for item in ops.stuck(self.store.path, Path(self.tmp.name) / 'missing-inbox', 'synthetic')))
 
     def test_direct_activity_target_retry(self):
         self.bridge.handle_webhook(self.session_event())
@@ -1696,18 +1743,20 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [], 'original retained line must not borrow successor binding')
 
 
-    def test_typed_delegation_resume_rechecks_session_and_recovers(self):
+    def test_inbox_followup_retry_rechecks_session_without_plugin_resume_state(self):
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         original = self.kanban.comment
         def crash(*args, **kwargs): raise RuntimeError("interrupted delegation receipt")
         self.kanban.comment = crash
-        row = self.store.get(ISSUE)
+        event = self.session_event("prompted")
         with self.assertRaises(RuntimeError):
-            self.bridge._resume(row, "Verified delegation resumed", SESSION, row["last_updated_at"] + 1)
+            self.bridge.handle_webhook(event)
         self.kanban.comment = original
         self.authority.requests.clear()
-        self.bridge._recover_kanban()
+        self.bridge.recover()
+        self.assertEqual(self.kanban.comments, [])
+        self.bridge.handle_webhook(event)
         self.assertTrue(any("query AgentSessionAuthorization" in q for q in self.authority.requests))
         self.assertTrue(self.kanban.comments)
         self.assertIsNone(self.store.get(ISSUE)["pending_resume"])
