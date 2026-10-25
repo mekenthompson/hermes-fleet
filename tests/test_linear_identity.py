@@ -77,10 +77,11 @@ class IdentityBindingTests(unittest.TestCase):
             def register_profile_service(self, name, factory):
                 services[name] = factory
         plugin.register(Context())
-        with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "token_provider") as tokens, \
+        with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "validate_native_task_runtime"), \
+                patch.object(plugin, "token_provider") as tokens, \
                 patch.object(plugin, "Store") as store:
             with self.assertRaises(ValueError):
-                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory))))
+                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory), gateway=object())))
             tokens.assert_not_called()
             store.assert_not_called()
 
@@ -101,11 +102,12 @@ class IdentityBindingTests(unittest.TestCase):
             def register_profile_service(self, name, factory):
                 services[name] = factory
         plugin.register(Context())
-        with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "token_provider", return_value=lambda: "synthetic"), \
+        with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "validate_native_task_runtime"), \
+                patch.object(plugin, "token_provider", return_value=lambda: "synthetic"), \
                 patch.object(BoundLinearAPI, "verify_identity", side_effect=LinearError("wrong actor")), \
                 patch.object(plugin, "Store") as store:
             with self.assertRaises(LinearError):
-                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory))))
+                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory), gateway=object())))
             store.assert_not_called()
 
     def test_invalid_binding_refused_without_credential_access(self):

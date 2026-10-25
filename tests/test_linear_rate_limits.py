@@ -122,9 +122,10 @@ class RateLimitTests(unittest.TestCase):
             def limited(*args):
                 loop.call_soon_threadsafe(stop.set)
                 raise RateLimited(time.time() + 120)
-            with patch.object(plugin.BoundLinearAPI, "viewer_id", side_effect=limited), patch.object(plugin, "Store") as store, \
+            with patch.object(plugin, "validate_native_task_runtime"), \
+                    patch.object(plugin.BoundLinearAPI, "viewer_id", side_effect=limited), patch.object(plugin, "Store") as store, \
                     patch.object(plugin, "token_provider", return_value=lambda: "t"):
-                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), stop_event=stop)), 5)
+                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), gateway=object(), stop_event=stop)), 5)
                 store.assert_not_called()
         with tempfile.TemporaryDirectory() as directory: asyncio.run(run(directory))
 
@@ -168,10 +169,11 @@ class RateLimitTests(unittest.TestCase):
                 self.assertEqual(len(attempts), 2)
                 stop.set()
                 return bridge
-            with patch.object(plugin.BoundLinearAPI, "verify_identity", identity), \
+            with patch.object(plugin, "validate_native_task_runtime"), \
+                    patch.object(plugin.BoundLinearAPI, "verify_identity", identity), \
                     patch.object(plugin, "Bridge", side_effect=create_bridge), patch.object(plugin, "Kanban"), \
                     patch.object(plugin, "token_provider", return_value=lambda: "t"):
-                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), profile_name="alpha", stop_event=stop)), 5)
+                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), profile_name="alpha", gateway=object(), stop_event=stop)), 5)
                 bridge.recover.assert_called_once()
             self.assertGreaterEqual(attempts[1] - attempts[0], 0.01)
         with tempfile.TemporaryDirectory() as directory: asyncio.run(run(directory))

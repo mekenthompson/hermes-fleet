@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from linear_fake_api import Clock, FakeLinear, SELF, load_plugin
@@ -103,6 +104,118 @@ class NativeContinuationScenarios(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
         with self.board.conn() as conn:
             self.assertEqual(len(kb.list_tasks(conn)), 1)
+
+    def test_inbox_stop_retries_native_cancellation_after_committed_fence(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            with self.board.conn() as conn:
+                self.assertTrue(kb.claim_task(conn, self.task_id))
+                dispatch._set_worker_pid(conn, self.task_id, process.pid)
+            event = self.prompt("", "retry-native-stop", signal="stop")
+            inbox = self.queue(event, "stop-retry")
+            with patch.object(self.board, "block", side_effect=OSError("native DB unavailable")):
+                self.bridge.drain_ingress(inbox)
+            self.assertGreater(self.store.get(ISSUE)["stop_requested_at"], 0)
+            self.assertEqual(self.board.get(self.task_id).status, "running")
+            self.assertIsNone(process.poll(), "a recorded fence does not prove process cancellation")
+            self.bridge = self.reopen()
+            self.clock.now += 5
+            self.bridge.drain_ingress(inbox)
+            self.bridge.handle_webhook(event)  # the same event may arrive under another delivery id
+            self.bridge.recover()
+            self.bridge.flush()
+            with sqlite3.connect(inbox) as conn:
+                self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+            self.assertEqual(self.board.get(self.task_id).status, "blocked")
+            self.assertIsNotNone(process.poll())
+            receipts = [activity for activity in self.remote.activities
+                        if "Stop recorded" in activity["content"].get("body", "")]
+            self.assertEqual(len(receipts), 1)
+            with self.board.conn() as conn:
+                self.assertEqual(len(kb.list_tasks(conn)), 1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=10)
+
+    def test_lost_native_resume_receipt_reconciles_fence_without_unblock_replay(self):
+        self.bridge.handle_webhook(self.prompt("", "prior-stop", signal="stop"))
+        old_stop = self.store.get(ISSUE)["stop_requested_at"]
+        self.clock.now += 1
+        event = self.remote.session_event("created", ISSUE, "resumed-assignment")
+        inbox = self.queue(event, "resume-lost-response")
+        unblock = self.board.unblock
+
+        def lost_response(task_id):
+            self.assertTrue(unblock(task_id))
+            raise OSError("native unblock committed, response lost")
+
+        with patch.object(self.board, "unblock", side_effect=lost_response):
+            self.bridge.drain_ingress(inbox)
+        self.assertEqual(self.board.get(self.task_id).status, "ready")
+        self.assertGreater(self.store.get(ISSUE)["stop_requested_at"], 0)
+        self.bridge = self.reopen()
+        self.clock.now += 5
+        with patch.object(self.board, "unblock", side_effect=AssertionError("committed native effect replayed")):
+            self.bridge.drain_ingress(inbox)
+        row = self.store.get(ISSUE)
+        self.assertEqual(row["stop_requested_at"], 0)
+        self.assertGreater(row["resume_fence_at"], old_stop)
+        delayed = self.remote.session_event("prompted", ISSUE, "original-session",
+                                            signal="stop", activity_id="pre-resume-stop")
+        delayed["agentActivity"]["createdAt"] = datetime.fromtimestamp(
+            (old_stop + 500) / 1000, timezone.utc).isoformat()
+        self.bridge.handle_webhook(delayed)
+        self.assertEqual(self.board.get(self.task_id).status, "ready")
+        with sqlite3.connect(inbox) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM deliveries").fetchone()[0], "imported")
+        self.assertEqual(sum("Re-delegated in Linear" in body for body in self.notes()), 1)
+
+    def test_old_schema_binding_stays_fenced_and_visible_without_provenance_inference(self):
+        current_time = self.clock.now
+        self.clock.now -= 10
+        prompt = self.remote.session_event("prompted", ISSUE, "prior-task-session",
+            body="Old implementation instructions", activity_id="old-generation-comment")
+        stop = self.remote.session_event("prompted", ISSUE, "prior-task-session",
+            signal="stop", activity_id="old-generation-stop")
+        self.clock.now = current_time
+        before = self.board.get(self.task_id)
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute("ALTER TABLE work DROP COLUMN linked_at")
+        self.bridge = self.reopen()  # exercise real pre-column migration, not just a helper's default
+        self.bridge.handle_webhook(prompt)
+        self.bridge.handle_webhook(stop)
+        self.bridge.recover()
+        self.assertEqual(self.notes(), [])
+        after = self.board.get(self.task_id)
+        self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                         (before.status, before.current_run_id, before.claim_lock))
+        self.assertEqual(self.store.get(ISSUE)["linked_at"], 0)
+        self.assertEqual(self.store.get(ISSUE)["task_id"], self.task_id)
+        from hermes_fleet_linear_plugin import ops
+        self.assertTrue(any(item["issue"] == ISSUE and "provenance" in item["why"]
+                            for item in ops.stuck(self.store.path, self.home / "inbox.db", "default")))
+
+    def test_unknown_completed_binding_cannot_start_an_assignment_increment(self):
+        evidence = "Checkpoint https://example.test/findings/migration-checkpoint"
+        with self.board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, self.task_id, result=evidence))
+        before = self.board.get(self.task_id)
+        with sqlite3.connect(self.store.path) as conn:
+            conn.execute("ALTER TABLE work DROP COLUMN linked_at")
+        self.bridge = self.reopen()
+        self.clock.now += 1
+        assignment = self.remote.session_event("created", ISSUE, "unreconciled-assignment")
+        self.bridge.handle_webhook(assignment)
+        self.bridge.handle_webhook(assignment)
+        self.assertEqual(self.store.get(ISSUE)["linked_at"], 0)
+        self.assertEqual(self.store.get(ISSUE)["task_id"], self.task_id)
+        after = self.board.get(self.task_id)
+        self.assertEqual((after.status, after.result, after.workspace_path, after.current_run_id),
+                         (before.status, before.result, before.workspace_path, before.current_run_id))
+        with self.board.conn() as conn:
+            self.assertEqual(len(kb.list_tasks(conn)), 1, "unknown prior binding cannot manufacture a new increment")
 
     def test_simultaneous_followups_share_one_native_execution(self):
         with self.board.conn() as conn:

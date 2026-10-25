@@ -153,8 +153,9 @@ class IngressBindingTests(unittest.TestCase):
             captured.update(kwargs)
             raise Captured()
         async def run():
-            runtime = SimpleNamespace(profile_home=self.home, profile_name="default", stop_event=asyncio.Event())
-            with patch.object(plugin.BoundLinearAPI, "viewer_id", return_value="app-a"), \
+            runtime = SimpleNamespace(profile_home=self.home, profile_name="default", gateway=object(), stop_event=asyncio.Event())
+            with patch.object(plugin, "validate_native_task_runtime"), \
+                    patch.object(plugin.BoundLinearAPI, "viewer_id", return_value="app-a"), \
                     patch.object(plugin, "token_provider", return_value=lambda: "synthetic"), \
                     patch.object(plugin, "Store"), patch.object(plugin, "Kanban"), \
                     patch.object(plugin, "Bridge", side_effect=capture):
@@ -180,12 +181,13 @@ class IngressBindingTests(unittest.TestCase):
                 plugin.register(context)
                 async def run():
                     stop = asyncio.Event()
-                    runtime = SimpleNamespace(profile_home=self.home, profile_name="default", stop_event=stop)
+                    runtime = SimpleNamespace(profile_home=self.home, profile_name="default", gateway=object(), stop_event=stop)
                     api = SimpleNamespace(viewer_id=lambda: "app-a", clock=lambda: 0, paused_until=0)
                     def admit(*args, **kwargs):
                         stop.set()
                         return Mock()
-                    with patch.object(plugin, "BoundLinearAPI", return_value=api) as api_factory, \
+                    with patch.object(plugin, "validate_native_task_runtime"), \
+                            patch.object(plugin, "BoundLinearAPI", return_value=api) as api_factory, \
                             patch.object(plugin, "token_provider") as credentials, \
                             patch.object(plugin, "Store") as store, patch.object(plugin, "Kanban"), \
                             patch.object(plugin, "Bridge", side_effect=admit), patch.object(transport, "Server"):

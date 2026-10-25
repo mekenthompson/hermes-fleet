@@ -190,7 +190,9 @@ automatically adopt manual tasks, delete checkpoints or create duplicate executo
 The reporting binding records `linked_at` as its source provenance. It is separate from the
 native resumption fence: a same-timestamp initial Stop wins, and an out-of-order distinct comment
 cannot hide Stop or another instruction. Existing records receive only the additive default of
-zero; migration does not infer a new binding, native grant or execution generation.
+zero, which fences event-driven execution requests until the retained binding and effects are
+reconciled and an authenticated native turn explicitly revalidates the same task. Migration does
+not infer a new binding, native grant or execution generation.
 
 ```bash
 hermes linear status --json
@@ -204,6 +206,11 @@ readback and local removal before a handoff. The historical transfer metadata is
 preserve fences; no transfer/resume protocol writes new ownership records.
 
 ## Tests and release
+
+Before credential access or state admission, the gateway service checks the native task authority
+and idempotent-comment APIs. An incompatible runtime receives a clear diagnostic and the service
+stays inactive; existing records are preserved. Import compatibility permits reviewed bundle
+staging during a coordinated image upgrade and never grants execution on the older runtime.
 
 Run `python3 -m unittest discover -s tests -p 'test_*.py'` and
 `python3 scripts/verify-public-tree.py`. The native boundary suite uses

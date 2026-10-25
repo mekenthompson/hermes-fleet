@@ -304,6 +304,13 @@ class Kanban:
             return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='commented' "
                                 "AND json_extract(payload, '$.idempotency_key')=? LIMIT 1",
                                 (task_id, marker)).fetchone() is not None
+    def resumption_received(self, task_id: str, marker: str) -> bool:
+        """Reconcile an unblock's native history after losing its return value."""
+        with self.conn() as conn:
+            return conn.execute("SELECT 1 FROM task_events u WHERE u.task_id=? AND u.kind='unblocked' "
+                "AND u.id>(SELECT MAX(c.id) FROM task_events c WHERE c.task_id=u.task_id "
+                "AND c.kind='commented' AND json_extract(c.payload, '$.idempotency_key')=?) LIMIT 1",
+                (task_id, marker)).fetchone() is not None
     def comment(self, task_id: str, body: str, *, marker: str = "") -> None:
         with self.conn() as conn:
             self.kb.add_comment(conn, task_id, "linear", body, idempotency_key=marker or None)
@@ -457,6 +464,14 @@ class Bridge:
         return self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id,
                                         "content": {"type": kind, "body": body},
                                         **self._alert_route(row or self.store.get(issue_id))}, at=self.clock())
+    @staticmethod
+    def content_binding_matches(work: dict | None, payload: dict) -> bool:
+        if (not work or work.get("ownership_id") != payload.get("work_owner")
+                or work.get("release_pending") or work.get("stop_requested_at")):
+            return False
+        if work["origin"] == "chat":
+            return work["owner_ref"] == payload.get("session_key")
+        return bool(work.get("task_id") and work["task_id"] == payload.get("task_id"))
     def say(self, row: dict[str, Any], body: str, kind: str = "response") -> None:
         """One visible message: an agent-session activity for Linear-origin work, else a comment."""
         if self.linear_session(row):
@@ -675,6 +690,10 @@ class Bridge:
             if row and row["origin"] == "chat" and row.get("panel_note"):
                 self.activity(issue_id, session_id, "elicitation", row["panel_note"])
         elif row:
+            if not row.get("linked_at"):
+                self.activity(issue_id, session_id, "response", "The retained native binding needs provenance "
+                              "and effect reconciliation before another assignment; no worker was created or resumed.")
+                return
             if stamp < max(row["linked_at"], row["resume_fence_at"]): return
             task = self.kanban.get(row["task_id"]) if row.get("task_id") else None
             if task and task.status == "done":
@@ -744,6 +763,10 @@ class Bridge:
             current = self.store.get(issue_id)
             if not admitted or not current or current.get("task_id") != row.get("task_id"):
                 return False
+            if not current.get("linked_at"):
+                self.activity(issue_id, session_id, "response", "The retained native binding has unknown provenance. "
+                              "Reconcile the existing task and effects, then explicitly revalidate tracking; no instruction was executed.")
+                return True
             if current.get("pending_resume"):
                 self.say(current, "A legacy continuation has an unresolved delivery. Reconcile it through "
                          "native task state before another continuation.", "error")
@@ -757,6 +780,9 @@ class Bridge:
             needs_resume = resume and task.status == "blocked"
             key = f"linear:{issue_id}:{session_id}:{marker or stamp}"
             received = getattr(self.kanban, "comment_received", lambda _task, _key: False)(task.id, key)
+            resumed = (received and getattr(self.kanban, "resumption_received",
+                       lambda _task, _key: bool(current["stop_requested_at"]))(task.id, key))
+            reconcile_resume = resume and (needs_resume or resumed)
             body = "" if received else "\n\n".join(value for value in (note, context() if context else "") if value)
             def deliver() -> bool:
                 if not received:
@@ -768,7 +794,7 @@ class Bridge:
             fields = {"last_updated_at": max(stamp, current["last_updated_at"])}
             if session_id:
                 fields.update(owner_ref=session_id, linear_session_id=session_id)
-            if needs_resume and self.kanban.get(task.id).status in ("ready", "running", "review"):
+            if reconcile_resume and self.kanban.get(task.id).status in ("ready", "running", "review"):
                 fields.update(stop_requested_at=0, resume_fence_at=stamp)
             self.store.update(issue_id, **fields)
             self.store.enqueue_once("activity", {"issue_id": issue_id, "session_id": session_id,
@@ -943,8 +969,12 @@ class Bridge:
         if row["origin"] in ("kanban", "kanban_chat"):
             with self.store.guard_issue(row["issue_id"]) as admitted:
                 current = self.store.get(row["issue_id"])
+                if current and not current.get("linked_at"):
+                    self.activity(row["issue_id"], session_id, "error", "Native binding provenance is unknown; "
+                                  "use supported native Stop and reconcile the retained binding before event delivery.")
+                    return
                 if (not current or stamp < current["linked_at"]
-                        or stamp <= max(current["resume_fence_at"], current["stop_requested_at"])): return
+                        or stamp <= current["resume_fence_at"] or stamp < current["stop_requested_at"]): return
                 row = current
                 if not admitted or not self.store.update(
                         row["issue_id"], last_updated_at=max(stamp, float(row["last_updated_at"])),
@@ -964,9 +994,18 @@ class Bridge:
             self.store.capture_chat_stop(row["issue_id"], session_id, activity_id,
                                          self.profile, at=self.clock(), stamp=stamp)
             return
-        self.status(row["issue_id"], "blocked")
-        self.say(row, f"Stop recorded from {who}; the native task is blocked. "
-                      "Reconcile worker/process teardown and external effects before requesting native resumption.")
+        if not self.authorize_specialist_effect(row["issue_id"]):
+            return
+        key = f"native-stop:{row['issue_id']}:{session_id}:{activity_id or stamp}"
+        route = self._alert_route(row)
+        self.store.enqueue_once("status", {"issue_id": row["issue_id"], "state": "blocked", **route},
+                                key + ":status", at=self.clock())
+        body = (f"Stop recorded from {who}; the native task is blocked. "
+                "Reconcile worker/process teardown and external effects before requesting native resumption.")
+        notice = ({"session_id": self.linear_session(row), "content": {"type": "response", "body": body}}
+                  if self.linear_session(row) else {"body": body})
+        self.store.enqueue_once("activity" if self.linear_session(row) else "comment",
+            {"issue_id": row["issue_id"], **notice, **route}, key + ":receipt", at=self.clock())
     def pump_kanban(self) -> None:
         for row in self.store.active("kanban") + self.store.active("kanban_chat"):
             with self.lock(row["issue_id"]):
@@ -1315,9 +1354,7 @@ class Bridge:
                             (row["kind"] == "status" and state in CLOSED)): raise ProjectUpdateDeferred
             if payload.get("content_action") or row and row.get("kind") == "description":
                 work = self.store.get(payload.get("issue_id", ""))
-                if (not work or work.get("ownership_id") != payload.get("work_owner") or
-                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
-                        work.get("stop_requested_at")):
+                if not self.content_binding_matches(work, payload):
                     raise ProjectUpdateDeferred
                 current = self._effect_issue(payload["issue_id"])
                 if ((current.get("delegate") or {}).get("id") != self.api.viewer_id() or
@@ -1451,9 +1488,7 @@ class Bridge:
         elif kind == "comment":
             if payload.get("content_action") and payload.get("work_owner"):
                 work = self.store.get(payload["issue_id"])
-                if (not work or work.get("ownership_id") != payload.get("work_owner") or
-                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
-                        work.get("stop_requested_at")):
+                if not self.content_binding_matches(work, payload):
                     return False
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
@@ -1464,10 +1499,7 @@ class Bridge:
         elif kind == "description":
             current = self._effect_issue(payload["issue_id"])
             work = self.store.get(payload["issue_id"])
-            if (current.get("id") != payload["issue_id"] or not work or
-                    work.get("ownership_id") != payload.get("work_owner") or
-                    work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
-                    work.get("stop_requested_at")):
+            if current.get("id") != payload["issue_id"] or not self.content_binding_matches(work, payload):
                 return False
             self._mutate_outbox(row["id"], lambda: self.api.replace_description(
                 payload["issue_id"], payload["expected_description"], payload["body"]))

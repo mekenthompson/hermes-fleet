@@ -32,7 +32,8 @@ def handle(bridge, args, context):
                 task = bridge.kanban.get(row["task_id"]) if row and row.get("task_id") else None
                 return _reply(True, "Native task state; no execution was changed.",
                               task_id=task.id if task else None, state=task.status if task else "unbound",
-                              legacy_reconciliation_required=bool(row and row["origin"] == "chat"))
+                              legacy_reconciliation_required=bool(row and (row["origin"] == "chat"
+                                  or (row.get("task_id") and not row.get("linked_at")))))
             task_id = args.get("task_id")
             if not isinstance(task_id, str) or not task_id.strip():
                 return _reply(False, "track needs the existing native task_id. Ordinary chat needs no Linear issue.")
@@ -48,6 +49,13 @@ def handle(bridge, args, context):
             if task is None or task.assignee != executor:
                 return _reply(False, "The task does not belong to this native execution profile.")
             if row:
+                if not row.get("linked_at"):
+                    if (row.get("pending_resume") or row.get("release_pending")
+                            or bridge.store.issue_reconciliation_blocked(issue_id) or bridge.store.retired(issue_id)):
+                        return _reply(False, "Retained delivery or effects need native reconciliation before tracking.",
+                                      code="legacy_reconciliation_required")
+                    if not bridge.store.update(issue_id, linked_at=bridge.clock() * 1000):
+                        return _reply(False, "The retained binding remains fenced; execution is unchanged.")
                 return _reply(True, "Already linked to the same native task; execution is unchanged.",
                               task_id=task.id, state=task.status)
             me = bridge.api.viewer_id()
@@ -58,7 +66,7 @@ def handle(bridge, args, context):
             if watermark <= 0:
                 return _reply(False, "Linear ordering timestamp is unavailable; native execution is unchanged.")
             if not bridge.store.link_task(issue_id, task.id, (issue.get("project") or {}).get("id"),
-                                          watermark):
+                                          max(watermark, bridge.clock() * 1000)):
                 return _reply(False, "An existing binding or unresolved effect needs reconciliation.")
             bridge.kanban.subscribe(task.id, issue_id)
             # Reporting is queued after native work already exists. Delivery never gates its worker.

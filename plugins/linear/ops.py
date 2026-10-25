@@ -73,6 +73,10 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 add(row["issue_id"], row["task_id"] or "legacy-continuation",
                     (row["last_updated_at"] or now * 1000) / 1000, "legacy continuation requires reconciliation",
                     "Read native task and external effect state; the plugin will not replay this continuation.", True)
+            for row in _rows(db, "SELECT issue_id, task_id FROM work WHERE task_id IS NOT NULL AND linked_at=0"):
+                add(row["issue_id"], row["task_id"], now, "retained native binding has unknown provenance",
+                    "Reconcile its native task/effects, then explicitly track that same task from an authenticated turn. "
+                    "Historical events cannot execute against it.", True)
             for row in _rows(db, "SELECT task_id, issue_id FROM retirement"):
                 add(row["issue_id"], row["task_id"], now, f"waiting for Kanban task {row['task_id']} to exit",
                     "Stop the worker in Kanban if it is still running.")

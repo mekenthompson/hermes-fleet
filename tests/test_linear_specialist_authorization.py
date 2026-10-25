@@ -182,7 +182,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.kanban.tasks[task_id] = SimpleNamespace(id=task_id, status=task_status,
                                                      completion_contract=None, result="", title="OPS-1: task", assignee="synthetic", created_by="linear")
         self.kanban.histories[task_id] = list(events)
-        self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT)
+        # This fixture is a new binding with a known initial source stamp. Migration tests retain zero.
+        self.store.put(issue_id, "kanban", SESSION, task_id=task_id, project_id=PROJECT, last_updated_at=1)
         return task_id
 
     def session_event(self, action="created", *, event_issue=ISSUE, creator=USER,

@@ -359,6 +359,18 @@ async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
         except Exception:  # noqa: BLE001 - a crash after core accepted stays ambiguous
             log.exception("linear: chat Stop observation/request uncertain for issue %s", intent["issue_id"])
 
+def validate_native_task_runtime(_gateway: Any = None) -> None:
+    """Introspection-only bundle guard; never start a service or create execution state."""
+    import inspect
+    from hermes_cli import kanban_db
+    from tools import approval_context
+    if ("idempotency_key" not in inspect.signature(kanban_db.add_comment).parameters
+            or not all(callable(getattr(approval_context, name, None))
+                       for name in ("background_task_refusal", "revoked_task_tool_error", "require_live_task_setup"))):
+        raise RuntimeError("Linear tracking requires the native task authority/idempotent-comment runtime; "
+                           "publish and deploy the approved native prerequisite before activating this bundle.")
+
+
 def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
         return
@@ -417,6 +429,7 @@ def register(ctx: Any) -> None:
                              description="Show held Linear work and the next step")
 
     async def service(runtime: Any) -> None:
+        validate_native_task_runtime(runtime.gateway)
         settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
         validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         validate_ingress_profile(settings.get("ingress_profile"))
