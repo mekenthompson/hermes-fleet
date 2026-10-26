@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS work (
   run_generation INTEGER, ownership_id TEXT, pending_resume TEXT, release_pending INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending');
+  attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+  hold_reason TEXT);
 CREATE TABLE IF NOT EXISTS chat_stop (
   id TEXT PRIMARY KEY, profile TEXT NOT NULL, issue_id TEXT NOT NULL,
   linear_session_id TEXT NOT NULL, source_activity_id TEXT NOT NULL,
@@ -58,6 +59,10 @@ class Store:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path)) as db:
             db.executescript(SCHEMA)
+            outbox_columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
+            if "hold_reason" not in outbox_columns:
+                db.execute("ALTER TABLE outbox ADD COLUMN hold_reason TEXT")
+            db.commit()
             columns = {row[1] for row in db.execute("PRAGMA table_info(work)")}
             for name in ("linear_session_id", "panel_note", "pending_resume"):
                 if name not in columns:
@@ -92,6 +97,75 @@ class Store:
                 raise
             finally:
                 self._local.db = None
+    @staticmethod
+    def unlinked_content(kind: str, payload: dict[str, Any]) -> bool:
+        """An ordinary content request carries no retained execution identity."""
+        return (kind in ("comment", "description") and payload.get("content_action") is True
+                and payload.get("unlinked_content") is True and not any(payload.get(key) for key in (
+                    "work_owner", "session_key", "admission_id", "claim", "release", "task_id",
+                    "stop_intent_id", "requires_status_id", "terminal")))
+    @staticmethod
+    def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
+        return (kind == "activity" and payload.get("reporting_notice_version") == 1
+                and payload.get("one_try") is True and bool(payload.get("session_id"))
+                and (payload.get("content") or {}).get("type") in ("response", "error")
+                and not any(payload.get(key) for key in (
+                    "work_owner", "session_key", "admission_id", "claim", "release", "stop_intent_id", "task_id", "terminal")))
+    @classmethod
+    def independent_comment(cls, kind: str, payload: dict[str, Any]) -> bool:
+        # Adding a new authorized comment does not resolve or repeat an earlier mutation.
+        return kind == "comment" and cls.unlinked_content(kind, payload)
+    @classmethod
+    def _delivery_hold_reason(cls, db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> str | None:
+        if cls.unlinked_content(kind, payload):
+            return None
+        if any(payload.get(key) for key in ("work_owner", "session_key", "admission_id", "claim", "release", "stop_intent_id")):
+            return "Retained execution-derived delivery requires explicit reconciliation; automatic replay is disabled"
+        if cls.reporting_notice(kind, payload):
+            return None  # A newly authorized refusal is reporting, never task admission.
+        targets = cls._targets(payload)
+        if not targets or not payload.get("task_id"):
+            return "Unverified retained delivery has no native reporting binding; inspect its original effect history"
+        matched_task = False
+        for issue_id in targets:
+            work = db.execute("SELECT origin,task_id FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+            binding = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-binding:{issue_id}",)).fetchone()
+            if not work or work["origin"] != "native" or not binding:
+                return "Retained or missing work cannot authorize automatic reporting replay"
+            saved = json.loads(binding[0])
+            if (saved.get("issue_id") != issue_id or saved.get("task_id") != work["task_id"]
+                    or not saved.get("profile") or not saved.get("board")):
+                return "Native reporting binding does not match the retained delivery; reconcile before migration"
+            matched_task = matched_task or payload["task_id"] == work["task_id"]
+            if kind != "project_update" and payload["task_id"] != work["task_id"]:
+                return "Native reporting binding does not match the retained delivery; reconcile before migration"
+        return None if matched_task else "Native report has no matching task binding; reconcile before migration"
+    @classmethod
+    def _hold_legacy_outbox(cls, db: sqlite3.Connection) -> None:
+        # Preserve request/effect history exactly: holding changes only this nullable column.
+        # Historical sent rows stay sent, but cannot become current native receipts.
+        rows = db.execute("SELECT id,kind,payload FROM outbox WHERE state IN ('pending','failed','sent') AND hold_reason IS NULL").fetchall()
+        for row in rows:
+            reason = cls._delivery_hold_reason(db, row["kind"], json.loads(row["payload"]))
+            if reason:
+                db.execute("UPDATE outbox SET hold_reason=? WHERE id=?", (reason, row["id"]))
+        # A native dependent must not launder an older release/admission receipt.
+        changed = True
+        while changed:
+            changed = False
+            for row in db.execute("SELECT id,payload FROM outbox WHERE state IN ('pending','failed','sent') AND hold_reason IS NULL").fetchall():
+                payload = json.loads(row["payload"])
+                dependencies = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()} - {None, ""}
+                if any(db.execute("SELECT 1 FROM outbox WHERE id=? AND hold_reason IS NOT NULL", (key,)).fetchone() for key in dependencies):
+                    db.execute("UPDATE outbox SET hold_reason=? WHERE id=?",
+                               ("Reporting depends on a retained delivery requiring explicit reconciliation", row["id"]))
+                    changed = True
+    def delivery_allowed(self, row_id: str) -> bool:
+        """Fence every consumer, including direct sends and send admission, before effects."""
+        with self._tx() as db:
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
+            return bool(row and row[0] is None)
     @staticmethod
     def _admitted(db: sqlite3.Connection, *issue_ids: str) -> bool:
         return all(not db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id=?", (ident,)).fetchone()
@@ -151,14 +225,19 @@ class Store:
             row = db.execute("SELECT kind, state, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if not row or row["state"] != "pending":
                 return False
+            self._hold_legacy_outbox(db)
+            if not self.delivery_allowed(row_id):
+                return False
             payload = json.loads(row["payload"])
             targets = self._targets(payload)
             if not self._admitted(db, *targets):
                 return False
             # A normal authorized issue edit/comment is independent of retained chat ownership.
             # An uncertain prior remote mutation still requires external reconciliation.
-            if payload.get("content_action"):
-                if any(self._unresolved_terminal(db, target, except_id=row_id) for target in targets):
+            if self.reporting_notice(row["kind"], payload):
+                pass  # Informational replies do not repeat or resolve any earlier effect.
+            elif payload.get("content_action"):
+                if not self.independent_comment(row["kind"], payload) and any(self._unresolved_terminal(db, target, except_id=row_id) for target in targets):
                     return False
             else:
                 if not self._effect_admitted(db, *targets, except_id=row_id):
@@ -176,17 +255,17 @@ class Store:
         if outcome not in ("applied", "not_applied") or not evidence.strip():
             raise ValueError("terminal reconciliation requires a verified outcome and evidence")
         with self._tx() as db:
-            row = db.execute("SELECT kind, state, attempts, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT kind, state, attempts, payload, hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
             if not row or row["kind"] not in ("status", "description"): return False
             payload = json.loads(row["payload"])
-            if not self.uncertain(row, payload): return False
+            if payload.get("reconciliation") or not self.uncertain(row, payload) and not row["hold_reason"]: return False
             payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
             payload["reconcile_required"], payload["reported"] = True, 1  # the operator acted; no alert
             if payload.get("release"):
                 payload["applied"] = int(outcome == "applied")
-                sql = "DELETE FROM work" if payload["applied"] else "UPDATE work SET release_pending=0"
-                db.execute(sql + " WHERE issue_id=? AND ownership_id=? AND release_pending=1",
-                           (payload["issue_id"], payload["work_owner"]))
+                # External release verification is not proof that retained execution ended.
+                # Keep its checkpoints, Stop and ownership/effect history unchanged.
             state = "sent" if payload.get("release") and payload.get("applied") else "failed"
             db.execute("UPDATE outbox SET payload=?, state=? WHERE id=?", (json.dumps(payload), state, row_id))
             return True
@@ -197,8 +276,9 @@ class Store:
                                     payload.get("issue_id") if not str(payload.get("issue_id", "")).startswith("update:")
                                     else None) if ident}
     def _row_admitted(self, db: sqlite3.Connection, row_id: str, state: str | None = None) -> bool:
-        row = db.execute("SELECT state, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
-        return bool(row and (state is None or row["state"] == state) and
+        self._hold_legacy_outbox(db)
+        row = db.execute("SELECT state, payload, hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
+        return bool(row and row["hold_reason"] is None and (state is None or row["state"] == state) and
                     self._admitted(db, *self._targets(json.loads(row["payload"]))))
     @contextmanager
     def guard_outbox(self, row_id: str, state: str = "pending") -> Iterator[bool]:
@@ -342,13 +422,14 @@ class Store:
                release: bool = False) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             if not self._effect_admitted(db, issue_id): return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not work: return False
             if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 if kind == "project_update":
-                    prior = db.execute("SELECT payload, state FROM outbox WHERE kind='project_update' AND "
+                    prior = db.execute("SELECT payload, state FROM outbox WHERE kind='project_update' AND hold_reason IS NULL AND "
                                        "json_extract(payload, '$.session_id')=? AND "
                                        "json_extract(payload, '$.project_id') IS ? ORDER BY "
                                        "CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, rowid DESC LIMIT 1",
@@ -364,7 +445,7 @@ class Store:
                     payload = {**payload, "requires_status_id": status_id}
                 if kind == "project_update":
                     payload["terminal_lines"] = {ident: status_id for ident in payload["lines"]}
-                    existing = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
+                    existing = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND hold_reason IS NULL AND "
                                           "json_extract(payload, '$.session_id') = ? AND "
                                           "json_extract(payload, '$.project_id') IS ? "
                                           "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
@@ -422,9 +503,10 @@ class Store:
     def captured_task_activities(self, issue_id: str, task_id: str, session_id: str) -> Counter[tuple[str, str]]:
         """Count captured alerts; legacy rows used issue and session without a task id."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             rows = db.execute(
                 "SELECT json_extract(payload, '$.content.type'), json_extract(payload, '$.content.body'), "
-                "COUNT(*) FROM outbox WHERE kind = 'activity' AND json_extract(payload, '$.issue_id') = ? "
+                "COUNT(*) FROM outbox WHERE hold_reason IS NULL AND kind = 'activity' AND json_extract(payload, '$.issue_id') = ? "
                 "AND (json_extract(payload, '$.task_id') = ? OR "
                 "(json_extract(payload, '$.task_id') IS NULL AND "
                 "json_extract(payload, '$.session_id') = ? AND "
@@ -433,13 +515,15 @@ class Store:
         return Counter({(kind, body): count for kind, body, count in rows})
     def terminal_captured(self, task_id: str) -> bool:
         with self._tx() as db:
-            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
+            self._hold_legacy_outbox(db)
+            return bool(db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND "
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
                                    "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id,)).fetchone())
     def assessment_comment_id(self, issue_id: str, body: str) -> str | None:
         with self._tx() as db:
-            row = db.execute("SELECT id FROM outbox WHERE kind='comment' AND "
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT id FROM outbox WHERE hold_reason IS NULL AND kind='comment' AND "
                              "json_extract(payload, '$.issue_id')=? AND "
                              "json_extract(payload, '$.assessment')=1 AND "
                              "json_extract(payload, '$.body')=? AND state IN ('sent', 'pending') LIMIT 1",
@@ -476,10 +560,13 @@ class Store:
                 raise ValueError("outbox id reused with conflicting content")
             targets = self._targets(payload)
             if payload.get("content_action"):
-                if not self._admitted(db, *targets) or any(self._unresolved_terminal(db, target) for target in targets): return ""
+                if not self._admitted(db, *targets) or (not self.independent_comment(kind, payload) and
+                        any(self._unresolved_terminal(db, target) for target in targets)): return ""
+            elif self.reporting_notice(kind, payload):
+                if not self._admitted(db, *targets): return ""
             elif not self._effect_admitted(db, *targets): return ""
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
-            body = json.dumps({**payload, "work_owner": work["ownership_id"] if work and not payload.get("content_action") else None,
+            body = json.dumps({**payload, "work_owner": work["ownership_id"] if work and not payload.get("content_action") and not self.reporting_notice(kind, payload) else None,
                                "enqueued_at": payload.get("enqueued_at", now)})
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)", (row_id, kind, body, now))
         return row_id
@@ -488,7 +575,7 @@ class Store:
             if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
-                if work: payload = {**payload, "work_owner": work["ownership_id"]}
+                if work and not self.reporting_notice(kind, payload): payload = {**payload, "work_owner": work["ownership_id"]}
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
             return True
@@ -509,7 +596,7 @@ class Store:
         """Oldest pending issue write per issue, if due, plus any due thought: issue writes go out in order."""
         def eligible(alias: str) -> str:
             dependency = f"json_extract({alias}.payload, '$.requires_status_id')"
-            return (f"(NOT EXISTS (SELECT 1 FROM outbox h WHERE h.id={dependency} "
+            return (f"({alias}.hold_reason IS NULL AND NOT EXISTS (SELECT 1 FROM outbox h WHERE h.id={dependency} "
                     "AND json_extract(h.payload, '$.reconcile_required')=1 AND "
                     f"({alias}.kind != 'project_update' OR json_extract({alias}.payload, '$.issue_id')="
                     "json_extract(h.payload, '$.issue_id'))) AND "
@@ -519,6 +606,7 @@ class Store:
                     "SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.state = 'sent' AND l.rowid > s.rowid "
                     "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id'))))))))")
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
                 " AND (" + ADVISORY + " OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
@@ -534,20 +622,21 @@ class Store:
     def last_activity_at(self, issue_id: str, session_id: str) -> float:
         """When this session last showed, or is about to show, an activity; dropped ones do not count."""
         with self._tx() as db:
-            row = db.execute("SELECT MAX(json_extract(payload, '$.enqueued_at')) FROM outbox WHERE kind = 'activity' "
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT MAX(json_extract(payload, '$.enqueued_at')) FROM outbox WHERE hold_reason IS NULL AND kind = 'activity' "
                              "AND (state = 'pending' OR (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 1)) AND "
                              "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ?",
                              (issue_id, session_id)).fetchone()
         return float(row[0] or 0)
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
-            rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND NOT " + ADVISORY + " AND "
+            rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND hold_reason IS NULL AND NOT " + ADVISORY + " AND "
                               "COALESCE(json_extract(payload, '$.reported'), 0) = 0 ORDER BY rowid").fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
     def retire_advisory(self, row_id: str, now: float) -> None:
         """Retire a due, unsent thought; one a quota pause deferred keeps its place. It changes no issue: no fence applies."""
         with self._tx() as db:
-            db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND next_at <= ? AND "
+            db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND hold_reason IS NULL AND next_at <= ? AND "
                        + ADVISORY, (row_id, now))
     def mark(self, row_id: str, state: str, error: str | None = None) -> None:
         with self._tx() as db:
@@ -559,12 +648,6 @@ class Store:
             if not self._row_admitted(db, row_id): return False
             db.execute("UPDATE outbox SET state = 'sent', payload = json_set(payload, '$.applied', ?) WHERE id = ?",
                        (int(applied), row_id))
-            if applied:
-                receipt = db.execute("SELECT payload FROM outbox WHERE id=?", (row_id,)).fetchone()
-                payload = json.loads(receipt["payload"])
-                if payload.get("release"):
-                    db.execute("DELETE FROM work WHERE issue_id=? AND ownership_id=? AND release_pending=1",
-                               (payload["issue_id"], payload["work_owner"]))
             return True
     def latest_status(self, issue_id: str) -> dict[str, Any] | None:
         """Newest status intent, including a pending or failed closeout."""
@@ -577,11 +660,12 @@ class Store:
         return {"id": row["id"], "state": row["intent"]}
     def verified_release(self, row_id: str) -> bool:
         row = self.outbox_row(row_id)
-        return bool(row and row["state"] == "sent" and row["kind"] == "status"
+        return bool(row and not row.get("hold_reason") and row["state"] == "sent" and row["kind"] == "status"
                     and row["payload"].get("release") and row["payload"].get("applied"))
     def terminal_status_applied(self, row_id: str) -> bool:
         with self._tx() as db:
-            row = db.execute("SELECT state, kind, json_extract(payload, '$.applied') FROM outbox WHERE id = ?",
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT state, kind, json_extract(payload, '$.applied') FROM outbox WHERE hold_reason IS NULL AND id = ?",
                              (row_id,)).fetchone()
         return bool(row and row["state"] == "sent" and row["kind"] == "status" and row[2] == 1)
     def terminal_text(self, status_id: str) -> str:
@@ -616,8 +700,9 @@ class Store:
         """After any successful write, give timed-out rows one more try (same client id). A status
         write superseded by a later one for the same issue stays failed, so it cannot land stale."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             rows = db.execute(
-                "SELECT id, payload FROM outbox WHERE state = 'failed' AND attempts > 0 AND "
+                "SELECT id, payload FROM outbox WHERE state = 'failed' AND hold_reason IS NULL AND attempts > 0 AND "
                 "COALESCE(json_extract(payload, '$.reconcile_required'), 0)=0 AND NOT " + ADVISORY + " AND NOT ("
                 " kind = 'status' AND EXISTS (SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > outbox.rowid"
                 " AND json_extract(l.payload, '$.issue_id') = json_extract(outbox.payload, '$.issue_id')))",
@@ -630,7 +715,7 @@ class Store:
             return revived
     @staticmethod
     def _latest_project_update(db: sqlite3.Connection, session_id: str, project_id: str | None):
-        return db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND "
+        return db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND hold_reason IS NULL AND "
                           "json_extract(payload, '$.session_id') = ? AND json_extract(payload, '$.project_id') IS ? "
                           "ORDER BY CASE state WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END, "
                           "rowid DESC LIMIT 1", (session_id, project_id)).fetchone()
@@ -649,6 +734,7 @@ class Store:
     def queue_project_update(self, payload: dict[str, Any], *, due: float, quiet: bool) -> bool:
         """Merge a session's update atomically with terminal capture in finish()."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             if not self._effect_admitted(db, *self._targets(payload)): return False
             row = self._latest_project_update(db, payload["session_id"], payload["project_id"])
             if row and self._requester_conflict(json.loads(row["payload"]), payload): row = None
@@ -689,7 +775,8 @@ class Store:
             return True
     def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None) -> bool:
         with self._tx() as db:
-            row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending'", (row_id,)).fetchone()
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending' AND hold_reason IS NULL", (row_id,)).fetchone()
             if not row:
                 return False
             payload = json.loads(row["payload"])
@@ -714,7 +801,8 @@ class Store:
                               body: str, project_id: str | None) -> bool | None:
         """Freeze the preflighted body only if it is still unchanged and due."""
         with self._tx() as db:
-            row = db.execute("SELECT * FROM outbox WHERE id = ? AND kind = 'project_update' AND state = 'pending'",
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT * FROM outbox WHERE id = ? AND kind = 'project_update' AND state = 'pending' AND hold_reason IS NULL",
                              (row_id,)).fetchone()
             if not row:
                 return False
@@ -740,15 +828,16 @@ class Store:
                              waiting: set[str]) -> bool | None:
         """Keep status-blocked lines pending while the eligible lines use this client id."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             row = db.execute("SELECT payload, next_at FROM outbox WHERE id=? AND kind='project_update' "
-                             "AND state='pending'", (row_id,)).fetchone()
+                             "AND state='pending' AND hold_reason IS NULL", (row_id,)).fetchone()
             if not row or row["next_at"] > now:
                 return False
             if json.loads(row["payload"]) != expected:
                 return None
             if not self._admitted(db, *self._targets(expected)): return False
             # A sibling proves this session/project already split; wait for it.
-            sibling = db.execute("SELECT 1 FROM outbox WHERE kind='project_update' AND id != ? AND "
+            sibling = db.execute("SELECT 1 FROM outbox WHERE kind='project_update' AND hold_reason IS NULL AND id != ? AND "
                                  "json_extract(payload, '$.session_id') = ? AND "
                                  "json_extract(payload, '$.project_id') IS ? LIMIT 1",
                                  (row_id, expected["session_id"], expected.get("project_id"))).fetchone()
@@ -776,8 +865,9 @@ class Store:
     def drop_unpublished_update(self, row_id: str, expected: dict[str, Any], now: float) -> bool | None:
         """Forget an empty batch only if no valid line merged during preflight."""
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             row = db.execute("SELECT payload, next_at FROM outbox WHERE id = ? AND kind = 'project_update' "
-                             "AND state = 'pending'", (row_id,)).fetchone()
+                             "AND state = 'pending' AND hold_reason IS NULL", (row_id,)).fetchone()
             if not row or row["next_at"] > now:
                 return False
             if json.loads(row["payload"]) != expected:
@@ -787,21 +877,24 @@ class Store:
         return True
     def pending_claim(self, issue_id: str) -> bool:
         with self._tx() as db:
+            self._hold_legacy_outbox(db)
             return bool(db.execute(
-                "SELECT 1 FROM outbox c WHERE c.kind = 'status' AND "
+                "SELECT 1 FROM outbox c WHERE c.hold_reason IS NULL AND c.kind = 'status' AND "
                 "json_extract(c.payload, '$.issue_id') = ? AND json_extract(c.payload, '$.claim') = 1 AND "
                 "(c.state = 'pending' OR (c.state = 'failed' AND c.attempts > 0 AND NOT EXISTS ("
                 "SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > c.rowid AND "
                 "json_extract(l.payload, '$.issue_id') = ?))) LIMIT 1", (issue_id, issue_id)).fetchone())
     def has_start_ack(self, issue_id: str, task_id: str) -> bool:
         with self._tx() as db:
-            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
+            self._hold_legacy_outbox(db)
+            return bool(db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND "
                                    "json_extract(payload, '$.issue_id')=? AND "
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "json_extract(payload, '$.claim')=1 LIMIT 1", (issue_id, task_id)).fetchone())
     def status_pending(self, row_id: str) -> bool:
         with self._tx() as db:
-            return bool(db.execute("SELECT 1 FROM outbox WHERE id = ? AND kind = 'status' AND "
+            self._hold_legacy_outbox(db)
+            return bool(db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND id = ? AND kind = 'status' AND "
                                    "(state = 'pending' OR (state = 'failed' AND attempts > 0))",
                                    (row_id,)).fetchone())
     def report(self, row_id: str) -> None:
@@ -815,7 +908,8 @@ class Store:
     def delay_session_updates(self, session_id: str, next_at: float, *, turn_id: str = "") -> None:
         """Quiet period: each identified turn retains its first captured deadline across replay."""
         with self._tx() as db:
-            rows = db.execute("SELECT id, payload FROM outbox WHERE kind='project_update' AND state='pending' AND "
+            self._hold_legacy_outbox(db)
+            rows = db.execute("SELECT id, payload FROM outbox WHERE kind='project_update' AND state='pending' AND hold_reason IS NULL AND "
                               "COALESCE(json_extract(payload, '$.frozen'), 0)=0 AND "
                               "json_extract(payload, '$.session_id')=?", (session_id,)).fetchall()
             if turn_id and rows:

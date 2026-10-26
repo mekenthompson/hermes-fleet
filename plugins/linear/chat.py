@@ -110,7 +110,7 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         body = args.get("description") if action == "update_description" else args.get("body")
         if not isinstance(body, str) or not body.strip():
             raise ValueError(f"{action} needs nonempty content.")
-        writes = bridge.store.issue_reconciliation_blocked(issue_id, except_id=client_id)
+        writes = bridge.store.issue_reconciliation_blocked(issue_id, except_id=client_id) if action == "update_description" else []
         if writes:
             return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])
         prior = bridge.store.outbox_row(client_id)

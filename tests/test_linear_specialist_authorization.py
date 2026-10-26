@@ -255,6 +255,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         return event
 
     def test_status_send_refuses_second_lookup_redirect(self):
+        self.seed_kanban_work()
         other = "issue-other"
         self.authority.issues[other] = issue_record(id=other)
         row_id = self.bridge.status(ISSUE, "in_progress")
@@ -269,6 +270,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return original(ref)
         self.api.issue = redirected
         self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(calls, 2)
         self.assertEqual(self.authority.mutations, [])
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
@@ -286,6 +288,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.pending(), [])
 
     def test_project_send_refuses_second_lookup_redirect(self):
+        self.seed_kanban_work()
         other = "issue-other"
         self.authority.issues[ISSUE] = issue_record(delegate={"id": VIEWER})
         self.authority.issues[other] = issue_record(id=other, delegate={"id": VIEWER})
@@ -302,6 +305,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return original(ref)
         self.api.issue = redirected
         self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(calls, 2)
         self.assertEqual(self.authority.mutations, [])
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertFalse(self.store.scope_fenced(other))
@@ -674,7 +678,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.authority.issues[other] = issue_record(id=other, delegate={"id": "viewer-foreign"})
         self.seed_kanban_work(ISSUE)
         task_id = self.seed_kanban_work(other)
-        outbox_id = self.store.enqueue("status", {"issue_id": other, "state": "done"}, at=1)
+        outbox_id = self.store.enqueue("status", {"issue_id": other, "state": "done", "task_id": task_id}, at=1)
         work, outbox = self.store.get(other), self.store.outbox_row(outbox_id)
         original = self.api.issue
         calls = 0
@@ -871,8 +875,9 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
 
     def test_fence_preserves_pending_and_uncertain_outbox_maintenance(self):
-        pending_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "pending"}, at=1)
-        failed_id = self.store.enqueue("status", {"issue_id": ISSUE, "state": "blocked"}, at=1)
+        task_id = self.seed_kanban_work()
+        pending_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "pending", "task_id": task_id}, at=1)
+        failed_id = self.store.enqueue("status", {"issue_id": ISSUE, "state": "blocked", "task_id": task_id}, at=1)
         self.store.retry(self.store.outbox_row(failed_id), 2)
         self.store.mark(failed_id, "failed")
         before = {ident: self.store.outbox_row(ident) for ident in (pending_id, failed_id)}
@@ -913,13 +918,15 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def test_project_update_merge_refuses_fence_on_either_issue(self):
         second = "issue-second"
         first = {"issue_id": "update:session:project", "session_id": SESSION, "project_id": PROJECT,
-                 "resolve": ISSUE, "lines": {"OPS-1": "first"}, "line_issues": {"OPS-1": ISSUE}}
+                 "resolve": ISSUE, "lines": {"OPS-1": "first"}, "line_issues": {"OPS-1": ISSUE}, "task_id": "task-first"}
         next_line = {**first, "resolve": second, "lines": {"OPS-2": "second"},
                      "line_issues": {"OPS-2": second}}
         for fenced in (ISSUE, second):
             with self.subTest(fenced=fenced):
                 path = Path(self.tmp.name) / f"{fenced}.db"
                 store = Store(path)
+                store.bind_native(ISSUE, "task-first", "synthetic", "default", owner_ref=SESSION, at=0)
+                store.bind_native(second, "task-second", "synthetic", "default", owner_ref=SESSION, at=0)
                 self.assertTrue(store.queue_project_update(first, due=1, quiet=True))
                 before = store.project_update(SESSION, PROJECT)
                 store.fence_scope(fenced, "permanent denial", at=2)
@@ -928,9 +935,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_nonmergeable_fenced_aggregate_does_not_refuse_allowed_noop(self):
         other = "issue-other"
+        task_id = self.seed_kanban_work()
+        self.seed_kanban_work(other)
         payload = {"issue_id": "update:session:project", "session_id": SESSION,
                    "project_id": PROJECT, "resolve": ISSUE, "lines": {"OPS-1": "prior"},
-                   "line_issues": {"OPS-1": ISSUE}}
+                   "line_issues": {"OPS-1": ISSUE}, "task_id": task_id}
         self.store.queue_project_update(payload, due=1, quiet=True)
         row = self.store.project_update(SESSION, PROJECT)
         self.store.mark_sent(row["id"], True)
@@ -942,8 +951,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.project_update(SESSION, PROJECT), before)
 
     def test_failed_alert_does_not_repeat_after_fence(self):
-        self.seed_kanban_work()
-        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "uncertain", "task_id": "task"}, at=1)
+        task_id = self.seed_kanban_work()
+        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "uncertain", "task_id": task_id}, at=1)
         self.store.mark(row_id, "failed")
         before = self.store.outbox_row(row_id)
         self.store.fence_scope(ISSUE, "permanent denial", at=2)
@@ -952,8 +961,28 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.kanban.comments, [])
         self.assertEqual(self.store.outbox_row(row_id), before)
 
+    def test_mismatched_task_report_is_held_without_laundering_current_requester(self):
+        task_id = self.seed_kanban_work()
+        old = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "Earlier task result",
+            "task_id": "unverified-other-task", "requester_sessions": {ISSUE: SESSION}}, at=1)
+        before = self.store.outbox_row(old)
+        self.assertEqual(self.bridge.flush(), 0)
+        held = self.store.outbox_row(old)
+        self.assertTrue(held["hold_reason"])
+        self.assertEqual({key: value for key, value in held.items() if key != "hold_reason"},
+                         {key: value for key, value in before.items() if key != "hold_reason"})
+        self.assertEqual(self.authority.mutations, [])
+        current = self.bridge.comment(ISSUE, "Current verified native result")
+        self.assertEqual(self.store.outbox_row(current)["payload"]["task_id"], task_id)
+        self.assertEqual(self.bridge.flush(), 1)
+        self.assertEqual(self.store.outbox_row(current)["state"], "sent")
+        self.assertIsNone(self.store.outbox_row(current)["hold_reason"])
+        self.assertEqual(self.store.outbox_row(old), held)
+        self.assertEqual(len(self.authority.mutations), 1)
+
     def test_outbox_effect_releases_writer_after_atomic_admission(self):
-        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved"}, at=1)
+        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved",
+            "content_action": True, "unlinked_content": True}, at=1)
         began, finished = threading.Event(), threading.Event()
         worker = None
         transport = self.api.transport
@@ -978,8 +1007,9 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertTrue(self.store.scope_fenced(ISSUE))
 
     def test_outbox_preflight_allows_fence_before_remote_mutation(self):
+        task_id = self.seed_kanban_work()
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
-        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved", "task_id": "task"}, at=1)
+        row_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved", "task_id": task_id}, at=1)
         original_issue, reads = self.api.issue, 0
         def issue(ident):
             nonlocal reads
@@ -998,12 +1028,14 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_project_update_resource_rechecks_do_not_delay_fence(self):
         other = "issue-second"
+        task_id = self.seed_kanban_work()
+        self.seed_kanban_work(other)
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         self.authority.issues[other] = issue_record(id=other, identifier="OPS-2", delegate={"id": VIEWER})
         payload = {"issue_id": "update:session:project", "session_id": SESSION,
                    "project_id": PROJECT, "resolve": ISSUE,
                    "lines": {"OPS-1": "first", "OPS-2": "second"},
-                   "line_issues": {"OPS-1": ISSUE, "OPS-2": other}}
+                   "line_issues": {"OPS-1": ISSUE, "OPS-2": other}, "task_id": task_id}
         self.assertTrue(self.store.queue_project_update(payload, due=1, quiet=False))
         row = self.store.project_update(SESSION, PROJECT)
         original, completed_during_recheck = self.api._mutation_issue, []
@@ -1052,17 +1084,18 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
     def test_fenced_aggregate_blocks_terminal_merge_and_quiet_shift(self):
         other = "issue-prior"
-        self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)
+        task_id = self.seed_kanban_work()
+        self.seed_kanban_work(other)
         payload = {"issue_id": "update:session:project", "session_id": SESSION,
                    "project_id": PROJECT, "resolve": other, "lines": {"OPS-2": "prior"},
-                   "line_issues": {"OPS-2": other}}
+                   "line_issues": {"OPS-2": other}, "task_id": f"task-{other}"}
         self.store.queue_project_update(payload, due=2, quiet=True)
         before_work = self.store.get(ISSUE)
         before_update = self.store.project_update(SESSION, PROJECT)
         self.store.fence_scope(other, "permanent denial", at=3)
         self.assertFalse(self.store.finish(ISSUE, [
-            ("status", {"issue_id": ISSUE, "state": "done"}),
-            ("project_update", {**payload, "resolve": ISSUE, "lines": {"OPS-1": "done"},
+            ("status", {"issue_id": ISSUE, "state": "done", "task_id": task_id}),
+            ("project_update", {**payload, "resolve": ISSUE, "task_id": task_id, "lines": {"OPS-1": "done"},
                                 "line_issues": {"OPS-1": ISSUE}})], at=4))
         self.store.delay_session_updates(SESSION, 50)
         self.assertEqual(self.store.get(ISSUE), before_work)
@@ -1150,7 +1183,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             with self.subTest(archived=forget):
                 issue_id = f"{ISSUE}-{forget}"
                 self.store.bind_native(issue_id, "task", "synthetic", "default", owner_ref=SESSION, project_id=PROJECT, at=0)
-                self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved"}, at=1)
+                self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved", "task_id": "task"}, at=1)
                 before, pending = self.store.get(issue_id), self.store.pending(issue_id)
                 self.store.fence_scope(issue_id, "permanent denial", at=1.0)
                 self.assertFalse(self.store.capture_event(issue_id, 2, [("status", {"issue_id": issue_id, "state": "done"})], at=2.0, forget=forget))
@@ -1191,14 +1224,14 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 self.assertEqual(self.store.pending(issue_id), [], "denied activity/status must not enter the outbox")
 
     def test_tick_keeps_pending_and_uncertain_writes_untouched_after_revocation_and_restart(self):
-        self.seed_kanban_work(task_status="blocked", events=[SimpleNamespace(
+        task_id = self.seed_kanban_work(task_status="blocked", events=[SimpleNamespace(
             id=1, kind="blocked", payload={"reason": "needs input"})])
-        status_id = self.store.enqueue("status", {"issue_id": ISSUE, "state": "done"}, at=1)
-        comment_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved evidence"}, at=1)
-        activity_id = self.store.enqueue("activity", {"issue_id": ISSUE, "session_id": SESSION,
+        status_id = self.store.enqueue("status", {"issue_id": ISSUE, "state": "done", "task_id": task_id}, at=1)
+        comment_id = self.store.enqueue("comment", {"issue_id": ISSUE, "body": "saved evidence", "task_id": task_id}, at=1)
+        activity_id = self.store.enqueue("activity", {"issue_id": ISSUE, "session_id": SESSION, "task_id": task_id,
                                                        "content": {"type": "response", "body": "saved"}}, at=1)
         project_id = self.store.enqueue("project_update", {"issue_id": "update:session:project",
-                                                            "resolve": ISSUE, "project_id": PROJECT,
+                                                            "resolve": ISSUE, "project_id": PROJECT, "task_id": task_id,
                                                             "lines": {"OPS-1": "Done"},
                                                             "line_issues": {"OPS-1": ISSUE}}, at=1)
         frozen_payload = self.store.outbox_row(project_id)["payload"]
@@ -1558,8 +1591,10 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge.flush()
         self.assertEqual(self.authority.mutations, [])
         held = self.store.outbox_row(row_id)
-        self.assertEqual((held["state"], held["attempts"]), ("failed", 0))
-        self.assertIn("requester-session", held["payload"]["authorization_error"])
+        self.assertEqual((held["state"], held["attempts"]), ("pending", 0))
+        self.assertTrue(held["hold_reason"])
+        self.assertNotIn("requester_sessions", held["payload"])
+        self.assertNotIn("authorization_error", held["payload"])
 
     def test_terminal_effect_does_not_borrow_successor_session_authority(self):
         self.bridge.handle_webhook(self.session_event())
@@ -1787,9 +1822,11 @@ class SessionRequesterTests(unittest.TestCase):
                     self.assertEqual(self.store.pending(), [])
 
     def test_project_thaw_requires_explicit_unsent_or_definite_rejection(self):
+        self.bridge.handle_webhook(self.session_event())
+        task_id = self.store.get(ISSUE)["task_id"]
         for marker, allowed in ((False, True), (True, False), (None, False)):
             payload = {"issue_id": "update:synthetic", "session_id": "batch", "project_id": PROJECT,
-                       "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE},
+                       "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE}, "task_id": task_id,
                        "frozen": True}
             if marker is not None: payload["write_started"] = marker
             row_id = self.store.enqueue("project_update", payload, at=0)
@@ -1802,8 +1839,10 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertIs(self.store.outbox_row(row_id)["payload"]["frozen"], True)
 
     def test_definite_401_refreezes_unsent_body_and_does_not_clear_started_marker(self):
+        self.bridge.handle_webhook(self.session_event())
+        task_id = self.store.get(ISSUE)["task_id"]
         unsent = {"issue_id": "update:synthetic", "session_id": "batch", "project_id": PROJECT,
-                  "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE},
+                  "resolve": ISSUE, "lines": {"OPS-1": "result"}, "line_issues": {"OPS-1": ISSUE}, "task_id": task_id,
                   "frozen": True, "write_started": False, "send_body": "Agent update\n\n- OPS-1: result",
                   "send_project_id": PROJECT}
         row_id = self.store.enqueue("project_update", unsent, at=0)
@@ -1829,7 +1868,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertIs(self.store.outbox_row(open_id)["payload"]["write_started"], True)
         self.assertNotIn("new body", json.dumps(self.store.outbox_row(open_id)["payload"]))
         retried = {"issue_id": "update:synthetic", "session_id": "retry", "project_id": PROJECT,
-                   "resolve": ISSUE, "lines": {"OPS-1": "later"}, "line_issues": {"OPS-1": ISSUE}}
+                   "resolve": ISSUE, "lines": {"OPS-1": "later"}, "line_issues": {"OPS-1": ISSUE}, "task_id": task_id}
         retry_id = self.store.enqueue("project_update", retried, at=0)
         self.store.retry(self.store.outbox_row(retry_id), 0)
         due = self.store.outbox_row(retry_id)

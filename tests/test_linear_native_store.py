@@ -80,12 +80,12 @@ class NativeStoreTests(unittest.TestCase):
             db.execute("UPDATE work SET stop_requested_at=100,release_pending=1 WHERE issue_id='legacy'")
         before = self.store.get("legacy")
         row = self.store.enqueue("comment", {"issue_id": "legacy", "body": "Status question", "id": "new-comment",
-                                             "content_action": True, "session_key": "different-channel"}, at=101)
+                                             "content_action": True, "unlinked_content": True}, at=101)
         self.assertTrue(self.store.admit_mutation(row))
         self.assertEqual(self.store.get("legacy"), before)
         self.assertIsNone(self.store.outbox_row(row)["payload"].get("work_owner"))
         description = self.store.enqueue("description", {"issue_id": "unlinked", "body": "New text", "id": "edit-1",
-                                                         "expected_description": "Old", "content_action": True}, at=101)
+                                                         "expected_description": "Old", "content_action": True, "unlinked_content": True}, at=101)
         self.assertTrue(self.store.admit_mutation(description))
         self.assertTrue(self.store.issue_reconciliation_blocked("unlinked"))
         self.assertEqual(self.store.enqueue("description", {"issue_id": "unlinked", "body": "Retry", "id": "edit-2",
