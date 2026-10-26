@@ -71,8 +71,9 @@ class NativeBridgeScenarios(unittest.TestCase):
     def create(self, *, activate=True):
         self.bridge.handle_webhook(self.event())
         task_id = self.store.get(ISSUE)["task_id"]
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        if activate:
+        status = self.board.get(task_id).status
+        self.assertEqual(status, "ready" if self.board.guarded_controls else "blocked")
+        if activate and status == "blocked":
             # Backend fixture uses the actual native operator path. This is not a
             # fabricated human transport event or an integration execution grant.
             with self.board.conn() as conn:
@@ -92,7 +93,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.bridge.handle_webhook(event)
         task_id = self.store.get(ISSUE)["task_id"]
         before = self.board.get(task_id)
-        self.assertEqual(before.status, "blocked")
+        self.assertEqual(before.status, "ready" if self.board.guarded_controls else "blocked")
         self.assertIsNone(before.current_run_id)
         self.bridge.handle_webhook(event)
         self.bridge.track(ISSUE, task_id)

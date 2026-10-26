@@ -5,7 +5,8 @@ worker recovery, permissions and Stop. This plugin links records, accepts verifi
 requests and reports native outcomes through a durable outbox. An issue, comment, assignee
 or reporting destination never grants execution permission.
 
-The native contract is official Hermes `ff294849385e433dd40a993b4f07673abb95c6f5`.
+Reporting remains compatible with official Hermes `ff294849385e433dd40a993b4f07673abb95c6f5`.
+Automatic assignment admission additionally requires native block/unblock task-event guards.
 No fork-specific invocation context, lifecycle controller, approval reservation or chat recovery
 API is required. The plugin is disabled by default.
 
@@ -14,7 +15,8 @@ API is required. The plugin is disabled by default.
 | Action | Result |
 | --- | --- |
 | `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
-| `status` with `issue` | Read the issue and linked native state, or retained migration/reconciliation information. |
+| `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
+| `status` with `issue` | Read the issue, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
@@ -40,13 +42,17 @@ without creating or reopening them. Subsequent status, follow-up and reporting u
 recorded board. The configured plugin board remains the creation destination for verified
 Linear assignments, so linking an ordinary or project task does not require moving it.
 
-Validated Linear assignments create a native task with `initial_status="blocked"`.
-They are durable requests, not automatic execution. Activate them through an authorized native
-Kanban action from any supported conversation or UI. No Linear claim or special wording is
-needed. The plugin never unblocks a task. Upstream has no atomic initial-state/generation guard
-for automatic activation; a read followed by unblock could undo a concurrent Stop. Keeping
-creation parked closes the Stop-during-creation race without another execution controller.
-Existing tasks created through native chat tools and already-running linked work are unaffected.
+Validated Linear assignments create a blocked native task, link it, then admit it using the
+native event guard. The user does not need a separate activation step. Activation retains
+the original creation token across retries; a newer Stop invalidates it. Native scheduling,
+capacity and dependencies decide when the admitted worker runs. A restart can finish an
+interrupted admission without creating a second task or refreshing a stopped task's token.
+
+Older native hosts without those guards keep new assignments blocked and explain the missing
+capability. Previously parked or legacy work is never automatically adopted on upgrade.
+Explicit chat work/takeover uses native controls after inspection; linking reporting alone
+never starts, stops or transfers a worker. Use `status`'s verified `native.local.profile` when
+creating local native work rather than guessing from an agent's display name.
 
 ## Trusted host context
 
@@ -133,11 +139,11 @@ linking new native work. A reporting link is metadata, never a competing ownersh
 Native create-task retry lookup is not an atomic exactly-once guarantee. A durable local
 intent coalesces duplicate ingress; ambiguous in-flight creation stays pending for inspection.
 Native comments have no idempotency key: the plugin retains ambiguous delivery and inspects
-actual comments before retrying. Marker text is provenance, never authorization. Native
-resume has no expected-generation compare-and-swap; stale Linear resume requests remain
-visible for a current authorized native action. Native Stop is the supported execution control.
-Linear Stop is relayed only when the current native run and ordering can be verified. Other
-requests remain visible for native reconciliation. A blocked task or Stop acknowledgement is
+actual comments before retrying. Marker text is provenance, never authorization. Guarded
+native controls reject stale observations. The integration does not interpret arbitrary
+tracker prose as permission to resume stopped work. Linear Stop uses guarded native controls
+when source ordering is verifiable, including initial queued work; conflicting controls remain
+visible for native reconciliation. A blocked task or Stop acknowledgement is
 not proof that an external process or effect ended; inspect native process/effect state.
 
 Before status mutations/retries the bridge re-reads Linear so human reassignment/closure wins.

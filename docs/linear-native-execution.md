@@ -11,9 +11,10 @@ activation steps, or checkpoint relays between agents.
 
 **This is not yet the complete implemented experience.** The
 [UX outcome review and revised sequence](../reference/rfcs/durable-work-execution.md#ux-outcome-review-2026-10-26)
-identify the profile/home mismatch, blocked Linear admission, and incomplete chat takeover
-path. The diagram and mechanisms below describe the reduced implementation, including its
-limitations; they do not establish acceptance of the target workflow.
+identify the original profile/home, admission, and takeover gaps. Caller identity resolution,
+guarded initial admission, and explicit reporting-link replacement address parts of that
+review. Actual handoff and client journeys still need their separate acceptance evidence.
+The mechanisms below describe implementation and compatibility limits, not passed live UAT.
 
 Ordinary conversation, short commands and status questions require no Linear issue. When
 work needs durability, use one native task and optionally link its human outcome with
@@ -32,8 +33,8 @@ surface without moving its executor or returning to an old chat.
 flowchart LR
   Chat[Authorized conversation] --> Native[Native task controls]
   Native --> Worker[Native dispatcher and worker]
-  Linear[Verified Linear request] --> Parked[Blocked native task]
-  Parked --> Native
+  Linear[Verified Linear request] --> Admission[Native guarded admission]
+  Admission --> Native
   Worker --> History[Persisted native events]
   History --> Outbox[Durable reporting outbox]
   Outbox --> Issue[Linear outcome]
@@ -46,11 +47,14 @@ The plugin targets the public API at official Hermes
 `5282b788113aef959925397d05252d883cd7c4be`; the plugin does not require the fork's
 invocation-context or profile-service APIs, approval helpers or lifecycle extensions.
 
-Validated Linear assignments create tasks **blocked**, with no automatic unblock. Native
-controls perform activation from an authorized surface. Native creation has no atomic
-create-and-cancel contract, and unblock has no expected-event guard. A state read followed
-by automatic activation could undo Stop. The parked request deliberately preserves that
-safeguard rather than introducing another control protocol.
+On a native host with task-event guards, validated Linear assignments create tasks blocked
+and activate only against their original creation token. A newer Stop invalidates activation;
+delivery retries retain the same token. A crash after linking can finish admission through
+the existing recovery path. No second execution controller or manual activation is required.
+
+Older hosts without native task-event guards retain parked assignment behavior and explain
+the missing capability. Existing parked or legacy records are not automatically adopted.
+Native creation retry lookup remains non-atomic; ambiguous creation is reconciled, not repeated.
 
 Running cancellation is relayed only with verified ordering and a concrete native run ID.
 Cancellation of a queued or otherwise unverified run remains a visible reconciliation request
@@ -58,9 +62,9 @@ for native controls; it is not an effective Stop. A blocked state or an acknowle
 does not prove external processes or effects ended. Native process observation and terminal
 reaping remain necessary. The plugin never kills a PID or clears revoked authority.
 
-These are explicit capability limits: automatic execution from a Linear assignment and
-complete queued cancellation are not implemented. Existing native task creation and active
-linked follow-ups retain their native behavior.
+Native guarded Stop also covers queued work when source ordering can be verified. Conflicting
+or unverifiable later native controls remain a scoped reconciliation case. Existing native
+task creation and active linked follow-ups retain their native behavior.
 
 ## Delivery and migration
 

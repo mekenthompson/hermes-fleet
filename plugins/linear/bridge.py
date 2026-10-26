@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import inspect
 import logging
 import math
 import re
@@ -276,6 +277,33 @@ class Kanban:
     def block(self, task_id: str, reason: str, *, run_id: int | None = None) -> bool:
         with self.conn() as conn:
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input", expected_run_id=run_id)
+
+    @property
+    def guarded_controls(self) -> bool:
+        """Older native hosts can still report; they must not activate unsafely."""
+        return all("expected_event_id" in inspect.signature(method).parameters
+                   for method in (self.kb.block_task, self.kb.unblock_task))
+
+    def initial_activation_event(self, task_id: str) -> int | None:
+        events = self.history(task_id, 0)
+        # A token read AFTER an operator Stop must never authorize activation.
+        # Only the pristine native create+initial-block pair identifies admission.
+        if (len(events) == 2 and events[0].kind == "created" and
+                (events[0].payload or {}).get("status") == "blocked" and
+                events[1].kind == "blocked" and
+                (events[1].payload or {}).get("reason") == "initial_status"):
+            return events[1].id
+        return None
+
+    def activate(self, task_id: str, expected_event_id: int) -> bool:
+        with self.conn() as conn:
+            return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id)
+
+    def stop(self, task_id: str, reason: str, *, expected_event_id: int,
+             run_id: int | None = None) -> bool:
+        with self.conn() as conn:
+            return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input",
+                                      expected_run_id=run_id, expected_event_id=expected_event_id)
 
     def comment(self, task_id: str, body: str, *, marker: str = "") -> int:
         # The integration author is provenance, never a human credential.
@@ -604,6 +632,8 @@ class Bridge:
 
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
         if row:
+            if self._assignment_activation(row):
+                return
             task = self.native_status(issue["id"])
             self._decline(issue["id"], session_id, f"Existing work: {task.get('status')}. Use native task controls to resume stopped work.")
             return
@@ -706,7 +736,8 @@ class Bridge:
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{fresh.get('identifier') or issue_id}: {fresh.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context),
-                   "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only", "initial_status": "blocked"}
+                   "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only", "initial_status": "blocked",
+                   "activation": "native-event-guard-v1", "source_ms": stamp}
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
@@ -748,19 +779,86 @@ class Bridge:
             return False
         self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
         self.kanban.subscribe(task.id, issue_id)
+        if self._assignment_activation(self.store.get(issue_id)):
+            return True
         unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
             self._decline(issue_id, session_id, "Stop arrived while task creation was in flight. The native task was created blocked and linked; inspect current native controls before any activation.")
         else:
             self.activity(issue_id, session_id, "thought", "Native task created and linked in blocked state. A current authorized native task control is required to activate it; Linear has not started a worker.")
         return True
+
+    def _assignment_activation(self, row: dict | None) -> bool:
+        """Finish only this version's authorized admission with a native event CAS.
+
+        The existing intent stores delivery progress, not another worker claim.
+        Legacy parked tasks and already settled admissions are never auto-resumed.
+        """
+        if not row or row.get("origin") != "native":
+            return False
+        issue_id = row["issue_id"]
+        created = self.store.native_intent(f"create:{issue_id}")
+        payload = (created or {}).get("payload", {})
+        if (not created or created.get("state") != "applied" or
+                created.get("task_id") != row["task_id"] or
+                payload.get("activation") != "native-event-guard-v1"):
+            return False
+        adapter = self._binding_adapter(issue_id)
+        if not getattr(adapter, "guarded_controls", False):
+            return False
+        key = f"activate:{issue_id}:{row['task_id']}"
+        prior = self.store.native_intent(key)
+        if prior and prior.get("state") in ("applied", "reconcile"):
+            return True
+        token = prior["payload"]["expected_event_id"] if prior else adapter.initial_activation_event(row["task_id"])
+        if token is None:
+            self._decline(issue_id, row["owner_ref"], "Native work changed after creation; current task controls take precedence. No automatic activation was attempted.")
+            return True
+        request = {"kind": "activate", "issue_id": issue_id, "task_id": row["task_id"],
+                   "profile": adapter.executor_profile, "board": adapter.board or "default",
+                   "expected_event_id": token, "source_ms": payload["source_ms"]}
+        self.store.native_intent_prepare(key, request)
+        stop = self.store.native_intent(f"unbound-stop:{issue_id}")
+        issue = self._effect_issue(issue_id)
+        if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
+                (issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                (issue.get("state") or {}).get("type") in CLOSED):
+            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
+            self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. The native task remains available for inspection; no worker was activated.")
+            return True
+        adapter.require_task(row["task_id"])
+        accepted = adapter.activate(row["task_id"], token)
+        owned_activation = accepted
+        if not accepted:
+            # A lost successful reply or another operator may have transitioned
+            # the task. Never refresh the token to revive a later stopped task.
+            events = adapter.history(row["task_id"], token)
+            accepted = bool(events and events[0].kind == "unblocked")
+        self.store.native_intent_settle(key, {"state": "applied" if accepted else "reconcile",
+                                             "accepted": accepted, "owned_activation": owned_activation})
+        task = adapter.require_task(row["task_id"])
+        self.activity(issue_id, row["owner_ref"], "thought",
+                      f"Native task linked; current state is {task.status}. Native scheduling and task controls own execution.")
+        return True
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
-              requester_session: str | None = None) -> dict:
-        if not self._require_effect(issue_id):
+              requester_session: str | None = None, replace: bool = False,
+              expected_revision: str | None = None, request_id: str | None = None) -> dict:
+        # A reporting link is not an execution grant or a conflicting remote
+        # mutation. Retained uncertain effects remain held independently.
+        if not (self.authorize_specialist_effect(issue_id) if replace else self._require_effect(issue_id)):
             raise LinearError("Issue authorization refused", retryable=False)
         issue = self._effect_issue(issue_id)
         adapter = self.kanban if board is None else self.kanban.for_board(board)
         task = adapter.require_task(task_id)
+        if replace:
+            binding = self.store.replace_native_binding(issue_id, task_id, adapter.executor_profile,
+                adapter.board or "default", expected_revision=expected_revision, request_id=request_id,
+                owner_ref=requester_session or "", project_id=(issue.get("project") or {}).get("id"),
+                at=self.clock() * 1000)
+            if not binding:
+                raise LinearError("Reporting link changed or its scope was refused; inspect current issue and native work before retrying", retryable=False)
+            return {"issue_id": issue_id, "task_id": task.id, "status": task.status,
+                    "reporting_only": True, "history_preserved": True}
         if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                 adapter.board or "default", owner_ref=requester_session or "",
                 project_id=(issue.get("project") or {}).get("id"), at=self.clock() * 1000):
@@ -777,16 +875,27 @@ class Bridge:
         adapter = self._binding_adapter(issue_id)
         return row, adapter.require_task(row["task_id"])
     def native_status(self, issue_id: str) -> dict:
+        # Observe the revision before subsequent state reads. A concurrent change
+        # can then cause only a safe stale-token refusal, never bless an unseen link.
+        revision = self.store.binding_revision(issue_id)
         row = self.store.get(issue_id)
+        local = {"profile": getattr(self.kanban, "executor_profile", None),
+                 "board": getattr(self.kanban, "board", None) or "default"}
         retained = {key: row.get(key) for key in ("origin", "task_id", "last_event_id", "stop_requested_at", "release_pending")} if row else {}
         try:
             row, task = self._native_task(issue_id)
         except LinearError as exc:
             return {"issue_id": issue_id, "linked": False, "status": "reconciliation" if row else "unlinked",
-                    "retained": retained, "message": str(exc)}
+                    "retained": retained, "local": local, "binding_revision": revision, "message": str(exc)}
+        binding = self.store.native_binding(issue_id)
+        if not binding or binding["task_id"] != task.id:
+            return {"issue_id": issue_id, "linked": False, "status": "changed",
+                    "local": local, "binding_revision": revision,
+                    "message": "Reporting link changed during inspection; read current state again."}
         return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status,
                 "run_id": task.current_run_id, "profile": task.assignee,
-                "board": self.store.native_binding(issue_id)["board"]}
+                "board": binding["board"], "local": local,
+                "binding_revision": revision}
     def followup(self, issue_id: str, body: str, request_id: str, *, requester_session: str | None = None, source_ms: float | None = None) -> dict:
         if not body.strip() or not request_id:
             raise LinearError("Follow-up body and stable request identity are required", retryable=False)
@@ -836,6 +945,8 @@ class Bridge:
             return
         if stamp < float(row["last_updated_at"]):
             return
+        if getattr(adapter, "guarded_controls", False):
+            return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
         key = f"stop:{row['issue_id']}:{activity_id}"
         prior = self.store.native_intent(key)
         payload = {"kind": "stop", "issue_id": row["issue_id"], "task_id": task.id,
@@ -865,6 +976,53 @@ class Bridge:
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
         self._decline(row["issue_id"], session_id, "Native Stop requested; inspect native worker/effect state." if stopped else "Stop was not verified. Use native task controls.")
+
+    def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> None:
+        issue_id = row["issue_id"]
+        key = f"stop:{issue_id}:{activity_id}"
+        prior = self.store.native_intent(key)
+        if prior and prior.get("state") == "applied":
+            return
+        payload = {"kind": "stop", "issue_id": issue_id, "task_id": task.id, "stamp": stamp,
+                   "control": "native-event-guard-v1"}
+        if prior and prior["payload"] != payload:
+            self._decline(issue_id, session_id, "The prior Stop has different native scope; inspect its recorded outcome.")
+            return
+        self.store.native_intent_prepare(key, payload)
+        stopped = False
+        for _ in range(2):
+            events = adapter.history(task.id, 0)
+            task = adapter.require_task(task.id)
+            if task.status in ("done", "archived", "triage"):
+                stopped = True
+                break
+            controls = [event for event in events if event.kind in (
+                "claimed", "spawned", "unblocked", "blocked", "completed", "archived",
+                "review_requested", "changes_requested")]
+            # For initial admission, the signed Stop is causally newer than its
+            # assignment even when native second-resolution timestamps coincide.
+            # A subsequent explicit native control removes that inference.
+            activation = self.store.native_intent(f"activate:{issue_id}:{task.id}")
+            creation = self.store.native_intent(f"create:{issue_id}")
+            initial = bool(activation and activation.get("owned_activation") is True and
+                           creation and stamp > float(creation["payload"].get("source_ms") or stamp))
+            if initial:
+                after = [event for event in controls if event.id > activation["payload"]["expected_event_id"]]
+                initial = bool(after and after[0].kind == "unblocked" and
+                               all(event.kind in ("claimed", "spawned") for event in after[1:]))
+            if not initial and any(stamp // 1000 <= event.created_at for event in controls):
+                self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable"})
+                self._decline(issue_id, session_id, "Stop ordering conflicts with a newer or unverifiable native control. Inspect current task history; no stale Stop was applied.")
+                return
+            if not events:
+                break
+            stopped = adapter.stop(task.id, f"{OWN} stopped by {who}", expected_event_id=events[-1].id,
+                                   run_id=task.current_run_id)
+            if stopped:
+                break
+        self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "stopped": stopped})
+        self._decline(issue_id, session_id, "Native Stop recorded; inspect worker termination and external effects."
+                      if stopped else "Native work changed during Stop; inspect current task controls and effects.")
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
@@ -1107,6 +1265,10 @@ class Bridge:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
             self.drain_ingress(ingress, retry_now=True)
+        for row in self.store.active("native"):
+            with self.lock(row["issue_id"]):
+                if self.authorize_specialist_effect(row["issue_id"]):
+                    self._assignment_activation(row)
         self.pump_kanban()
 
     def flush(self, *, only_id: str | None = None) -> int:
