@@ -453,6 +453,18 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-intent:{key}",)).fetchone()
         return json.loads(row[0]) if row else None
+    def record_unbound_stop(self, issue_id: str, source_ms: float, *, session_id: str,
+                            activity_id: str, actor: str) -> dict[str, Any]:
+        """Keep the newest authenticated Stop even across independent service instances."""
+        with self._tx():
+            key = f"unbound-stop:{issue_id}"
+            saved, _ = self.native_intent_prepare(key, {"kind": "stop", "issue_id": issue_id})
+            if source_ms >= float(saved.get("source_ms") or 0):
+                return self.native_intent_settle(key, {"state": "reconcile", "source_ms": source_ms,
+                    "session_id": session_id, "activity_id": activity_id, "actor": actor,
+                    "control_version": "native-event-guard-v1",
+                    "reason": "Stop arrived before a native binding; inspect any in-flight task creation"})
+            return saved
     def native_intent_prepare(self, key: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         """Commit a delivery attempt before the native call; only one caller may send.
 
