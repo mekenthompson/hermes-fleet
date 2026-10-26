@@ -47,7 +47,7 @@ The plugin targets the public API at official Hermes
 `5282b788113aef959925397d05252d883cd7c4be`; the plugin does not require the fork's
 invocation-context or profile-service APIs, approval helpers or lifecycle extensions.
 
-On a native host with task-event guards, validated Linear assignments create tasks blocked
+On a native host with task-event guards and resume receipts, validated Linear assignments create tasks blocked
 and activate only against their original creation token. A newer Stop invalidates activation;
 delivery retries retain the same token. A crash after linking can finish admission through
 the existing recovery path. No second execution controller or manual activation is required.

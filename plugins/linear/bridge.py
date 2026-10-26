@@ -281,8 +281,9 @@ class Kanban:
     @property
     def guarded_controls(self) -> bool:
         """Older native hosts can still report; they must not activate unsafely."""
-        return all("expected_event_id" in inspect.signature(method).parameters
-                   for method in (self.kb.block_task, self.kb.unblock_task))
+        return (all("expected_event_id" in inspect.signature(method).parameters
+                    for method in (self.kb.block_task, self.kb.unblock_task)) and
+                "request_id" in inspect.signature(self.kb.unblock_task).parameters)
 
     def initial_activation_event(self, task_id: str) -> int | None:
         events = self.history(task_id, 0)
@@ -297,7 +298,18 @@ class Kanban:
 
     def activate(self, task_id: str, expected_event_id: int) -> bool:
         with self.conn() as conn:
-            return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id)
+            return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id,
+                                       request_id=self.activation_request_id(task_id, expected_event_id))
+
+    def activation_request_id(self, task_id: str, expected_event_id: int) -> str:
+        value = f"activate:{self.executor_profile}:{self.board or 'default'}:{task_id}:{expected_event_id}"
+        return "linear:" + hashlib.sha256(value.encode()).hexdigest()
+
+    def activation_receipt(self, task_id: str, expected_event_id: int, events: list | None = None) -> bool:
+        after = self.history(task_id, expected_event_id) if events is None else events
+        return bool(after and after[0].kind == "unblocked" and
+                    (after[0].payload or {}).get("request_id") == self.activation_request_id(task_id, expected_event_id) and
+                    (after[0].payload or {}).get("expected_event_id") == expected_event_id)
 
     def stop(self, task_id: str, reason: str, *, expected_event_id: int,
              run_id: int | None = None) -> bool:
@@ -620,9 +632,18 @@ class Bridge:
                 if row is None:
                     key = f"unbound-stop:{issue_id}"
                     saved, _ = self.store.native_intent_prepare(key, {"kind": "stop", "issue_id": issue_id})
-                    self.store.native_intent_settle(key, {"state": "reconcile",
-                        "source_ms": max(stamp, float(saved.get("source_ms") or 0)),
-                        "reason": "Stop arrived before a native binding; inspect any in-flight task creation"})
+                    if stamp >= float(saved.get("source_ms") or 0):
+                        self.store.native_intent_settle(key, {"state": "reconcile", "source_ms": stamp,
+                            "session_id": session_id, "activity_id": str(activity.get("id") or ""),
+                            "actor": (activity.get("user") or {}).get("id") or "Linear user",
+                            "control_version": "native-event-guard-v1",
+                            "reason": "Stop arrived before a native binding; inspect any in-flight task creation"})
+                    # Creation may have committed after the initial snapshot.
+                    # Carry this durable Stop into the native controls too.
+                    current = self.store.get(issue_id)
+                    if current and current.get("origin") == "native":
+                        self._pending_assignment_stop(current)
+                        return
                     self._decline(issue_id, session_id, "Stop recorded before a native task binding. Inspect in-flight task creation; no stopped worker state is claimed.")
                     return
                 self._stop(row, session_id, (activity.get("user") or {}).get("id") or "Linear user", stamp,
@@ -799,24 +820,42 @@ class Bridge:
         issue_id = row["issue_id"]
         created = self.store.native_intent(f"create:{issue_id}")
         payload = (created or {}).get("payload", {})
-        if (not created or created.get("state") != "applied" or
-                created.get("task_id") != row["task_id"] or
-                payload.get("activation") != "native-event-guard-v1"):
+        if not created or payload.get("activation") != "native-event-guard-v1":
             return False
-        adapter = self._binding_adapter(issue_id)
-        if not getattr(adapter, "guarded_controls", False):
+        if created.get("state") == "attempting":
+            # A crash can occur after binding but before its creation receipt.
+            # Inspect the already committed native request; never call create again.
+            adapter = self._binding_adapter(issue_id)
+            candidates = adapter.find_created(payload["external_key"])
+            if (len(candidates) != 1 or candidates[0].id != row["task_id"] or
+                    any(getattr(candidates[0], field, None) != payload[field]
+                        for field in ("title", "body", "created_by", "completion_contract"))):
+                return False
+            created = self.store.native_intent_settle(f"create:{issue_id}",
+                                                      {"state": "applied", "task_id": row["task_id"]})
+        if created.get("state") != "applied" or created.get("task_id") != row["task_id"]:
             return False
         key = f"activate:{issue_id}:{row['task_id']}"
         prior = self.store.native_intent(key)
         if prior and prior.get("state") in ("applied", "reconcile"):
+            self._pending_assignment_stop(row)
             return True
+        adapter = self._binding_adapter(issue_id)
+        binding = self.store.native_binding(issue_id)
+        if (not binding or binding["task_id"] != row["task_id"] or
+                binding["profile"] != payload["profile"] or binding["board"] != payload["board"]):
+            return False
+        if not getattr(adapter, "guarded_controls", False):
+            return False
         token = prior["payload"]["expected_event_id"] if prior else adapter.initial_activation_event(row["task_id"])
-        if token is None:
-            self._decline(issue_id, row["owner_ref"], "Native work changed after creation; current task controls take precedence. No automatic activation was attempted.")
-            return True
         request = {"kind": "activate", "issue_id": issue_id, "task_id": row["task_id"],
                    "profile": adapter.executor_profile, "board": adapter.board or "default",
                    "expected_event_id": token, "source_ms": payload["source_ms"]}
+        if token is None:
+            self.store.native_intent_prepare(key, request)
+            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native work changed after creation"})
+            self._decline(issue_id, row["owner_ref"], "Native work changed after creation; current task controls take precedence. No automatic activation was attempted.")
+            return True
         self.store.native_intent_prepare(key, request)
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         issue = self._effect_issue(issue_id)
@@ -824,7 +863,9 @@ class Bridge:
                 (issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
                 (issue.get("state") or {}).get("type") in CLOSED):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
-            self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. The native task remains available for inspection; no worker was activated.")
+            if stop:
+                self._pending_assignment_stop(row)
+            self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. No new activation was attempted; inspect native worker and effect state.")
             return True
         adapter.require_task(row["task_id"])
         accepted = adapter.activate(row["task_id"], token)
@@ -833,16 +874,52 @@ class Bridge:
             # A lost successful reply or another operator may have transitioned
             # the task. Never refresh the token to revive a later stopped task.
             events = adapter.history(row["task_id"], token)
-            accepted = bool(events and events[0].kind == "unblocked")
+            accepted = adapter.activation_receipt(row["task_id"], token, events)
+            owned_activation = accepted
         self.store.native_intent_settle(key, {"state": "applied" if accepted else "reconcile",
                                              "accepted": accepted, "owned_activation": owned_activation})
+        self._pending_assignment_stop(row)
         task = adapter.require_task(row["task_id"])
         self.activity(issue_id, row["owner_ref"], "thought",
                       f"Native task linked; current state is {task.status}. Native scheduling and task controls own execution.")
         return True
+
+    def _pending_assignment_stop(self, row: dict) -> None:
+        stop = self.store.native_intent(f"unbound-stop:{row['issue_id']}")
+        if (stop and stop.get("control_version") == "native-event-guard-v1" and stop.get("activity_id")):
+            receipt = self.store.native_intent(f"stop:{row['issue_id']}:{stop['activity_id']}")
+            if receipt and receipt.get("state") in ("applied", "reconcile"):
+                return
+            self._stop(row, stop.get("session_id") or row["owner_ref"], stop.get("actor") or "Linear user",
+                       float(stop["source_ms"]), stop["activity_id"])
+
+    def _instruction_follows_initial_admission(self, issue_id, task_id, adapter, stamp, events) -> bool:
+        created = self.store.native_intent(f"create:{issue_id}")
+        if (not created or created.get("state") != "applied" or created.get("task_id") != task_id or
+                created["payload"].get("activation") != "native-event-guard-v1" or
+                stamp < float(created["payload"].get("source_ms") or stamp)):
+            return False
+        # Initial create and initial block are native atomic history. An event
+        # receipt labels our guarded unblock even when its response was lost.
+        if (len(events) >= 2 and events[0].kind == "created" and events[1].kind == "blocked" and
+                (events[1].payload or {}).get("reason") == "initial_status"):
+            if len(events) == 2:
+                return True
+            after = events[2:]
+            return (adapter.activation_receipt(task_id, events[1].id, after) and
+                    all(event.kind not in ("unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")
+                        for event in after[1:]))
+        return False
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
               requester_session: str | None = None, replace: bool = False,
               expected_revision: str | None = None, request_id: str | None = None) -> dict:
+        with self.lock(issue_id):
+            return self._track(issue_id, task_id, board=board, requester_session=requester_session,
+                               replace=replace, expected_revision=expected_revision, request_id=request_id)
+
+    def _track(self, issue_id: str, task_id: str, *, board: str | None,
+               requester_session: str | None, replace: bool,
+               expected_revision: str | None, request_id: str | None) -> dict:
         # A reporting link is not an execution grant or a conflicting remote
         # mutation. Retained uncertain effects remain held independently.
         if not (self.authorize_specialist_effect(issue_id) if replace else self._require_effect(issue_id)):
@@ -914,9 +991,12 @@ class Bridge:
             marker = f"{issue_id}:{request_id}"
             intent_key = f"comment:{marker}"
             if source_ms is not None and self.store.native_intent(intent_key) is None:
-                controls = [event for event in adapter.history(task.id, 0)
+                events = adapter.history(task.id, 0)
+                controls = [event for event in events
                             if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived")]
-                if any(source_ms // 1000 <= event.created_at for event in controls):
+                initial = (getattr(adapter, "guarded_controls", False) and
+                           self._instruction_follows_initial_admission(issue_id, task.id, adapter, source_ms, events))
+                if not initial and any(source_ms // 1000 <= event.created_at for event in controls):
                     return {"task_id": task.id, "status": task.status,
                             "message": "Follow-up ordering is stale or unverifiable. Inspect native task history and send a current native instruction."}
             payload = {"kind": "comment", "issue_id": issue_id, "task_id": task.id, "body": body.strip(),
@@ -981,7 +1061,7 @@ class Bridge:
         issue_id = row["issue_id"]
         key = f"stop:{issue_id}:{activity_id}"
         prior = self.store.native_intent(key)
-        if prior and prior.get("state") == "applied":
+        if prior and prior.get("state") in ("applied", "reconcile"):
             return
         payload = {"kind": "stop", "issue_id": issue_id, "task_id": task.id, "stamp": stamp,
                    "control": "native-event-guard-v1"}
@@ -989,10 +1069,17 @@ class Bridge:
             self._decline(issue_id, session_id, "The prior Stop has different native scope; inspect its recorded outcome.")
             return
         self.store.native_intent_prepare(key, payload)
+        reason = f"{OWN} stopped by {who} [{activity_id}]"
         stopped = False
-        for _ in range(2):
+        for _ in range(4):
             events = adapter.history(task.id, 0)
             task = adapter.require_task(task.id)
+            if any(event.kind in ("blocked", "block_loop_detected") and
+                   (event.payload or {}).get("reason") == reason for event in events):
+                # This request's native record is also its response-loss receipt.
+                # A later explicit resume stays authoritative; do not repeat Stop.
+                self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
+                return
             if task.status in ("done", "archived", "triage"):
                 stopped = True
                 break
@@ -1002,21 +1089,14 @@ class Bridge:
             # For initial admission, the signed Stop is causally newer than its
             # assignment even when native second-resolution timestamps coincide.
             # A subsequent explicit native control removes that inference.
-            activation = self.store.native_intent(f"activate:{issue_id}:{task.id}")
-            creation = self.store.native_intent(f"create:{issue_id}")
-            initial = bool(activation and activation.get("owned_activation") is True and
-                           creation and stamp > float(creation["payload"].get("source_ms") or stamp))
-            if initial:
-                after = [event for event in controls if event.id > activation["payload"]["expected_event_id"]]
-                initial = bool(after and after[0].kind == "unblocked" and
-                               all(event.kind in ("claimed", "spawned") for event in after[1:]))
+            initial = self._instruction_follows_initial_admission(issue_id, task.id, adapter, stamp, events)
             if not initial and any(stamp // 1000 <= event.created_at for event in controls):
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable"})
                 self._decline(issue_id, session_id, "Stop ordering conflicts with a newer or unverifiable native control. Inspect current task history; no stale Stop was applied.")
                 return
             if not events:
                 break
-            stopped = adapter.stop(task.id, f"{OWN} stopped by {who}", expected_event_id=events[-1].id,
+            stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
                                    run_id=task.current_run_id)
             if stopped:
                 break
@@ -1265,11 +1345,18 @@ class Bridge:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
             self.drain_ingress(ingress, retry_now=True)
+        self._recover_admissions()
+        self.pump_kanban()
+
+    def _recover_admissions(self) -> None:
+        """Use the existing service loop; one unavailable binding holds only itself."""
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
-                if self.authorize_specialist_effect(row["issue_id"]):
-                    self._assignment_activation(row)
-        self.pump_kanban()
+                try:
+                    if self.authorize_specialist_effect(row["issue_id"]):
+                        self._assignment_activation(row)
+                except (LinearError, ValueError, OSError, KeyError, TypeError) as exc:
+                    log.warning("linear: admission recovery held for %s: %s", row["issue_id"], exc)
 
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
@@ -1693,6 +1780,7 @@ class Bridge:
     def tick(self, ingress: Path | None = None) -> None:
         if ingress is not None:
             self.drain_ingress(ingress)
+        self._recover_admissions()
         self.pump_kanban()
         self.recheck()
         self.flush()

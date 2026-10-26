@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import test_linear_native_bridge_scenarios as scenarios
@@ -124,6 +126,155 @@ class GuardedAdmissionScenarios(unittest.TestCase):
             self.assertTrue(scenarios.kb.unblock_task(conn, task_id))
         self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.001))
         self.assertEqual(self.board.get(task_id).status, "ready")
+
+    def test_no_row_stop_is_carried_into_a_concurrently_committed_native_binding(self):
+        stopper = self.fixture.make_bridge()
+        saw_none, continue_stop, stop_done = threading.Event(), threading.Event(), threading.Event()
+        get, activate = stopper.store.get, self.board.activate
+        def snapshot(issue_id):
+            row = get(issue_id)
+            if threading.current_thread().name.startswith("stop") and not saw_none.is_set():
+                self.assertIsNone(row)
+                saw_none.set()
+                self.assertTrue(continue_stop.wait(5))
+            return row
+        def after_stop(task_id, token):
+            continue_stop.set()
+            self.assertTrue(stop_done.wait(5))
+            return activate(task_id, token)
+        stamp = time.time()
+        def stop():
+            try:
+                stopper.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01))
+            finally:
+                stop_done.set()
+        with patch.object(stopper.store, "get", side_effect=snapshot), patch.object(self.board, "activate", side_effect=after_stop):
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stop") as pool:
+                request = pool.submit(stop)
+                self.assertTrue(saw_none.wait(5))
+                self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+                request.result(5)
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        self.fixture.make_bridge().recover()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        with self.board.conn() as conn:
+            self.assertIsNone(scenarios.kb.claim_task(conn, task_id, claimer="must-not-start"))
+
+    def test_unavailable_binding_does_not_abort_other_recovery_or_reporting(self):
+        from hermes_cli.kanban_db_boards import create_board, remove_board
+        create_board("project")
+        board = self.board.for_board("project")
+        bridge = scenarios.Bridge(self.store, self.fixture.authority.api(scope=None), board, profile="default")
+        bridge.handle_webhook(self.fixture.event())
+        remove_board("project")
+        restarted = self.fixture.make_bridge()
+        with patch.object(restarted, "pump_kanban", wraps=restarted.pump_kanban) as pump:
+            restarted.recover()
+            self.assertEqual(pump.call_count, 1)
+
+    def test_lost_activation_receipt_still_accepts_current_same_second_stop(self):
+        now = int(time.time()) + 0.1
+        activate = self.board.activate
+        def lost(task_id, token):
+            self.assertTrue(activate(task_id, token))
+            raise ConnectionError("lost successful native response")
+        with patch("time.time", return_value=now), patch.object(self.board, "activate", side_effect=lost):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(self.fixture.event(stamp=now))
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        with patch("time.time", return_value=now):
+            self.fixture.make_bridge().recover()
+            self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=now + 0.1))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_same_second_linear_followup_reaches_existing_native_run(self):
+        now = int(time.time()) + 0.1
+        with patch("time.time", return_value=now):
+            self.bridge.handle_webhook(self.fixture.event(stamp=now))
+            task_id = self.store.get(scenarios.ISSUE)["task_id"]
+            with self.board.conn() as conn:
+                native = scenarios.kb.claim_task(conn, task_id, claimer="native-test-worker")
+            self.bridge.handle_webhook(self.fixture.event("prompted", body="use the v2 endpoint", stamp=now + 0.1))
+        self.assertEqual([comment.body for comment in self.fixture.comments(task_id)], ["use the v2 endpoint"])
+        self.assertEqual(self.board.get(task_id).current_run_id, native.current_run_id)
+
+    def test_restart_recovers_creation_receipt_lost_after_binding(self):
+        settle = self.store.native_intent_settle
+        def lost(key, updates):
+            if key == f"create:{scenarios.ISSUE}" and updates.get("state") == "applied":
+                raise ConnectionError("crash after binding before creation receipt")
+            return settle(key, updates)
+        with patch.object(self.bridge.store, "native_intent_settle", side_effect=lost):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(self.fixture.event())
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        self.fixture.make_bridge().recover()
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        self.assertEqual(len(self.fixture.tasks()), 1)
+
+    def test_transient_binding_failure_retries_in_existing_service_loop(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=ConnectionError("crash after binding")):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(self.fixture.event())
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        restarted = self.fixture.make_bridge()
+        with patch.object(restarted, "_assignment_activation", side_effect=scenarios.LinearError("temporary read outage")):
+            restarted.recover()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        restarted.tick()
+        self.assertEqual(self.board.get(task_id).status, "ready")
+
+    def test_lost_stop_response_cannot_cancel_a_later_native_resume_on_retry(self):
+        stamp = time.time()
+        self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        event = self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01)
+        stop = self.board.stop
+        def lost(*args, **kwargs):
+            self.assertTrue(stop(*args, **kwargs))
+            raise ConnectionError("lost Stop response")
+        with patch.object(self.board, "stop", side_effect=lost):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(event)
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.unblock_task(conn, task_id))
+        self.fixture.make_bridge().handle_webhook(event)
+        self.assertEqual(self.board.get(task_id).status, "ready")
+
+    def test_recorded_no_row_stop_survives_handler_crash_before_native_control(self):
+        stamp = time.time()
+        self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        stopper = self.fixture.make_bridge()
+        get = stopper.store.get
+        reads = []
+        def stale(issue_id):
+            reads.append(issue_id)
+            return None if len(reads) == 1 else get(issue_id)
+        with patch.object(stopper.store, "get", side_effect=stale):
+            with patch.object(stopper, "_pending_assignment_stop", side_effect=ConnectionError("handler crash")):
+                with self.assertRaises(ConnectionError):
+                    stopper.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01))
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        self.fixture.make_bridge().recover()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_changed_creation_is_reported_once_without_restart_notice_spam(self):
+        create = self.board.create
+        def stopped(**fields):
+            task = create(**fields)
+            with self.board.conn() as conn:
+                self.assertTrue(scenarios.kb.block_task(conn, task.id, reason="operator Stop", kind="needs_input"))
+            return task
+        with patch.object(self.board, "create", side_effect=stopped):
+            self.assign()
+        def notices():
+            return [row for row in self.store.pending() if
+                    (row["payload"].get("content") or {}).get("body", "").startswith("Native work changed after creation;")]
+        before = len(notices())
+        self.fixture.make_bridge().recover()
+        self.fixture.make_bridge().recover()
+        self.assertEqual(len(notices()), before)
 
 
 if __name__ == "__main__":
