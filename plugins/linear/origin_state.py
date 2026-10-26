@@ -25,6 +25,22 @@ def _refuse(message="The originating native request is not current and independe
     raise Unavailable(message)
 
 
+def resolve_reference(home: Path, ref: dict) -> str:
+    """Resolve private logical coordinates only from this owner's exact native admission."""
+    from hermes_state import SessionDB
+    from hermes_state_runtime import get_session_admission
+    with SessionDB(home / "state.db", read_only=True) as db:
+        row = get_session_admission(db, admission_id=ref["admission_id"])
+        if (row is None or row["status"] != "started" or row["outcome"] is not None
+                or row["owner_epoch"] != ref["authority_epoch"]
+                or row["generation"] != ref["execution_generation"]):
+            _refuse()
+        sid = row["target_session_id"]
+        if not isinstance(sid, str) or not sid or len(sid) > 4096:
+            _refuse()
+        return sid
+
+
 def _policy(db, session_id: str, platform: str) -> dict:
     if platform != "local":
         return {"source": platform}
@@ -45,9 +61,10 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
     from gateway.session_operator import is_viewer_input
     from agent.turn_author import parse_turn_author
     with SessionDB(home / "state.db", read_only=True) as db:
+        sid = current["session_id"]
         row = get_session_admission(db, admission_id=ref["admission_id"])
-        if (row is None or row["target_session_id"] != ref["session_id"]
-                or row["request_id"] != ref["input_id"] or row["status"] != "started"
+        if (row is None or row["target_session_id"] != sid
+                or row["request_id"] != current["input_id"] or row["status"] != "started"
                 or row["outcome"] is not None or row["owner_epoch"] != ref["authority_epoch"]
                 or row["generation"] != ref["execution_generation"]):
             _refuse()
@@ -96,9 +113,9 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
             from hermes_state_local import local_receipt
             platform = "local"
             stamp = payload.get("local_operator_v1")
-            owner = local_receipt(db, ref["session_id"])
+            owner = local_receipt(db, sid)
             if (stamp is None and row["principal_id"] != owner.get("principal_id")
-                    or stamp is not None and stamp != {"profile_id": str(home), "session_id": ref["session_id"],
+                    or stamp is not None and stamp != {"profile_id": str(home), "session_id": sid,
                                                        "principal_id": row["principal_id"]}):
                 _refuse()
             requester.update(kind="local_principal", platform=platform)
@@ -106,10 +123,10 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
                 _refuse()
         else:
             _refuse("The admission is not ordinary native requester input.")
-        stored = db.get_session(ref["session_id"])
+        stored = db.get_session(sid)
         if not stored or stored.get("source") not in ({platform} if platform != "local" else INTERACTIVE_SOURCES | {"local"}):
             _refuse("The stored session is not an eligible requester surface.")
-        policy = _policy(db, ref["session_id"], platform)
+        policy = _policy(db, sid, platform)
         policy["profile"] = ref["profile"]
         if platform != "local" and stored.get("cwd"):
             policy["cwd"] = stored["cwd"]

@@ -13,11 +13,12 @@ from hermes_fleet_linear_plugin import origin, ops, transport
 
 class OriginEdgeTests(unittest.TestCase):
     def test_reference_shape_cannot_select_a_home_database_or_identity(self):
-        ref = dict(version=1, profile="default", session_id="session", admission_id="admission", input_id="input",
+        ref = dict(version=1, profile="default", admission_id="admission",
                    instance_id="owner", authority_epoch=1, execution_generation=1, scope_digest="digest")
         self.assertEqual(origin.reference(ref), ref)
         for changed in ({**ref, "home": "/foreign"}, {**ref, "principal": "human"},
-                        {**ref, "authority_epoch": True}, {**ref, "session_id": ""}, {}):
+                        {**ref, "authority_epoch": True}, {**ref, "session_id": ""},
+                        {**ref, "input_id": "private"}, {}):
             with self.subTest(changed=changed), self.assertRaises(transport.Unavailable):
                 origin.reference(changed)
 

@@ -285,6 +285,12 @@ The registered `linear` tool accepts `{"action":"origin_reference"}` with no oth
 It captures the current host-bound caller, resolves its native compression lineage, and
 checks its ordinary active admission with the existing gateway owner. It returns a reference
 and `permission_granted: false`; it does not contact another agent or transfer execution.
+The reference contains the native-generated admission ID and profile/owner/epoch/generation/
+scope binding only. Arbitrary session and request IDs stay inside the owner, where the
+read-only admission getter resolves them. Work references use the same minimal coordinates.
+This lets native A2A privacy redaction remain enabled even for explicit API IDs containing
+addresses or credential-shaped text; neither requester principals nor original input leave
+the owner in a cross-agent reference.
 Delegated children, bots, automation, ambiguous steering, unknown execution and stale owners
 cannot supply this reference. Unsupported native hosts fail closed.
 

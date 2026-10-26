@@ -12,7 +12,7 @@ from typing import Any
 from .transport import NativeContext, Unavailable
 
 VERSION = 1
-REFERENCE_FIELDS = frozenset({"version", "profile", "session_id", "admission_id", "input_id",
+REFERENCE_FIELDS = frozenset({"version", "profile", "admission_id",
                               "instance_id", "authority_epoch", "execution_generation", "scope_digest"})
 
 
@@ -81,9 +81,10 @@ async def _snapshot(client, home: Path, session_id: str) -> tuple[dict, dict]:
 async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | None,
                    context: NativeContext | None = None) -> dict:
     async with _client(home) as (client, endpoint):
-        snapshot, current = await _snapshot(client, home, context.session_id if context else ref["session_id"])
-        observed = {"version": VERSION, "profile": profile, "session_id": snapshot["session_id"],
-                    "admission_id": current["admission_id"], "input_id": current["input_id"],
+        from .origin_state import resolve_reference
+        sid = context.session_id if context else await asyncio.to_thread(resolve_reference, home, ref)
+        snapshot, current = await _snapshot(client, home, sid)
+        observed = {"version": VERSION, "profile": profile, "admission_id": current["admission_id"],
                     "instance_id": endpoint.instance_id, "authority_epoch": endpoint.authority_epoch,
                     "execution_generation": snapshot["execution_generation"], "scope_digest": _digest(declared_scope)}
         if (observed["authority_epoch"] != snapshot.get("authority_epoch")
@@ -92,15 +93,16 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
             _refuse()
         ref = reference(observed)
         from .origin_state import _evidence, stop_evidence
-        evidence = await asyncio.to_thread(_evidence, home, ref, current, declared_scope, context)
-        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, ref["session_id"])
+        evidence = await asyncio.to_thread(_evidence, home, ref,
+            {**current, "session_id": snapshot["session_id"]}, declared_scope, context)
+        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
         # Recheck after the state read: Stop, settlement, restart or a new turn invalidates the result.
-        after, active = await _snapshot(client, home, ref["session_id"])
+        after, active = await _snapshot(client, home, snapshot["session_id"])
         if (after.get("authority_epoch") != ref["authority_epoch"]
                 or after.get("execution_generation") != ref["execution_generation"]
                 or active.get("admission_id") != ref["admission_id"]):
             _refuse()
-        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, ref["session_id"])
+        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
         return evidence
 
 
