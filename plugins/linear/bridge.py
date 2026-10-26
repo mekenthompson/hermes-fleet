@@ -218,9 +218,10 @@ class Kanban:
         if metadata.get("archived"):
             return  # Reporting/content stays available; native connections refuse this archived target.
         path = Path(kanban_db.kanban_db_path(board=self.board))
-        if not path.is_file() and self.board_has_history(self.board, path):
-            # Keep the reporting service usable, but never replace missing
-            # native data during plugin startup. Restoration needs no new flag.
+        if self.board_has_history(self.board, path):
+            # Existing files are not initialization authority: an empty or
+            # damaged file may stand in for unavailable native history. Defer
+            # read-only validation to native operations and keep content usable.
             return
         if self.board != "default":
             from hermes_cli.kanban_db_boards import create_board
@@ -264,8 +265,16 @@ class Kanban:
             transport.native_board_target(self.board or "default")
         except transport.Unavailable as exc:
             raise LinearError(str(exc), retryable=False) from exc
-        with closing(self.kc.connect(board=self.board)) as conn:
-            yield conn
+        path = Path(self.kb.kanban_db_path(board=self.board))
+        # Native connect may initialize, migrate or repair. Never give it an
+        # existing file that has not first passed non-mutating inspection.
+        with self.history_conn(path, snapshot=True):
+            pass
+        try:
+            with closing(self.kc.connect(board=self.board)) as conn:
+                yield conn
+        except (OSError, sqlite3.Error) as exc:
+            raise LinearError("Existing native storage is unavailable; inspect it before native operations", retryable=False) from exc
     @contextmanager
     def history_conn(self, path: Path, *, snapshot: bool = False):
         """Read native rows without creating, migrating or reopening a board."""
@@ -285,18 +294,35 @@ class Kanban:
                                 stat = source.stat()
                                 result.append((source.name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
                         return result
-                    before = versions()
                     temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="linear-native-history-")))
-                    for source in files:
-                        if source.exists():
-                            shutil.copyfile(source, temporary / source.name)
-                    if versions() != before:
-                        raise ValueError("archive changed during inspection")
-                    path = temporary / path.name
+                    for attempt in range(5):
+                        destination = temporary / str(attempt)
+                        destination.mkdir()
+                        try:
+                            before = versions()
+                            for source in files:
+                                if source.exists():
+                                    shutil.copyfile(source, destination / source.name)
+                            if versions() != before:
+                                raise ValueError("native history changed during inspection")
+                            break
+                        except (OSError, ValueError):
+                            if attempt == 4:
+                                raise
+                            # An active native connection may checkpoint away
+                            # WAL between enumeration and copy. Retry from new
+                            # files; never inspect a mixed or stale snapshot.
+                            time.sleep(0.01)
+                    path = destination / path.name
                 conn = stack.enter_context(closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)))
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("BEGIN")
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"tasks", "task_events", "task_runs", "task_comments"} <= tables:
+                    raise ValueError("existing database has no native task schema")
+                if [row[0] for row in conn.execute("PRAGMA quick_check")] != ["ok"]:
+                    raise ValueError("existing native database failed integrity inspection")
                 yield conn
         except (OSError, ValueError, sqlite3.Error) as exc:
             raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
@@ -429,7 +455,7 @@ class Kanban:
                     continue
                 raise LinearError(f"Existing native board {slug!r} has no readable database; inspect it before replacement work", retryable=False)
             adapter = self.for_board(slug)
-            with adapter.history_conn(path) as conn:
+            with adapter.history_conn(path, snapshot=True) as conn:
                 for task in self.kb.list_tasks(conn, include_archived=True):
                     if task_issue_match(task, issue):
                         found.append((adapter, task))

@@ -351,6 +351,57 @@ class ExistingWorkScenarios(unittest.TestCase):
             self.assertIsNotNone(store.get(native.ISSUE))
             self.assertFalse(default.exists())
 
+    def test_genuinely_fresh_default_initializes_and_allows_assignment(self):
+        home = self.fixture.home / "fresh-home"
+        home.mkdir()
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "HERMES_KANBAN_HOME": str(home), "HERMES_PROFILE": "default"}):
+            database = Path(native.kb.kanban_db_path(board="default"))
+            self.assertFalse(database.exists())
+            board = native.Kanban(profile="default", profile_home=home)
+            self.assertTrue(database.is_file())
+            store = native.Store(home / "linear.db")
+            bridge = native.Bridge(store, self.fixture.authority.api(scope=None), board, profile="default")
+            bridge.handle_webhook(self.fixture.event())
+            self.assertIsNotNone(store.get(native.ISSUE))
+
+    def test_existing_wal_database_startup_and_validation_do_not_create_source_sidecars(self):
+        self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        # Persist WAL mode without live connections/sidecars. Validation must
+        # create any SQLite WAL/SHM artifacts only in its disposable snapshot.
+        with closing(sqlite3.connect(database)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        before = self.archive_bytes(database.parent)
+        restarted = native.Kanban(profile="default", profile_home=self.fixture.home)
+        with restarted.history_conn(database, snapshot=True) as conn:
+            self.assertEqual(len(native.kb.list_tasks(conn)), 1)
+        restarted.discover(self.issue)
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def test_transient_wal_copy_race_retries_a_fresh_snapshot_without_source_mutation(self):
+        _, task_id = self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_fleet_linear_plugin import bridge as module
+        copyfile, attempted = module.shutil.copyfile, []
+        def transient(source, destination):
+            if str(source).endswith("-wal") and not attempted:
+                attempted.append(source)
+                raise FileNotFoundError("native checkpoint raced the snapshot copy")
+            return copyfile(source, destination)
+        with closing(sqlite3.connect(database, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            native.kb.complete_task(conn, task_id, result="Committed native outcome")
+            before = self.archive_bytes(database.parent)
+            with patch.object(module.shutil, "copyfile", side_effect=transient):
+                [(_, task)] = self.board.discover(self.issue)
+            self.assertEqual(task.id, task_id)
+            self.assertEqual(task.status, "done")
+            self.assertEqual(len(attempted), 1)
+            self.assertEqual(self.archive_bytes(database.parent), before)
+
     def test_missing_previously_configured_default_is_not_fresh_setup(self):
         database = Path(native.kb.kanban_db_path(board="default"))
         saved = database.with_name("temporarily-unavailable.db")
@@ -360,6 +411,97 @@ class ExistingWorkScenarios(unittest.TestCase):
             self.assertFalse(database.exists())
             self.assertIsNone(self.store.get(native.ISSUE))
         finally:
+            saved.rename(database)
+
+    def invalid_startup(self, kind, *, board="default"):
+        adapter, task_id = self.existing(board=None if board == "default" else board)
+        with adapter.conn() as conn:
+            original = native.kb.claim_task(conn, task_id)
+        database = Path(native.kb.kanban_db_path(board=board))
+        saved = database.with_name("prior-unavailable.db")
+        database.rename(saved)
+        if kind == "schema-less":
+            with closing(sqlite3.connect(database)) as conn:
+                conn.execute("CREATE TABLE unrelated (value TEXT)")
+                conn.commit()
+        else:
+            content = {"empty": b"", "truncated": saved.read_bytes()[:100],
+                       "corrupt": b"not a SQLite database", "read-refused": saved.read_bytes()}[kind]
+            database.write_bytes(content)
+        before = database.read_bytes()
+        names = set(database.parent.iterdir())
+        if kind == "read-refused":
+            database.chmod(0)
+        adapter.kc._INITIALIZED_PATHS.discard(str(database.resolve()))
+        try:
+            restarted = native.Kanban(board, profile="default", profile_home=self.fixture.home)
+            bridge = native.Bridge(self.store, self.fixture.authority.api(scope=None), restarted, profile="default")
+            bridge.profile_home = self.fixture.home
+            from hermes_fleet_linear_plugin import chat
+            context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+            result = json.loads(chat.handle(bridge, {"action": "status", "issue": native.ISSUE}, context))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["issue"]["id"], native.ISSUE)
+            bridge.handle_webhook(self.fixture.event())
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+            with self.assertRaises(native.LinearError):
+                restarted.get(task_id)
+            self.assertEqual(set(database.parent.iterdir()), names)
+        finally:
+            database.chmod(0o600)
+            after = database.read_bytes()
+            database.unlink()
+            saved.rename(database)
+        self.assertEqual(after, before)
+        bridge.handle_webhook(self.fixture.event())
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        current = restarted.get(task_id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (original.current_run_id, original.claim_lock))
+
+    def test_restart_preserves_empty_existing_database_without_reinitializing(self):
+        self.invalid_startup("empty")
+
+    def test_restart_preserves_truncated_existing_database_without_repair(self):
+        self.invalid_startup("truncated")
+
+    def test_restart_preserves_schema_less_existing_database_without_adoption(self):
+        self.invalid_startup("schema-less")
+
+    def test_restart_preserves_corrupt_existing_database_without_crashing_reporting(self):
+        self.invalid_startup("corrupt")
+
+    def test_restart_preserves_read_refused_existing_database_without_crashing_reporting(self):
+        self.invalid_startup("read-refused")
+
+    def test_restart_preserves_empty_named_database_without_reinitializing(self):
+        self.invalid_startup("empty", board="project-work")
+
+    def test_restart_preserves_corrupt_named_database_without_crashing_reporting(self):
+        self.invalid_startup("corrupt", board="project-work")
+
+    def test_linked_issue_read_survives_corrupt_native_storage(self):
+        self.existing()
+        self.assign()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        saved = database.with_name("prior-unavailable.db")
+        database.rename(saved)
+        database.write_bytes(b"corrupt native storage")
+        try:
+            from hermes_fleet_linear_plugin import chat
+            self.bridge.profile_home = self.fixture.home
+            context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+            result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["issue"]["id"], native.ISSUE)
+            self.assertFalse(result["native"]["linked"])
+            self.assertEqual(result["native"]["status"], "reconciliation")
+            with patch.object(self.bridge, "authorize_specialist_effect", return_value=False):
+                refused = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
+            self.assertFalse(refused["ok"])
+            self.assertNotIn("issue", refused)
+        finally:
+            database.unlink()
             saved.rename(database)
 
     def test_plugin_restart_does_not_recreate_missing_default_and_issue_reads_still_work(self):
