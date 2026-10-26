@@ -169,11 +169,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.claim()
         self.bind(platform, self.sid, user="human", chat="chat", thread="thread", scope="scope")
 
-    async def api(self):
+    async def api(self, *, session_id="api-session"):
         from gateway.session_api import bind_api_session
         from gateway.session_contract import SessionRef
         from hermes_state_runtime import admit_session_input
-        self.sid = "api-session"
+        self.sid = session_id
         self.ref = bind_api_session(self.authority, self.sid)
         payload = {"text": "Take over ABC-1", "api_turn_v1": {"history": None, "settings": {},
             "transfer_auth": {"principal": "principal:fixture:" + "a" * 32, "transport_family": "local-api"}}}
@@ -275,6 +275,116 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         with patch.object(runtime_session_store, "_worker_process", False):
             return await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default",
                                            self.stop_id if stop_id is None else stop_id, self.settings)
+
+    def cancelled_control(self):
+        """Pinned-fae final-row adapter for candidate c9b8ad4's atomic Stop writer.
+
+        This does not execute the unaccepted writer. Its final native row has the same
+        principal/request/payload/status and NULL generation; no prompt or worker exists.
+        The target is the logical owner_admitted session, never a physical worker SID.
+        """
+        from hermes_state_runtime import admit_session_input, cancel_session_input
+        identity = json.dumps(["completion", "fixture-process", 123.0], separators=(",", ":"))
+        row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            principal_id="native-process-stop", session_id=self.sid, request_id=identity,
+            payload={"process_completion": identity, "route": "fixture-process-route"})
+        row = cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+                                   admission_id=row["admission_id"])
+        self.assertEqual((row["status"], row["outcome"], row["generation"]),
+                         ("terminal", "cancelled", None))
+        self.assertEqual(set(row["payload"]), {"process_completion", "route"})
+        self.assertEqual(row["target_session_id"], self.sid)
+        return row
+
+    def reference_through_a2a(self, captured):
+        # These are the actual primitives used by tools._send_task and adapter._prepare_task.
+        # No SendMessage handler, task store, audit, network or dispatch is invoked.
+        from plugins.platforms.a2a import protocol, security
+        wire = json.dumps(captured, sort_keys=True, separators=(",", ":"))
+        safe = security.redact_outbound(wire)
+        self.assertEqual(safe, wire)
+        message = protocol.text_message(protocol.ROLE_USER, safe, context_id="fixture-context")
+        extracted = protocol.extract_text(json.loads(json.dumps({"message": message})))
+        self.assertEqual(extracted, wire)
+        framed = security.wrap_inbound("configured-peer", extracted)
+        prefix = security.PRIVACY_PREFIX.format(peer="configured-peer")
+        self.assertTrue(framed.startswith(prefix))
+        decoded = json.loads(framed[len(prefix):])
+        self.assertEqual(decoded, captured)
+        self.assertFalse(decoded["permission_granted"])
+        # Keep the real scrub/framer enabled: preservation must not depend on bypassing them.
+        self.assertNotIn("sk-" + "a" * 40, security.redact_outbound("sk-" + "a" * 40))
+        self.assertIn("[filtered]", security.wrap_inbound("configured-peer", "<|system|>"))
+        return decoded["reference"]
+
+    async def test_a2a_reference_framing_preserves_each_interactive_surface(self):
+        for surface in ("local", "api", "telegram", "slack"):
+            with self.subTest(surface=surface):
+                if surface == "local":
+                    await self.local()
+                elif surface == "api":
+                    await self.api()
+                else:
+                    await self.messaging(surface)
+                captured = await self.current()
+                ref = self.reference_through_a2a(captured)
+                evidence = await self.inspected(ref)
+                self.assertEqual(evidence["reference"], ref)
+                self.assertFalse(evidence["permission_granted"])
+
+    async def test_a2a_work_reference_framing_preserves_unknown_requester(self):
+        await self.kanban()
+        ref = self.reference_through_a2a(await self.work_current())
+        evidence = await self.work_inspected(ref)
+        self.assertEqual(evidence["requester"], {"kind": "native_dispatcher", "original_requester": "unknown"})
+        self.assertFalse(evidence["permission_granted"])
+
+    async def test_a2a_privacy_scrub_of_explicit_api_id_fails_exact_inspection(self):
+        from plugins.platforms.a2a import security
+        # Native API binding permits an explicit path-safe ID containing an address. The
+        # third-party egress privacy scrub intentionally alters that otherwise valid ID.
+        await self.api(session_id="fixture@example.invalid")
+        captured = await self.current()
+        self.assertEqual((await self.inspected(captured["reference"]))["requester"]["kind"], "api_credential")
+        wire = json.dumps(captured)
+        scrubbed = security.redact_outbound(wire)
+        self.assertNotEqual(scrubbed, wire)
+        changed = json.loads(scrubbed)["reference"]
+        self.assertNotEqual(changed["session_id"], captured["reference"]["session_id"])
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(changed)
+
+    async def test_stop_control_receipt_is_never_origin_or_requester_authority(self):
+        from hermes_state_runtime import settle_session_input
+        await self.local()
+        control = self.cancelled_control()
+        captured = await self.current()
+        self.assertEqual(captured["reference"]["admission_id"], self.admission)
+        evidence = await self.inspected(captured["reference"])
+        self.assertEqual(evidence["original_message"], "Take over ABC-1")
+        self.assertNotEqual(evidence["requester"]["principal_id"], control["principal_id"])
+        forged = dict(captured["reference"], admission_id=control["admission_id"], input_id=control["request_id"])
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(forged)
+        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+            admission_id=self.admission, generation=self.row["generation"], outcome="interrupted")
+        with self.assertRaises(transport.Unavailable):
+            await self.current()
+
+    async def test_cleanup_terminal_stop_controls_are_data_not_execution_or_proof(self):
+        await self.stopped_issue()
+        control = self.cancelled_control()
+        before = self.authority.db._read_all("SELECT * FROM session_admissions")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertFalse(evidence["permission_granted"])
+        self.assertNotIn(control["request_id"], json.dumps(evidence))
+        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), before)
+        # A terminal cancellation is never a substitute for a clear native Stop checkpoint.
+        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        pending = await self.cleanup_inspected()
+        self.assertFalse(pending["quiescence_proven"])
+        self.assertEqual(pending["reason"], "native_stop_checkpoint_pending")
 
     async def test_cleanup_owner_cli_proves_only_bound_stopped_work_without_state_changes(self):
         from hermes_fleet_linear_plugin import ops
