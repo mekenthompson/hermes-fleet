@@ -303,7 +303,7 @@ class Kanban:
                 if [row[0] for row in conn.execute("PRAGMA integrity_check")] != ["ok"]:
                     raise ValueError("existing native database failed integrity inspection")
                 yield conn
-        except (OSError, ValueError, IndexError, KeyError, sqlite3.Error) as exc:
+        except (OSError, ValueError, TypeError, OverflowError, IndexError, KeyError, sqlite3.Error) as exc:
             raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
     def for_board(self, board: str):
         """An inspected existing board with the same verified executor; never create it."""
