@@ -867,7 +867,14 @@ class Store:
             if row and self._requester_conflict(json.loads(row["payload"]), payload): row = None
             if row:
                 prior = json.loads(row["payload"])
-                if row["state"] not in ("pending", "failed") or prior.get("frozen"):
+                if (row["state"] not in ("pending", "failed") or prior.get("frozen") or
+                        prior.get("write_started") is True or
+                        ("write_started" not in prior and prior.get("send_body"))):
+                    return True
+                if prior.get("followup") and not set(payload["lines"]) <= set(prior["lines"]):
+                    # A split remainder contains only its original unpublished
+                    # members. Later same-session updates cannot reintroduce a
+                    # published line or expand the once-per-project/session batch.
                     return True
                 if not self._admitted(db, *self._targets(prior)): return False
                 prior["lines"].update(payload["lines"])
@@ -963,12 +970,10 @@ class Store:
             if json.loads(row["payload"]) != expected:
                 return None
             if not self._admitted(db, *self._targets(expected)): return False
-            # A sibling proves this session/project already split; wait for it.
-            sibling = db.execute("SELECT 1 FROM outbox WHERE kind='project_update' AND hold_reason IS NULL AND id != ? AND "
-                                 "json_extract(payload, '$.session_id') = ? AND "
-                                 "json_extract(payload, '$.project_id') IS ? LIMIT 1",
-                                 (row_id, expected["session_id"], expected.get("project_id"))).fetchone()
-            if sibling:
+            # The exact unstarted row may partition again as original held
+            # members regain scope. Sent siblings do not own this request ID.
+            if expected.get("write_started") is True or expected.get("frozen") or (
+                    "write_started" not in expected and expected.get("send_body")):
                 return False
             if not waiting or waiting == set(expected["lines"]):
                 return False
