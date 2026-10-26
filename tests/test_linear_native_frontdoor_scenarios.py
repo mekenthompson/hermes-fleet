@@ -335,7 +335,7 @@ class NativeFrontdoorTests(unittest.TestCase):
                 self.assertIn("pin", result["message"])
                 self.assertEqual(len(self.seen), before)
 
-    def test_pinned_status_and_followup_cannot_reach_another_binding_board(self):
+    def test_pinned_status_keeps_issue_read_but_cannot_reach_other_board_evidence_or_followup(self):
         from hermes_cli import kanban_db as kb
         self.bind_api()
         board = Kanban("other-project", profile="default", profile_home=self.home)
@@ -347,8 +347,15 @@ class NativeFrontdoorTests(unittest.TestCase):
                                    "HERMES_KANBAN_TASK": "native-worker"}):
             for action in ("status", "followup"):
                 result = self.call({"action": action, "issue": "ABC-1", "body": "A new instruction", "id": str(uuid.uuid4())})
-                self.assertFalse(result["ok"], result)
-                self.assertIn("pin", result["message"])
+                if action == "status":
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["issue"]["id"], "issue-1")
+                    self.assertEqual(result["native"]["status"], "unavailable")
+                    self.assertIn("pin", result["native"]["message"])
+                    self.assertNotIn(task.id, json.dumps(result["native"]))
+                else:
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("pin", result["message"])
                 self.assertEqual(self.seen[-1].pinned_board, "default")
         with board.conn() as conn:
             self.assertEqual(kb.list_comments(conn, task.id), [])
@@ -362,6 +369,28 @@ class NativeFrontdoorTests(unittest.TestCase):
             self.assertEqual(self.seen[-1].native_board, "")
             self.assertEqual(self.seen[-1].pinned_db_path, "")
             self.assertTrue(self.call({"action": "status", "issue": "ABC-1"})["ok"])
+
+    def test_linked_issue_content_survives_missing_native_storage_in_registered_status(self):
+        from hermes_cli import kanban_db as kb
+        self.bind_api()
+        task = self.board.create(title="Existing native work")
+        self.assertTrue(self.call({"action": "track", "issue": "ABC-1", "task_id": task.id})["ok"])
+        database = Path(kb.kanban_db_path(board="default"))
+        saved = database.with_name("unavailable-original.db")
+        database.rename(saved)
+        try:
+            for marker in ({}, {"HERMES_KANBAN_TASK": "native-worker", "HERMES_KANBAN_BOARD": "default",
+                                "HERMES_KANBAN_DB": str(database)}):
+                with self.subTest(marker=marker), patch.dict(os.environ, marker):
+                    result = self.call({"action": "status", "issue": "ABC-1"})
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["issue"]["id"], "issue-1")
+                    self.assertFalse(result["native"]["linked"])
+                    followup = self.call({"action": "followup", "issue": "ABC-1", "body": "Instruction", "id": str(uuid.uuid4())})
+                    self.assertFalse(followup["ok"], followup)
+                    self.assertFalse(database.exists())
+        finally:
+            saved.rename(database)
 
     def specialist_content_bridge(self, *, bound=True):
         self.specialist_sessions = {"linear-request": {"id": "linear-request", "creator": {"id": "allowed-requester"},

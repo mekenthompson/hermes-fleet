@@ -138,11 +138,18 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         issue_id = issue["id"]
         if not bridge.authorize_specialist_effect(issue_id):
             return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
-        if action in {"track", "status", "followup"}:
-            _check_native_route(bridge, action, issue_id, context)
         if action == "status":
+            try:
+                _check_native_route(bridge, action, issue_id, context)
+                native = bridge.native_status(issue_id)
+            except (LinearError, transport.Unavailable) as exc:
+                # Issue authorization above does not grant access to pinned or
+                # unavailable native evidence. Keep that refusal scoped here.
+                native = {"issue_id": issue_id, "linked": False, "status": "unavailable", "message": str(exc)}
             return _reply(True, "Current Linear and native reporting state.", issue=issue,
-                          native=bridge.native_status(issue_id))
+                          native=native)
+        if action in {"track", "followup"}:
+            _check_native_route(bridge, action, issue_id, context)
         if action == "track":
             task_id = _text(args, "task_id")
             if not task_id:
