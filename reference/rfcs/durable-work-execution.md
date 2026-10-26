@@ -2,6 +2,7 @@
 title: Durable work execution
 serves: entrust-ongoing-work
 status: accepted-direction-implementation-unverified
+last_reviewed: 2026-10-26
 ---
 
 # RFC: durable work execution
@@ -26,6 +27,12 @@ A gateway needs one accountable execution owner per deliverable and durable link
 
 Private rollout identities, repository assignments, budgets, and private deployment tracker URLs belong in the deployment overlay or private tracker, never this public tree.
 
+### User clarification, 2026-10-26
+
+The [job](../jobs/entrust-ongoing-work.md) now explicitly includes assignment in Linear and ordinary chat requests to start, continue, or take over an issue. Both lead to the same managed durable work. The agent reads the issue and inspects actual execution before choosing continuation, handoff, or new work. A current explicit takeover request authorizes that coordination within scope; it does not require a second confirmation or a special sentence.
+
+Native Hermes Kanban owns execution, recovery, worker claims, and Stop. Linear holds human-visible outcomes and finite projects. The integration carries authorized requests, task links, and reporting. It must not introduce a second executor, scheduler, ownership authority, or shared cross-container database. Agent orchestration uses existing tools and native controls; users do not manage binding IDs, board names, activation steps, or worker handoff bookkeeping.
+
 ## Operating contract
 
 ### Ownership and interfaces
@@ -35,6 +42,9 @@ Private rollout identities, repository assignments, budgets, and private deploym
 - A chat-created item records the current owner without creating another executor. A tracker-origin assignment may start work. Follow-ups steer the owner rather than relaunching it.
 - The owning gateway manages local cards and dependencies. Cross-gateway handoffs use linked tracker outcomes, retaining original accountability for the overall result and receiving ownership of the handed-off deliverable.
 - Current human edits and newer stop decisions must not be overwritten by stale snapshots or delayed events. Verify the integration's revision and ownership handling before claiming cross-surface synchronization.
+- Authorized issue reads and work inspection remain available without an execution binding. A legacy or uncertain record can constrain an affected mutation; it must not prevent reading the issue or investigating the actual work.
+- On explicit takeover, inspect live task/run state and saved progress. Continue the current agent's work, arrange a native handoff from another active agent, or start only the remaining work when no executor exists. Preserve the old task/run evidence and verify the old executor has stopped before replacement execution. Do not infer that a stale record proves either a live worker or safe takeover.
+- Keep public agent identity, the local native profile/home, and the configured Linear app identity distinct. Resolve their relationship at the trusted host boundary using native semantics. A deployment label must not be mistaken for a nested filesystem profile; do not remove profile isolation or accept identity from model arguments to make reads work.
 
 ### Parallelism and workspaces
 
@@ -65,15 +75,42 @@ The work tracker receives meaningful milestones, blockers, review outcomes, and 
 
 Notification recovery must replay unsent durable milestones without rerunning completed work or mirroring every message to every interface. Interval and retention policies remain deployment decisions; no unsupported delivery guarantee is claimed.
 
-## Delivery sequence
+## UX outcome review, 2026-10-26
+
+**Verdict: the current simplification is a useful reduction in machinery, but does not yet satisfy the job.** Review basis: the original upstream-native simplification plan and public plugin source at `b12dddd32e2c1b11a8461fabd00f7f899df4ab16`, including `plugins/linear/{transport,chat,bridge}.py`, the shipped behavior notes, and the existing native scenario tests. This is a source/plan review; it is not fresh acceptance of every deployed channel.
+
+| User outcome | Current plan/implementation | UX verdict and smallest next step |
+| --- | --- | --- |
+| Read an issue from a normal conversation | `capture_context` checks the bound profile against the native home before every tool action. The producer can bind a deployment label while the service resolves its native executor as `default`. | **Fails the demonstrated container case.** Align caller/service profile resolution using trusted native host identity. Reproduce the real container layout and actual messaging/API producer paths; keep foreign-profile refusal. |
+| Assign an agent in Linear and let it work | `Bridge._start` creates a task with `initial_status="blocked"` and requires a separate native activation. Creation idempotency and queued Stop ordering have known native limits. | **Incomplete.** Admission must safely reach execution from the authorized assignment without another user step, while preserving a concurrent/newer Stop. Do not hide an automatic unblock in a retry loop. |
+| Ask an agent in chat to work on an issue | `create_issue` makes an undelegated issue; `track` only links an existing own-profile task. Normal native task creation is available separately. | **Partial.** The agent should compose native task controls and issue tracking, first checking for existing work. Keep that orchestration in the agent's normal workflow; do not add a parallel chat execution engine. |
+| Take over an existing issue here | `require_task` accepts only the local verified executor. `track` does not transfer work, and existing/uncertain bindings can refuse replacement. The plan says to use supported handoff but does not specify a demonstrated route. | **Incomplete.** Establish a supported end-to-end inspection and handoff path through existing native controls and authorized agent communication. Local refusal is a boundary result for the agent to resolve, not a reason to stop inspecting the issue. No direct reads of another container's private state. |
+| Steer the same work from another surface | `followup` writes a native operator comment for linked active work; stopped/completed work is reported without restart. | **Partial.** Retain this mechanism and prove the actual worker consumes the instruction. A saved comment is not proof that work followed it. Verify Linear-to-chat, chat-to-Linear, and chat-to-chat routes. |
+| Stop, restart, and resume deliberately | The plugin avoids unsafe activation and limits cancellation to verifiable run ordering. Queued cancellation and assignment/handoff races remain capability gaps. | **Incomplete.** Native Stop must remain authoritative throughout admission, handoff, and recovery. Unsupported ordering is a scoped visible blocker, not a complete assignment UX. |
+| Follow longer work and projects in Linear | Native events feed a durable outbox; agent guidance routes meaningful outcomes to projects. | **Direction fits.** Reuse it. Prove a multi-outcome project and notification catch-up; do not add another project store or mirror every internal task. |
+| Keep working around a narrow failure | Unlinked content operations are independent of old execution claims; uncertain conflicting description writes remain held. | **Direction fits.** Keep reads/discussion available and hold only affected effects or conflicting execution. A reporting outage must not become a general execution outage. |
+| Trust the completed release | Source tests and rollout checks prove parts; full real-channel outcome acceptance remains unverified. | **Not accepted end to end.** Tool registration, matching bytes, a healthy gateway, and a queued report each prove less than the user job. Use the job's outcome cases as the release gate. |
+
+### Keep the implementation small
+
+- **One native execution path.** Both entry points converge on existing Kanban tasks and native controls. The agent decides the route from the user's request and current state; the plugin does not classify phrases or own execution.
+- **One human work record.** Reuse the configured Linear issue/project and the existing task link. Internal native steps do not automatically become Linear issues.
+- **Reuse existing delivery state.** Keep the current ingress, reporting cursor, outbox, and uncertain-delivery reconciliation. No new daemon, workflow ledger, generic retry framework, transfer ticket, or second lock service.
+- **Use the least invasive layer that completes the outcome.** First fix the demonstrated caller/service identity mismatch and missing agent workflow. If safe activation, Stop, or handoff needs a native primitive that is absent, specify and test the smallest native change at that boundary, preferably upstream. The earlier "no new Core work" constraint cannot turn a blocked assignment into accepted UX. It also does not justify rebuilding the removed private lifecycle/custody framework.
+- **Keep user decisions at user level.** Ask only for genuinely ambiguous work or a material scope/access decision. Routine authorized continuation and takeover coordination do not need repeated permission. Preserve newer Stop, specialist permissions, and uncertain effects.
+- **Choose one route before implementing handoff.** Inspect the available native and agent-communication interfaces, then document and exercise that route. Avoid adding several overlapping takeover APIs. If none can quiesce the old worker and admit the new one safely, name that precise capability gap before promising transfer.
+
+## Revised delivery sequence
 
 Acceptance of this RFC does not itself authorize implementation execution, disruptive testing, publication, deployment, or runtime rollout; those require separately granted execution scope.
 
-1. **Reconcile, read-only:** identify existing work owners and projects; inspect boards, launch paths, profile resolution, mounts, workspaces, integration state, approvals, and evidence. Do not migrate or take over existing tasks by inference.
-2. **Specify the minimal delta:** reuse native features; map each unmet guarantee to an existing component, test, and owner. Fix only demonstrated gaps. Keep independently buildable outcomes parallel after the shared reconciliation.
-3. **Verify components:** separate unit behavior from cross-component behavior. Test duplicate/out-of-order events, ownership fencing, isolation failure, cancellation, ambiguous effects, evidence retention, and notification catch-up.
-4. **Prove a bounded pilot:** one authorized deliverable, then concurrent scoped projects within the same repository. Live interruption and publication/deployment canaries require their own explicit execution scope and safe recovery path.
-5. **Expand in bounded batches:** apply the common contract with domain-specific permissions and acceptance. Confirm neighbouring gateways did not change unexpectedly. Preserve task ownership throughout rollout.
+1. **Make ordinary inspection work:** correct profile/home identity at the real host boundaries. An authorized issue read must work from each claimed chat surface, including a container whose deployment label differs from its native filesystem profile. Reject real cross-profile attempts and preserve specialist scope.
+2. **Complete the native admission/control path:** inspect current native activation, queued/running Stop, recovery, and handoff capabilities. Resolve only the demonstrated missing primitive. Prove assignment plus concurrent Stop cannot produce a delayed unwanted worker. Do not keep the separate-activation workaround as the target experience.
+3. **Connect both entry points:** implement the normal agent workflow for Linear assignment and explicit chat work/takeover. Read issue and live work first; continue, hand off, or start only the remainder. Reuse native controls and reporting. Inspect existing work without migration or takeover by inference; an explicit current takeover request is different from automatic adoption.
+4. **Exercise whole journeys:** apply the job's outcome cases through real Linear and authenticated Telegram, Slack, and Desktop paths, with verified worker consumption and final delivery. Include active other-agent takeover, stopped/legacy work, duplicates, outages, a restart, delayed events, and a multi-outcome project. Reuse existing component scenarios for race and crash cases rather than building another test platform. Keep source tests, outcome UAT, and production-readiness evidence distinct.
+5. **Release and close honestly:** use the established reviewed immutable release and scoped delivery paths. Verify the actual running behavior and neighbouring agents; account for paused operational automation and retained uncertainty. Close the outcome only when the user journeys and their stated acceptance pass. Release plumbing, repeated image bakes, or deployment drift are not substitutes for missing product behavior.
+
+This sequence is implementation guidance, not permission to activate work, stop a live worker, or perform an external effect during a documentation review. Preserve existing authorizations and current human decisions.
 
 ## Capability and proof gaps
 
@@ -82,6 +119,9 @@ All outcome evidence below is **to validate**. Source inspection and historical 
 | Requirement | Required evidence |
 | --- | --- |
 | Single owner across chat and configured Linear | Duplicate assignment and follow-up do not spawn competing execution; current instructions win |
+| Assignment reaches execution | A configured Linear agent assignment starts or continues authorized work without separate user activation; capacity/dependency waits are explained |
+| Chat takeover after inspection | Same-agent continuation, active other-agent handoff, and inactive/legacy takeover preserve evidence with no overlapping replacement; an old owner record does not prevent reads |
+| Native identity works in the deployed layout | Actual messaging/API producers reach the tool with the correct native home/profile even when the deployment uses a different label; foreign profiles stay denied |
 | Bounded parallel work | Independent tasks overlap, dependencies gate, and observed aggregate activity stays within the approved bound |
 | Safe workspaces | Expected commit ancestry; isolated writers; failed isolation blocks unsafe work |
 | Durable resume | Interrupted authorized work reconciles actual processes, Git and remote actions before continuation |

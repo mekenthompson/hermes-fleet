@@ -1,5 +1,20 @@
 # Linear reports native Hermes work
 
+## User outcome and current limits
+
+The target experience is documented in the [ongoing-work job](../reference/jobs/entrust-ongoing-work.md).
+Assigning a configured Hermes agent in Linear or asking one in Telegram, Slack, or Desktop
+to work on or take over an issue should lead to the same durable native execution. The agent
+first reads the issue and inspects actual work, then continues it, arranges an authorized
+handoff, or starts only the remaining work. The user should not manage tracking links,
+activation steps, or checkpoint relays between agents.
+
+**This is not yet the complete implemented experience.** The
+[UX outcome review and revised sequence](../reference/rfcs/durable-work-execution.md#ux-outcome-review-2026-10-26)
+identify the profile/home mismatch, blocked Linear admission, and incomplete chat takeover
+path. The diagram and mechanisms below describe the reduced implementation, including its
+limitations; they do not establish acceptance of the target workflow.
+
 Ordinary conversation, short commands and status questions require no Linear issue. When
 work needs durability, use one native task and optionally link its human outcome with
 `linear track`. An authenticated conversation can discuss or follow that task from another
