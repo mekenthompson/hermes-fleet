@@ -339,6 +339,38 @@ Neither a reference, a receipt nor a clear checkpoint proves physical quiescence
 requiring known Stop evidence must reject `unknown` before effects and separately verify
 checkpoint, native Stop, settlement and process quiescence using its authorized control path.
 
+For the stopped task's final cleanup observation, an already authorized operator can run
+the owner-only command inside the old work's fixed approved deployment:
+
+```sh
+hermes --profile default linear inspect-cleanup <issue-id> --expected-stop-event-id <stop-event-id>
+```
+
+It derives the board/task from the current saved native reporting link. If the link is absent
+or retained legacy data, it inspects existing native history using the same issue-matching
+rules as ordinary discovery, without creating or adopting a reporting link. Optional
+`--issue-json '{"id":"...","identifier":"...","url":"..."}'` supplies independently read
+issue metadata for explicit marker matching; it is discovery data and grants no authority.
+Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown.
+
+`quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
+claim, matching frozen owner/run/admission/executor records, terminal native admissions and
+worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
+submitter identities proven gone or recycled. Scoped process checkpoints must also contain
+no live or unconfirmed scope; foreign records are retained. Reads use native tracked SQLite
+transactions, never database copies. Receipts and the entire scoped observation are checked
+again before returning. A newer Stop, unblock, late worker binding, owner change or changed
+reporting link invalidates the old observation. Reinspect immediately before later effects.
+
+Unknown evidence returns `quiescence_proven: false`, `state: unknown` and exit code 1. This
+includes a missing old-core Stop getter, missing worker identity or executor settlement,
+pending cleanup, queued/unknown admission or inaccessible history. A Stop ACK, receipt or
+second successful `kanban block` alone is insufficient. Output excludes transcript contents,
+claim tokens, process commands and unrelated records. This command is not an agent-tool action,
+does not stop/recover processes or mutate state, and always returns `permission_granted: false`.
+The pinned older-core tests label corrective getter adapters explicitly; they are not proof
+of deployed corrective-core behavior or production takeover acceptance.
+
 The isolated source proof is `python scripts/run-linear-origin-scenarios.py --agent-source
 <clean manifest-pinned Agent checkout>`. Its guard is installed before native imports and
 rejects credential/model activation, external processes/network, real-user config access and

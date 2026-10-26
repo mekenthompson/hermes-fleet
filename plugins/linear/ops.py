@@ -150,8 +150,21 @@ def setup(parser: Any) -> None:
     inspect_origin.add_argument("--reference-json", required=True, help="Complete origin_reference result's reference object")
     inspect_work = sub.add_parser("inspect-work", help="Inspect current dispatcher-owned work; original requester unknown, grants no permissions")
     inspect_work.add_argument("--reference-json", required=True, help="Complete work_reference result's reference object")
+    cleanup = sub.add_parser("inspect-cleanup", help="Read cleanup evidence for one currently bound stopped issue; grants no permissions")
+    cleanup.add_argument("issue_id")
+    cleanup.add_argument("--expected-stop-event-id", required=True, type=int)
+    cleanup.add_argument("--issue-json", help="Optional independently inspected issue id/identifier/url for native marker discovery; grants no permission")
 
 def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None) -> int:
+    if args.linear_command == "inspect-cleanup":
+        from . import cleanup
+        try:
+            metadata = json.loads(args.issue_json) if args.issue_json else None
+        except ValueError:
+            metadata = {}  # The projection reports a bounded unknown without executing a selector.
+        result = cleanup.inspect(state, args.issue_id, profile, args.expected_stop_event_id, origin_settings or {}, metadata)
+        print(json.dumps(result))
+        return 0 if result["quiescence_proven"] else 1
     if args.linear_command in {"inspect-origin", "inspect-work"}:
         from . import origin, work
         from .transport import Unavailable

@@ -21,7 +21,7 @@ GUARDED_ROOT = os.environ.get("HERMES_LINEAR_ORIGIN_TEST_ROOT")
 if SOURCE and GUARDED_ROOT:
     sys.path.insert(0, SOURCE)
 plugin = load_plugin()
-from hermes_fleet_linear_plugin import origin, transport, work
+from hermes_fleet_linear_plugin import origin, transport, work, cleanup
 
 
 @unittest.skipUnless(SOURCE and GUARDED_ROOT, "requires the guarded manifest-pinned origin proof entrypoint")
@@ -199,7 +199,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             worker = patch.object(runtime_session_store, "_worker_process", True)
             worker.start()
             self.addCleanup(worker.stop)
-            self.board_path = self.home / "work.db"
+            self.board_path = self.home / "kanban.db"
             kb.init_db(self.board_path)
             self.board = _sqlite_connect(self.board_path)
             self.board.row_factory = __import__("sqlite3").Row
@@ -233,6 +233,211 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def work_inspected(self, ref):
         return await asyncio.to_thread(work.inspect, ref, self.settings)
+
+    async def stopped_issue(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+            mutate_worker_execution, settle_session_input)
+        from hermes_fleet_linear_plugin.store import Store
+        from gateway import session_ancillary
+        await self.kanban()
+        # Finite native state fixtures: real register/adopt/finish and admission settlement;
+        # no actual model, process launch, owner bootstrap or production Stop.
+        executor = "admission-worker:" + self.admission
+        args = dict(epoch=self.authority.epoch, execution_id=executor, session_id=self.sid,
+                    generation=self.row["generation"])
+        register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-adoption-private")
+        adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-adoption-private")
+        mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                             generation=self.row["generation"], outcome="interrupted")
+        with kb.write_txn(self.board):
+            self.board.execute("UPDATE task_events SET payload=? WHERE kind='worker_bound' AND task_id=?",
+                (json.dumps({"pid": 99999998, "started_at": "fixture-boot|1", "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+            kb._append_event(self.board, self.task_id, "spawned", {"pid": 99999999, "started_at": "fixture-boot|2"},
+                             run_id=self.work_context["run_id"])
+            self.board.execute("UPDATE task_runs SET worker_pid=99999999,worker_started_at='fixture-boot|2' WHERE id=?",
+                               (self.work_context["run_id"],))
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="fixture Stop"))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        self.linear_state = self.home / "linear" / "state.db"
+        self.linear_store = Store(self.linear_state)
+        self.assertTrue(self.linear_store.bind_native("issue-one", self.task_id, "default", "default", at=1))
+        # Optional corrective-core getter adapter, explicitly synthetic on pinned fae; it
+        # executes a real native read-only meta lookup, not an unconditional success stub.
+        getter = patch.object(session_ancillary, "process_stop_pending",
+            lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
+        getter.start()
+        self.addCleanup(getter.stop)
+
+    async def cleanup_inspected(self, *, stop_id=None):
+        from agent import runtime_session_store
+        with patch.object(runtime_session_store, "_worker_process", False):
+            return await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default",
+                                           self.stop_id if stop_id is None else stop_id, self.settings)
+
+    async def test_cleanup_owner_cli_proves_only_bound_stopped_work_without_state_changes(self):
+        from hermes_fleet_linear_plugin import ops
+        import argparse
+        from agent import runtime_session_store
+        await self.stopped_issue()
+        self.authority.db.append_message(self.sid, "user", "PRIVATE_TRANSCRIPT_SENTINEL")
+        before = [tuple(r) for r in self.board.execute("SELECT * FROM task_events")]
+        native = self.authority.db._read_all("SELECT * FROM session_admissions")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertFalse(evidence["permission_granted"])
+        self.assertEqual(evidence["stop_event_id"], self.stop_id)
+        for private in ("CLAIM_PRIVATE_SENTINEL", "PRIVATE_TRANSCRIPT_SENTINEL", str(self.board_path), "fixture-adoption-private"):
+            self.assertNotIn(private, json.dumps(evidence))
+        self.assertEqual([tuple(r) for r in self.board.execute("SELECT * FROM task_events")], before)
+        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), native)
+        parser = argparse.ArgumentParser()
+        ops.setup(parser)
+        args = parser.parse_args(["inspect-cleanup", "issue-one", "--expected-stop-event-id", str(self.stop_id)])
+        with patch.object(runtime_session_store, "_worker_process", False), patch("builtins.print") as printed:
+            rc = await asyncio.to_thread(ops.run, args, self.linear_state, self.home / "unused", "deployment-routing-alias", origin_settings=self.settings)
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(printed.call_args.args[0])["quiescence_proven"])
+        self.board.execute("ALTER TABLE task_runs DROP COLUMN worker_started_at")
+        damaged = await self.cleanup_inspected()
+        self.assertFalse(damaged["quiescence_proven"])
+        self.assertEqual(damaged["reason"], "cleanup_evidence_unavailable")
+
+    async def test_cleanup_unsupported_pending_and_live_admission_are_unknown(self):
+        from gateway import session_ancillary
+        await self.stopped_issue()
+        with patch.object(session_ancillary, "process_stop_pending", None):
+            result = await self.cleanup_inspected()
+        self.assertEqual(result["reason"], "native_stop_checkpoint_unsupported")
+        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        result = await self.cleanup_inspected()
+        self.assertFalse(result["quiescence_proven"])
+        self.assertEqual(result["reason"], "native_stop_checkpoint_pending")
+        self.authority.db._execute_write(lambda c: c.execute("DELETE FROM state_meta WHERE key=?", ("fixture.pending.stop." + self.sid,)))
+        self.authority.db._execute_write(lambda c: c.execute("UPDATE session_admissions SET status='started',outcome=NULL WHERE admission_id=?", (self.admission,)))
+        result = await self.cleanup_inspected()
+        self.assertFalse(result["quiescence_proven"])
+        self.assertEqual(result["reason"], "native_admission_not_settled")
+
+    async def test_cleanup_unknown_workers_or_missing_executor_never_become_settlement(self):
+        from hermes_state_runtime import register_worker_execution
+        await self.stopped_issue()
+        executor = "admission-worker:" + self.admission
+        self.authority.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='unknown' WHERE execution_id=?", (executor,)))
+        result = await self.cleanup_inspected()
+        self.assertEqual(result["reason"], "native_worker_or_spawner_unsettled")
+        self.authority.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id=?", (executor,)))
+        child = self.sid + "-child"
+        self.authority.db.create_session(child, source="subagent", parent_session_id=self.sid)
+        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id=executor + "/child:fixture",
+            session_id=child, generation=0, kind="child", adoption_secret="fixture-child-private")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_child_spawner_unsettled")
+        self.authority.db._execute_write(lambda c: c.execute("DELETE FROM worker_executions WHERE execution_id=?", (executor + "/child:fixture",)))
+        self.authority.db._execute_write(lambda c: (c.execute("DELETE FROM worker_receipts WHERE execution_id=?", (executor,)),
+            c.execute("DELETE FROM worker_executions WHERE execution_id=?", (executor,))))
+        result = await self.cleanup_inspected()
+        self.assertEqual(result["reason"], "native_executor_settlement_missing")
+
+    async def test_cleanup_live_recycled_and_unverifiable_worker_fingerprints(self):
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        real = _process_fingerprint(os.getpid())
+        self.assertIsNotNone(real)
+        def bound(fingerprint):
+            self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+                (json.dumps({"pid": os.getpid(), "started_at": fingerprint, "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        bound(real)
+        self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+        bound("fixture-previous-boot|1")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(evidence["attempts"][0]["workers"][0]["fate"], "recycled")
+        bound(None)
+        self.assertEqual((await self.cleanup_inspected())["reason"], "worker_identity_missing")
+
+    async def test_cleanup_scoped_checkpoint_retains_foreign_records_and_recycled_pids(self):
+        from gateway.status import get_process_start_time
+        await self.stopped_issue()
+        route = self.authority.sessions[self.sid].route
+        foreign = {"session_key": "foreign", "owner_task_id": "foreign", "pid": os.getpid(),
+                   "host_start_time": get_process_start_time(os.getpid()), "systemd_unit": "FOREIGN_SCOPE_PRIVATE"}
+        own = {"session_key": route, "parent_session_id": self.sid, "pid": os.getpid(),
+               "host_start_time": get_process_start_time(os.getpid()), "pid_scope": "host"}
+        path = self.home / "processes.json"
+        path.write_text(json.dumps([foreign, own]))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "scoped_process_alive")
+        own["host_start_time"] = 1
+        path.write_text(json.dumps([foreign, own]))
+        before = path.read_bytes()
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(evidence["scoped_checkpoint"], {"scoped_records": 1, "recycled_records": 1})
+        self.assertNotIn("FOREIGN_SCOPE_PRIVATE", json.dumps(evidence))
+        self.assertEqual(path.read_bytes(), before)
+        own["systemd_unit"] = "pending-native-scope"
+        path.write_text(json.dumps([foreign, own]))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "scoped_process_cleanup_unknown")
+
+    async def test_cleanup_new_stop_unblock_foreign_binding_and_late_spawner_invalidate(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=self.stop_id))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "stop_event_changed")
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        with kb.write_txn(self.board):
+            kb._append_event(self.board, self.task_id, "worker_bound", {"pid": 99999998,
+                "started_at": "fixture|1", "claim_lock": self.work_context["claim_lock"]}, run_id=self.work_context["run_id"])
+        self.assertEqual((await self.cleanup_inspected())["reason"], "late_worker_binding_after_stop")
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "task_not_currently_stopped")
+
+    async def test_cleanup_stop_changes_during_receipt_or_owner_restart_are_unknown(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_state_runtime import begin_runtime_epoch
+        await self.stopped_issue()
+        def stop(method, params):
+            self.before_rpc = None
+            kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=self.stop_id)
+        self.before_rpc = stop
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id="different-owner")
+        # Endpoint still reports old instance: independently read epoch/instance must refuse.
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_owner_changed")
+
+    async def test_cleanup_missing_reporting_link_discovers_unique_native_work_without_adopting(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        with self.linear_store._tx() as db:
+            db.execute("DELETE FROM metadata WHERE key='native-binding:issue-one'")
+            db.execute("DELETE FROM work WHERE issue_id='issue-one'")
+        self.board.execute("UPDATE tasks SET idempotency_key='linear:issue-one' WHERE id=?", (self.task_id,))
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(evidence["discovery_source"], "native_history_discovery")
+        self.assertIsNone(self.linear_store.get("issue-one"))
+        kb.create_task(self.board, title="second plausible work", assignee="default", idempotency_key=None,
+                       body="Linear issue issue-one: https://linear.example/issue")
+        # Marker-only metadata is owner CLI discovery data, not authorization.
+        from agent import runtime_session_store
+        with patch.object(runtime_session_store, "_worker_process", False):
+            result = await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default", self.stop_id,
+                self.settings, {"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue"})
+        self.assertEqual(result["reason"], "native_history_match_missing_or_ambiguous")
+        self.assertIsNone(self.linear_store.get("issue-one"))
+
+    async def test_cleanup_foreign_binding_and_scope_fence_are_not_authority(self):
+        await self.stopped_issue()
+        with self.linear_store._tx() as db:
+            db.execute("UPDATE metadata SET value=? WHERE key='native-binding:issue-one'",
+                       (json.dumps({"issue_id": "issue-one", "task_id": self.task_id, "board": "default", "profile": "foreign"}),))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_history_match_missing_or_ambiguous")
+        with self.linear_store._tx() as db:
+            db.execute("INSERT INTO specialist_scope_fence(issue_id,reason,fenced_at) VALUES('issue-one','fixture',1)")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "issue_scope_fenced")
 
     async def test_work_current_preserves_unknown_requester_and_selective_privacy(self):
         from hermes_cli import kanban_db as kb
