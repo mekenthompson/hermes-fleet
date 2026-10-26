@@ -3,6 +3,7 @@
 The database records reporting and uncertain delivery. It never grants execution.
 """
 from __future__ import annotations
+import hashlib
 import json
 import sqlite3
 import threading
@@ -346,6 +347,106 @@ class Store:
             db.execute("INSERT INTO metadata (key,value) VALUES (?,?)",
                        (f"native-binding:{issue_id}", json.dumps(binding)))
             return True
+    @staticmethod
+    def _binding_snapshot(db: sqlite3.Connection, issue_id: str) -> dict[str, Any]:
+        work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
+        binding = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-binding:{issue_id}",)).fetchone()
+        return {"work": dict(work) if work else None, "native_binding": binding[0] if binding else None}
+    @staticmethod
+    def _binding_revision(issue_id: str, snapshot: dict[str, Any]) -> str:
+        # Include absence and the exact stored binding text, not only its parsed target.
+        value = json.dumps({"issue_id": issue_id, **snapshot}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(value.encode()).hexdigest()
+    def binding_revision(self, issue_id: str) -> str:
+        """Token for an exact inspected reporting projection; it proves no execution state."""
+        with self._tx() as db:
+            return self._binding_revision(issue_id, self._binding_snapshot(db, issue_id))
+    @classmethod
+    def _hold_superseded_reports(cls, db: sqlite3.Connection, issue_id: str) -> None:
+        # Do not rewrite an attempted request or reinterpret a historical sent receipt.
+        # Ordinary content is independent of execution, including uncertain descriptions.
+        reason = "Reporting binding was explicitly replaced; retained delivery must not be replayed"
+        superseded = set()
+        for row in db.execute("SELECT id,kind,payload,hold_reason FROM outbox").fetchall():
+            payload = json.loads(row["payload"])
+            if issue_id in cls._targets(payload) and not cls.unlinked_content(row["kind"], payload):
+                superseded.add(row["id"])
+                if row["hold_reason"] is None:
+                    db.execute("UPDATE outbox SET hold_reason=? WHERE id=?", (reason, row["id"]))
+        changed = True
+        while changed:
+            changed = False
+            for row in db.execute("SELECT id,payload FROM outbox WHERE hold_reason IS NULL").fetchall():
+                payload = json.loads(row["payload"])
+                dependencies = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()} - {None, ""}
+                if dependencies & superseded:
+                    db.execute("UPDATE outbox SET hold_reason=? WHERE id=?",
+                               ("Reporting depends on a superseded delivery; retained history must not be replayed", row["id"]))
+                    superseded.add(row["id"])
+                    changed = True
+    def replace_native_binding(self, issue_id: str, task_id: str, profile: str, board: str | None, *,
+                               expected_revision: str, request_id: str, owner_ref: str = "",
+                               project_id: str | None = None, at: float) -> dict[str, Any] | None:
+        """Explicitly replace reporting after caller inspection, never native execution.
+
+        Archive the exact prior projection in the existing immutable intent. Uncertain
+        effects, Stop/admission/transfer records and specialist fences remain untouched.
+        A stale inspection or scope fence returns None; conflicting request reuse fails.
+        """
+        if any(not isinstance(value, str) or not value.strip() for value in (issue_id, task_id, profile)):
+            raise ValueError("native binding needs an issue, task and profile")
+        if (board is not None and (not isinstance(board, str) or not board.strip()) or
+                not isinstance(owner_ref, str) or project_id is not None and not isinstance(project_id, str)):
+            raise ValueError("native binding has invalid board or reporting scope")
+        try:
+            parsed = uuid.UUID(request_id)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("reporting replacement needs a canonical request UUIDv4") from None
+        if parsed.version != 4 or str(parsed) != request_id:
+            raise ValueError("reporting replacement needs a canonical request UUIDv4")
+        if (not isinstance(expected_revision, str) or len(expected_revision) != 64 or
+                any(char not in "0123456789abcdef" for char in expected_revision)):
+            raise ValueError("reporting replacement needs an inspected binding revision")
+        binding = {"issue_id": issue_id, "task_id": task_id, "profile": profile, "board": board or "default"}
+        request = {"binding": binding, "expected_revision": expected_revision,
+                   "owner_ref": owner_ref, "project_id": project_id}
+        key = f"track:{issue_id}:{request_id}"
+        with self._tx() as db:
+            if not self._admitted(db, issue_id):
+                return None
+            previous = self._binding_snapshot(db, issue_id)
+            prior = self.native_intent(key)
+            if prior:
+                if prior["payload"].get("request") != request:
+                    raise ValueError("native intent key reused with conflicting reporting replacement")
+                work = previous["work"] or {}
+                current = json.loads(previous["native_binding"]) if previous["native_binding"] else None
+                return dict(binding) if (prior["state"] == "applied" and current == binding and
+                    work.get("origin") == "native" and work.get("task_id") == task_id and
+                    work.get("owner_ref") == owner_ref and work.get("project_id") == project_id) else None
+            if self._binding_revision(issue_id, previous) != expected_revision:
+                return None
+            self.native_intent_prepare(key, {"kind": "track", "issue_id": issue_id, "request": request,
+                                            "previous": previous, "at": at})
+            work = previous["work"] or {}
+            old_binding = json.loads(previous["native_binding"]) if previous["native_binding"] else {}
+            same_target = (isinstance(old_binding, dict) and work.get("origin") == "native" and work.get("task_id") == task_id and
+                           all(old_binding.get(field) == value for field, value in binding.items()))
+            unchanged = same_target and work.get("owner_ref") == owner_ref and work.get("project_id") == project_id
+            if not unchanged:
+                self._hold_superseded_reports(db, issue_id)
+                if same_target:
+                    db.execute("UPDATE work SET owner_ref=?,project_id=?,last_updated_at=?,linear_session_id=? WHERE issue_id=?",
+                               (owner_ref, project_id, at, owner_ref or None, issue_id))
+                else:
+                    db.execute("DELETE FROM work WHERE issue_id=?", (issue_id,))
+                    db.execute("INSERT INTO work(issue_id,origin,owner_ref,task_id,project_id,last_updated_at,linear_session_id) "
+                               "VALUES (?,'native',?,?,?,?,?)", (issue_id, owner_ref, task_id, project_id, at, owner_ref or None))
+                db.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (f"native-binding:{issue_id}", json.dumps(binding)))
+            self.native_intent_settle(key, {"state": "applied", "binding": binding,
+                "revision": self._binding_revision(issue_id, self._binding_snapshot(db, issue_id))})
+            return dict(binding)
     def native_intent(self, key: str) -> dict[str, Any] | None:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-intent:{key}",)).fetchone()
