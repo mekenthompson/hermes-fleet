@@ -630,14 +630,9 @@ class Bridge:
                 self._delegated(event, issue, session_id, row)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
-                    key = f"unbound-stop:{issue_id}"
-                    saved, _ = self.store.native_intent_prepare(key, {"kind": "stop", "issue_id": issue_id})
-                    if stamp >= float(saved.get("source_ms") or 0):
-                        self.store.native_intent_settle(key, {"state": "reconcile", "source_ms": stamp,
-                            "session_id": session_id, "activity_id": str(activity.get("id") or ""),
-                            "actor": (activity.get("user") or {}).get("id") or "Linear user",
-                            "control_version": "native-event-guard-v1",
-                            "reason": "Stop arrived before a native binding; inspect any in-flight task creation"})
+                    self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
+                        activity_id=str(activity.get("id") or ""),
+                        actor=(activity.get("user") or {}).get("id") or "Linear user")
                     # Creation may have committed after the initial snapshot.
                     # Carry this durable Stop into the native controls too.
                     current = self.store.get(issue_id)

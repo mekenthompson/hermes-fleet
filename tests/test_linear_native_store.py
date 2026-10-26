@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,23 @@ class NativeStoreTests(unittest.TestCase):
 
     def bind(self, issue="issue-1", task="task-1"):
         return self.store.bind_native(issue, task, "alpha", "default", at=100)
+
+    def test_concurrent_unbound_stops_preserve_maximum_source_and_its_actor(self):
+        barrier = threading.Barrier(4)
+        def record(stamp):
+            store = Store(self.path)
+            barrier.wait(timeout=5)
+            return store.record_unbound_stop("issue-1", stamp, session_id="session",
+                activity_id=f"activity-{stamp}", actor=f"actor-{stamp}")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(record, [400, 100, 300, 200]))
+        saved = self.store.native_intent("unbound-stop:issue-1")
+        self.assertEqual(saved["source_ms"], 400)
+        self.assertEqual(saved["activity_id"], "activity-400")
+        self.assertEqual(saved["actor"], "actor-400")
+        older = self.store.record_unbound_stop("issue-1", 250, session_id="old-session",
+            activity_id="old-activity", actor="old-actor")
+        self.assertEqual(older, saved)
 
     def replace(self, task="replacement", *, issue="issue-1", revision=None, request_id=None,
                 owner_ref="new-session", project_id="project-1", at=200):
