@@ -200,6 +200,87 @@ connection.close()
         with closing(connect_tracked(database.as_uri() + "?mode=ro", uri=True)) as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "delete")
 
+    def test_missing_required_native_column_is_scoped_and_authorized_linked_issue_stays_readable(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("ALTER TABLE tasks DROP COLUMN body")
+            conn.commit()
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        before = self.archive_bytes(database.parent)
+        from hermes_fleet_linear_plugin import chat
+        self.bridge.profile_home = self.fixture.home
+        context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+        result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["issue"]["id"], native.ISSUE)
+        self.assertFalse(result["native"]["linked"])
+        self.assertEqual(result["native"]["status"], "reconciliation")
+        with self.assertRaises(native.LinearError):
+            adapter.get(task_id)
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def test_missing_required_column_holds_new_admission_without_repair(self):
+        self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("ALTER TABLE tasks DROP COLUMN body")
+            conn.commit()
+        before = self.archive_bytes(database.parent)
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def corrupt_status_index(self):
+        adapter, task_id = self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_cli.sqlite_safe_read import connect_tracked, offline_file_access
+        with closing(connect_tracked(database)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            page = conn.execute("SELECT rootpage FROM sqlite_master WHERE name='idx_tasks_status'").fetchone()[0]
+            size = conn.execute("PRAGMA page_size").fetchone()[0]
+        with offline_file_access(database, what="damage disposable index fixture"):
+            data = bytearray(database.read_bytes())
+            offset = (page - 1) * size
+            self.assertEqual(data[offset], 0x0a)  # A single-row index leaf.
+            position = data.index(b"ready", offset, offset + size)
+            data[position:position + 5] = b"xxxxx"
+            database.write_bytes(data)
+        with closing(connect_tracked(database.as_uri() + "?mode=ro", uri=True)) as conn:
+            self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            self.assertNotEqual([row[0] for row in conn.execute("PRAGMA integrity_check")], ["ok"])
+        adapter.kc._INITIALIZED_PATHS.discard(str(database.resolve()))
+        return adapter, task_id, database
+
+    def test_index_mismatch_holds_assignment_before_native_connect_can_reindex_source(self):
+        _, _, database = self.corrupt_status_index()
+        before = self.archive_bytes(database.parent)
+        self.assign()
+        self.assertEqual(self.archive_bytes(database.parent), before)
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+
+    def test_unrelated_valid_native_binding_stays_readable_when_default_index_is_damaged(self):
+        from test_linear_specialist_authorization import issue_record
+        other = issue_record(id="issue-other", identifier="OPS-2", url="https://linear.example/issue/OPS-2")
+        self.fixture.authority.issues[other["id"]] = other
+        valid = native.Kanban("valid-project", profile="default", profile_home=self.fixture.home)
+        task = valid.create(title="Unrelated valid work", body=f"Linear issue {other['id']}: {other['url']}")
+        self.bridge.track(other["id"], task.id, board="valid-project")
+        self.corrupt_status_index()
+        from hermes_fleet_linear_plugin import chat
+        self.bridge.profile_home = self.fixture.home
+        context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+        result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": other["id"]}, context))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["issue"]["id"], other["id"])
+        self.assertTrue(result["native"]["linked"])
+        self.assertEqual(result["native"]["task_id"], task.id)
+
     def test_running_unlinked_chat_task_is_reused_and_followup_keeps_its_run(self):
         adapter, task_id = self.existing()
         with adapter.conn() as conn:

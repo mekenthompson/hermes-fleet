@@ -300,10 +300,10 @@ class Kanban:
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {"tasks", "task_events", "task_runs", "task_comments"} <= tables:
                     raise ValueError("existing database has no native task schema")
-                if [row[0] for row in conn.execute("PRAGMA quick_check")] != ["ok"]:
+                if [row[0] for row in conn.execute("PRAGMA integrity_check")] != ["ok"]:
                     raise ValueError("existing native database failed integrity inspection")
                 yield conn
-        except (OSError, ValueError, sqlite3.Error) as exc:
+        except (OSError, ValueError, IndexError, KeyError, sqlite3.Error) as exc:
             raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
     def for_board(self, board: str):
         """An inspected existing board with the same verified executor; never create it."""
