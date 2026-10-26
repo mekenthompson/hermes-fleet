@@ -307,6 +307,38 @@ no new cross-profile route. A peer may communicate a reference as untrusted inpu
 must independently inspect its original instruction and apply existing requester, profile,
 specialist and workspace permissions. Native Stop and quiescence verification remain separate.
 
+For an already authorized Kanban task that continues after its original chat turn ends, the
+registered tool separately accepts `{"action":"work_reference"}` with no other fields. Its
+worker-only capture requires native worker registration, the actually bound session ID and
+the dispatcher-owned process; it does not require or fabricate a chat platform or requester.
+The current task/run/claim coordinates come only from the owner's frozen Kanban policy.
+An authorized operator can inspect this typed reference inside the same owning profile:
+
+```sh
+hermes linear inspect-work --reference-json '<reference object>'
+```
+
+The projection verifies the exact active native admission, epoch/generation, current running
+task and run, unexpired claim, assigned profile, owner/worker bindings and frozen workspace,
+branch, tenant and skills. It uses native tracked read-only SQLite transactions. It returns
+only this task's bounded instruction and scope; raw claim tokens, DB paths, unrelated cards,
+context and transcript history are excluded. A successor run needs its own fresh reference.
+Stopped, settled, superseded, expired or changed work invalidates an earlier reference.
+
+Work evidence reports `requester.kind: native_dispatcher`, `original_requester: unknown` and
+`permission_granted: false`. Native cards do not bind the original human/API principal or an
+approved issue scope. Generated task text is work content; it is never human consent. Any
+controller must apply its independently authorized profile, issue, specialist and workspace
+limits before effects. These commands do not create a controller route or execute a takeover.
+
+Both owner inspections return `stop_evidence`. Where the existing native
+`process_stop_pending` getter is supported, a pending checkpoint refuses inspection; a clear
+checkpoint is labelled `clear`. Older compatible cores report `unknown`, never false. In
+particular, a direct Stop can remain in flight while an older core's receipt is still started.
+Neither a reference, a receipt nor a clear checkpoint proves physical quiescence. A controller
+requiring known Stop evidence must reject `unknown` before effects and separately verify
+checkpoint, native Stop, settlement and process quiescence using its authorized control path.
+
 The isolated source proof is `python scripts/run-linear-origin-scenarios.py --agent-source
 <clean manifest-pinned Agent checkout>`. Its guard is installed before native imports and
 rejects credential/model activation, external processes/network, real-user config access and
