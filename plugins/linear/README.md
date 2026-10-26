@@ -6,7 +6,8 @@ requests and reports native outcomes through a durable outbox. An issue, comment
 or reporting destination never grants execution permission.
 
 Reporting remains compatible with official Hermes `ff294849385e433dd40a993b4f07673abb95c6f5`.
-Automatic assignment admission additionally requires native block/unblock task-event guards.
+Automatic assignment admission additionally requires native block/unblock task-event guards
+and guarded-resume event receipts for response-loss reconciliation.
 No fork-specific invocation context, lifecycle controller, approval reservation or chat recovery
 API is required. The plugin is disabled by default.
 
