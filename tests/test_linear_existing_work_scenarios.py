@@ -2,8 +2,10 @@
 import hashlib
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -212,8 +214,19 @@ class ExistingWorkScenarios(unittest.TestCase):
 
     def test_archive_snapshot_reads_committed_wal_without_mutating_archive_files(self):
         adapter, task_id = self.existing(board="project-work")
-        with adapter.conn() as conn:
+        database = Path(native.kb.kanban_db_path(board="project-work"))
+        # Native runtime safety may deliberately choose DELETE on older SQLite.
+        # Craft WAL only in this disposable single-writer fixture, with every
+        # native connection closed; no runtime safety function is patched.
+        with closing(sqlite3.connect(database, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
             native.kb.complete_task(conn, task_id, result="Completed result committed in WAL")
+            with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True)) as main_only:
+                main_only.row_factory = sqlite3.Row
+                self.assertEqual(native.kb.get_task(main_only, task_id).status, "ready")
             path = Path(native.kb.remove_board("project-work", archive=True)["new_path"])
             self.assertGreater((path / "kanban.db-wal").stat().st_size, 0)
             before = self.archive_bytes(path)
@@ -346,6 +359,88 @@ class ExistingWorkScenarios(unittest.TestCase):
             self.assign()
             self.assertFalse(database.exists())
             self.assertIsNone(self.store.get(native.ISSUE))
+        finally:
+            saved.rename(database)
+
+    def test_plugin_restart_does_not_recreate_missing_default_and_issue_reads_still_work(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            original = native.kb.claim_task(conn, task_id)
+        database = Path(native.kb.kanban_db_path(board="default"))
+        self.assertFalse(native.kb.board_metadata_path("default").exists())  # Metadata is synthesized.
+        saved = database.with_name("missing-saved.db")
+        database.rename(saved)
+        try:
+            restarted = native.Kanban(profile="default", profile_home=self.fixture.home)
+            self.assertFalse(database.exists())
+            bridge = native.Bridge(self.store, self.fixture.authority.api(scope=None), restarted, profile="default")
+            bridge.profile_home = self.fixture.home
+            from hermes_fleet_linear_plugin import chat
+            # Isolated handler fixture; transport identity producer paths have
+            # separate real-native frontdoor coverage, not a client-UAT claim.
+            context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+            result = json.loads(chat.handle(bridge, {"action": "status", "issue": native.ISSUE}, context))
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["issue"]["id"], native.ISSUE)
+            bridge.handle_webhook(self.fixture.event())
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        finally:
+            saved.rename(database)
+        # Restoring native data is sufficient; no plugin marker/reset is needed.
+        bridge.handle_webhook(self.fixture.event())
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        current = restarted.get(task_id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (original.current_run_id, original.claim_lock))
+
+    def test_plugin_restart_does_not_recreate_missing_registered_named_database(self):
+        adapter, task_id = self.existing(board="project-work")
+        database = Path(native.kb.kanban_db_path(board="project-work"))
+        saved = database.with_name("missing-saved.db")
+        database.rename(saved)
+        try:
+            restarted = native.Kanban("project-work", profile="default", profile_home=self.fixture.home)
+            self.assertFalse(database.exists())
+            bridge = native.Bridge(self.store, self.fixture.authority.api(scope=None), restarted, profile="default")
+            bridge.handle_webhook(self.fixture.event())
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+        finally:
+            saved.rename(database)
+        self.assertEqual(adapter.get(task_id).status, "ready")
+
+    def test_missing_default_with_native_workspace_evidence_is_not_initialized_even_without_lock(self):
+        adapter, task_id = self.existing()
+        from hermes_cli.kanban_db_workspace import resolve_workspace
+        workspace = Path(resolve_workspace(adapter.get(task_id), board="default"))
+        self.assertTrue(workspace.is_dir())
+        database = Path(native.kb.kanban_db_path(board="default"))
+        saved = database.with_name("missing-saved.db")
+        database.rename(saved)
+        Path(str(database) + ".init.lock").unlink()
+        try:
+            native.Kanban(profile="default", profile_home=self.fixture.home)
+            self.assertFalse(database.exists())
+            self.assign()
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+        finally:
+            saved.rename(database)
+
+    def test_named_service_does_not_ignore_missing_default_with_prior_initialization_evidence(self):
+        self.existing()
+        creation = native.Kanban("linear-inbox", profile="default", profile_home=self.fixture.home)
+        database = Path(native.kb.kanban_db_path(board="default"))
+        saved = database.with_name("missing-saved.db")
+        database.rename(saved)
+        try:
+            bridge = native.Bridge(self.store, self.fixture.authority.api(scope=None), creation, profile="default")
+            bridge.handle_webhook(self.fixture.event())
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+            with creation.conn() as conn:
+                self.assertEqual(native.kb.list_tasks(conn), [])
         finally:
             saved.rename(database)
 

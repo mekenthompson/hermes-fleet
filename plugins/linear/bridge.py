@@ -217,11 +217,34 @@ class Kanban:
         self.profile_home = Path(profile_home).resolve(strict=True) if profile is not None else None
         if metadata.get("archived"):
             return  # Reporting/content stays available; native connections refuse this archived target.
+        path = Path(kanban_db.kanban_db_path(board=self.board))
+        if not path.is_file() and self.board_has_history(self.board, path):
+            # Keep the reporting service usable, but never replace missing
+            # native data during plugin startup. Restoration needs no new flag.
+            return
         if self.board != "default":
             from hermes_cli.kanban_db_boards import create_board
             create_board(self.board)
         else:
             kanban_db_connect.init_db(board=self.board)
+    def board_has_history(self, board: str, path: Path) -> bool:
+        """Existing native artifacts distinguish loss from first initialization.
+
+        No new ownership marker is stored. Default metadata may be synthesized,
+        so retain native initialization/dispatch evidence and task directories.
+        """
+        try:
+            evidence = [path, self.kb.board_metadata_path(board), *(
+                Path(str(path) + suffix) for suffix in (".init.lock", ".dispatch.lock", "-wal", "-shm", "-journal"))]
+            if any(item.exists() or item.is_symlink() for item in evidence):
+                return True
+            for root in (self.kb.workspaces_root(board=board), self.kb.attachments_root(board=board),
+                         self.kb.worker_logs_dir(board=board)):
+                if root.is_dir() and any(re.match(r"t_[0-9a-f]{8}(?:$|[._-])", item.name) for item in root.iterdir()):
+                    return True
+        except OSError:
+            return True  # Unavailable native history is not evidence of a fresh board.
+        return False
     @staticmethod
     def resolve_executor_profile(profile: str, profile_home: Any) -> str:
         from hermes_cli.profiles import get_profile_dir, profile_exists
@@ -402,8 +425,7 @@ class Kanban:
             # genuinely absent in a fresh home using a named creation board.
             if not path.is_file():
                 if (slug == "default" and self.board != "default" and
-                        not self.kb.board_metadata_path(slug).exists() and
-                        not any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))):
+                        not self.board_has_history(slug, path)):
                     continue
                 raise LinearError(f"Existing native board {slug!r} has no readable database; inspect it before replacement work", retryable=False)
             adapter = self.for_board(slug)

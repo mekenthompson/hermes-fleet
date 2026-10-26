@@ -59,6 +59,8 @@ history until a deliberate new increment. Intact unrelated archives do not block
 Unavailable or ambiguous history holds the affected replacement while ordinary reads and
 unrelated native work remain available. A missing database for an existing board is not an
 empty board; a fresh named-board setup may still have no synthesized default database.
+Plugin restart preserves unavailable existing native data and keeps ordinary issue reads
+available; restoring that data needs no new activation marker or service reset.
 Agents creating issue-related native work should preserve the explicit issue line and use
 the canonical retry key when available; the user does not supply these internal arguments.
 
