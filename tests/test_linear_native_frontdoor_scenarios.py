@@ -11,6 +11,7 @@ import inspect
 import multiprocessing
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import socket
 import sys
 import tempfile
@@ -109,6 +110,77 @@ class NativeFrontdoorTests(unittest.TestCase):
 
     def call(self, args):
         return json.loads(self.tool(args))
+
+    def bind_messaging(self, platform, *, profile=None, launch="sample-agent"):
+        """Execute the real gateway producer without starting a gateway or its adapters."""
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionContext, SessionSource
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(multiplex_profiles=False)
+        runner.adapters = {}
+        runner._configured_runtime_profile_name = launch
+        source = SessionSource(platform=Platform(platform), chat_id="chat-1", user_id="human-1",
+                               scope_id="workspace-1", thread_id="thread-1", profile=profile)
+        context = SessionContext(source=source, connected_platforms=[], home_channels={},
+                                 session_key=f"{platform}:chat-1:thread-1", session_id="messaging-run")
+        return runner._set_session_env(context)
+
+    def test_standalone_launch_label_reaches_service_from_real_messaging_producers(self):
+        with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            for platform in ("telegram", "slack"):
+                for profile in (None, "sample-agent"):
+                    with self.subTest(platform=platform, profile=profile):
+                        self.bind_messaging(platform, profile=profile)
+                        result = self.call({"action": "status", "issue": "ABC-1"})
+                        self.assertTrue(result["ok"], result)
+                        got = self.seen[-1]
+                        self.assertEqual((got.profile, got.home), ("default", str(self.home)))
+                        self.assertEqual((got.platform, got.session_id, got.user_id, got.scope_id),
+                                         (platform, "messaging-run", "human-1", "workspace-1"))
+                        self.assertEqual((got.chat_id, got.thread_id), ("chat-1", "thread-1"))
+        self.assertIsNone(self.bridge.store.get("issue-1"), "reading must not start or bind execution")
+
+    def test_api_default_and_launch_label_use_same_native_profile(self):
+        with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            for profile in ("", "sample-agent"):
+                with self.subTest(profile=profile):
+                    self.bind_api(profile=profile)
+                    result = self.call({"action": "status", "issue": "ABC-1"})
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(self.seen[-1].profile, "default")
+
+    def test_launch_label_does_not_authorize_foreign_messaging_or_api_profile(self):
+        with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            for platform in ("telegram", "slack", "api_server"):
+                with self.subTest(platform=platform):
+                    if platform == "api_server":
+                        self.bind_api(profile="foreign")
+                    else:
+                        self.bind_messaging(platform, profile="foreign")
+                    result = self.call({"action": "status", "issue": "ABC-1"})
+                    self.assertFalse(result["ok"], result)
+        self.assertEqual(self.seen, [])
+
+    def test_existing_other_native_profile_is_not_a_launch_label_alias(self):
+        other = self.home / "profiles" / "sample-agent"
+        other.mkdir(parents=True)
+        (other / "config.yaml").write_text("model: synthetic\n")
+        with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            self.bind_messaging("telegram", profile="sample-agent")
+            result = self.call({"action": "status", "issue": "ABC-1"})
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(self.seen, [])
+
+    def test_launch_label_cannot_alias_a_routed_home(self):
+        from hermes_constants import pin_process_hermes_home
+        with tempfile.TemporaryDirectory() as process_home, patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            pin_process_hermes_home(process_home)
+            self.addCleanup(pin_process_hermes_home, None)
+            self.bind_messaging("slack", profile="sample-agent")
+            result = self.call({"action": "status", "issue": "ABC-1"})
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(self.seen, [])
 
     def test_actual_api_producer_registered_handler_socket_and_unlinked_comment(self):
         self.bind_api()
