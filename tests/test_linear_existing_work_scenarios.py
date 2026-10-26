@@ -5,6 +5,9 @@ import os
 from contextlib import closing
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -32,6 +35,80 @@ class ExistingWorkScenarios(unittest.TestCase):
 
     def assign(self):
         self.bridge.handle_webhook(self.fixture.event())
+
+    def competing_writer(self, database):
+        result = subprocess.run([sys.executable, "-c", """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0.1, isolation_level=None)
+try:
+    connection.execute('BEGIN IMMEDIATE')
+except sqlite3.OperationalError as exc:
+    if 'locked' not in str(exc):
+        raise
+    print('locked')
+else:
+    print('acquired')
+    connection.rollback()
+finally:
+    connection.close()
+""", str(database)], capture_output=True, text=True, timeout=3, check=True)
+        return result.stdout.strip()
+
+    def test_live_delete_transaction_keeps_competing_writer_excluded_after_inspection_and_reader_close(self):
+        _, task_id = self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_cli.sqlite_safe_read import has_live_connection
+        with closing(self.board.kc.connect(board="default")) as writer:
+            self.assertTrue(has_live_connection(database))
+            self.assertEqual(writer.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            writer.execute("BEGIN IMMEDIATE")
+            before = self.competing_writer(database)
+            with self.board.history_conn(database, snapshot=True) as reader:
+                self.assertEqual(native.kb.get_task(reader, task_id).id, task_id)
+                during = self.competing_writer(database)
+            after = self.competing_writer(database)
+            self.assertTrue(writer.in_transaction)
+            self.assertEqual((before, during, after), ("locked", "locked", "locked"))
+            writer.rollback()
+        self.assertEqual(self.competing_writer(database), "acquired")
+
+    def test_live_exclusive_transaction_refuses_bounded_native_inspection_but_keeps_issue_content(self):
+        self.existing()
+        self.assign()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_fleet_linear_plugin import chat
+        self.bridge.profile_home = self.fixture.home
+        context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+        with closing(self.board.kc.connect(board="default")) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            writer.execute("BEGIN EXCLUSIVE")
+            self.assertEqual(self.competing_writer(database), "locked")
+            started = time.monotonic()
+            with self.assertRaises(native.LinearError):
+                with self.board.history_conn(database, snapshot=True):
+                    self.fail("EXCLUSIVE native lock must refuse inspection")
+            self.assertLess(time.monotonic() - started, 1)
+            result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["issue"]["id"], native.ISSUE)
+            self.assertFalse(result["native"]["linked"])
+            self.assertTrue(writer.in_transaction)
+            self.assertEqual(self.competing_writer(database), "locked")
+            writer.rollback()
+        self.assertEqual(self.competing_writer(database), "acquired")
+
+    def test_source_reader_is_tracked_against_native_raw_file_access(self):
+        self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        from hermes_cli.sqlite_safe_read import offline_file_access, LiveConnectionError, has_live_connection
+        self.assertFalse(has_live_connection(database))
+        with self.board.history_conn(database) as reader:
+            self.assertTrue(has_live_connection(database))
+            self.assertEqual(reader.execute("PRAGMA query_only").fetchone()[0], 1)
+            with self.assertRaises(LiveConnectionError):
+                with offline_file_access(database):
+                    self.fail("plugin source reader must fence raw file access")
+        self.assertFalse(has_live_connection(database))
 
     def test_running_unlinked_chat_task_is_reused_and_followup_keeps_its_run(self):
         adapter, task_id = self.existing()

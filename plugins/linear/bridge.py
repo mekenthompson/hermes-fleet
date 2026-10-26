@@ -278,6 +278,7 @@ class Kanban:
     @contextmanager
     def history_conn(self, path: Path, *, snapshot: bool = False):
         """Read native rows without creating, migrating or reopening a board."""
+        from hermes_cli.sqlite_safe_read import connect_tracked, offline_file_access, LiveConnectionError
         try:
             with ExitStack() as stack:
                 if snapshot:
@@ -295,26 +296,34 @@ class Kanban:
                                 result.append((source.name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
                         return result
                     temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="linear-native-history-")))
-                    for attempt in range(5):
-                        destination = temporary / str(attempt)
-                        destination.mkdir()
-                        try:
-                            before = versions()
-                            for source in files:
-                                if source.exists():
-                                    shutil.copyfile(source, destination / source.name)
-                            if versions() != before:
-                                raise ValueError("native history changed during inspection")
-                            break
-                        except (OSError, ValueError):
-                            if attempt == 4:
-                                raise
-                            # An active native connection may checkpoint away
-                            # WAL between enumeration and copy. Retry from new
-                            # files; never inspect a mixed or stale snapshot.
-                            time.sleep(0.01)
-                    path = destination / path.name
-                conn = stack.enter_context(closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)))
+                    try:
+                        # Raw fd close cancels this process's SQLite locks.
+                        # Native's lifecycle lock makes the no-live-handle
+                        # check and all source-byte reads atomic together.
+                        with offline_file_access(path, what="inspect native history"):
+                            for attempt in range(5):
+                                destination = temporary / str(attempt)
+                                destination.mkdir()
+                                try:
+                                    before = versions()
+                                    for source in files:
+                                        if source.exists():
+                                            shutil.copyfile(source, destination / source.name)
+                                    if versions() != before:
+                                        raise ValueError("native history changed during inspection")
+                                    break
+                                except (OSError, ValueError):
+                                    if attempt == 4:
+                                        raise
+                                    time.sleep(0.01)
+                        path = destination / path.name
+                    except LiveConnectionError:
+                        # SQLite coordinates same-process readers with existing
+                        # writers. A finite read timeout refuses EXCLUSIVE locks
+                        # without waiting for our own connection to release one.
+                        pass
+                conn = stack.enter_context(closing(connect_tracked(
+                    path.resolve(strict=True).as_uri() + "?mode=ro", tracking_path=path, uri=True, timeout=0.1)))
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("BEGIN")
