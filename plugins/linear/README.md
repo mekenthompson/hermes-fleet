@@ -13,7 +13,7 @@ API is required. The plugin is disabled by default.
 
 | Action | Result |
 | --- | --- |
-| `track` with `issue`, `task_id` | Link an existing task on this profile's configured board for reporting. No task creation, claim, restart, resume or transfer. |
+| `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
 | `status` with `issue` | Read the issue and linked native state, or retained migration/reconciliation information. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
@@ -32,6 +32,13 @@ cancellation and routing. Questions, short commands and bounded investigations w
 Linear. To continue active linked work, resolve its task and send a native operator comment;
 opening another conversation does not replace its executor. Passive progress uses native
 notification subscriptions with `notify`, never `wake` as an execution workaround.
+
+Tracking preserves the native profile, board and task. The task must belong to the verified
+executor profile. Native board validation and worker pins apply across the private RPC;
+selecting a board cannot expand a worker's scope. Missing or archived boards are refused
+without creating or reopening them. Subsequent status, follow-up and reporting use the
+recorded board. The configured plugin board remains the creation destination for verified
+Linear assignments, so linking an ordinary or project task does not require moving it.
 
 Validated Linear assignments create a native task with `initial_status="blocked"`.
 They are durable requests, not automatic execution. Activate them through an authorized native
@@ -99,8 +106,9 @@ plugins:
 `token_file` credentials with `path` are also supported. OAuth and token caches remain private
 profile state. The immutable viewer/workspace binding is revalidated on requests. Optional
 `identity.teams` and `identity.projects` restrict issue access and writes. `state_database`
-defaults to `<profile home>/linear/state.db`; optional `board`, `api_url`, `tick_seconds`
-(default 2), `team_states` and `completion_contracts` retain their existing meanings.
+defaults to `<profile home>/linear/state.db`; optional `board` selects the destination for
+Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
+`completion_contracts` retain their existing meanings.
 `ingress_profile` selects the trusted inbox route only; it does not change caller authorization.
 `activation_cutoff_ms` imports older signals without executing them and cannot retroactively
 activate an existing state database. API quota backoff remains durable and profile-local.
@@ -133,6 +141,8 @@ requests remain visible for native reconciliation. A blocked task or Stop acknow
 not proof that an external process or effect ended; inspect native process/effect state.
 
 Before status mutations/retries the bridge re-reads Linear so human reassignment/closure wins.
+This revalidation does not provide remote compare-and-swap; conflicting or unverifiable
+mutation responses remain subject to reconciliation.
 The local outbox preserves UUIDs and uncertain external effects. Use the profile CLI:
 
 ```bash

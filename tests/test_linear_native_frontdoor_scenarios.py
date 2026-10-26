@@ -68,7 +68,10 @@ class NativeFrontdoorTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.env = patch.dict(os.environ, {"HERMES_HOME": str(self.home), "HERMES_KANBAN_HOME": str(self.home / "kanban"), "_HERMES_GATEWAY": ""})
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("HERMES_KANBAN_") and key != "HERMES_DELEGATED_CHILD_CONTEXT"}
+        environment.update(HERMES_HOME=str(self.home), HERMES_KANBAN_HOME=str(self.home / "kanban"), _HERMES_GATEWAY="")
+        self.env = patch.dict(os.environ, environment, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
         token = set_hermes_home_override(self.home)
@@ -193,6 +196,173 @@ class NativeFrontdoorTests(unittest.TestCase):
                          (before.status, before.current_run_id, before.assignee))
         self.assertEqual(self.bridge.store.get("issue-1")["origin"], "native")
         self.assertEqual(self.call({"action": "status", "issue": "ABC-1"})["native"]["task_id"], task.id)
+
+    def test_default_and_project_tasks_link_with_separate_creation_board(self):
+        self.bind_api()
+        creation = Kanban("sample-linear-v1", profile="default", profile_home=self.home)
+        self.bridge.kanban = creation
+        for slug in ("default", "project-board"):
+            with self.subTest(board=slug):
+                board = Kanban(slug, profile="default", profile_home=self.home)
+                task = board.create(title="Existing native work", initial_status="blocked")
+                issue_id = "issue-" + slug
+                self.remote.add_issue(issue_id, "ABC-" + slug)
+                args = {"action": "track", "issue": "ABC-" + slug, "task_id": task.id}
+                if slug != "default":
+                    args["board"] = slug
+                result = self.call(args)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(self.seen[-1].native_board, slug)
+                binding = self.bridge.store.native_binding(issue_id)
+                self.assertEqual(binding["board"], slug)
+                status = self.call({"action": "status", "issue": "ABC-" + slug})
+                self.assertEqual((status["native"]["task_id"], status["native"]["board"]), (task.id, slug))
+                after = board.get(task.id)
+                self.assertEqual((after.status, after.current_run_id, after.claim_lock, after.assignee),
+                                 (task.status, task.current_run_id, task.claim_lock, task.assignee))
+        self.assertEqual(self.bridge.kanban.board, "sample-linear-v1")
+        with creation.conn() as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
+
+    def test_track_defaults_to_actual_native_current_board(self):
+        from hermes_cli import kanban_db as kb
+        self.bind_api()
+        board = Kanban("current-project", profile="default", profile_home=self.home)
+        task = board.create(title="Current project work", initial_status="blocked")
+        with kb.scoped_current_board("current-project"):
+            result = self.call({"action": "track", "issue": "ABC-1", "task_id": task.id})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.bridge.store.native_binding("issue-1")["board"], "current-project")
+
+    def test_missing_and_archived_track_boards_are_not_created_or_resurrected(self):
+        from hermes_cli import kanban_db as kb
+        self.bind_api()
+        Kanban("retired-project", profile="default", profile_home=self.home)
+        kb.remove_board("retired-project", archive=True)
+        for slug in ("missing-project", "retired-project", "../outside"):
+            with self.subTest(board=slug):
+                before = len(self.seen)
+                result = self.call({"action": "track", "issue": "ABC-1", "task_id": "existing", "board": slug})
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(len(self.seen), before)
+        self.assertFalse(kb.board_dir("missing-project").exists())
+        self.assertFalse(kb.kanban_db_path(board="retired-project").exists())
+        self.assertTrue(kb.read_board_metadata("retired-project")["archived"])
+
+    def test_worker_and_descendant_cannot_retarget_track_before_rpc(self):
+        from hermes_cli import kanban_db as kb
+        self.bind_api()
+        Kanban("other-project", profile="default", profile_home=self.home)
+        for marker in ({"HERMES_KANBAN_TASK": "native-worker"},
+                       {"HERMES_DELEGATED_CHILD_CONTEXT": str(kb.kanban_home())}):
+            with self.subTest(marker=marker), patch.dict(os.environ, {
+                    "HERMES_KANBAN_BOARD": "default", "HERMES_KANBAN_DB": str(kb.kanban_db_path(board="default")), **marker}):
+                before = len(self.seen)
+                result = self.call({"action": "track", "issue": "ABC-1", "task_id": "existing", "board": "other-project"})
+                self.assertFalse(result["ok"], result)
+                self.assertIn("pin", result["message"])
+                self.assertEqual(len(self.seen), before)
+
+    def test_pinned_status_and_followup_cannot_reach_another_binding_board(self):
+        from hermes_cli import kanban_db as kb
+        self.bind_api()
+        board = Kanban("other-project", profile="default", profile_home=self.home)
+        task = board.create(title="Other board work")
+        self.assertTrue(self.bridge.authorize_specialist_effect("issue-1"))
+        self.assertTrue(self.bridge.store.bind_native("issue-1", task.id, "default", "other-project", at=self.clock()))
+        with patch.dict(os.environ, {"HERMES_KANBAN_BOARD": "default",
+                                   "HERMES_KANBAN_DB": str(kb.kanban_db_path(board="default")),
+                                   "HERMES_KANBAN_TASK": "native-worker"}):
+            for action in ("status", "followup"):
+                result = self.call({"action": action, "issue": "ABC-1", "body": "A new instruction", "id": str(uuid.uuid4())})
+                self.assertFalse(result["ok"], result)
+                self.assertIn("pin", result["message"])
+                self.assertEqual(self.seen[-1].pinned_board, "default")
+        with board.conn() as conn:
+            self.assertEqual(kb.list_comments(conn, task.id), [])
+
+    def test_unlinked_content_needs_no_native_board_and_ignores_model_pins(self):
+        self.bind_api()
+        with patch.object(transport, "native_board_target", side_effect=AssertionError("ordinary content needs no board")):
+            result = self.call({"action": "add_comment", "issue": "ABC-1", "id": str(uuid.uuid4()),
+                                "body": "Ordinary content", "native_board": "forged", "pinned_db_path": "/forged"})
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(self.seen[-1].native_board, "")
+            self.assertEqual(self.seen[-1].pinned_db_path, "")
+            self.assertTrue(self.call({"action": "status", "issue": "ABC-1"})["ok"])
+
+    def specialist_content_bridge(self, *, bound=True):
+        self.specialist_sessions = {"linear-request": {"id": "linear-request", "creator": {"id": "allowed-requester"},
+                                                     "appUser": {"id": "app-self"}, "issue": {"id": "issue-1"}}}
+        original = self.remote._apply
+        def authority(query, variables):
+            if "IdentityBinding" in query:
+                return 200, {"data": {"viewer": {"id": "app-self"}, "organization": {"id": "org-1"}}}
+            if "AgentSessionAuthorization" in query:
+                return 200, {"data": {"agentSession": self.specialist_sessions.get(variables["id"])}}
+            return original(query, variables)
+        self.remote._apply = authority
+        api = plugin.BoundLinearAPI(lambda: "synthetic-token", endpoint=self.remote.url,
+            identity={"viewer_id": "app-self", "organization_id": "org-1"},
+            specialist_scope={"all_teams": True, "all_projects": True,
+                              "allowed_requester_ids": ["allowed-requester"], "requester_basis": "agent_session"})
+        self.bridge = Bridge(self.bridge.store, api, self.board, profile="default", clock=self.clock)
+        self.bridge.profile_home = self.home
+        if bound:
+            task = self.board.create(title="Existing specialist request", initial_status="blocked")
+            self.assertTrue(self.bridge.store.bind_native("issue-1", task.id, "default", "default",
+                                                         owner_ref="linear-request", at=self.clock()))
+            return task
+
+    def test_specialist_registered_content_persists_verified_requester_and_delivers(self):
+        self.bind_api()
+        task = self.specialist_content_bridge()
+        request = str(uuid.uuid4())
+        result = self.call({"action": "add_comment", "issue": "ABC-1", "id": request, "body": "Authorized ordinary comment"})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.bridge.store.outbox_row(request)["payload"]["requester_sessions"], {"issue-1": "linear-request"})
+        self.assertEqual(self.bridge.flush(), 1)
+        self.assertEqual(self.remote.comments[0]["body"], "Authorized ordinary comment")
+        after = self.board.get(task.id)
+        self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                         (task.status, task.current_run_id, task.claim_lock))
+
+    def test_specialist_unbound_cross_issue_or_revoked_requester_refuses_before_queue(self):
+        self.bind_api()
+        self.specialist_content_bridge(bound=False)
+        request = str(uuid.uuid4())
+        args = {"action": "add_comment", "issue": "ABC-1", "id": request, "body": "Authorized comment"}
+        result = self.call(args)
+        self.assertFalse(result["ok"], result)
+        self.assertIsNone(self.bridge.store.outbox_row(request))
+        # Establish the original native request without fabricating outbox authority.
+        task = self.board.create(title="Existing request", initial_status="blocked")
+        self.assertTrue(self.bridge.store.bind_native("issue-1", task.id, "default", "default",
+                                                     owner_ref="linear-request", at=self.clock()))
+        self.specialist_sessions["linear-request"]["issue"] = {"id": "other-issue"}
+        result = self.call(args)
+        self.assertFalse(result["ok"], result)
+        self.assertIsNone(self.bridge.store.outbox_row(request))
+        self.specialist_sessions["linear-request"].update(issue={"id": "issue-1"}, creator={"id": "revoked-requester"})
+        result = self.call(args)
+        self.assertFalse(result["ok"], result)
+        self.assertIsNone(self.bridge.store.outbox_row(request))
+        self.assertEqual(self.remote.comments, [])
+
+    def test_specialist_delivery_never_borrows_a_later_binding_requester(self):
+        self.bind_api()
+        self.specialist_content_bridge()
+        request = str(uuid.uuid4())
+        result = self.call({"action": "add_comment", "issue": "ABC-1", "id": request, "body": "Original authorized comment"})
+        self.assertTrue(result["ok"], result)
+        self.specialist_sessions["linear-request"]["creator"] = {"id": "revoked-requester"}
+        self.specialist_sessions["later-request"] = {"id": "later-request", "creator": {"id": "allowed-requester"},
+                                                    "appUser": {"id": "app-self"}, "issue": {"id": "issue-1"}}
+        with self.bridge.store._tx() as db:
+            db.execute("UPDATE work SET owner_ref='later-request' WHERE issue_id='issue-1'")
+        self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(self.remote.comments, [])
+        self.assertEqual(self.bridge.store.outbox_row(request)["payload"]["requester_sessions"], {"issue-1": "linear-request"})
 
     def test_content_with_retained_stopped_chat_does_not_adopt_or_execute_it(self):
         self.bind_api()

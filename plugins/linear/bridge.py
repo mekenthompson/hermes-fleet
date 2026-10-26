@@ -1,6 +1,7 @@
 """Translate authorized Linear requests and native task history through durable reporting intents."""
 from __future__ import annotations
 import json
+import copy
 import hashlib
 import logging
 import math
@@ -17,6 +18,7 @@ from typing import Any, Callable
 from .api import markdown_matches, LinearAPI, LinearError, RateLimited, state_id
 from .oauth import ReauthorizationRequired
 from .store import Store, advisory
+from . import transport
 log = logging.getLogger("linear")
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
@@ -192,14 +194,18 @@ class Kanban:
     def __init__(self, board: str | None = None, *, profile: str | None = None,
                  profile_home: Any = None) -> None:
         from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
-        self.kb, self.kc, self.kn, self.board = kanban_db, kanban_db_connect, kanban_db_notify, board
+        self.kb, self.kc, self.kn = kanban_db, kanban_db_connect, kanban_db_notify
+        metadata = kanban_db.read_board_metadata(board if board is not None else kanban_db.get_current_board())
+        self.board = metadata["slug"]
         self.executor_profile = self.resolve_executor_profile(profile, profile_home) if profile is not None else None
         self.profile_home = Path(profile_home).resolve(strict=True) if profile is not None else None
-        if board and board != "default":
+        if metadata.get("archived"):
+            return  # Reporting/content stays available; native connections refuse this archived target.
+        if self.board != "default":
             from hermes_cli.kanban_db_boards import create_board
-            create_board(board)
+            create_board(self.board)
         else:
-            kanban_db_connect.init_db(board=board)
+            kanban_db_connect.init_db(board=self.board)
     @staticmethod
     def resolve_executor_profile(profile: str, profile_home: Any) -> str:
         from hermes_cli.profiles import get_profile_dir, profile_exists
@@ -211,8 +217,21 @@ class Kanban:
         raise ValueError("linear: no Kanban executor profile matches the service home")
     @contextmanager
     def conn(self):
+        try:
+            transport.native_board_target(self.board or "default")
+        except transport.Unavailable as exc:
+            raise LinearError(str(exc), retryable=False) from exc
         with closing(self.kc.connect(board=self.board)) as conn:
             yield conn
+    def for_board(self, board: str):
+        """An inspected existing board with the same verified executor; never create it."""
+        try:
+            slug, _ = transport.native_board_target(board)
+        except transport.Unavailable as exc:
+            raise LinearError(str(exc), retryable=False) from exc
+        adapter = copy.copy(self)
+        adapter.board = slug
+        return adapter
     def create(self, **fields: Any):
         if self.executor_profile is not None:
             fields["assignee"] = self.executor_profile
@@ -234,8 +253,8 @@ class Kanban:
 
     def history(self, task_id: str, after_id: int) -> list:
         with self.conn() as conn:
-            return [event for event in self.kb.list_events(conn, task_id)
-                    if event.id > after_id]
+            return sorted((event for event in self.kb.list_events(conn, task_id)
+                           if event.id > after_id), key=lambda event: event.id)
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.conn() as conn:
             comments = self.kb.list_comments(conn, task_id)
@@ -424,6 +443,10 @@ class Bridge:
                                       terminal, requires_status_id)
     def _queue_update(self, session_id, project_id, ident, line, session_key, quiet, issue_id, due,
                       terminal, requires_status_id) -> bool:
+        binding = self.store.native_binding(issue_id)
+        if binding:
+            self._binding_adapter(issue_id)
+            session_id = self._project_batch(binding, session_id)
         return self.store.queue_project_update({"issue_id": f"update:{session_id}:{project_id or issue_id}",
                                          "session_id": session_id, "session_key": session_key,
                                          **self._alert_route(self.store.get(issue_id)),
@@ -433,6 +456,10 @@ class Bridge:
                                          "lines": {ident: line}, "line_issues": {ident: issue_id},
                                          "terminal_lines": {ident: requires_status_id} if terminal else {}},
                                         due=due, quiet=quiet)
+    @staticmethod
+    def _project_batch(binding: dict, session_id: str | None = None) -> str:
+        # Task IDs are board-local. This is only a reporting batch key, never a worker identity.
+        return json.dumps([binding["profile"], binding["board"], session_id or binding["task_id"]], separators=(",", ":"))
     def _specialist_scope_active(self) -> bool:
         return getattr(self.api, "specialist_scope", None) is not None
     def _fence_scope_denial(self, issue_id: str, exc: LinearError) -> None:
@@ -628,7 +655,7 @@ class Bridge:
             return  # Ordinary linked issues have no Agent Session keepalive contract.
         if self.clock() - self.store.last_activity_at(row["issue_id"], row["owner_ref"]) < 25 * 60 - self.recheck_every:
             return
-        task = self.kanban.require_task(row["task_id"])
+        task = self._binding_adapter(row["issue_id"]).require_task(row["task_id"])
         if task.status in ("running", "ready"):
             kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
                                                     else "Waiting for native execution", "Native work remains active", ephemeral=True)
@@ -636,14 +663,15 @@ class Bridge:
 
     def _unfinished(self, row: dict, *, event_id: int | None = None) -> None:
         issue_id = row["issue_id"]
-        latest = [event.id for event in self.kanban.history(row["task_id"], 0) if event.kind == "archived"]
+        adapter = self._binding_adapter(issue_id)
+        latest = [event.id for event in adapter.history(row["task_id"], 0) if event.kind == "archived"]
         if event_id is not None and latest and event_id != max(latest):
             self.store.capture_event(issue_id, event_id, [], at=self.clock())
             return
-        if self.store.terminal_captured(row["task_id"]):
+        if self.store.terminal_captured(row["task_id"], issue_id=issue_id):
             self.store.capture_event(issue_id, event_id, [], at=self.clock())
             return
-        completed = [event for event in self.kanban.history(row["task_id"], 0) if event.kind == "completed"]
+        completed = [event for event in adapter.history(row["task_id"], 0) if event.kind == "completed"]
         if completed:
             # Archive is not evidence that an earlier completion was undone.
             writes = [("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
@@ -726,22 +754,28 @@ class Bridge:
         else:
             self.activity(issue_id, session_id, "thought", "Native task created and linked in blocked state. A current authorized native task control is required to activate it; Linear has not started a worker.")
         return True
-    def track(self, issue_id: str, task_id: str, *, requester_session: str | None = None) -> dict:
+    def track(self, issue_id: str, task_id: str, *, board: str | None = None,
+              requester_session: str | None = None) -> dict:
         if not self._require_effect(issue_id):
             raise LinearError("Issue authorization refused", retryable=False)
         issue = self._effect_issue(issue_id)
-        task = self.kanban.require_task(task_id)
-        if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile,
-                self.kanban.board or "default", owner_ref=requester_session or "",
+        adapter = self.kanban if board is None else self.kanban.for_board(board)
+        task = adapter.require_task(task_id)
+        if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
+                adapter.board or "default", owner_ref=requester_session or "",
                 project_id=(issue.get("project") or {}).get("id"), at=self.clock() * 1000):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
+    def _binding_adapter(self, issue_id: str):
+        binding = self.store.native_binding(issue_id, self.kanban.executor_profile)
+        if not binding:
+            raise LinearError("No verified native binding; legacy/manual records require reconciliation", retryable=False)
+        return (self.kanban if binding["board"] == (self.kanban.board or "default")
+                else self.kanban.for_board(binding["board"]))
     def _native_task(self, issue_id: str):
         row = self.store.get(issue_id)
-        binding = self.store.native_binding(issue_id, self.kanban.executor_profile, self.kanban.board or "default")
-        if not row or row.get("origin") != "native" or not binding:
-            raise LinearError("No verified native binding; legacy/manual records require reconciliation", retryable=False)
-        return row, self.kanban.require_task(row["task_id"])
+        adapter = self._binding_adapter(issue_id)
+        return row, adapter.require_task(row["task_id"])
     def native_status(self, issue_id: str) -> dict:
         row = self.store.get(issue_id)
         retained = {key: row.get(key) for key in ("origin", "task_id", "last_event_id", "stop_requested_at", "release_pending")} if row else {}
@@ -751,7 +785,8 @@ class Bridge:
             return {"issue_id": issue_id, "linked": False, "status": "reconciliation" if row else "unlinked",
                     "retained": retained, "message": str(exc)}
         return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status,
-                "run_id": task.current_run_id, "profile": task.assignee, "board": self.kanban.board or "default"}
+                "run_id": task.current_run_id, "profile": task.assignee,
+                "board": self.store.native_binding(issue_id)["board"]}
     def followup(self, issue_id: str, body: str, request_id: str, *, requester_session: str | None = None, source_ms: float | None = None) -> dict:
         if not body.strip() or not request_id:
             raise LinearError("Follow-up body and stable request identity are required", retryable=False)
@@ -759,6 +794,7 @@ class Bridge:
             raise LinearError("Issue authorization refused", retryable=False)
         with self.lock(issue_id):
             row, task = self._native_task(issue_id)
+            adapter = self._binding_adapter(issue_id)
             issue = self._effect_issue(issue_id)
             if (issue.get("state") or {}).get("type") in CLOSED or (issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()):
                 raise LinearError("Issue was closed or reassigned; follow-up held", retryable=False)
@@ -769,31 +805,32 @@ class Bridge:
             marker = f"{issue_id}:{request_id}"
             intent_key = f"comment:{marker}"
             if source_ms is not None and self.store.native_intent(intent_key) is None:
-                controls = [event for event in self.kanban.history(task.id, 0)
+                controls = [event for event in adapter.history(task.id, 0)
                             if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived")]
                 if any(source_ms // 1000 <= event.created_at for event in controls):
                     return {"task_id": task.id, "status": task.status,
                             "message": "Follow-up ordering is stale or unverifiable. Inspect native task history and send a current native instruction."}
             payload = {"kind": "comment", "issue_id": issue_id, "task_id": task.id, "body": body.strip(),
-                       "profile": self.kanban.executor_profile, "board": self.kanban.board or "default", "marker": marker}
+                       "profile": adapter.executor_profile, "board": adapter.board or "default", "marker": marker}
             saved, first = self.store.native_intent_prepare(intent_key, payload)
             if saved.get("state") == "applied":
                 return {"task_id": task.id, "status": task.status, "message": "Instruction already saved on the existing native task."}
             if not first:
-                comments = self.kanban.find_comment(task.id, body, marker)
+                comments = adapter.find_comment(task.id, body, marker)
                 if len(comments) != 1:
                     self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native comment outcome is ambiguous"})
                     raise LinearError("Follow-up delivery outcome is unknown; inspect native comments before repeating", retryable=False)
                 comment_id = comments[0].id
             else:
-                self.kanban.require_task(task.id)
-                comment_id = self.kanban.comment(task.id, body, marker=marker)
+                adapter.require_task(task.id)
+                comment_id = adapter.comment(task.id, body, marker=marker)
             self.store.native_intent_settle(intent_key, {"state": "applied", "comment_id": comment_id})
             return {"task_id": task.id, "status": task.status, "message": "Instruction saved on the existing native task."}
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> None:
         if not row or row.get("origin") != "native" or not activity_id:
             return
         row, task = self._native_task(row["issue_id"])
+        adapter = self._binding_adapter(row["issue_id"])
         issue = self._effect_issue(row["issue_id"])
         if (issue.get("delegate") or {}).get("id") != self.api.viewer_id():
             return
@@ -806,7 +843,7 @@ class Bridge:
         if prior:
             payload["run_id"] = prior["payload"].get("run_id")
         else:
-            controls = [event for event in self.kanban.history(task.id, 0)
+            controls = [event for event in adapter.history(task.id, 0)
                         if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")]
             if any(stamp // 1000 <= event.created_at for event in controls):
                 self._decline(row["issue_id"], session_id, "Stop ordering is stale or unverifiable. Use current native task controls.")
@@ -823,8 +860,8 @@ class Bridge:
             self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
             self._decline(row["issue_id"], session_id, "Stop needs a current native task control; no run-scoped ordering was available.")
             return
-        self.kanban.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id)
-        latest = self.kanban.require_task(task.id)
+        adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id)
+        latest = adapter.require_task(task.id)
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
         self._decline(row["issue_id"], session_id, "Native Stop requested; inspect native worker/effect state." if stopped else "Stop was not verified. Use native task controls.")
@@ -841,15 +878,15 @@ class Bridge:
                     continue
                 captured = (self.store.captured_task_activities(row["issue_id"], row["task_id"], row["owner_ref"])
                             if row["last_event_id"] == 0 else {})
-                for event in self.kanban.history(row["task_id"], row["last_event_id"]):
+                for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], row["last_event_id"]):
                     # A pre-cursor work row upgrades at zero. Its history may include a
                     # delivered give-up from an earlier attempt. Reconcile transitions
                     # with the current task, while still capturing a claimed event that
                     # describes its current state.
                     self._task_event(row, event, task.status, captured)
                     row = self.store.get(row["issue_id"])
-                    if not row:
-                        break
+                    if not row or row["last_event_id"] < event.id:
+                        break  # Retry this event before consuming any later event for this binding.
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
         payload, issue_id = event.payload or {}, row["issue_id"]
@@ -905,7 +942,7 @@ class Bridge:
             if note:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
         elif event.kind == "commented":
-            reader = getattr(self.kanban, "comment_text", None)
+            reader = getattr(self._binding_adapter(issue_id), "comment_text", None)
             event_at = getattr(event, "created_at", None)
             body = (_progress_text(reader(row["task_id"], str(payload.get("author") or ""), int(payload.get("len") or 0), event_at), 800)
                     if callable(reader) and event_at is not None else "")
@@ -932,7 +969,7 @@ class Bridge:
         row = self.store.get(issue_id)
         if not row or row.get("origin") != "native" or event_id is None:
             return False
-        source = next((getattr(event, "created_at", None) for event in self.kanban.history(row["task_id"], 0) if event.id == event_id), None)
+        source = next((getattr(event, "created_at", None) for event in self._binding_adapter(issue_id).history(row["task_id"], 0) if event.id == event_id), None)
         writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source * 1000} if kind == "status" and source is not None else {})})
                   for kind, payload in self._report_writes(row, writes)]
         # Cursor and reporting intents commit together, including completion.
@@ -940,18 +977,19 @@ class Bridge:
     def _finished(self, row: dict[str, Any], *, event_id: int | None = None) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
-        task = self.kanban.require_task(row["task_id"])
-        latest = [event.id for event in self.kanban.history(task.id, 0) if event.kind == "completed"]
+        adapter = self._binding_adapter(row["issue_id"])
+        task = adapter.require_task(row["task_id"])
+        latest = [event.id for event in adapter.history(task.id, 0) if event.kind == "completed"]
         if task.status != "done" or (event_id is not None and latest and event_id != max(latest)):
             if event_id is not None:
                 self.store.capture_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
-        evidence = [contract] if contract.startswith("https://") else evidence_links(self.kanban.evidence_text(task))
+        evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
         issue_id = row["issue_id"]
         heads, failures = {}, []
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
-        summary = _project_summary(self.kanban.completion_summary(task), 1500)
+        summary = _project_summary(adapter.completion_summary(task), 1500)
         residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", summary, flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
@@ -966,7 +1004,7 @@ class Bridge:
                                                        "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id)
             return
         assessment = ""
-        reader = getattr(self.kanban, "issue_comment", None)
+        reader = getattr(adapter, "issue_comment", None)
         if (callable(reader) and row.get("origin") == "native" and
                 (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
             raw = reader(task)
@@ -987,7 +1025,8 @@ class Bridge:
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
                                 "content": {"type": "response", "body": "Assessment posted on the issue." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
-                  ("project_update", {"issue_id": issue_id, "session_id": task.id, "session_key": "",
+                  ("project_update", {"issue_id": issue_id,
+                                      "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
                                       "lines": {task.title.split(":")[0]: "Assessment posted on the issue." if assessment else f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
@@ -1004,8 +1043,37 @@ class Bridge:
             return True
         row = self.store.get(issue["id"])
         return bool(delegate is None and row and row.get("origin") == "native" and not row.get("owner_ref")
-                    and self.store.native_binding(issue["id"], self.kanban.executor_profile, self.kanban.board or "default")
+                    and self.store.native_binding(issue["id"], self.kanban.executor_profile)
                     and (not payload or not payload.get("task_id") or payload["task_id"] == row["task_id"]))
+    @staticmethod
+    def _issue_version(issue: dict[str, Any] | None) -> dict | None:
+        if not isinstance(issue, dict) or not all(key in issue for key in ("id", "updatedAt", "state", "delegate", "assignee")):
+            return None
+        state = issue.get("state") or {}
+        if not issue.get("id") or not state.get("id") or iso_ms(issue.get("updatedAt")) <= 0:
+            return None
+        return {"id": issue["id"], "updatedAt": issue["updatedAt"], "state_id": state["id"],
+                "delegate_id": (issue.get("delegate") or {}).get("id"),
+                "assignee_id": (issue.get("assignee") or {}).get("id")}
+    def _receipt_scope(self, payload: dict, receipt: dict | None) -> bool:
+        profile = self.kanban.executor_profile
+        binding = self.store.native_binding(payload["issue_id"], profile)
+        return bool(binding and isinstance(receipt, dict) and receipt.get("task_id") == payload.get("task_id") == binding["task_id"]
+                    and receipt.get("profile") == profile and receipt.get("board") == binding["board"]
+                    and (receipt.get("issue") or {}).get("id") == payload["issue_id"])
+    def _record_status_receipt(self, row: dict, before: dict, fields: dict, result: dict | None) -> None:
+        expected, actual = self._issue_version(before), self._issue_version(result)
+        if (not expected or not actual or actual["id"] != expected["id"] or actual["state_id"] != fields.get("stateId")
+                or any(actual[key] != expected[key] for key in ("delegate_id", "assignee_id"))
+                or iso_ms(actual["updatedAt"]) < iso_ms(expected["updatedAt"])):
+            self._hold_terminal(row, "Status mutation response could not verify its exact issue version and assignment; reconcile before further reporting")
+        adapter = self._binding_adapter(row["payload"]["issue_id"])
+        receipt = {"task_id": row["payload"].get("task_id"), "profile": adapter.executor_profile,
+                   "board": adapter.board or "default", "issue": actual}
+        if not self._receipt_scope(row["payload"], receipt):
+            self._hold_terminal(row, "Status response does not match the native reporting binding")
+        current = self.store.outbox_row(row["id"])
+        self.store.rewrite(row["id"], {**current["payload"], "issue_write_receipt": receipt}, current["next_at"])
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
                   source_ms: float | None = None) -> bool:
         if claim or (issue.get("state") or {}).get("type") in CLOSED:
@@ -1014,7 +1082,9 @@ class Bridge:
         if row and row.get("origin") == "native":
             fence = source_ms if source_ms is not None else queued_at * 1000
             if iso_ms(issue.get("updatedAt")) > fence:
-                return False  # Never overwrite a human state/assignment changed since capture.
+                receipt = self.store.native_status_receipt(issue["id"], row["task_id"])
+                if not self._receipt_scope({"issue_id": issue["id"], "task_id": row["task_id"]}, receipt) or receipt["issue"] != self._issue_version(issue):
+                    return False  # Only the exact acknowledged own version can supersede the event timestamp.
         return self._report_delegate_allowed(issue)
     def recheck(self, force: bool = False) -> None:
         now = self.clock()
@@ -1184,7 +1254,11 @@ class Bridge:
             return True  # read-only settlement, even if the human changed ownership since send
         release_status = self.store.outbox_row(payload.get("requires_status_id", ""))
         if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return False
-        if kind == "status" and payload.get("terminal"):
+        if kind == "status" and payload.get("issue_write_receipt"):
+            if not self._receipt_scope(payload, payload["issue_write_receipt"]):
+                self._hold_terminal(row, "Persisted status receipt no longer matches its reporting scope")
+            return True  # The atomic mutation response already proves this effect; never send it again.
+        if kind == "status":
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])
                 if not payload.get("reported"):
@@ -1269,8 +1343,10 @@ class Bridge:
             if payload.get("release"):
                 fields["delegateId"] = None
             if fields:
-                self._mutate_outbox(row["id"], lambda: self.api.update_issue(payload["issue_id"], fields),
-                                    terminal=bool(payload.get("terminal")))
+                def update():
+                    result = self.api.update_issue(payload["issue_id"], fields)
+                    self._record_status_receipt(row, issue, fields, result)
+                self._mutate_outbox(row["id"], update, terminal=bool(payload.get("terminal")))
             if payload.get("release"):
                 verified = self._effect_issue(payload["issue_id"])
                 if (verified.get("id") != payload["issue_id"] or "delegate" not in verified or

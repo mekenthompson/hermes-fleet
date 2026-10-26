@@ -55,6 +55,7 @@ def issue_record(**changes):
         "updatedAt": "2026-01-01T00:00:00Z",
         "creator": {"id": USER},
         "delegate": None,
+        "assignee": None,
         "state": {"id": "state-todo", "name": "Todo", "type": "unstarted"},
         "project": {"id": PROJECT},
         "team": {"id": TEAM, "key": "OPS", "states": {"nodes": [
@@ -120,6 +121,11 @@ class Authority:
             if field == "issueUpdate" and "description" in variables.get("input", {}):
                 self.issues[variables["id"]]["description"] = variables["input"]["description"]
             data = {field: {"success": True}} if field else {}
+            if field == "issueUpdate":
+                issue, fields = self.issues[variables["id"]], variables["input"]
+                if "stateId" in fields:
+                    issue["state"] = next(dict(state) for state in issue["team"]["states"]["nodes"] if state["id"] == fields["stateId"])
+                data[field]["issue"] = json.loads(json.dumps(issue))
         else:
             data = {"organization": {"id": ORG}}
         return 200, {}, json.dumps({"data": data}).encode()

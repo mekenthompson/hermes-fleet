@@ -411,11 +411,12 @@ def register(ctx: Any) -> None:
 
     def tool(args: dict[str, Any] | None = None, **_: Any) -> str:
         try:
-            context = transport.capture_context()
+            args = args or {}
+            context = transport.capture_context(track=args.get("action") == "track", board=args.get("board"))
             bridge = running.get("bridge")
             if bridge is not None:
-                return chat.handle(bridge, args or {}, context)
-            return transport.chat_request(Path(context.home), args or {}, context)
+                return chat.handle(bridge, args, context)
+            return transport.chat_request(Path(context.home), args, context)
         except transport.Unavailable as exc:
             return chat._reply(False, str(exc), code="context_or_service_unavailable")
         except transport.Uncertain as exc:

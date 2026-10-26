@@ -356,11 +356,13 @@ class LinearAPI:
                                       for n in nodes if isinstance(n, dict)), key=lambda comment: comment["at"])
     def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
         return self.issue_with_thread(issue_id, limit)[1]
-    def update_issue(self, issue_id: str, fields: dict[str, Any]) -> None:
+    def update_issue(self, issue_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
-                            "{ issueUpdate(id: $id, input: $input) { success } }",
+                            "{ issueUpdate(id: $id, input: $input) { success issue { " + ISSUE_FIELDS + " } } }",
                             {"id": issue_id, "input": fields})
         _require_mutation_success(data, "issueUpdate")
+        issue = data["issueUpdate"].get("issue")
+        return issue if isinstance(issue, dict) else None
     def replace_description(self, issue_id: str, expected: str, body: str) -> None:
         current = self.issue(issue_id)
         if current.get("id") != issue_id:
