@@ -436,8 +436,10 @@ class Store:
             if not unchanged:
                 self._hold_superseded_reports(db, issue_id)
                 if same_target:
-                    db.execute("UPDATE work SET owner_ref=?,project_id=?,last_updated_at=?,linear_session_id=? WHERE issue_id=?",
-                               (owner_ref, project_id, at, owner_ref or None, issue_id))
+                    # Reporting metadata cannot manufacture a newer execution
+                    # instruction or suppress an already valid source Stop.
+                    db.execute("UPDATE work SET owner_ref=?,project_id=?,linear_session_id=? WHERE issue_id=?",
+                               (owner_ref, project_id, owner_ref or None, issue_id))
                 else:
                     db.execute("DELETE FROM work WHERE issue_id=?", (issue_id,))
                     db.execute("INSERT INTO work(issue_id,origin,owner_ref,task_id,project_id,last_updated_at,linear_session_id) "

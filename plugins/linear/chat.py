@@ -12,6 +12,8 @@ SCHEMA = {
     "description": (
         "Read Linear status, link an existing native task for reporting, or edit issues and projects. "
         "track requires issue and task_id and never starts, claims, resumes or transfers work. "
+        "After inspecting and coordinating native work, replace=true can replace only the reporting link; "
+        "requires id and the exact binding_revision from status, and preserves prior history. "
         "status reports the existing task and retained reconciliation records. "
         "followup adds an operator comment to active native work; requires issue, body and UUID id. "
         "Use native Kanban controls for an explicit resume, cancellation or new task. "
@@ -23,6 +25,8 @@ SCHEMA = {
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
         "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},
+        "replace": {"type": "boolean", "description": "track: explicitly replace a prior reporting link after inspecting actual work. Does not transfer execution or prove the old worker stopped."},
+        "expected_binding_revision": {"type": "string", "description": "track with replace: exact native.binding_revision from a fresh status read."},
         "id": {"type": "string", "description": "Caller UUIDv4 for creates, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
         "description": {"type": "string", "description": "Readable Linear Markdown."},
@@ -143,8 +147,13 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             task_id = _text(args, "task_id")
             if not task_id:
                 raise ValueError("track needs an existing task_id.")
-            return _reply(True, "Existing native task linked for reporting.",
-                          native=bridge.track(issue_id, task_id, board=context.native_board))
+            replace = args.get("replace", False)
+            if type(replace) is not bool:
+                raise ValueError("track replace must be a boolean.")
+            return _reply(True, "Existing native task linked for reporting; execution state was not changed.",
+                          native=bridge.track(issue_id, task_id, board=context.native_board, replace=replace,
+                              expected_revision=args.get("expected_binding_revision"),
+                              request_id=_uuid(args.get("id")) if replace else None))
         if action == "followup":
             if context.delegated_child:
                 return _reply(False, "Native delegated children cannot mutate Kanban; return findings to the parent agent.",
