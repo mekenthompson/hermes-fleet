@@ -108,28 +108,36 @@ How to work this task:
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 
-def task_issue_link(task, issue: dict) -> bool:
-    """An explicit issue link, not an incidental mention or execution authority."""
+def task_issue_scope(task, issue: dict) -> tuple[bool, bool]:
+    """Resolve all complete explicit lines as (matching, conflicting).
+
+    Canonical ID/identifier aliases and repeated identical lines share scope.
+    Incidental references do not assert ownership of native work.
+    """
+    markers = {line.strip() for line in (getattr(task, "body", None) or "").splitlines()
+               if re.fullmatch(r"Linear issue [^\s:]+: https?://\S+", line.strip())}
     url = issue.get("url")
-    if not isinstance(url, str) or not url:
-        return False
-    markers = {f"Linear issue {ref}: {url}" for ref in (issue["id"], issue.get("identifier")) if ref}
-    return any(line.strip() in markers for line in (getattr(task, "body", None) or "").splitlines())
+    allowed = ({f"Linear issue {ref}: {url}" for ref in (issue["id"], issue.get("identifier")) if ref}
+               if isinstance(url, str) and url else set())
+    return bool(markers & allowed), bool(markers - allowed)
+
+def task_issue_link(task, issue: dict) -> bool:
+    """A consistent explicit issue link, not execution authority."""
+    matching, conflicting = task_issue_scope(task, issue)
+    return matching and not conflicting
 
 def task_issue_match(task, issue: dict) -> bool:
+    # Keep ambiguous matching work visible to admission; never treat it as absent.
     return (getattr(task, "idempotency_key", None) == f"linear:{issue['id']}" or
-            task_issue_link(task, issue))
+            task_issue_scope(task, issue)[0])
 
 def require_task_issue_scope(task, issue: dict) -> None:
-    """Keep explicit current issue conflicts out of native steering.
+    """Hold explicit conflicts; marker-free authorized manual links remain valid.
 
-    Marker-free manually tracked work retains its existing reporting authority.
     This checks the last observed task; native writes retain their own boundary.
     """
-    if not task_issue_link(task, issue) and any(
-            re.fullmatch(r"Linear issue [^\s:]+: https?://\S+", line.strip())
-            for line in (getattr(task, "body", None) or "").splitlines()):
-        raise LinearError("Native task explicitly references a different issue; follow-up held for inspection", retryable=False)
+    if task_issue_scope(task, issue)[1]:
+        raise LinearError("Native task explicitly references a different or ambiguous issue; instruction or reporting link held for inspection", retryable=False)
 
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
@@ -915,6 +923,11 @@ class Bridge:
                     self._decline(issue_id, session_id, "Several native tasks explicitly reference this issue. Inspect their work and effects before admitting a replacement; no new task was created.")
                     return False
                 adapter, task = existing[0]
+                try:
+                    require_task_issue_scope(task, fresh)
+                except LinearError as exc:
+                    self._decline(issue_id, session_id, str(exc))
+                    return False
                 if not task_issue_link(task, fresh):
                     message = "Native issue retry key collides with work without a verified issue link; inspect before binding or creating replacement work"
                     self._decline(issue_id, session_id, message)
@@ -996,6 +1009,7 @@ class Bridge:
         if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
             self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
             raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
+        require_task_issue_scope(task, fresh)
         if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
                                      owner_ref=session_id, project_id=project, at=stamp):
             self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
@@ -1069,7 +1083,7 @@ class Bridge:
                 self._pending_assignment_stop(row)
             self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. No new activation was attempted; inspect native worker and effect state.")
             return True
-        adapter.require_task(row["task_id"])
+        require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
         accepted = adapter.activate(row["task_id"], token)
         owned_activation = accepted
         if not accepted:
@@ -1129,6 +1143,7 @@ class Bridge:
         issue = self._effect_issue(issue_id)
         adapter = self.kanban if board is None else self.kanban.for_board(board)
         task = adapter.require_task(task_id)
+        require_task_issue_scope(task, issue)
         if replace:
             binding = self.store.replace_native_binding(issue_id, task_id, adapter.executor_profile,
                 adapter.board or "default", expected_revision=expected_revision, request_id=request_id,

@@ -42,6 +42,104 @@ class ExistingWorkScenarios(unittest.TestCase):
             self.assertTrue(native.kb.edit_task(conn, task_id,
                 body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
 
+    def mixed_issue_markers(self):
+        return (f"Linear issue {native.ISSUE}: {self.issue['url']}\n"
+                "Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
+
+    def test_mixed_explicit_markers_hold_automatic_binding_without_replacement(self):
+        adapter, task_id = self.existing(body=self.mixed_issue_markers())
+        with adapter.conn() as conn:
+            run = native.kb.claim_task(conn, task_id)
+        self.assign()
+        self.assertIsNone(self.store.native_binding(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(len(self.fixture.tasks()), 1)
+        self.assertEqual(self.fixture.comments(task_id), [])
+        self.assertEqual(adapter.get(task_id).current_run_id, run.current_run_id)
+
+    def test_conflicting_explicit_marker_holds_manual_tracking(self):
+        _, task_id = self.existing(body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
+        with self.assertRaises(native.LinearError):
+            self.bridge.track(native.ISSUE, task_id)
+        self.assertIsNone(self.store.native_binding(native.ISSUE))
+        self.assertEqual(self.fixture.comments(task_id), [])
+
+    def test_mixed_explicit_markers_hold_manual_tracking(self):
+        _, task_id = self.existing(body=self.mixed_issue_markers())
+        with self.assertRaises(native.LinearError):
+            self.bridge.track(native.ISSUE, task_id)
+        self.assertIsNone(self.store.native_binding(native.ISSUE))
+
+    def test_conflicting_manual_replacement_preserves_previous_chat_binding(self):
+        self.store.put(native.ISSUE, "chat", "previous-conversation")
+        previous = self.store.get(native.ISSUE)
+        revision = self.store.binding_revision(native.ISSUE)
+        _, task_id = self.existing(body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
+        with self.assertRaises(native.LinearError):
+            self.bridge.track(native.ISSUE, task_id, replace=True, expected_revision=revision,
+                              request_id="b9e5907c-801d-42f8-924f-eb9c738ac1a7")
+        self.assertEqual(self.store.get(native.ISSUE), previous)
+        self.assertEqual(self.store.binding_revision(native.ISSUE), revision)
+
+    def test_mixed_manual_replacement_preserves_previous_native_binding(self):
+        _, original = self.existing()
+        self.bridge.track(native.ISSUE, original)
+        previous = self.store.get(native.ISSUE)
+        binding = self.store.native_binding(native.ISSUE)
+        revision = self.store.binding_revision(native.ISSUE)
+        _, task_id = self.existing(body=self.mixed_issue_markers(), key="chat:distinct-mixed-task")
+        with self.assertRaises(native.LinearError):
+            self.bridge.track(native.ISSUE, task_id, replace=True, expected_revision=revision,
+                              request_id="b9e5907c-801d-42f8-924f-eb9c738ac1a7")
+        self.assertEqual(self.store.get(native.ISSUE), previous)
+        self.assertEqual(self.store.native_binding(native.ISSUE), binding)
+        self.assertEqual(self.store.binding_revision(native.ISSUE), revision)
+
+    def test_mixed_markers_at_final_native_comment_read_hold_delivery(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        comment = adapter.comment
+        def changed(*args, **kwargs):
+            with adapter.conn() as conn:
+                native.kb.edit_task(conn, task_id, body=self.mixed_issue_markers())
+            return comment(*args, **kwargs)
+        with patch.object(adapter, "comment", side_effect=changed), self.assertRaises(native.LinearError):
+            self.bridge.followup(native.ISSUE, "Original instruction", "mixed-at-delivery")
+        self.assertEqual(self.fixture.comments(task_id), [])
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+
+    def test_duplicate_matching_markers_and_canonical_aliases_reuse_same_run(self):
+        marker = f"Linear issue {native.ISSUE}: {self.issue['url']}"
+        adapter, task_id = self.existing(body=f"{marker}\n{marker}\nLinear issue {self.issue['identifier']}: {self.issue['url']}")
+        with adapter.conn() as conn:
+            run = native.kb.claim_task(conn, task_id)
+        self.assign()
+        self.bridge.followup(native.ISSUE, "Same issue instruction", "matching-aliases")
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        self.assertEqual(adapter.get(task_id).current_run_id, run.current_run_id)
+        self.assertEqual(self.fixture.comments(task_id)[-1].body, "Same issue instruction")
+        self.assertEqual(len(self.fixture.tasks()), 1)
+
+    def test_incidental_foreign_references_do_not_override_explicit_issue_link(self):
+        body = (f"Linear issue {native.ISSUE}: {self.issue['url']}\n"
+                "Discuss Linear issue OTHER-2: https://linear.example/issue/OTHER-2\n"
+                "See OTHER-2 for background only.")
+        _, task_id = self.existing(body=body)
+        self.assign()
+        self.bridge.followup(native.ISSUE, "Authorized instruction", "incidental-ref")
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        self.assertEqual(self.fixture.comments(task_id)[-1].body, "Authorized instruction")
+
+    def test_marker_free_manual_replacement_keeps_authorized_followup(self):
+        self.store.put(native.ISSUE, "chat", "previous-conversation")
+        _, task_id = self.existing(body="Native work with ordinary issue discussion")
+        self.bridge.track(native.ISSUE, task_id, replace=True,
+                          expected_revision=self.store.binding_revision(native.ISSUE),
+                          request_id="b9e5907c-801d-42f8-924f-eb9c738ac1a7")
+        self.bridge.followup(native.ISSUE, "Authorized manual instruction", "manual-replacement")
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        self.assertEqual(self.fixture.comments(task_id)[-1].body, "Authorized manual instruction")
+
     def test_native_issue_marker_change_after_discovery_holds_binding_without_replacement(self):
         adapter, task_id = self.existing()
         discover = self.board.discover
