@@ -452,12 +452,18 @@ class DurableCloseoutTests(unittest.TestCase):
             task = kanban.create(title='OPS-1: review')
             task.status, task.result, task.completion_contract = 'done', None, 'local-only'
             adapter = object.__new__(Kanban)
+            database = sqlite3.connect(':memory:')
+            self.addCleanup(database.close)
+            database.row_factory = sqlite3.Row
+            database.execute('CREATE TABLE task_runs(id INTEGER, task_id TEXT, started_at INTEGER, summary TEXT, metadata TEXT)')
+            database.execute('INSERT INTO task_runs VALUES(1, ?, 1, ?, ?)',
+                             (task.id, summary, json.dumps({'artifacts': ['/private/findings.md']})))
             @contextmanager
             def connection():
-                yield object()
+                yield database
             adapter.read_conn = connection
-            adapter.kb = SimpleNamespace(latest_run=lambda conn, task_id: SimpleNamespace(
-                summary=summary, metadata={'artifacts': ['/private/findings.md']}))
+            adapter.kb = SimpleNamespace(Run=SimpleNamespace(from_row=lambda row: SimpleNamespace(
+                summary=row['summary'], metadata=None)))
             kanban.evidence_text = adapter.evidence_text
             kanban.completion_summary = adapter.completion_summary
             store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)

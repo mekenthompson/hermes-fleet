@@ -242,7 +242,7 @@ class Kanban:
         try:
             target = board if board is not None else kanban_db.get_current_board()
             self.board = kanban_db.board_metadata_path(target).parent.name
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             self.board = "default"
             self.board_selection_error = exc
             return  # Keep authorized issue/content service available without native authority.
@@ -342,7 +342,7 @@ class Kanban:
                 if [row[0] for row in conn.execute("PRAGMA integrity_check")] != ["ok"]:
                     raise ValueError("existing native database failed integrity inspection")
                 yield conn
-        except (OSError, ValueError, TypeError, OverflowError, IndexError, KeyError, sqlite3.Error) as exc:
+        except (OSError, ValueError, TypeError, OverflowError, IndexError, KeyError, RecursionError, sqlite3.Error) as exc:
             raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
     def for_board(self, board: str):
         """An inspected existing board with the same verified executor; never create it."""
