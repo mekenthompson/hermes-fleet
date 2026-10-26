@@ -1,6 +1,7 @@
 """Human-readable content through the real handler, SQLite and fake HTTP."""
 from __future__ import annotations
 import json
+from dataclasses import replace
 import sqlite3
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from linear_fake_api import load_plugin, Clock, FakeLinear, SELF, OTHER
 load_plugin()
 from hermes_fleet_linear_plugin import chat
+from hermes_fleet_linear_plugin.transport import NativeContext
 from hermes_fleet_linear_plugin.api import LinearAPI, LinearError
 from hermes_fleet_linear_plugin.bridge import Bridge, ProjectUpdateDeferred
 from hermes_fleet_linear_plugin.store import Store
@@ -46,8 +48,9 @@ class ContentActionTests(unittest.TestCase):
         self.store.put('issue-1', 'chat', 'chat', run_generation=1)
         self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
         self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock)
-        self.context = SimpleNamespace(session_key='chat', session_id='session', profile='alpha',
-                                       platform='slack', run_generation=1)
+        self.bridge.profile_home = Path(tmp.name)
+        self.context = NativeContext(home=tmp.name, session_key='chat', session_id='session', profile='alpha',
+                                     platform='slack', source='slack')
         self.request_id = str(uuid.uuid4())
 
     def invoke(self, action='update_description', *, content=BODY, request_id=None, context=None):
@@ -233,18 +236,15 @@ class ContentActionTests(unittest.TestCase):
                 with patch.object(self.api, 'graphql', return_value={'comment': changed}):
                     self.assertFalse(self.api.verify_comment(self.request_id, 'issue-1', BODY))
 
-    def test_stop_release_foreign_chat_and_unbound_context_refuse_capture(self):
-        for field in ('stop_requested_at', 'release_pending'):
-            self.store.update('issue-1', **{field: 1})
-            self.assertFalse(self.invoke()['ok'])
-            self.store.update('issue-1', **{field: 0})
-        self.context.session_key = 'other'
-        self.assertFalse(self.invoke()['ok'])
-        self.context.session_key = 'chat'
-        self.context.profile = 'foreign'
-        self.assertFalse(self.invoke()['ok'])
+    def test_legacy_stop_and_other_chat_do_not_gate_content_but_foreign_profile_does(self):
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE work SET stop_requested_at=1, release_pending=1 WHERE issue_id='issue-1'")
+        prior = self.store.get('issue-1')
+        self.assertTrue(self.invoke(context=replace(self.context, session_key='another-chat'))['ok'])
+        self.assertEqual(self.store.get('issue-1'), prior)
+        foreign = replace(self.context, profile='foreign')
+        self.assertFalse(self.invoke(request_id=str(uuid.uuid4()), context=foreign)['ok'])
         self.assertEqual(self.mutations(), [])
-        self.assertIsNone(self.row())
 
     def test_scope_denial_has_zero_content_mutations(self):
         with patch.object(self.bridge, 'authorize_specialist_effect', return_value=False):
@@ -252,51 +252,51 @@ class ContentActionTests(unittest.TestCase):
         self.assertIsNone(self.row())
         self.assertEqual(self.mutations(), [])
 
-    def test_owner_replacement_before_send_suppresses_both_actions(self):
+    def test_chat_owner_replacement_does_not_gate_ordinary_content(self):
         for action in ('update_description', 'add_comment'):
             with self.subTest(action=action):
                 self.request_id = str(uuid.uuid4())
-                self.store.put('issue-1', 'chat', 'chat', run_generation=1)
                 self.assertTrue(self.invoke(action)['ok'])
-                self.store.put('issue-1', 'chat', 'successor', run_generation=2)
-                self.assertFalse(self.bridge._send(self.row()))
-        self.assertEqual(self.mutations(), [])
+                with sqlite3.connect(self.path) as db:
+                    db.execute("UPDATE work SET owner_ref='successor' WHERE issue_id='issue-1'")
+                self.assertTrue(self.bridge._send(self.row()))
+                self.store.mark_sent(self.request_id, True)
+                self.assertEqual(self.store.get('issue-1')['owner_ref'], 'successor')
+        self.assertEqual(len(self.mutations()), 2)
 
-    def test_remote_foreign_delegate_or_closed_issue_suppresses_description(self):
+    def test_remote_delegate_and_closed_state_do_not_gate_content(self):
         self.assertTrue(self.invoke()['ok'])
         self.remote.set_delegate('issue-1', OTHER)
-        self.assertFalse(self.bridge._send(self.row()))
-        self.remote.set_delegate('issue-1', {'id': SELF})
         self.remote.set_state('issue-1', 'Done')
-        self.assertFalse(self.bridge._send(self.row()))
-        self.assertEqual(self.mutations(), [])
+        self.assertTrue(self.bridge._send(self.row()))
+        self.assertEqual(self.remote.issues['issue-1']['delegate'], OTHER)
+        self.assertEqual(self.remote.state('issue-1'), 'Done')
 
-    def test_owner_change_during_credentials_suppresses_both_transports(self):
+    def test_chat_owner_change_during_credentials_preserves_content_authorization(self):
         for action in ('update_description', 'add_comment'):
             with self.subTest(action=action):
                 self.request_id = str(uuid.uuid4())
-                self.store.put('issue-1', 'chat', 'chat', run_generation=1)
                 self.assertTrue(self.invoke(action)['ok'])
                 def token():
                     if getattr(self.api._mutation_guard, 'callback', None):
-                        self.store.put('issue-1', 'chat', 'successor', run_generation=2)
+                        with sqlite3.connect(self.path) as db:
+                            db.execute("UPDATE work SET owner_ref='successor' WHERE issue_id='issue-1'")
                     return 'synthetic'
                 self.api.token = token
-                with self.assertRaises(ProjectUpdateDeferred):
-                    self.bridge._send(self.row())
+                self.assertTrue(self.bridge._send(self.row()))
+                self.store.mark_sent(self.request_id, True)
                 self.api.token = lambda: 'synthetic'
-        self.assertEqual(self.mutations(), [])
+        self.assertEqual(len(self.mutations()), 2)
 
-    def test_remote_delegate_change_during_credentials_suppresses_description(self):
+    def test_remote_delegate_change_during_credentials_preserves_content_authorization(self):
         self.assertTrue(self.invoke()['ok'])
         def token():
             if getattr(self.api._mutation_guard, 'callback', None):
                 self.remote.set_delegate('issue-1', OTHER)
             return 'synthetic'
         self.api.token = token
-        with self.assertRaises(ProjectUpdateDeferred):
-            self.bridge._send(self.row())
-        self.assertEqual(self.mutations(), [])
+        self.assertTrue(self.bridge._send(self.row()))
+        self.assertEqual(self.remote.issues['issue-1']['delegate'], OTHER)
 
     def test_description_response_loss_restart_reconciles_without_resend(self):
         self.assertTrue(self.invoke()['ok'])
@@ -335,7 +335,7 @@ class ContentActionTests(unittest.TestCase):
         self.assertTrue(self.invoke('add_comment')['ok'])
         reply = self.invoke('add_comment', content='Different request')
         self.assertFalse(reply['ok'])
-        self.assertIn('conflicts', reply['message'])
+        self.assertIn('conflict', reply['message'])
         self.assertEqual(self.row()['payload']['body'], BODY)
         self.assertFalse(self.invoke(request_id='not-a-uuid')['ok'])
         self.assertEqual(self.mutations(), [])

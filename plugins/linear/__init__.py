@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import threading
@@ -180,19 +181,24 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear issue authorization does not match mutation target", retryable=False)
         return issue
     def agent_session(self, session_id):
-        if self.specialist_scope is None:
-            raise LinearError("Agent Session resolution requires specialist_scope", retryable=False)
         query = ("query AgentSessionAuthorization($id: String!) { agentSession(id: $id) "
                  "{ id creator { id } appUser { id } issue { id } } }")
         with self._permit_specialist_operation():
             session = self.graphql(query, {"id": session_id}).get("agentSession")
         if not isinstance(session, dict) or session.get("id") != session_id:
             raise LinearError("Linear Agent Session could not be authoritatively resolved", retryable=False)
+        if not isinstance(session.get("appUser"), dict) or session["appUser"].get("id") != self.identity["viewer_id"]:
+            raise LinearError("Linear Agent Session belongs to another app", retryable=False)
         issue = session.get("issue")
         creator = session.get("creator")
         creator_id = creator.get("id") if isinstance(creator, dict) else None
         if not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip():
             raise LinearError("Linear Agent Session requester or issue is outside specialist scope", retryable=False)
+        if self.specialist_scope is None:
+            if creator is not None and (not isinstance(creator_id, str) or not creator_id):
+                raise LinearError("Linear Agent Session requester could not be resolved", retryable=False)
+            self.issue(issue["id"])
+            return session
         if (self.specialist_scope.get("requester_basis") != "agent_session" and creator is None and
                 isinstance(session.get("appUser"), dict) and session["appUser"].get("id") == self.identity["viewer_id"]):
             # Automatic delegation sessions have no creator. Admit only this
@@ -211,8 +217,6 @@ class BoundLinearAPI(LinearAPI):
                               authoritative_issue_id=issue["id"])
         return session
     def agent_activity(self, activity_id, session_id):
-        if self.specialist_scope is None:
-            raise LinearError("Agent Activity resolution requires specialist_scope", retryable=False)
         query = ("query AgentActivityAuthorization($id: String!) { agentActivity(id: $id) "
                  "{ id user { id } agentSession { id } } }")
         with self._permit_specialist_operation():
@@ -223,6 +227,12 @@ class BoundLinearAPI(LinearAPI):
         if (not isinstance(activity, dict) or activity.get("id") != activity_id or
                 not isinstance(session, dict) or session.get("id") != session_id):
             raise LinearError("Linear Agent Activity could not be authoritatively resolved", retryable=False)
+        if self.specialist_scope is None:
+            self.agent_session(session_id)  # current app and issue/workspace restrictions
+            if not isinstance(user_id, str) or not user_id or user_id == self.identity["viewer_id"]:
+                raise LinearError("Linear Agent Activity has no verified human actor", retryable=False,
+                                  authoritative_session_id=session_id)
+            return activity
         if not isinstance(user_id, str) or user_id not in self.specialist_scope["allowed_requester_ids"]:
             raise LinearError("Linear Agent Activity actor is outside specialist scope", retryable=False, authoritative_session_id=session_id)
         return activity
@@ -317,170 +327,151 @@ class BoundLinearAPI(LinearAPI):
         left, right = self.issue(issue_id), self.issue(related_issue_id)
         return super().link_issue(left["id"], right["id"], relation)
 
-async def process_chat_stops(bridge: Bridge, runtime: Any) -> None:
-    """Run core's ordinary-chat API on the profile service's gateway loop."""
-    gateway = runtime.gateway
-    for intent in bridge.store.stop_intents():
-        if intent["profile"] != bridge.profile or intent["status"] not in ("requested", "accepted"):
-            continue
-        if intent["status"] == "accepted" and intent["worker_completion"] == "completed": continue
-        if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
-        if not callable(getattr(gateway, "request_chat_run_stop", None)) or not callable(
-                getattr(gateway, "get_chat_run_stop_observation", None)):
-            bridge.store.stop_result(intent["id"], "unsupported", "unknown", at=bridge.clock())
-            continue
-        target = {"session_key": intent["session_key"], "profile_home": runtime.profile_home}
+async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event, running: dict) -> None:
+    from . import transport
+    settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
+    validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
+    validate_ingress_profile(settings.get("ingress_profile"))
+    api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
+                         specialist_scope=settings.get("specialist_scope"),
+                         rate_limit_path=Path(str(settings.get("state_database") or home / "linear" / "state.db") + ".rate-limit.json"),
+                         endpoint=settings.get("api_url") or ENDPOINT)
+    api.token = token_provider(settings, home)
+    while not stop_requested.is_set():
         try:
-            if intent["status"] == "accepted":
-                observed = await gateway.get_chat_run_stop_observation(
-                    **target, run_generation=intent["run_generation"])
-                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
-                completion = observed.get("worker_completion", "unknown") if observed.get("status") == "observed" else "unknown"
-                if completion != intent["worker_completion"]:
-                    bridge.store.stop_result(intent["id"], "accepted", completion, at=bridge.clock())
-                continue
-            observed = await gateway.get_chat_run_stop_observation(
-                **target, run_generation=intent["run_generation"])
-            if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
-            if observed.get("status") == "observed":
-                status = observed.get("stop_status", "unknown")
-                completion = observed.get("worker_completion", "unknown")
-            else:
-                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
-                receipt = await gateway.request_chat_run_stop(
-                    **target, expected_run_generation=intent["run_generation"])
-                if not bridge.authorize_specialist_effect(intent["issue_id"]): continue
-                status = receipt.get("status", "unknown")
-                completion = receipt.get("worker_completion", "unknown")
-            if status not in ("accepted", "stale", "not_running", "unsupported"): status = "unknown"
-            if completion not in ("pending", "completed", "unknown"):
-                completion = "unknown"
-            bridge.store.stop_result(intent["id"], status, completion, at=bridge.clock())
-        except Exception:  # noqa: BLE001 - a crash after core accepted stays ambiguous
-            log.exception("linear: chat Stop observation/request uncertain for issue %s", intent["issue_id"])
+            await asyncio.to_thread(api.viewer_id)
+            if api.clock() < api.paused_until:
+                raise RateLimited(api.paused_until)
+            break
+        except RateLimited as exc:
+            await asyncio.sleep(min(0.25, max(0.01, exc.until - api.clock())))
+        except LinearError as exc:
+            if not exc.retryable:
+                raise
+            log.warning("linear: identity lookup unavailable; reporting startup will retry")
+            retry_until = time.monotonic() + max(1.0, float(settings.get("tick_seconds", 2)))
+            while not stop_requested.is_set() and time.monotonic() < retry_until:
+                await asyncio.sleep(min(0.25, max(0.01, retry_until - time.monotonic())))
+    if stop_requested.is_set():
+        return
+    from hermes_cli.profiles import get_active_profile_name
+    profile_name = Kanban.resolve_executor_profile(get_active_profile_name(), home)
+    bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
+                    await asyncio.to_thread(Kanban, settings.get("board"), profile=profile_name,
+                                            profile_home=home), profile=profile_name,
+                    settings=settings)
+    bridge.profile_home = home
+    ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
+    server = None
+    try:
+        while server is None and not stop_requested.is_set():
+            try:
+                server = transport.Server(home, profile_name,
+                                          lambda args, context: chat.handle(bridge, args, context))
+            except transport.Unavailable as exc:
+                if "already owns" not in str(exc):
+                    raise
+                await asyncio.sleep(0.25)
+        if server is None:
+            return
+        running.update(bridge=bridge, loop=asyncio.get_running_loop(), wake=asyncio.Event())
+        recovered = False
+        while not stop_requested.is_set():
+            running["wake"].clear()
+            try:
+                if not recovered:
+                    await asyncio.to_thread(bridge.recover, ingress)
+                    recovered = True
+                await asyncio.to_thread(bridge.tick, ingress)
+                await asyncio.to_thread(bridge.flush)
+            except Exception:  # one bad remote delivery must not stop native execution
+                log.exception("linear: reporting tick failed")
+            wake_wait = asyncio.create_task(running["wake"].wait())
+            try:
+                await asyncio.wait({wake_wait}, timeout=float(settings.get("tick_seconds", 2)))
+            finally:
+                wake_wait.cancel()
+                await asyncio.gather(wake_wait, return_exceptions=True)
+    finally:
+        running.clear()
+        if server is not None:
+            await asyncio.to_thread(server.close)
+
+
 
 def register(ctx: Any) -> None:
     if ctx.get_config("enabled", False) is not True:
         return
-    # Detached workers have task authority, not chat authority. The gateway
-    # bridge projects its own linked tasks; worker env never grants a chat claim.
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return
-    running: dict[str, Bridge] = {}
     from . import transport
+    running: dict[str, Any] = {}
 
     def active_home():
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home()).resolve(strict=True)
 
-    def tool(args: dict[str, Any] | None = None, invocation_context: Any = None, **_: Any) -> str:
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            return chat._reply(False, "The Linear chat tool is unavailable to detached Kanban workers. "
-                               "Use this task's Kanban lifecycle; only bridge-linked tasks project to Linear. "
-                               "A manual task requires owner reconciliation, not a worker chat claim.")
-        bridge = running.get("bridge")
-        if bridge is not None:
-            return chat.handle(bridge, args or {}, invocation_context)
+    def tool(args: dict[str, Any] | None = None, **_: Any) -> str:
         try:
-            return transport.chat_request(active_home(), args or {}, invocation_context)
+            context = transport.capture_context()
+            bridge = running.get("bridge")
+            if bridge is not None:
+                return chat.handle(bridge, args or {}, context)
+            return transport.chat_request(Path(context.home), args or {}, context)
         except transport.Unavailable as exc:
-            return chat._reply(False, str(exc))
+            return chat._reply(False, str(exc), code="context_or_service_unavailable")
         except transport.Uncertain as exc:
-            return chat._reply(False, str(exc))
+            return chat._reply(False, str(exc), code="delivery_uncertain")
 
-    def on_session_end(session_id: str = "", turn_id: str = "", **_: Any) -> None:
-        if not session_id or not isinstance(turn_id, str) or not turn_id: return
-        bridge = running.get("bridge")
-        home = active_home()
-        path = Path(ctx.get_config("state_database") or home / "linear" / "state.db")
-        if bridge is not None or path.is_file():
-            # Capture once under the original turn identity before any service replacement.
-            store = bridge.store if bridge is not None else Store(path)
-            quiet = bridge.quiet if bridge is not None else float(ctx.get_config("quiet_minutes", 30)) * 60
-            store.delay_session_updates(session_id, time.time() + quiet, turn_id=turn_id)
-
+    # The official PluginContext API does not accept an invocation-context injection flag.
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
-                      description=chat.SCHEMA["description"], inject_invocation_context=True)
-    ctx.register_hook("on_session_end", on_session_end)
+                      description=chat.SCHEMA["description"])
 
     def paths() -> tuple[Path, Path, str]:
         home = active_home()
         return (Path(ctx.get_config("state_database") or home / "linear" / "state.db"),
                 Path(ctx.get_config("ingress_database") or home / "workspace" / "linear" / "ingress.db"),
-                validate_ingress_profile(ctx.get_config("ingress_profile")) or  # the gateway's own profile rule
+                validate_ingress_profile(ctx.get_config("ingress_profile")) or
                 os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or "default")
-    if hasattr(ctx, "register_cli_command"):  # hermes linear status | resolve | replay
-        ctx.register_cli_command("linear", "Show and resolve held Linear work", ops.setup,
+    if hasattr(ctx, "register_cli_command"):
+        ctx.register_cli_command("linear", "Show and resolve held Linear reporting", ops.setup,
                                  lambda args: ops.run(args, *paths()))
-    if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):  # other requesters share chat
+    if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):
         ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths())),
-                             description="Show held Linear work and the next step")
+                             description="Show held Linear reporting and reconciliation")
 
-    async def service(runtime: Any) -> None:
-        settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
-        validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
-        validate_ingress_profile(settings.get("ingress_profile"))
-        home = Path(runtime.profile_home)
-        api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
-                             specialist_scope=settings.get("specialist_scope"),
-                             rate_limit_path=Path(str(settings.get("state_database") or home / "linear" / "state.db") + ".rate-limit.json"),
-                             endpoint=settings.get("api_url") or ENDPOINT)
-        api.token = token_provider(settings, home)  # identity settings validated before credentials
-        while True:
+    def native_hint(**_: Any) -> None:
+        # Lifecycle callbacks run near native writers/dispatchers. Only schedule a wake;
+        # the service reads durable history later, without either database lock held.
+        loop, wake = running.get("loop"), running.get("wake")
+        if loop is not None and wake is not None:
             try:
-                await asyncio.to_thread(api.viewer_id)  # refuse before state, recovery, or service admission
-                if api.clock() < api.paused_until: raise RateLimited(api.paused_until)
-                break
-            except RateLimited as exc:
-                try:
-                    await asyncio.wait_for(runtime.stop_event.wait(), timeout=max(0.01, exc.until - api.clock()))
-                    return
-                except asyncio.TimeoutError: pass
-        bridge = Bridge(Store(settings.get("state_database") or home / "linear" / "state.db"), api,
-                        await asyncio.to_thread(Kanban, settings.get("board"), profile=runtime.profile_name,
-                                                profile_home=home), profile=runtime.profile_name,
-                        settings=settings, inject=lambda key, text: bool(ctx.inject_message(text, session_key=key)))
-        from . import admission
-        bridge.validate_chat_admission = lambda context: admission.bound_to_live_turn(runtime, context)
-        bridge.profile_home = home.resolve(strict=True)
-        try:
-            from gateway.chat_execution_recovery import ChatExecutionStore
-            if (callable(getattr(ChatExecutionStore, "retire_for_handoff", None))
-                    and callable(getattr(ChatExecutionStore, "lineage_keys", None))):
-                bridge.retire_chat = lambda key, generation, request_id: ChatExecutionStore(
-                    bridge.profile_home).retire_for_handoff(key, generation, request_id)
-                bridge.chat_lineage = lambda key: ChatExecutionStore(bridge.profile_home).lineage_keys(key)
-        except ImportError:
-            pass  # Older Agent images refuse transfer before preparing any intent.
-        def native_transfer_message(context):
-            if not admission.bound_to_live_turn(runtime, context):
-                return ""
-            # Agent stamps the committed original human text only for this exact
-            # native turn. The mutable event text can be rewritten during a turn.
-            return context.user_message if isinstance(context.user_message, str) else ""
-        bridge.transfer_user_message = native_transfer_message
-        ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
-        running["bridge"] = bridge
-        server = None
-        try:
-            await asyncio.to_thread(bridge.recover, ingress)
-            server = transport.Server(home, runtime.profile_name,
-                                      lambda args, context: chat.handle(bridge, args, context),
-                                      lambda session: chat.on_turn_end(bridge, session))
-            while not runtime.stop_event.is_set():
-                try:
-                    await asyncio.to_thread(bridge.tick, ingress)
-                    await process_chat_stops(bridge, runtime)
-                    await asyncio.to_thread(bridge.flush)
-                except Exception:  # noqa: BLE001 - one bad tick must not stop the service
-                    log.exception("linear: tick failed")
-                try:
-                    await asyncio.wait_for(runtime.stop_event.wait(), timeout=float(settings.get("tick_seconds", 2)))
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            running.pop("bridge", None)
-            if server is not None:
-                await asyncio.to_thread(server.close)
+                loop.call_soon_threadsafe(wake.set)
+            except RuntimeError:
+                pass
+    for event in ("on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
+                  "on_kanban_task_updated", "on_kanban_dispatch_tick"):
+        ctx.register_hook(event, native_hint)
 
-    ctx.register_profile_service("linear", service)
+    stop_requested = threading.Event()
+
+    # Official upstream has on_unload/spawn_task, not the fork's profile-service API.
+    # gateway.run stamps this startup hint; it is never authorization. Detached native
+    # workers and API-only plugin discovery never start another reporting service.
+    if os.environ.get("_HERMES_GATEWAY") != "1" or os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    home = active_home()
+    scope = contextvars.copy_context()
+    def serve() -> None:
+        try:
+            asyncio.run(_reporting_loop(ctx, home, stop_requested, running))
+        except transport.Unavailable:
+            log.info("linear: another profile reporting service already owns the socket")
+        except Exception:
+            log.exception("linear: reporting service stopped")
+    thread = threading.Thread(target=lambda: scope.run(serve), name="linear-reporting", daemon=True)
+    def close() -> None:
+        stop_requested.set()
+        native_hint()
+        if thread.is_alive():
+            thread.join(timeout=5)
+    ctx.on_unload(close)
+    thread.start()

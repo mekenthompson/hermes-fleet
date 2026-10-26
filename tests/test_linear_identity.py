@@ -66,7 +66,6 @@ class IdentityBindingTests(unittest.TestCase):
         from pathlib import Path
         from types import SimpleNamespace
         from unittest.mock import patch
-        services = {}
         class Context:
             def get_config(self, key, default=None):
                 return {"enabled": True, "identity": {}}.get(key, default)
@@ -74,13 +73,11 @@ class IdentityBindingTests(unittest.TestCase):
                 pass
             def register_hook(self, *args):
                 pass
-            def register_profile_service(self, name, factory):
-                services[name] = factory
-        plugin.register(Context())
+        context = Context()
         with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "token_provider") as tokens, \
                 patch.object(plugin, "Store") as store:
             with self.assertRaises(ValueError):
-                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory))))
+                asyncio.run(plugin._reporting_loop(context, Path(directory), __import__("threading").Event(), {}))
             tokens.assert_not_called()
             store.assert_not_called()
 
@@ -90,7 +87,6 @@ class IdentityBindingTests(unittest.TestCase):
         from pathlib import Path
         from types import SimpleNamespace
         from unittest.mock import patch
-        services = {}
         class Context:
             def get_config(self, key, default=None):
                 return {"enabled": True, "identity": {"viewer_id": "app-a", "organization_id": "org-a"}}.get(key, default)
@@ -98,14 +94,12 @@ class IdentityBindingTests(unittest.TestCase):
                 pass
             def register_hook(self, *args):
                 pass
-            def register_profile_service(self, name, factory):
-                services[name] = factory
-        plugin.register(Context())
+        context = Context()
         with tempfile.TemporaryDirectory() as directory, patch.object(plugin, "token_provider", return_value=lambda: "synthetic"), \
-                patch.object(BoundLinearAPI, "verify_identity", side_effect=LinearError("wrong actor")), \
+                patch.object(BoundLinearAPI, "verify_identity", side_effect=LinearError("wrong actor", retryable=False)), \
                 patch.object(plugin, "Store") as store:
             with self.assertRaises(LinearError):
-                asyncio.run(services["linear"](SimpleNamespace(profile_home=Path(directory))))
+                asyncio.run(plugin._reporting_loop(context, Path(directory), __import__("threading").Event(), {}))
             store.assert_not_called()
 
     def test_invalid_binding_refused_without_credential_access(self):

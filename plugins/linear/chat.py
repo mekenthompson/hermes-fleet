@@ -1,359 +1,136 @@
-"""Chat-origin work: `linear start|done|blocked|release`. The chat session stays the executor."""
+"""Linear records and native task links; execution stays in Hermes Kanban."""
 from __future__ import annotations
 import json
-import re
+import uuid
 from typing import Any
 from .api import LinearError
-from .bridge import Bridge, acceptance_refusal, evidence_links, iso_ms
 from .ops import held
+
 SCHEMA = {
     "name": "linear",
     "description": (
-        "Track work on a Linear issue, or create issues and projects as this profile's own app. "
-        "start: claim an existing issue for this chat. Another chat of this same agent is adopted "
-        "when the user asked to continue it here. Refused if another agent holds the Linear "
-        "delegate, a Kanban task owns it, or Stop is still fenced. "
-        "delegate: session-free gateway-chat handoff of a fresh unowned issue to one durable Kanban task; requires id. "
-        "done: finish it; needs an evidence link. blocked: you need a human. "
-        "release: stop tracking unfinished work. "
-        "transfer: heavy control handoff after durable retirement of the predecessor chat; "
-        "requires id and expected_owner. Not a channel switch and not an agent change. "
-        "Execution remains blocked. "
-        "resume_transfer: after reconciling predecessor effects, explicitly admit this chat to continue; "
-        "requires id and an evidence URL present in the user's instruction. "
-        "create_issue: create an undelegated issue; requires id, title, and team. "
-        "update_description: replace an issue description with an expected_description preflight; readable headings and bullets/checklists required. "
-        "add_comment: add a concise progress note with headings; requires a caller UUID id. "
-        "create_project: create a project; requires id, name, and team. "
-        "link_issue: relate two existing issues. Creates never assign, delegate, or start tracking."),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": ["start", "delegate", "done", "blocked", "release", "transfer", "resume_transfer", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
-            "issue": {"type": "string", "description": "Existing issue identifier, for example ABC-123. Required for tracking, link_issue, update_description and add_comment."},
-            "id": {"type": "string", "description": "Canonical caller UUID for transfer, resume_transfer, create_issue, create_project, update_description and add_comment. Reuse the exact id/payload to reconcile a lost response."},
-            "expected_owner": {"type": "string", "description": "transfer: exact ownership_id of this issue's current chat claim."},
-            "title": {"type": "string", "description": "create_issue title."},
-            "name": {"type": "string", "description": "create_project name."},
-            "team": {"type": "string", "description": "Team id or key. Required for create_issue and create_project."},
-            "description": {"type": "string", "description": "Markdown description. Use readable headings and bullets/checklists, not one long paragraph. Short prose is valid."},
-            "expected_description": {"type": "string", "description": "Required current description for update_description's optimistic preflight. This is not server-side compare-and-swap; concurrent edits can race."},
-            "project": {"type": "string", "description": "Optional project id for create_issue."},
-            "parent": {"type": "string", "description": "Optional parent issue id for create_issue."},
-            "related": {"type": "string", "description": "Other issue id for link_issue."},
-            "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"], "description": "link_issue relation."},
-            "evidence": {"type": "string", "description": "done: outcome link(s); resume_transfer: reconciliation URL explicitly included in the user's instruction."},
-            "note": {"type": "string", "description": "done: outcome summary; blocked/release: what is needed or why"},
-            "body": {"type": "string", "description": "add_comment: concise progress note; use short headings and bullets/checklists rather than one long paragraph. Short prose is valid."},
-        },
-        "required": ["action"],
-    },
+        "Read Linear status, link an existing native task for reporting, or edit issues and projects. "
+        "track requires issue and task_id and never starts, claims, resumes or transfers work. "
+        "status reports the existing task and retained reconciliation records. "
+        "followup adds an operator comment to active native work; requires issue, body and UUID id. "
+        "Use native Kanban controls for an explicit resume, cancellation or new task. "
+        "create_issue, create_project, link_issue, update_description and add_comment work without "
+        "a task link or chat claim. Description replacement requires the exact expected_description. "
+        "Reuse the same UUID id and content after a lost mutation response."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["track", "status", "followup", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
+        "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
+        "task_id": {"type": "string", "description": "track: existing native task on this profile's configured board."},
+        "id": {"type": "string", "description": "Caller UUIDv4 for creates, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
+        "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
+        "description": {"type": "string", "description": "Readable Linear Markdown."},
+        "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
+        "project": {"type": "string"}, "parent": {"type": "string"}, "related": {"type": "string"},
+        "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"]},
+        "body": {"type": "string", "description": "Comment or instruction; never an execution grant."},
+    }, "required": ["action"], "additionalProperties": False},
 }
+
 def _reply(ok: bool, message: str, **details: Any) -> str:
     return json.dumps({"ok": ok, "message": message, **details})
 
-_CONTINUE_WORD = re.compile(r"\b(continue|transfer|take[\s-]?over|handoff|hand[\s-]?over|hand[\s-]?off)\b", re.I)
-_HERE = re.compile(r"\b(here|this chat|this thread|this conversation|the chat)\b", re.I)
-_NEGATION = re.compile(r"\b(do not|don't|dont|never|forbidden|not a request)\b", re.I)
-
-def _user_text(bridge: Bridge, context: Any) -> str:
-    text = getattr(context, "user_message", None)
-    if isinstance(text, str) and text.strip():
-        return text
-    source = getattr(bridge, "transfer_user_message", None)
-    if not callable(source):
-        return ""
+def _uuid(value: Any) -> str:
     try:
-        got = source(context)
-    except TypeError:
-        return ""
-    return got if isinstance(got, str) else ""
+        parsed = uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("id must be a canonical caller UUIDv4.") from None
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("id must be a canonical caller UUIDv4.")
+    return value
 
-def _channel_continue(text: str, identifier: str) -> bool:
-    """Same agent, new channel. Not a heartbeat, and not the heavy transfer ritual."""
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if not stripped or stripped.startswith("[Heartbeat") or "INTERNAL NOTIFICATION" in stripped:
-        return False
-    if _NEGATION.search(stripped) or not _CONTINUE_WORD.search(stripped):
-        return False
-    from .chat_transfer import _explicit
-    if identifier and _explicit(stripped, identifier):
-        return False
-    if identifier and identifier.casefold() in stripped.casefold():
-        return True
-    return _HERE.search(stripped) is not None
+def _text(args: dict, key: str) -> str:
+    value = args.get(key)
+    return value.strip() if isinstance(value, str) else ""
 
-def _held(bridge: Bridge, issue_id: str) -> str | None:
-    writes = bridge.store.issue_reconciliation_blocked(issue_id)
-    return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes]) if writes else None
-def _ownership_refusal(issue: dict[str, Any], row: dict, code: str) -> str:
-    """Durable ownership is not a liveness observation. Do not invent one."""
-    owner = row.get("owner_ref") or ""
-    state = (issue.get("state") or {}).get("name") or "unknown"
-    ownership = {"origin": row["origin"], "owner_session_key": owner if row["origin"] == "chat" else None,
-                 "ownership_id": row.get("ownership_id"),
-                 "task_id": row.get("task_id"), "execution_state": "unknown",
-                 "release_pending": bool(row.get("release_pending")),
-                 "stop_requested": bool(row.get("stop_requested_at")), "linear_state": state}
-    if code == "release_pending":
-        message = "Release is pending verified relinquishment; reconcile it before further work."
-    elif row["origin"] == "chat":
-        message = (f"{issue.get('identifier')} has a retained ownership claim from chat {owner!r}. "
-                   "This is not proof of active work; execution state is unknown. "
-                   f"Linear state is {state!r}, not a liveness signal. "
-                   "Continue in the owning chat, or call start from this chat after the user asks to "
-                   "continue this issue here. transfer does not switch channels or agents. "
-                   "If that chat cannot be resumed, request guarded ownership recovery; "
-                   "do not clear the claim based on inactivity or an old blocker comment.")
-    else:
-        message = (f"{issue.get('identifier')} is bound to Kanban task {row.get('task_id')!r}; "
-                   "the binding alone does not prove the task is running. "
-                   "Continue its existing task/Linear session rather than creating another executor.")
-    return _reply(False, f"{message} {issue.get('url', '')}", code=code, ownership=ownership)
+def _plan(bridge: Any, args: dict, action: str) -> str:
+    if action == "create_issue":
+        client_id, title, team = _uuid(args.get("id")), _text(args, "title"), _text(args, "team")
+        if not title or not team:
+            raise ValueError("create_issue needs title and team.")
+        created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
+                                          project_id=args.get("project") or None, parent_id=args.get("parent") or None)
+        warning = (" Formatting tip: split this long paragraph into headings and bullets." if
+                   isinstance(args.get("description"), str) and len(args["description"]) > 500 and "\n" not in args["description"] else "")
+        return _reply(True, "Created an undelegated issue." + warning, issue=created)
+    if action == "create_project":
+        client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
+        if not name or not team:
+            raise ValueError("create_project needs name and team.")
+        created = bridge.api.create_project(client_id, name, [team], description=args.get("description"))
+        return _reply(True, "Created a project.", project=created)
+    issue, related, relation = (_text(args, key) for key in ("issue", "related", "relation"))
+    if not issue or not related or relation not in {"blocks", "blocked_by", "related"}:
+        raise ValueError("link_issue needs issue, related, and a supported relation.")
+    return _reply(True, "Linked issues.", relation=bridge.api.link_issue(issue, related, relation))
 
-def _plan(bridge: Bridge, args: dict[str, Any], action: str) -> str:
-    """Create or link as this app. Do not assign, delegate, or start tracking."""
-    client_id = str(args.get("id") or "").strip()
-    try:
-        if action == "create_issue":
-            title, team = str(args.get("title") or "").strip(), str(args.get("team") or "").strip()
-            if not client_id or not title or not team:
-                return _reply(False, "create_issue needs id, title, and team.")
-            created = bridge.api.create_issue(
-                client_id, team, title, description=args.get("description"),
-                project_id=args.get("project") or None, parent_id=args.get("parent") or None)
-            return _reply(True, f"Created {created.get('identifier')} {created.get('url')} undelegated." +
-                          (" Formatting tip: split this long single paragraph with headings and bullets/checklists." if
-                           isinstance(args.get("description"), str) and len(args["description"]) > 500 and "\n" not in args["description"] else ""))
-        if action == "create_project":
-            name, team = str(args.get("name") or "").strip(), str(args.get("team") or "").strip()
-            if not client_id or not name or not team:
-                return _reply(False, "create_project needs id, name, and team.")
-            created = bridge.api.create_project(client_id, name, [team], description=args.get("description"))
-            return _reply(True, f"Created project {created.get('name')} {created.get('url')}.")
-        if action == "link_issue":
-            issue = str(args.get("issue") or "").strip()
-            related, relation = str(args.get("related") or "").strip(), str(args.get("relation") or "").strip()
-            if not issue or not related or not relation:
-                return _reply(False, "link_issue needs issue, related, and relation.")
-            linked = bridge.api.link_issue(issue, related, relation)
-            return _reply(True, f"Linked {linked.get('type')} {issue} -> {related}.")
-    except LinearError as exc:
-        return _reply(False, str(exc))
-    return _reply(False, f"Unknown planning action {action!r}.")
-
-def handle(bridge: Bridge | None, args: dict[str, Any], invocation_context: Any = None) -> str:
+def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     if bridge is None:
-        return _reply(False, "The Linear service is not running on this profile.")
-    session_key = str(getattr(invocation_context, "session_key", "") or "")
-    session_id = str(getattr(invocation_context, "session_id", "") or session_key)
-    profile = str(getattr(invocation_context, "profile", "") or "")
-    platform = str(getattr(invocation_context, "platform", "") or "")
-    bound = bridge.chat_profile_matches(profile, platform=platform)
-    generation = getattr(invocation_context, "run_generation", None)
-    generation = generation if bound and type(generation) is int and generation > 0 else None
-    if not bound:
-        return _reply(False, "linear needs a tool turn bound to this profile.")
-    if not session_key:
-        return _reply(False, "linear needs a chat session; it cannot run from this context.")
-    action = str(args.get("action", ""))
-    if action in {"transfer", "resume_transfer"}:
-        from . import chat_transfer
-        return chat_transfer.handle(bridge, args, invocation_context)
-    if action == "delegate":
-        from . import admission
-        return admission.handle(bridge, args, invocation_context)
-    if action in {"update_description", "add_comment"}:
-        ref = str(args.get("issue") or "").strip()
-        client_id = str(args.get("id") or "").strip()
-        body = args.get("description") if action == "update_description" else args.get("body")
-        if not ref or not client_id or not isinstance(body, str) or not body.strip():
-            return _reply(False, f"{action} needs issue, caller UUID id, and nonempty content.")
-        try:
-            import uuid
-            if str(uuid.UUID(client_id)) != client_id: raise ValueError
-        except (ValueError, AttributeError):
-            return _reply(False, f"{action} id must be a UUID caller id.")
-        try:
-            issue = bridge.api.issue(ref)
-            issue_id = issue.get("id")
-            if ref not in (issue_id, issue.get("identifier")):
-                return _reply(False, "Linear issue resolution did not match the requested issue.")
-            if not bridge.authorize_specialist_effect(issue_id):
-                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
-            with bridge.lock(issue_id):
-                owner = bridge.store.get(issue_id)
-                if not owner or owner.get("origin") != "chat" or owner.get("owner_ref") != session_key:
-                    return _reply(False, "Content changes require the owning chat's active Linear claim.")
-                if owner.get("release_pending") or owner.get("stop_requested_at"):
-                    return _reply(False, "Content changes are blocked during Stop or release reconciliation.")
-                payload = {"issue_id": issue_id, "body": body, "session_key": session_key,
-                           "work_owner": owner.get("ownership_id"), "id": client_id, "content_action": True, "write_started": False}
-                if action == "update_description":
-                    expected = args.get("expected_description")
-                    if not isinstance(expected, str):
-                        return _reply(False, "update_description requires expected_description (the exact current text).")
-                    payload.update({"expected_description": expected, "body": body})
-                    kind = "description"
-                if action == "add_comment":
-                    kind = "comment"
-                try:
-                    row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
-                except ValueError:
-                    return _reply(False, f"Caller id conflicts with an earlier {action}; no change was made.")
-                if not row_id:
-                    return _held(bridge, issue_id) or _reply(False, "Content change was not admitted; no change was made.")
-                warning = (" Formatting tip: split this long single paragraph with headings and bullets/checklists."
-                           if len(body) > 500 and "\n" not in body else "")
-                return _reply(True, f"{action} queued durably for {issue.get('identifier')}; delivery is not yet confirmed.{warning}", outbox_id=row_id)
-        except LinearError as exc:
-            if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:
-                bridge._fence_scope_denial(getattr(exc, "authoritative_issue_id", "") or "", exc)
-                return _reply(False, "This issue is outside the configured Linear specialist scope.")
-            return _reply(False, f"Linear is unavailable ({exc}); no content change was confirmed.")
-    if action in {"create_issue", "create_project", "link_issue"}:
-        return _plan(bridge, args, action)
-    ref = str(args.get("issue", "")).strip()
-    if not ref:
-        return _reply(False, "tracking needs an issue identifier.")
-    action, ref = action, ref
-    note = str(args.get("note") or "").strip()
+        return _reply(False, "The Linear service is not running on this profile.", code="service_unavailable")
+    # The registered handler captures host context. Model args never supply it.
+    if context is None or context.profile != bridge.profile or str(context.home) != str(bridge.profile_home):
+        return _reply(False, "Linear needs trusted native session context for this profile.", code="context_unavailable")
+    action = _text(args, "action")
+    if action not in SCHEMA["parameters"]["properties"]["action"]["enum"]:
+        return _reply(False, "Use track/status for native reporting or a supported content action.", code="unsupported_action")
     try:
+        if action in {"create_issue", "create_project", "link_issue"}:
+            return _plan(bridge, args, action)
+        ref = _text(args, "issue")
+        if not ref:
+            raise ValueError(f"{action} needs an issue identifier.")
         issue = bridge.api.issue(ref)
-        if ref not in (issue.get("id"), issue.get("identifier")):
-            raise LinearError("Linear issue resolution does not match the requested ref")
-        me = bridge.api.viewer_id()
-    except LinearError as exc:
-        if getattr(bridge.api, "specialist_scope", None) is not None and not exc.retryable:
-            bridge._fence_scope_denial(exc.authoritative_issue_id or "", exc)
-            return _reply(False, "This issue is outside the configured Linear specialist scope.")
-        return _reply(False, f"Linear is unavailable ({exc}); try again shortly.")
-    issue_id, ident, project = issue["id"], issue.get("identifier") or ref, (issue.get("project") or {}).get("id")
-    with bridge.lock(issue_id):
+        if not isinstance(issue, dict) or ref not in (issue.get("id"), issue.get("identifier")):
+            raise LinearError("Linear issue resolution did not match the requested issue.")
+        issue_id = issue["id"]
         if not bridge.authorize_specialist_effect(issue_id):
-            return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
-        row = bridge.store.get(issue_id)
-        if row and row.get("release_pending"):
-            return _ownership_refusal(issue, row, "release_pending")
-        if action == "start":
-            try: bridge.await_retired(issue_id)
-            except LinearError as exc: return _reply(False, str(exc))
-            if refusal := _held(bridge, issue_id):
-                return refusal
-            return _start(bridge, issue, row, me, session_key, session_id, generation, invocation_context)
-        if not row or row["origin"] != "chat":
-            return _reply(False, f"{ident} is not tracked from chat here; run `linear start {ident}` first.")
-        if action in {"done", "blocked", "release"} and row.get("owner_ref") != session_key:
-            return _ownership_refusal(issue, row, "chat_ownership_conflict")
-        if action == "done":
-            if refusal := _held(bridge, issue_id):
-                return refusal  # before evidence: a held write must be reconciled, not replayed under a new closeout
-            if row.get("stop_requested_at"):
-                return _reply(False, "Stop was requested in Linear; this issue cannot be marked Done until a newer "
-                                     "instruction explicitly resumes it.")
-            links = evidence_links(str(args.get("evidence") or ""))
-            if not links:
-                return _reply(False, "done needs an evidence link: the PR, merged commit, deploy check or findings. "
-                                     "Without one, use `linear blocked` or `linear release`.")
-            heads: dict[str, str] = {}
-            failures: list[str] = []
-            if not bridge.accepted_evidence(links, heads=heads, failures=failures):
-                return _reply(False, acceptance_refusal(failures))
-            if not _finish(bridge, row, session_key, session_id, project, ident, "done",
-                           f"Done. {note}\n\nEvidence: {' '.join(links)}".replace(". \n", ".\n"),
-                           f"Done: {' '.join(links)}", links, heads):
-                return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
-            return _reply(True, f"{ident} closeout queued durably; Linear delivery is not yet confirmed.")
-        if action == "blocked":
-            message = f"Blocked: {note or 'needs input'}."
-            if not bridge.status(issue_id, "blocked"):
-                return _reply(False, "Specialist authorization is fenced or unavailable; Blocked was not captured.")
-            if row.get("linear_session_id"):
-                captured = bridge.activity(issue_id, row["linear_session_id"], "elicitation", message, row=row)
-                updated = bridge.store.update(issue_id, panel_note=None)
-            else:
-                updated = bridge.store.update(issue_id, panel_note=message)
-                captured = bridge.comment(issue_id, message) if updated else ""
-            if not (captured and updated and bridge.project_update(
-                    session_id, project, ident, f"Blocked: {note}", session_key=session_key, issue_id=issue_id)):
-                return _reply(False, "Specialist authorization is fenced or unavailable; Blocked was not fully captured.")
-            return _reply(True, f"{ident} Blocked update queued; it stays yours. Delivery is not yet confirmed.")
-        if action == "release":
-            if not _finish(bridge, row, session_key, session_id, project, ident, "blocked",
-                           f"Released unfinished from chat: {note or 'no reason given'}.", "Released unfinished",
-                           release=True):
-                return _reply(False, "Specialist authorization is fenced or unavailable; closeout was not captured.")
-            return _reply(True, f"{ident} unfinished release queued durably; relinquishment is not yet verified.")
-    return _reply(False, f"Unknown action {action!r}.")
-def _finish(bridge: Bridge, row: dict, session_key: str, session_id: str, project: str | None,
-            ident: str, state: str, message: str, update: str, evidence: list[str] | None = None,
-            heads: dict[str, str] | None = None, *, release: bool = False) -> bool:
-    issue_id = row["issue_id"]
-    if not bridge.authorize_specialist_effect(issue_id):
-        return False
-    route = {"session_key": session_key, "terminal": True, "owner_issue_id": issue_id}
-    return bridge.store.finish(issue_id, [
-        ("status", {"issue_id": issue_id, "state": state, "evidence": evidence or [],
-                    "evidence_contract": "local-only", "pr_heads": heads or {}, "release": release, **route}),
-        ("comment", {"issue_id": issue_id, "body": message, **route}),
-        *([("activity", {"issue_id": issue_id, "session_id": row["linear_session_id"],
-                         "content": {"type": "response", "body": message}, **route})]
-          if release and row.get("linear_session_id") else []),
-        ("project_update", {"issue_id": f"update:{session_id}:{project or issue_id}",
-                            "session_id": session_id, "project_id": project, "resolve": issue_id,
-                            "lines": {ident: update}, "line_issues": {ident: issue_id},
-                            "quiet": bridge.quiet, **route}),
-    ], at=bridge.clock(), release=release)
-def _start(bridge: Bridge, issue: dict[str, Any], row: dict | None, me: str, session_key: str,
-           session_id: str, generation: int | None, context: Any = None) -> str:
-    ident, url = issue.get("identifier"), issue.get("url", "")
-    if row and row["origin"] == "kanban":
-        return _ownership_refusal(issue, row, "task_ownership_conflict")
-    delegate = issue.get("delegate") or {}
-    if delegate.get("id") not in (None, me) and (issue.get("state") or {}).get("type") == "started":
-        return _reply(False, f"{ident} is taken by {delegate.get('name') or 'another agent'}: {url}")
-    if row and row["origin"] == "chat" and row["owner_ref"] != session_key:
-        if delegate.get("id") not in (None, me):
-            return _reply(False, f"{ident} is delegated to {delegate.get('name') or 'another agent'}; "
-                           f"channel continue does not move it: {url}")
-        if row.get("stop_requested_at") or not _channel_continue(_user_text(bridge, context), ident or ""):
-            return _ownership_refusal(issue, row, "chat_ownership_conflict")
-        fields: dict[str, Any] = {"owner_ref": session_key}
-        if generation is not None:
-            fields["run_generation"] = generation
-        if not bridge.store.update(issue["id"], **fields):
-            return _reply(False, "Could not move this agent's chat claim; no change was made.")
-        row = bridge.store.get(issue["id"])
-    project = (issue.get("project") or {}).get("id")
-    if row:
-        if row.get("stop_requested_at") and (row.get("run_generation") is None or generation is None or
-                                             generation <= row["run_generation"]):
-            return _reply(False, "Stop is still fenced; a newer bound chat turn must explicitly resume this issue.")
-        if generation is not None and generation > (row.get("run_generation") or 0):
-            if not bridge.store.update(issue["id"], run_generation=generation):
-                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
-        if row.get("stop_requested_at"):
-            fence = max(bridge.clock() * 1000, row["last_updated_at"] + 1)
-            if not bridge.store.update(issue["id"], stop_requested_at=0,
-                                       last_updated_at=fence, resume_fence_at=fence):
-                return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
-    else:
-        watermark = iso_ms(issue.get("updatedAt"))
-        if not watermark or watermark <= 0:
-            return _reply(False, "Linear issue ordering timestamp is unavailable; no claim was captured.")
-        if not bridge.store.put(issue["id"], "chat", session_key, project_id=project,
-                                run_generation=generation, last_updated_at=watermark):
-            return _reply(False, "Specialist authorization is fenced or unavailable; no change was made.")
-    if not bridge.status(issue["id"], "in_progress", claim=True, seen=delegate.get("id")) or not bridge.project_update(
-            session_id, project, ident, "In progress", session_key=session_key, issue_id=issue["id"]):
-        return _reply(False, "Specialist authorization is fenced or unavailable; tracking was not fully captured.")
-    message = f"Tracking {ident} from this chat: {url}"
-    if generation is None:
-        message += " Linear Stop cannot interrupt this chat adapter; use the chat's own Stop control."
-    return _reply(True, message)
-def on_turn_end(bridge: Bridge | None, session_id: str) -> None:
-    """Every finished turn restarts the quiet period for that session's project updates."""
-    if bridge is not None and session_id:
-        bridge.store.delay_session_updates(session_id, bridge.clock() + bridge.quiet)
+            return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
+        if action == "status":
+            return _reply(True, "Current Linear and native reporting state.", issue=issue,
+                          native=bridge.native_status(issue_id))
+        if action == "track":
+            task_id = _text(args, "task_id")
+            if not task_id:
+                raise ValueError("track needs an existing task_id.")
+            return _reply(True, "Existing native task linked for reporting.", native=bridge.track(issue_id, task_id))
+        if action == "followup":
+            if context.delegated_child:
+                return _reply(False, "Native delegated children cannot mutate Kanban; return findings to the parent agent.",
+                              code="native_scope_refused")
+            body = _text(args, "body")
+            if not body:
+                raise ValueError("followup needs a nonempty body.")
+            result = bridge.followup(issue_id, body, _uuid(args.get("id")))
+            return _reply(True, "Native follow-up recorded; native task state controls execution.", native=result)
+        client_id = _uuid(args.get("id"))
+        body = args.get("description") if action == "update_description" else args.get("body")
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError(f"{action} needs nonempty content.")
+        writes = bridge.store.issue_reconciliation_blocked(issue_id, except_id=client_id)
+        if writes:
+            return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])
+        prior = bridge.store.outbox_row(client_id)
+        payload = {"issue_id": issue_id, "body": body, "id": client_id, "content_action": True,
+                   "unlinked_content": True, "write_started": False, "caller_context": context.to_wire()}
+        kind = "comment"
+        if action == "update_description":
+            expected = args.get("expected_description")
+            if not isinstance(expected, str):
+                raise ValueError("update_description requires expected_description (the exact current text).")
+            if prior is None and (issue.get("description") or "") != expected:
+                return _reply(False, "Description changed; inspect it before replacing it.", code="description_conflict")
+            payload["expected_description"] = expected
+            kind = "description"
+        with bridge.lock(issue_id):
+            row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
+        if not row_id:
+            return _reply(False, "An uncertain issue write or authorization fence needs reconciliation.", code="reconciliation_required")
+        warning = (" Formatting tip: split this long paragraph into headings and bullets." if
+                   len(body) > 500 and "\n" not in body else "")
+        return _reply(True, "Content queued durably; Linear delivery is not yet confirmed." + warning, outbox_id=row_id)
+    except (ValueError, LinearError) as exc:
+        return _reply(False, str(exc), code="request_refused")
