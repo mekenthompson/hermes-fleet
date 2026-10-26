@@ -53,8 +53,10 @@ executor, or an unavailable existing board require scoped inspection, never a re
 worker or access to another profile's private state. A conflicting configured project
 completion contract requires acceptance reconciliation; reuse cannot downgrade it.
 Incidental issue mentions are not links.
-Automatic binding rechecks the issue line on the freshly read native task. Follow-up
-delivery holds a current explicit marker for another issue and any newly stopped task;
+Automatic binding rechecks all explicit issue lines on the freshly read native task.
+Repeated matching lines and canonical ID/identifier aliases share one scope; distinct
+explicit issue markers hold automatic or manual linking, replacement and follow-up delivery.
+Follow-up delivery also holds any newly stopped task;
 marker-free manually tracked work retains its authorized reporting binding. Validation
 reflects the last native observation before the existing write boundary; native concurrency
 and control rules continue to apply.
