@@ -148,13 +148,16 @@ def setup(parser: Any) -> None:
     sub.add_parser("replay", help="Retry one parked Linear delivery").add_argument("delivery_id")
     inspect_origin = sub.add_parser("inspect-origin", help="Inspect one current native origin inside its owning profile; grants no permissions")
     inspect_origin.add_argument("--reference-json", required=True, help="Complete origin_reference result's reference object")
+    inspect_work = sub.add_parser("inspect-work", help="Inspect current dispatcher-owned work; original requester unknown, grants no permissions")
+    inspect_work.add_argument("--reference-json", required=True, help="Complete work_reference result's reference object")
 
 def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None) -> int:
-    if args.linear_command == "inspect-origin":
-        from . import origin
+    if args.linear_command in {"inspect-origin", "inspect-work"}:
+        from . import origin, work
         from .transport import Unavailable
         try:
-            result = origin.inspect(json.loads(args.reference_json), origin_settings or {})
+            projection = work if args.linear_command == "inspect-work" else origin
+            result = projection.inspect(json.loads(args.reference_json), origin_settings or {})
         except (Unavailable, ValueError, ImportError, OSError, RuntimeError) as exc:
             print(json.dumps({"ok": False, "message": str(exc), "permission_granted": False}))
             return 1

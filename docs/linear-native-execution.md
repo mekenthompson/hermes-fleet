@@ -121,6 +121,14 @@ converting them into human authority. A2A text remains untrusted input; controll
 native checkpoint/Stop/quiescence are separate requirements. See the plugin README for the
 guarded, manifest-pinned origin proof entrypoint.
 
+For recovery into an already authorized native Kanban task, the separate selector-free
+`work_reference` / owner `inspect-work` projection verifies the exact current dispatcher run
+from its frozen owner policy and tracked read-only Task/Run/Claim records. It reports the
+original requester as unknown; task content supplies no human consent. A successor needs a
+fresh reference. Both inspections reject known pending native Stop checkpoints and report
+`stop_evidence.state: unknown` on older cores lacking that getter. This evidence grants no
+control permission and cannot establish quiescence or absence of an in-flight older-core Stop.
+
 The native scenario suite exercises upstream task creation, claiming, lifecycle and comment
 consumption; the registered tool and private socket are exercised with actual upstream session
 producers, including a separate API process. Cases cover concurrent and duplicate requests,

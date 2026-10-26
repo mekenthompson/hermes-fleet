@@ -91,14 +91,16 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
                 or ref is not None and observed != ref):
             _refuse()
         ref = reference(observed)
-        from .origin_state import _evidence
+        from .origin_state import _evidence, stop_evidence
         evidence = await asyncio.to_thread(_evidence, home, ref, current, declared_scope, context)
+        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, ref["session_id"])
         # Recheck after the state read: Stop, settlement, restart or a new turn invalidates the result.
         after, active = await _snapshot(client, home, ref["session_id"])
         if (after.get("authority_epoch") != ref["authority_epoch"]
                 or after.get("execution_generation") != ref["execution_generation"]
                 or active.get("admission_id") != ref["admission_id"]):
             _refuse()
+        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, ref["session_id"])
         return evidence
 
 

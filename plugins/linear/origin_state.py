@@ -7,6 +7,20 @@ from .transport import NativeContext, Unavailable
 INTERACTIVE_SOURCES = frozenset({"cli", "tui", "gui", "acp"})
 
 
+def stop_evidence(home: Path, session_id: str) -> dict:
+    """Read the existing core cleanup checkpoint when supported; absence is never false."""
+    from gateway import session_ancillary
+    getter = getattr(session_ancillary, "process_stop_pending", None)
+    if getter is None:
+        return {"state": "unknown", "source": "native_stop_checkpoint_unavailable", "quiescence_proven": False}
+    from hermes_state import SessionDB
+    with SessionDB(home / "state.db", read_only=True) as db:
+        pending = getter(db, session_id)
+    if pending is not None:
+        _refuse("The native owner has a pending Stop checkpoint; current origin evidence is refused.")
+    return {"state": "clear", "source": "native_process_stop_checkpoint", "quiescence_proven": False}
+
+
 def _refuse(message="The originating native request is not current and independently verifiable."):
     raise Unavailable(message)
 

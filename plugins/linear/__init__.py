@@ -450,6 +450,12 @@ def register(ctx: Any) -> None:
     def tool(args: dict[str, Any] | None = None, **_: Any) -> str:
         try:
             args = args or {}
+            if args.get("action") == "work_reference":
+                if set(args) != {"action"}:
+                    raise transport.Unavailable("Native work references accept no identity, session or task selectors.")
+                from . import work
+                return chat._reply(True, "Current dispatcher work reference; original requester unknown, no permission granted.",
+                                   **work.current(work.capture_context(), origin_settings()))
             context = transport.capture_context(track=args.get("action") == "track", board=args.get("board"))
             if args.get("action") == "origin_reference":
                 if set(args) != {"action"}:
