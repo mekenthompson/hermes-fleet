@@ -120,6 +120,17 @@ def task_issue_match(task, issue: dict) -> bool:
     return (getattr(task, "idempotency_key", None) == f"linear:{issue['id']}" or
             task_issue_link(task, issue))
 
+def require_task_issue_scope(task, issue: dict) -> None:
+    """Keep explicit current issue conflicts out of native steering.
+
+    Marker-free manually tracked work retains its existing reporting authority.
+    This checks the last observed task; native writes retain their own boundary.
+    """
+    if not task_issue_link(task, issue) and any(
+            re.fullmatch(r"Linear issue [^\s:]+: https?://\S+", line.strip())
+            for line in (getattr(task, "body", None) or "").splitlines()):
+        raise LinearError("Native task explicitly references a different issue; follow-up held for inspection", retryable=False)
+
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
     activity, session = event.get("agentActivity") or {}, event.get("agentSession") or {}
@@ -398,11 +409,15 @@ class Kanban:
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                                       expected_run_id=run_id, expected_event_id=expected_event_id)
 
-    def comment(self, task_id: str, body: str, *, marker: str = "") -> int:
+    def comment(self, task_id: str, body: str, *, marker: str = "", issue: dict | None = None) -> int:
         # The integration author is provenance, never a human credential.
         author = "linear:" + hashlib.sha256(marker.encode()).hexdigest() if marker else "linear"
         with self.conn() as conn:
-            self.require_task(task_id)
+            task = self.require_task(task_id)
+            if issue is not None:
+                require_task_issue_scope(task, issue)
+                if task.status not in ("running", "ready", "review"):
+                    raise LinearError("Native work stopped or ended before follow-up delivery; inspect current controls", retryable=False)
             return self.kb.add_comment(conn, task_id, author, body)
     def find_comment(self, task_id: str, body: str, marker: str) -> list:
         author = "linear:" + hashlib.sha256(marker.encode()).hexdigest()
@@ -919,6 +934,9 @@ class Bridge:
                 if ((current.get("delegate") or {}).get("id") != me or
                         (current.get("state") or {}).get("type") in CLOSED):
                     return False
+                if not task_issue_link(task, current):
+                    self._decline(issue_id, session_id, "Native task issue link changed during inspection; no reporting link or replacement work was created. Inspect current work before a new instruction.")
+                    return False
                 contract = self.contracts.get((current.get("project") or {}).get("id"))
                 if contract and (task.completion_contract or "local-only") != contract:
                     self._decline(issue_id, session_id, "Existing native work has a different completion contract. Reconcile its acceptance evidence through native controls before linking; no replacement worker was created or existing work stopped.")
@@ -974,7 +992,7 @@ class Bridge:
                 self._decline(issue_id, session_id, "Task creation outcome is unknown. Inspect native tasks before retrying.")
                 return False
             task = tasks[0]
-        self.kanban.require_task(task.id)
+        task = self.kanban.require_task(task.id)
         if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
             self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
             raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
@@ -1168,6 +1186,7 @@ class Bridge:
             issue = self._effect_issue(issue_id)
             if (issue.get("state") or {}).get("type") in CLOSED or (issue.get("delegate") or {}).get("id") not in (None, self.api.viewer_id()):
                 raise LinearError("Issue was closed or reassigned; follow-up held", retryable=False)
+            require_task_issue_scope(task, issue)
             if task.status in ("done", "archived"):
                 return {"task_id": task.id, "status": task.status, "message": "Work has ended. Review history or explicitly create a new native increment."}
             if task.status not in ("running", "ready", "review"):
@@ -1195,8 +1214,8 @@ class Bridge:
                     raise LinearError("Follow-up delivery outcome is unknown; inspect native comments before repeating", retryable=False)
                 comment_id = comments[0].id
             else:
-                adapter.require_task(task.id)
-                comment_id = adapter.comment(task.id, body, marker=marker)
+                require_task_issue_scope(adapter.require_task(task.id), issue)
+                comment_id = adapter.comment(task.id, body, marker=marker, issue=issue)
             self.store.native_intent_settle(intent_key, {"state": "applied", "comment_id": comment_id})
             return {"task_id": task.id, "status": task.status, "message": "Instruction saved on the existing native task."}
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> None:

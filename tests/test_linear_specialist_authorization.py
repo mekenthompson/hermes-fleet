@@ -179,7 +179,13 @@ class FakeKanban:
     def subscribe(self, task_id, issue_id):
         self.subscriptions.append((task_id, issue_id))
 
-    def comment(self, task_id, body, *, marker=""):
+    def comment(self, task_id, body, *, marker="", issue=None):
+        if issue is not None:
+            from hermes_fleet_linear_plugin.bridge import require_task_issue_scope
+            task = self.require_task(task_id)
+            require_task_issue_scope(task, issue)
+            if task.status not in ("running", "ready", "review"):
+                raise LinearError("Native work stopped or ended before follow-up delivery", retryable=False)
         self.comments.append((task_id, body))
         self._comment_receipts.append((task_id, body.strip(), marker, len(self.comments)))
         return len(self.comments)
