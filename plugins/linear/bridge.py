@@ -7,14 +7,12 @@ import inspect
 import logging
 import math
 import re
-import shutil
 import sqlite3
-import tempfile
 import threading
 import uuid
 import time
 from collections import defaultdict
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -256,9 +254,9 @@ class Kanban:
                 return candidate
         raise ValueError("linear: no Kanban executor profile matches the service home")
     @contextmanager
-    def conn(self):
+    def read_conn(self):
         if getattr(self, "history_only", False):
-            with self.history_conn(self.history_db, snapshot=True) as conn:
+            with self.history_conn(self.history_db) as conn:
                 yield conn
             return
         try:
@@ -266,9 +264,17 @@ class Kanban:
         except transport.Unavailable as exc:
             raise LinearError(str(exc), retryable=False) from exc
         path = Path(self.kb.kanban_db_path(board=self.board))
+        with self.history_conn(path) as conn:
+            yield conn
+    @contextmanager
+    def conn(self):
+        if getattr(self, "history_only", False):
+            with self.read_conn() as conn:
+                yield conn
+            return
         # Native connect may initialize, migrate or repair. Never give it an
         # existing file that has not first passed non-mutating inspection.
-        with self.history_conn(path, snapshot=True):
+        with self.read_conn():
             pass
         try:
             with closing(self.kc.connect(board=self.board)) as conn:
@@ -277,53 +283,17 @@ class Kanban:
             raise LinearError("Existing native storage is unavailable; inspect it before native operations", retryable=False) from exc
     @contextmanager
     def history_conn(self, path: Path, *, snapshot: bool = False):
-        """Read native rows without creating, migrating or reopening a board."""
-        from hermes_cli.sqlite_safe_read import connect_tracked, offline_file_access, LiveConnectionError
+        """SQLite supplies the read snapshot, including WAL and external locks.
+
+        The snapshot keyword is retained for callers; every inspection uses a
+        tracked read transaction, never source-byte copies or native init.
+        """
+        from hermes_cli.sqlite_safe_read import connect_tracked
         try:
-            with ExitStack() as stack:
-                if snapshot:
-                    # SQLite mode=ro can still create WAL/SHM sidecars. Keep all
-                    # such files in a disposable copy, including committed WAL
-                    # frames (immutable=1 would silently ignore those frames).
-                    files = (path, Path(str(path) + "-wal"))
-                    def versions():
-                        result = []
-                        for source in files:
-                            if source.is_symlink():
-                                raise ValueError("archive database is a symlink")
-                            if source.exists():
-                                stat = source.stat()
-                                result.append((source.name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
-                        return result
-                    temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="linear-native-history-")))
-                    try:
-                        # Raw fd close cancels this process's SQLite locks.
-                        # Native's lifecycle lock makes the no-live-handle
-                        # check and all source-byte reads atomic together.
-                        with offline_file_access(path, what="inspect native history"):
-                            for attempt in range(5):
-                                destination = temporary / str(attempt)
-                                destination.mkdir()
-                                try:
-                                    before = versions()
-                                    for source in files:
-                                        if source.exists():
-                                            shutil.copyfile(source, destination / source.name)
-                                    if versions() != before:
-                                        raise ValueError("native history changed during inspection")
-                                    break
-                                except (OSError, ValueError):
-                                    if attempt == 4:
-                                        raise
-                                    time.sleep(0.01)
-                        path = destination / path.name
-                    except LiveConnectionError:
-                        # SQLite coordinates same-process readers with existing
-                        # writers. A finite read timeout refuses EXCLUSIVE locks
-                        # without waiting for our own connection to release one.
-                        pass
-                conn = stack.enter_context(closing(connect_tracked(
-                    path.resolve(strict=True).as_uri() + "?mode=ro", tracking_path=path, uri=True, timeout=0.1)))
+            if any(source.is_symlink() for source in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"))):
+                raise ValueError("native history path is a symlink")
+            with closing(connect_tracked(path.resolve(strict=True).as_uri() + "?mode=ro",
+                                         tracking_path=path, uri=True, timeout=0.1)) as conn:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA query_only=ON")
                 conn.execute("BEGIN")
@@ -350,7 +320,7 @@ class Kanban:
         with self.conn() as conn:
             return self.kb.get_task(conn, self.kb.create_task(conn, board=self.board, **fields))
     def get(self, task_id: str):
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             return self.kb.get_task(conn, task_id)
     def subscribe(self, task_id: str, issue_id: str) -> None:
         with self.conn() as conn:
@@ -364,23 +334,23 @@ class Kanban:
                 delivery_metadata={"scope_id": route.get("scope_id") or ""})
 
     def history(self, task_id: str, after_id: int) -> list:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             return sorted((event for event in self.kb.list_events(conn, task_id)
                            if event.id > after_id), key=lambda event: event.id)
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             comments = self.kb.list_comments(conn, task_id)
         return resolve_comment_body(comments, author, length, event_at=event_at)
     def evidence_text(self, task) -> str:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             run = self.kb.latest_run(conn, task.id)
         return " ".join(str(x) for x in (task.result, run and run.summary, run and json.dumps(run.metadata)) if x)
     def completion_summary(self, task) -> str:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             run = self.kb.latest_run(conn, task.id)
         return ((run.summary if run else None) or task.result or "").strip()
     def issue_comment(self, task) -> str:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             run = self.kb.latest_run(conn, task.id)
         metadata = run.metadata if run else None
         body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
@@ -436,11 +406,11 @@ class Kanban:
             return self.kb.add_comment(conn, task_id, author, body)
     def find_comment(self, task_id: str, body: str, marker: str) -> list:
         author = "linear:" + hashlib.sha256(marker.encode()).hexdigest()
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             return [item for item in self.kb.list_comments(conn, task_id)
                     if item.author == author and item.body == body.strip()]
     def find_created(self, key: str) -> list:
-        with self.conn() as conn:
+        with self.read_conn() as conn:
             ids = [row[0] for row in conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (key,))]
             return [self.kb.get_task(conn, ident) for ident in ids]
     def discover(self, issue: dict) -> list:

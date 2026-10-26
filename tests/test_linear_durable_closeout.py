@@ -455,7 +455,7 @@ class DurableCloseoutTests(unittest.TestCase):
             @contextmanager
             def connection():
                 yield object()
-            adapter.conn = connection
+            adapter.read_conn = connection
             adapter.kb = SimpleNamespace(latest_run=lambda conn, task_id: SimpleNamespace(
                 summary=summary, metadata={'artifacts': ['/private/findings.md']}))
             kanban.evidence_text = adapter.evidence_text
