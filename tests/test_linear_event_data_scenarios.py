@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import test_linear_isolation_scenarios as isolation
 import test_linear_native_bridge_scenarios as native
-from hermes_fleet_linear_plugin.api import RateLimited
+from hermes_fleet_linear_plugin.api import LinearError, RateLimited
 
 GENERATED = object()
 COMMENT = "Verified native operator note"
@@ -16,7 +16,7 @@ COMMENT = "Verified native operator note"
 @unittest.skipIf(native.CORE is not None, f"native source unavailable ({native.CORE})")
 class EventDataScenarios(unittest.TestCase):
     @contextmanager
-    def event_case(self, kind, payload, *, invalid=True, comment=False):
+    def event_case(self, kind, payload, *, invalid=True, comment=False, raw_payload=GENERATED):
         fixture = isolation.IsolationScenarios()
         try:
             fixture.setUp()
@@ -40,7 +40,8 @@ class EventDataScenarios(unittest.TestCase):
                         conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event_id))
                 else:
                     event_id = conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
-                                            (task_id, kind, json.dumps(payload), int(clock()))).lastrowid
+                                            (task_id, kind, json.dumps(payload) if raw_payload is GENERATED else raw_payload,
+                                             int(clock()))).lastrowid
                 if invalid:
                     conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)",
                         (task_id, "heartbeat", json.dumps({"note": "Must not publish after invalid event"}), int(clock())))
@@ -76,6 +77,26 @@ class EventDataScenarios(unittest.TestCase):
         for payload in (["unexpected-list"], [], "unexpected-string", "", 0, False, True):
             with self.subTest(payload=payload):
                 self.check_invalid("heartbeat", payload)
+
+    def test_malformed_persisted_json_cannot_become_legacy_absence(self):
+        for raw in ('{"note":', 'not-json', '[', '', ' ', b'\xff',
+                    '{"note":"wrong encoding"}'.encode('utf-16'), b'\xef\xbb\xbf{}'):
+            with self.subTest(raw=raw), self.event_case("heartbeat", None, raw_payload=raw) as case:
+                with self.assertRaises(LinearError):
+                    case.board.history(case.task_id, case.before["last_event_id"])
+                case.reporter.tick()
+                self.assertEqual(case.reporter.store.get(native.ISSUE), case.before)
+                self.assertEqual(case.reporter.store.native_binding(native.ISSUE), case.binding)
+                self.assertFalse(case.reporter.store.pending(native.ISSUE))
+                self.assertFalse(any("Must not publish" in body for body in case.remote.bodies(native.ISSUE)))
+                self.check_independent_delivery(case)
+
+    def test_sql_null_and_valid_json_null_object_records_keep_working(self):
+        for raw in (None, 'null', ' {} ', '{"note": "Valid native progress"}', b'{"note":"Valid native UTF-8 progress"}'):
+            with self.subTest(raw=raw), self.event_case("heartbeat", None, invalid=False, raw_payload=raw) as case:
+                case.reporter.tick()
+                self.assertEqual(case.reporter.store.get(native.ISSUE)["last_event_id"], case.event_id)
+                self.check_independent_delivery(case)
 
     def test_comment_numeric_metadata_failures_are_scoped_without_an_exception_whitelist(self):
         for value in ("not-a-number", "", [], [1], {}, {"value": 1}, float("inf"), float("nan")):
