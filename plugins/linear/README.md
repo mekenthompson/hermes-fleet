@@ -43,7 +43,20 @@ without creating or reopening them. Subsequent status, follow-up and reporting u
 recorded board. The configured plugin board remains the creation destination for verified
 Linear assignments, so linking an ordinary or project task does not require moving it.
 
-Validated Linear assignments create a blocked native task, link it, then admit it using the
+Before creating work, a validated assignment inspects existing native boards in this home.
+A task's `linear:<issue id>` retry key or explicit `Linear issue <id or identifier>: <issue URL>`
+body line identifies existing work to inspect. A unique task with that explicit issue link,
+assigned to the verified local executor, is linked on its original board; subsequent follow-ups
+steer that task. A retry key alone cannot authorize adoption of manual work. Linking
+does not resume stopped work or restart completed work. Several matching tasks, a different
+executor, or an unavailable existing board require scoped inspection, never a replacement
+worker or access to another profile's private state. A conflicting configured project
+completion contract requires acceptance reconciliation; reuse cannot downgrade it.
+Incidental issue mentions are not links.
+Agents creating issue-related native work should preserve the explicit issue line and use
+the canonical retry key when available; the user does not supply these internal arguments.
+
+When no existing work is found, validated Linear assignments create a blocked native task, link it, then admit it using the
 native event guard. The user does not need a separate activation step. Activation retains
 the original creation token across retries; a newer Stop invalidates it. Native scheduling,
 capacity and dependencies decide when the admitted worker runs. A restart can finish an

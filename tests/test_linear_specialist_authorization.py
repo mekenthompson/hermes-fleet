@@ -195,6 +195,11 @@ class FakeKanban:
     def find_created(self, key):
         return [task for task in self.tasks.values() if getattr(task, "idempotency_key", None) == key]
 
+    def discover(self, issue):
+        from hermes_fleet_linear_plugin.bridge import task_issue_match
+        return [(self, task) for task in self.tasks.values()
+                if task.status != "archived" and task_issue_match(task, issue)]
+
     def find_comment(self, task_id, body, marker):
         return [SimpleNamespace(id=receipt[3]) for receipt in self._comment_receipts
                 if receipt[:3] == (task_id, body.strip(), marker)]

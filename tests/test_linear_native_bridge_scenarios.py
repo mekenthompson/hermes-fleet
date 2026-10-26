@@ -174,7 +174,8 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertEqual((before.status, before.current_run_id, before.assignee), (after.status, after.current_run_id, after.assignee))
         self.assertEqual(len(self.tasks()), 1)
         self.assertIsNone(self.store.get(ISSUE))
-        self.assertEqual(self.store.native_intent(f"create:{ISSUE}")["state"], "reconcile")
+        # Discovery rejects the collision before any native create attempt.
+        self.assertIsNone(self.store.native_intent(f"create:{ISSUE}"))
 
     def test_same_profile_followup_reaches_actual_native_injector_same_run(self):
         from tools import kanban_tools as kt
