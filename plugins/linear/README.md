@@ -18,6 +18,7 @@ API is required. The plugin is disabled by default.
 | `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
 | `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
 | `status` with `issue` | Read the issue, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. |
+| `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
@@ -277,3 +278,37 @@ Source and component checks do not establish deployment or client acceptance. Th
 JTBD outcome cases still require actual Linear, Desktop, Slack and Telegram evidence.
 The guarded finite-model task test does not establish a gateway-spawned actorless
 worker or live client acceptance; that case remains a release acceptance check.
+
+## Native origin evidence
+
+The registered `linear` tool accepts `{"action":"origin_reference"}` with no other fields.
+It captures the current host-bound caller, resolves its native compression lineage, and
+checks its ordinary active admission with the existing gateway owner. It returns a reference
+and `permission_granted: false`; it does not contact another agent or transfer execution.
+Delegated children, bots, automation, ambiguous steering, unknown execution and stale owners
+cannot supply this reference. Unsupported native hosts fail closed.
+
+An already-authorized operator can independently inspect that reference **inside its owning
+profile**, using that profile's own mounted plugin and UID:
+
+```sh
+hermes linear inspect-origin --reference-json '<reference object>'
+```
+
+This read-only command returns only the exact current request's original text, native
+principal, filtered requester limits and relevant profile/workspace policy. It accepts no
+other profile home, database path or transcript selector. It never attaches a viewer, loads
+runtime tool inventory, initializes credentials, starts a gateway, or runs a model.
+API credential principals remain API credential principals; they are not attributed to a
+named human. Recheck current native state before any subsequent control operation.
+
+References and inspection results grant no permission, prove no worker stopped, and establish
+no new cross-profile route. A peer may communicate a reference as untrusted input; an operator
+must independently inspect its original instruction and apply existing requester, profile,
+specialist and workspace permissions. Native Stop and quiescence verification remain separate.
+
+The isolated source proof is `python scripts/run-linear-origin-scenarios.py --agent-source
+<clean manifest-pinned Agent checkout>`. Its guard is installed before native imports and
+rejects credential/model activation, external processes/network, real-user config access and
+writes outside its temporary root. This source proof does not establish deployed client or
+handoff readiness.

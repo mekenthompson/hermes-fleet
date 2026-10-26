@@ -134,7 +134,7 @@ class LinearPluginUnitTests(unittest.TestCase):
 
     def test_production_file_inventory(self) -> None:
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "native_input.py", "oauth.py", "ops.py", "plugin.yaml",
+                         ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "native_input.py", "oauth.py", "ops.py", "origin.py", "origin_state.py", "plugin.yaml",
                           "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:

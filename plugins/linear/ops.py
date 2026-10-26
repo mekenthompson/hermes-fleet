@@ -146,8 +146,20 @@ def setup(parser: Any) -> None:
     resolve.add_argument("outcome", choices=("applied", "not_applied"))
     resolve.add_argument("--evidence", required=True, help="What you checked in Linear")
     sub.add_parser("replay", help="Retry one parked Linear delivery").add_argument("delivery_id")
+    inspect_origin = sub.add_parser("inspect-origin", help="Inspect one current native origin inside its owning profile; grants no permissions")
+    inspect_origin.add_argument("--reference-json", required=True, help="Complete origin_reference result's reference object")
 
-def run(args: Any, state: Path, ingress: Path, profile: str) -> int:
+def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None) -> int:
+    if args.linear_command == "inspect-origin":
+        from . import origin
+        from .transport import Unavailable
+        try:
+            result = origin.inspect(json.loads(args.reference_json), origin_settings or {})
+        except (Unavailable, ValueError, ImportError, OSError, RuntimeError) as exc:
+            print(json.dumps({"ok": False, "message": str(exc), "permission_granted": False}))
+            return 1
+        print(json.dumps({"ok": True, **result}))
+        return 0
     if args.linear_command == "status":
         items = stuck(state, ingress, profile)
         print(json.dumps(items, indent=2) if args.json else report(items))

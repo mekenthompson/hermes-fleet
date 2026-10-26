@@ -17,11 +17,13 @@ SCHEMA = {
         "status reports the existing task and retained reconciliation records. "
         "followup adds an operator comment to active native work; requires issue, body and UUID id. "
         "Use native Kanban controls for an explicit resume, cancellation or new task. "
+        "origin_reference accepts only action and returns the current authenticated native input reference; "
+        "it grants no control permission and must be independently inspected by the owner. "
         "create_issue, create_project, link_issue, update_description and add_comment work without "
         "a task link or chat claim. Description replacement requires the exact expected_description. "
         "Reuse the same UUID id and content after a lost mutation response."),
     "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["track", "status", "followup", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
+        "action": {"type": "string", "enum": ["track", "status", "followup", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
         "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},

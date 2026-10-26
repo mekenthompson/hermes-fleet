@@ -74,6 +74,11 @@ jobs:
         run: |
           "$RUNNER_TEMP/linear-scenarios/bin/python" -m unittest discover \
             -s tests -p 'test_claude_acp_context.py' -v
+      - name: Guarded native origin evidence
+        run: |
+          python3 -I -S scripts/check-linear-origin-guard.py
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-origin-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-source"
 
   history-root:
     runs-on: ubuntu-latest

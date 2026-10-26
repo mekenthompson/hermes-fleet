@@ -451,6 +451,12 @@ def register(ctx: Any) -> None:
         try:
             args = args or {}
             context = transport.capture_context(track=args.get("action") == "track", board=args.get("board"))
+            if args.get("action") == "origin_reference":
+                if set(args) != {"action"}:
+                    raise transport.Unavailable("origin_reference accepts no identity, session or task selectors.")
+                from . import origin
+                return chat._reply(True, "Current native origin reference; it grants no control permission.",
+                                   **origin.current(context, origin_settings()))
             bridge = running.get("bridge")
             if bridge is not None:
                 return chat.handle(bridge, args, context)
@@ -470,9 +476,11 @@ def register(ctx: Any) -> None:
                 Path(ctx.get_config("ingress_database") or home / "workspace" / "linear" / "ingress.db"),
                 validate_ingress_profile(ctx.get_config("ingress_profile")) or
                 os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or "default")
+    def origin_settings():
+        return {key: ctx.get_config(key) for key in ("identity", "specialist_scope")}
     if hasattr(ctx, "register_cli_command"):
         ctx.register_cli_command("linear", "Show and resolve held Linear reporting", ops.setup,
-                                 lambda args: ops.run(args, *paths()))
+                                 lambda args: ops.run(args, *paths(), origin_settings=origin_settings()))
     if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):
         ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths())),
                              description="Show held Linear reporting and reconciliation")
