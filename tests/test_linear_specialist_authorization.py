@@ -176,7 +176,10 @@ class FakeKanban:
     def evidence_text(self, _task):
         return ""
 
-    def subscribe(self, task_id, issue_id):
+    def subscribe(self, task_id, issue_id, *, issue=None):
+        if issue is not None:
+            from hermes_fleet_linear_plugin.bridge import require_task_issue_scope
+            require_task_issue_scope(self.require_task(task_id), issue)
         self.subscriptions.append((task_id, issue_id))
 
     def comment(self, task_id, body, *, marker="", issue=None):
@@ -221,7 +224,10 @@ class FakeKanban:
     def archive(self, task_id):
         self.tasks[task_id].status = "archived"
 
-    def block(self, task_id, _reason, *, run_id=None):
+    def block(self, task_id, _reason, *, run_id=None, issue=None):
+        if issue is not None:
+            from hermes_fleet_linear_plugin.bridge import require_task_issue_scope
+            require_task_issue_scope(self.require_task(task_id), issue)
         self.tasks[task_id].status = "blocked"
 
 

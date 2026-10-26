@@ -59,7 +59,10 @@ explicit issue markers hold automatic or manual linking, replacement and follow-
 Follow-up delivery also holds any newly stopped task;
 marker-free manually tracked work retains its authorized reporting binding. Validation
 reflects the last native observation before the existing write boundary; native concurrency
-and control rules continue to apply.
+and control rules continue to apply. Current explicit scope conflicts also hold native
+Stop controls, new event capture and queued publication. The binding, native history and
+queued evidence stay available for inspection; authorized status reads show reconciliation.
+A held project line does not prevent other valid lines from reporting.
 Archived tasks and board archives in this native home are inspected as retained history.
 An archived board is never reopened or linked for execution; a completed outcome stays
 history until a deliberate new increment. Intact unrelated archives do not block new work.
