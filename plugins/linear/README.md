@@ -65,6 +65,10 @@ queued evidence stay available for inspection; authorized status reads show reco
 Unavailable history or event metadata that cannot be projected holds that binding's
 cursor while other work and ordinary issue content continue. Persisted JSON is checked
 before native decoding; SQL NULL and valid JSON null remain supported legacy absence.
+Consumed run evidence uses the same check. Existing active board files must contain
+a JSON object with a boolean archive flag when present; supported missing metadata
+and legacy defaults still work. Invalid storage holds native admission and reporting
+for that board while authorized issue content and other valid bindings remain usable.
 Invalid events are retained
 for inspection, without being consumed or repaired. Original held project lines can report separately as their scope
 becomes valid; later same-session updates do not republish completed lines.

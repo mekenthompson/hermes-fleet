@@ -62,6 +62,37 @@ class NativeContext:
         return context
 
 
+def native_json_object(raw: Any, *, allow_null: bool = False, encoding: str = 'utf-8') -> dict | None:
+    """Decode consumed native metadata without a lossy fallback to absence."""
+    if isinstance(raw, bytes):
+        raw = raw.decode(encoding)
+    value = json.loads(raw) if raw is not None else None
+    if value is None and allow_null:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError('Native metadata must be a JSON object')
+    return value
+
+
+def native_board_metadata(board: Any = None) -> dict:
+    """Inspect native directory identity and archive state without lossy defaults."""
+    from hermes_cli import kanban_db as kb
+    try:
+        target = board if board is not None else kb.get_current_board()
+        path = kb.board_metadata_path(target)
+        if path.is_symlink():
+            raise ValueError('Native board metadata is a symlink')
+        try:
+            raw = native_json_object(path.read_bytes(), encoding='utf-8-sig')
+        except FileNotFoundError:
+            raw = {}  # Native supports absent metadata, including fresh default setup.
+        if 'archived' in raw and type(raw['archived']) is not bool:
+            raise ValueError('Native board archive state is invalid')
+        return {'slug': path.parent.name, 'archived': raw.get('archived', False)}
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
+        raise Unavailable('Native board metadata is unavailable or invalid; inspect existing work') from exc
+
+
 def native_board_target(board: Any = None) -> tuple[str, str]:
     """Inspect an existing native target without initializing or creating its board."""
     from hermes_cli import kanban_db as kb
@@ -69,7 +100,7 @@ def native_board_target(board: Any = None) -> tuple[str, str]:
         raise Unavailable('track board must name an existing native board')
     try:
         target = board if board is not None else kb.get_current_board()
-        metadata = kb.read_board_metadata(target)
+        metadata = native_board_metadata(target)
         slug = metadata['slug']
         path = Path(kb.kanban_db_path(board=slug)).resolve(strict=True)
         if not kb.board_exists(slug) or metadata.get('archived') or not path.is_file():
@@ -135,7 +166,9 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
         fields.update(native_board='', native_db_path='', pinned_board='', pinned_db_path='')
         if explicit_board_intent_is_pinned():
             from hermes_cli import kanban_db as kb
-            fields['pinned_board'] = kb.read_board_metadata(kb.get_current_board())['slug']
+            # The native directory identifies a pin. Metadata availability is
+            # checked at native access, so ordinary authorized content can work.
+            fields['pinned_board'] = kb.board_metadata_path(kb.get_current_board()).parent.name
             fields['pinned_db_path'] = str(Path(kb.kanban_db_path()).resolve())
         if track:
             fields['native_board'], fields['native_db_path'] = native_board_target(board)

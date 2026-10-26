@@ -237,10 +237,19 @@ class Kanban:
                  profile_home: Any = None) -> None:
         from hermes_cli import kanban_db, kanban_db_connect, kanban_db_notify
         self.kb, self.kc, self.kn = kanban_db, kanban_db_connect, kanban_db_notify
-        metadata = kanban_db.read_board_metadata(board if board is not None else kanban_db.get_current_board())
-        self.board = metadata["slug"]
         self.executor_profile = self.resolve_executor_profile(profile, profile_home) if profile is not None else None
         self.profile_home = Path(profile_home).resolve(strict=True) if profile is not None else None
+        try:
+            target = board if board is not None else kanban_db.get_current_board()
+            self.board = kanban_db.board_metadata_path(target).parent.name
+        except (OSError, ValueError) as exc:
+            self.board = "default"
+            self.board_selection_error = exc
+            return  # Keep authorized issue/content service available without native authority.
+        try:
+            metadata = transport.native_board_metadata(self.board)
+        except transport.Unavailable:
+            return  # Native reads revalidate; invalid metadata never authorizes initialization.
         if metadata.get("archived"):
             return  # Reporting/content stays available; native connections refuse this archived target.
         path = Path(kanban_db.kanban_db_path(board=self.board))
@@ -283,6 +292,8 @@ class Kanban:
         raise ValueError("linear: no Kanban executor profile matches the service home")
     @contextmanager
     def read_conn(self):
+        if getattr(self, "board_selection_error", None) is not None:
+            raise LinearError("Native board selection is unavailable; inspect existing work", retryable=False)
         if getattr(self, "history_only", False):
             with self.history_conn(self.history_db) as conn:
                 yield conn
@@ -341,6 +352,7 @@ class Kanban:
             raise LinearError(str(exc), retryable=False) from exc
         adapter = copy.copy(self)
         adapter.board = slug
+        adapter.board_selection_error = None
         return adapter
     def create(self, **fields: Any):
         if self.executor_profile is not None:
@@ -372,14 +384,9 @@ class Kanban:
                 # persisted metadata first, in this same tracked read snapshot,
                 # so corrupt records cannot masquerade as legacy absence.
                 try:
-                    raw = row["payload"]
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    payload = json.loads(raw) if raw is not None else None
+                    payload = transport.native_json_object(row["payload"], allow_null=True)
                 except (ValueError, TypeError, RecursionError) as exc:
                     raise LinearError("Native event metadata cannot be decoded; inspect retained history before reporting", retryable=False) from exc
-                if payload is not None and not isinstance(payload, dict):
-                    raise LinearError("Native event metadata is not an object; inspect retained history before reporting", retryable=False)
                 event = self.kb.Event.from_row(row)
                 event.payload = payload
                 native_event_payload(event)
@@ -391,18 +398,27 @@ class Kanban:
         return resolve_comment_body(comments, author, length, event_at=event_at)
     def evidence_text(self, task) -> str:
         with self.read_conn() as conn:
-            run = self.kb.latest_run(conn, task.id)
+            run = self.latest_run(conn, task.id)
         return " ".join(str(x) for x in (task.result, run and run.summary, run and json.dumps(run.metadata)) if x)
     def completion_summary(self, task) -> str:
         with self.read_conn() as conn:
-            run = self.kb.latest_run(conn, task.id)
+            run = self.latest_run(conn, task.id)
         return ((run.summary if run else None) or task.result or "").strip()
     def issue_comment(self, task) -> str:
         with self.read_conn() as conn:
-            run = self.kb.latest_run(conn, task.id)
+            run = self.latest_run(conn, task.id)
         metadata = run.metadata if run else None
         body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
         return body if isinstance(body, str) else ""
+    def latest_run(self, conn, task_id: str):
+        row = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC, id DESC LIMIT 1",
+                           (task_id,)).fetchone()
+        if row is None:
+            return None
+        metadata = transport.native_json_object(row["metadata"], allow_null=True)
+        run = self.kb.Run.from_row(row)
+        run.metadata = metadata
+        return run
     def block(self, task_id: str, reason: str, *, run_id: int | None = None, issue: dict | None = None) -> bool:
         with self.conn() as conn:
             if issue is not None:
@@ -478,8 +494,16 @@ class Kanban:
         for discovery, and an unreadable existing target is not an empty result.
         """
         found, archived = [], set()
-        for metadata in self.kb.list_boards(include_archived=True):
+        try:
+            boards = self.kb.list_boards(include_archived=True)
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            raise LinearError("Native board metadata is unavailable; inspect it before replacement work", retryable=False) from exc
+        for metadata in boards:
             slug = metadata["slug"]
+            try:
+                metadata = transport.native_board_metadata(slug)
+            except transport.Unavailable as exc:
+                raise LinearError(str(exc), retryable=False) from exc
             if metadata.get("archived"):
                 archived.add(slug)
                 continue
@@ -516,13 +540,14 @@ class Kanban:
                             path.resolve(strict=True).parent != entry.resolve(strict=True) or
                             metadata_path.resolve(strict=True).parent != entry.resolve(strict=True)):
                         raise ValueError("archive path is outside its native directory")
-                    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                    metadata = transport.native_json_object(metadata_path.read_bytes(), encoding="utf-8-sig")
                     slug = metadata.get("slug") if isinstance(metadata, dict) else None
                     if (not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", slug) or
                             not re.fullmatch(re.escape(slug) + r"-\d+(?:-\d+)?", entry.name)):
                         raise ValueError("archive board identity is ambiguous")
                     adapter = copy.copy(self)
                     adapter.board, adapter.history_only, adapter.history_db = slug, True, path
+                    adapter.board_selection_error = None
                     with adapter.conn() as conn:
                         for task in self.kb.list_tasks(conn, include_archived=True):
                             if task_issue_match(task, issue):
@@ -530,7 +555,7 @@ class Kanban:
                     inspected.add(slug)
             if archived - inspected:
                 raise ValueError("archived board history is unavailable")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
             raise LinearError("Archived native history is unavailable or its identity is ambiguous; inspect it before replacement work", retryable=False) from exc
         return found
     def require_task(self, task_id: str):
@@ -1430,9 +1455,14 @@ class Bridge:
                 issue_id, task_id, event_id = row["issue_id"], row.get("task_id"), None
                 try:
                     row, task = self._native_task(row["issue_id"])
+                    adapter = self._binding_adapter(row["issue_id"])
+                    # Completed outcomes consume run evidence. Validate it
+                    # before any batch capture, retaining an unreadable cursor.
+                    if task.status == "done":
+                        adapter.evidence_text(task)
                     captured = (self.store.captured_task_activities(row["issue_id"], row["task_id"], row["owner_ref"])
                                 if row["last_event_id"] == 0 else {})
-                    for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], row["last_event_id"]):
+                    for event in adapter.history(row["task_id"], row["last_event_id"]):
                         # Our durable cursor is independent of core's claim cursor.
                         event_id = event.id
                         self._task_event(row, event, task.status, captured)
