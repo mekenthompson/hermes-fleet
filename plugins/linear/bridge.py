@@ -139,6 +139,15 @@ def require_task_issue_scope(task, issue: dict) -> None:
     if task_issue_scope(task, issue)[1]:
         raise LinearError("Native task explicitly references a different or ambiguous issue; instruction or reporting link held for inspection", retryable=False)
 
+def native_event_payload(event) -> dict:
+    """Native JSON objects are metadata; legacy absence is an empty object."""
+    payload = event.payload
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise LinearError("Native event metadata is not an object; inspect retained history before reporting", retryable=False)
+    return payload
+
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
     activity, session = event.get("agentActivity") or {}, event.get("agentSession") or {}
@@ -356,8 +365,11 @@ class Kanban:
 
     def history(self, task_id: str, after_id: int) -> list:
         with self.read_conn() as conn:
-            return sorted((event for event in self.kb.list_events(conn, task_id)
-                           if event.id > after_id), key=lambda event: event.id)
+            events = sorted((event for event in self.kb.list_events(conn, task_id)
+                             if event.id > after_id), key=lambda event: event.id)
+            for event in events:
+                native_event_payload(event)
+            return events
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.read_conn() as conn:
             comments = self.kb.list_comments(conn, task_id)
@@ -1400,21 +1412,26 @@ class Bridge:
                 # Loading or iterating one task's native history can fail just
                 # like decoding its task row. Keep that entire read/capture path
                 # inside this binding's boundary so later work and flush proceed.
+                issue_id, task_id, event_id = row["issue_id"], row.get("task_id"), None
                 try:
                     row, task = self._native_task(row["issue_id"])
                     captured = (self.store.captured_task_activities(row["issue_id"], row["task_id"], row["owner_ref"])
                                 if row["last_event_id"] == 0 else {})
                     for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], row["last_event_id"]):
                         # Our durable cursor is independent of core's claim cursor.
+                        event_id = event.id
                         self._task_event(row, event, task.status, captured)
                         row = self.store.get(row["issue_id"])
                         if not row or row["last_event_id"] < event.id:
                             break  # Retry this event before consuming any later one.
-                except LinearError as exc:
-                    log.warning("linear: native reporting binding held: %s", exc)
+                except RateLimited:
+                    raise
+                except Exception as exc:  # External native data cannot abort other bindings or flush.
+                    log.warning("linear: native reporting held for issue %s task %s event %s (%s)",
+                                issue_id, task_id, event_id, type(exc).__name__)
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
-        payload, issue_id = event.payload or {}, row["issue_id"]
+        payload, issue_id = native_event_payload(event), row["issue_id"]
         if not self.authorize_specialist_effect(issue_id):
             return
         self._native_effect_task(issue_id)
@@ -1470,7 +1487,7 @@ class Bridge:
         elif event.kind == "commented":
             reader = getattr(self._binding_adapter(issue_id), "comment_text", None)
             event_at = getattr(event, "created_at", None)
-            body = (_progress_text(reader(row["task_id"], str(payload.get("author") or ""), int(payload.get("len") or 0), event_at), 800)
+            body = (_progress_text(reader(row["task_id"], str(payload.get("author") or ""), (int(payload["len"]) if payload.get("len") is not None else 0), event_at), 800)
                     if callable(reader) and event_at is not None else "")
             if body:
                 writes = [message("thought", body)]
@@ -1624,11 +1641,15 @@ class Bridge:
                     issue = self._effect_issue(row["issue_id"])
                     if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
                         self._keepalive(row)
-                except LinearError as exc:
-                    if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
-                        self._alert_reauthorization()
-                    if not exc.retryable:
-                        self._fence_scope_denial(row["issue_id"], exc)
+                except RateLimited:
+                    raise
+                except Exception as exc:
+                    if isinstance(exc, LinearError):
+                        if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
+                            self._alert_reauthorization()
+                        if not exc.retryable:
+                            self._fence_scope_denial(row["issue_id"], exc)
+                    log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
     def recover(self, ingress: Path | None = None) -> None:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
@@ -1643,8 +1664,11 @@ class Bridge:
                 try:
                     if self.authorize_specialist_effect(row["issue_id"]):
                         self._assignment_activation(row)
-                except (LinearError, ValueError, OSError, KeyError, TypeError) as exc:
-                    log.warning("linear: admission recovery held for %s: %s", row["issue_id"], exc)
+                except RateLimited:
+                    raise
+                except Exception as exc:
+                    log.warning("linear: admission recovery held for %s (%s); inspect retained task/history",
+                                row["issue_id"], type(exc).__name__)
 
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""

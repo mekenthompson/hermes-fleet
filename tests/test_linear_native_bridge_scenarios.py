@@ -262,9 +262,13 @@ class NativeBridgeScenarios(unittest.TestCase):
             kb.block_task(conn, task_id, reason="human decision required", kind="needs_input")
         def crash(*args, **kwargs):
             raise RuntimeError("before plugin durable commit")
+        pending_before = self.store.pending()
         with patch.object(self.bridge.store, "capture_event", side_effect=crash):
-            with self.assertRaises(RuntimeError):
+            with self.assertLogs("linear", level="WARNING") as held:
                 self.bridge.pump_kanban()
+        self.assertTrue(any("RuntimeError" in entry and task_id in entry for entry in held.output))
+        self.assertFalse(any("before plugin durable commit" in entry for entry in held.output))
+        self.assertEqual(self.store.pending(), pending_before)
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
         # No native subscription notification cursor was consumed before the durable outbox.
         with self.board.conn() as conn:
