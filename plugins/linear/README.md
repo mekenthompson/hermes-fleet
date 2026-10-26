@@ -63,7 +63,9 @@ and control rules continue to apply. Current explicit scope conflicts also hold 
 Stop controls, new event capture and queued publication. The binding, native history and
 queued evidence stay available for inspection; authorized status reads show reconciliation.
 Unavailable history or event metadata that cannot be projected holds that binding's
-cursor while other work and ordinary issue content continue. Invalid events are retained
+cursor while other work and ordinary issue content continue. Persisted JSON is checked
+before native decoding; SQL NULL and valid JSON null remain supported legacy absence.
+Invalid events are retained
 for inspection, without being consumed or repaired. Original held project lines can report separately as their scope
 becomes valid; later same-session updates do not republish completed lines.
 Uncertain started project requests retain their frozen content and identity.

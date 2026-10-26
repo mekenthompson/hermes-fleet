@@ -365,10 +365,25 @@ class Kanban:
 
     def history(self, task_id: str, after_id: int) -> list:
         with self.read_conn() as conn:
-            events = sorted((event for event in self.kb.list_events(conn, task_id)
-                             if event.id > after_id), key=lambda event: event.id)
-            for event in events:
+            events = []
+            for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
+                                    (task_id, after_id)):
+                # Native Event decoding treats malformed JSON as None. Validate
+                # persisted metadata first, in this same tracked read snapshot,
+                # so corrupt records cannot masquerade as legacy absence.
+                try:
+                    raw = row["payload"]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8")
+                    payload = json.loads(raw) if raw is not None else None
+                except (ValueError, TypeError, RecursionError) as exc:
+                    raise LinearError("Native event metadata cannot be decoded; inspect retained history before reporting", retryable=False) from exc
+                if payload is not None and not isinstance(payload, dict):
+                    raise LinearError("Native event metadata is not an object; inspect retained history before reporting", retryable=False)
+                event = self.kb.Event.from_row(row)
+                event.payload = payload
                 native_event_payload(event)
+                events.append(event)
             return events
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.read_conn() as conn:
