@@ -34,6 +34,11 @@ class LinearOperatorTests(unittest.TestCase):
         return code, out.getvalue()
 
     def uncertain(self, kind, issue, *, settled=True, **payload):
+        if kind == "status":
+            self.store.bind_native(issue, f"native-{issue}", "default", "default", at=0)
+            payload["task_id"] = f"native-{issue}"
+        elif kind == "description":
+            payload.update(content_action=True, unlinked_content=True)
         row = self.store.enqueue(kind, {"issue_id": issue, **payload}, at=100)
         saved = self.store.outbox_row(row)
         self.store.rewrite(row, {**saved["payload"], "write_started": True}, 100)
@@ -80,7 +85,8 @@ class LinearOperatorTests(unittest.TestCase):
                 ops.stuck(self.state, self.inbox, "default")
 
     def test_retried_terminal_comment_never_asks_for_resolve(self):
-        comment = self.store.enqueue("comment", {"issue_id": "issue-7", "body": "Done", "terminal": True}, at=100)
+        self.store.bind_native("issue-7", "native-7", "default", "default", at=0)
+        comment = self.store.enqueue("comment", {"issue_id": "issue-7", "task_id": "native-7", "body": "Done", "terminal": True}, at=100)
         self.store.retry(self.store.outbox_row(comment), 100)
         self.store.mark(comment, "failed")
         items = ops.stuck(self.state, self.inbox, "default", now=200)
@@ -105,9 +111,10 @@ class LinearOperatorTests(unittest.TestCase):
 
     def test_fences_and_undelivered_writes_explain_the_next_step(self):
         self.store.fence_scope("issue-3", "requester outside scope", at=50)
-        refused = self.store.enqueue("comment", {"issue_id": "issue-4", "body": "evidence"}, at=100)
+        refused = self.store.enqueue("comment", {"issue_id": "issue-4", "body": "evidence", "content_action": True, "unlinked_content": True}, at=100)
         self.store.mark(refused, "failed")
-        thought = self.store.enqueue("activity", {"issue_id": "issue-4", "session_id": "s",
+        self.store.bind_native("issue-4", "native-4", "default", "default", at=0)
+        thought = self.store.enqueue("activity", {"issue_id": "issue-4", "task_id": "native-4", "session_id": "s",
                                                   "content": {"type": "thought", "body": "Working"}}, at=100)
         self.store.mark(thought, "failed")
         items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=200)}

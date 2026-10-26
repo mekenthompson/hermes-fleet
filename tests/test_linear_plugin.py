@@ -56,15 +56,15 @@ class LinearOutboxOrderTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.store = Store(Path(tmp.name) / "state.db")
-        self.store.put("issue-1", "chat", "chat-key")
-        self.store.finish("issue-1", [("status", {"issue_id": "issue-1", "state": "done"}),
-                                      ("comment", {"issue_id": "issue-1", "body": "evidence"})], at=100)
+        self.store.bind_native("issue-1", "native-1", "default", "default", at=0)
+        self.store.finish("issue-1", [("status", {"issue_id": "issue-1", "task_id": "native-1", "state": "done"}),
+                                      ("comment", {"issue_id": "issue-1", "task_id": "native-1", "body": "evidence"})], at=100)
         self.status = next(row for row in self.store.pending() if row["kind"] == "status")
 
     def test_retryable_failed_status_holds_evidence_until_recovery_or_supersession(self) -> None:
         self.assertTrue(self.store.retry(self.status, 100 + 86_401))
         self.assertEqual(self.store.due(100 + 86_401), [])
-        newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=100 + 86_402)
+        newer = self.store.enqueue("status", {"issue_id": "issue-1", "task_id": "native-1", "state": "in_progress"}, at=100 + 86_402)
         self.assertEqual([row["id"] for row in self.store.due(100 + 86_402)], [newer])
         self.store.mark_sent(newer, True)
         self.assertEqual([row["kind"] for row in self.store.due(100 + 86_402)], ["comment"])
@@ -76,7 +76,7 @@ class LinearOutboxOrderTests(unittest.TestCase):
         [dependent] = self.store.due(100)
         self.assertEqual(dependent["kind"], "comment")
         self.store.mark_sent(dependent["id"], False)
-        newer = self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101)
+        newer = self.store.enqueue("status", {"issue_id": "issue-1", "task_id": "native-1", "state": "in_progress"}, at=101)
         self.assertEqual([row["id"] for row in self.store.due(101)], [newer])
 
     def test_legacy_attempted_terminal_without_send_marker_requires_explicit_resolution(self) -> None:
@@ -85,13 +85,14 @@ class LinearOutboxOrderTests(unittest.TestCase):
         self.store.retry(attempted, 100)
         self.assertTrue(self.store.issue_reconciliation_blocked("issue-1"))
         self.assertFalse(self.store.put("issue-1", "chat", "fresh"))
-        self.assertEqual(self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_progress"}, at=101), "")
+        self.assertEqual(self.store.enqueue("status", {"issue_id": "issue-1", "task_id": "native-1", "state": "in_progress"}, at=101), "")
         with self.assertRaises(ValueError):
             self.store.reconcile_terminal(self.status["id"], outcome="applied", evidence="", at=102)
         self.assertTrue(self.store.reconcile_terminal(
             self.status["id"], outcome="not_applied", evidence="https://docs.example/verified", at=102))
         self.assertFalse(self.store.issue_reconciliation_blocked("issue-1"))
-        self.assertTrue(self.store.put("issue-1", "chat", "fresh"))
+        self.assertFalse(self.store.put("issue-1", "chat", "fresh"))
+        self.assertIsNotNone(self.store.native_binding("issue-1"))
         receipt = self.store.outbox_row(self.status["id"])
         self.assertEqual(receipt["state"], "failed")
         self.assertEqual(receipt["attempts"], 1)
@@ -99,7 +100,7 @@ class LinearOutboxOrderTests(unittest.TestCase):
 
 
     def test_advisory_thoughts_never_hold_or_wait_for_issue_writes_and_are_not_revived(self) -> None:
-        thought = self.store.enqueue("activity", {"issue_id": "issue-1", "session_id": "s-1",
+        thought = self.store.enqueue("activity", {"issue_id": "issue-1", "task_id": "native-1", "session_id": "s-1",
                                                   "content": {"type": "thought", "body": "Working"}}, at=100)
         self.assertEqual({row["kind"] for row in self.store.due(100)}, {"status", "activity"})
         self.store.retry(self.store.outbox_row(thought), 100)  # a thought backing off holds nothing
@@ -242,7 +243,8 @@ class LinearPluginUnitTests(unittest.TestCase):
     def test_outbox_backoff_give_up_and_revival(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store, now = Store(Path(tmp) / "state.db"), 1_000_000.0
-            store.enqueue("status", {"issue_id": "i", "state": "in_progress"}, at=now)
+            store.bind_native("i", "native-i", "default", "default", at=0)
+            store.enqueue("status", {"issue_id": "i", "task_id": "native-i", "state": "in_progress"}, at=now)
             delays = []
             for _ in range(8):
                 [row] = store.due(1e12)
@@ -252,23 +254,23 @@ class LinearPluginUnitTests(unittest.TestCase):
             [row] = store.due(1e12)
             self.assertTrue(store.retry(row, now + 86_400))
             self.assertEqual(store.pending(), [])
-            store.enqueue("status", {"issue_id": "i", "state": "done"}, at=now)
-            store.enqueue("comment", {"issue_id": "i", "body": "x"}, at=now)
+            store.enqueue("status", {"issue_id": "i", "task_id": "native-i", "state": "done"}, at=now)
+            store.enqueue("comment", {"issue_id": "i", "task_id": "native-i", "body": "x"}, at=now)
             self.assertEqual([r["kind"] for r in store.due(now)], ["status"])  # one issue, in order
             store.revive_failed(now)  # the older status write is superseded: it must not land late
             self.assertEqual([r["payload"]["state"] for r in store.pending() if r["kind"] == "status"], ["done"])
 
-    def test_terminal_outbox_capture_and_work_removal_are_atomic(self) -> None:
+    def test_terminal_outbox_capture_preserves_verified_native_binding_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp) / "state.db")
-            store.put("i", "kanban", "session", task_id="task")
+            store.bind_native("i", "native-i", "default", "default", at=0)
             with self.assertRaises(TypeError):
-                store.finish("i", [("status", {"issue_id": "i", "state": "done"}),
+                store.finish("i", [("status", {"issue_id": "i", "task_id": "native-i", "state": "done"}),
                                    ("activity", {"issue_id": "i", "body": object()})], at=1000)
             self.assertIsNotNone(store.get("i"))
             self.assertEqual(store.pending(), [])
-            self.assertTrue(store.finish("i", [("status", {"issue_id": "i", "state": "done"})], at=1000))
-            self.assertIsNone(store.get("i"))
+            self.assertTrue(store.finish("i", [("status", {"issue_id": "i", "task_id": "native-i", "state": "done"})], at=1000))
+            self.assertIsNotNone(store.native_binding("i"))
             self.assertEqual(len(store.pending()), 1)
 
     def test_existing_work_table_adds_chat_panel_and_stop_columns(self) -> None:

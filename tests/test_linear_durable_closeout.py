@@ -10,6 +10,7 @@ Desktop or messaging delivery evidence.
 import tempfile
 import uuid
 import json
+import sqlite3
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -70,7 +71,11 @@ class DurableCloseoutTests(unittest.TestCase):
                     store.enqueue('activity', {'id': legacy, 'issue_id': ISSUE, 'initial_ack': True,
                         'session_id': SESSION, 'requester_sessions': {ISSUE: SESSION},
                         'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
-                    if mode == 'legacy_failed': store.mark(legacy, 'failed')
+                    if mode == 'legacy_failed':
+                        # Seed a previously failed historical receipt; current consumers must not rewrite it.
+                        with sqlite3.connect(store.path) as db:
+                            db.execute("UPDATE outbox SET state='failed',attempts=2 WHERE id=?", (legacy,))
+                    before_legacy = store.outbox_row(legacy)
                 kanban = FakeKanban()
                 bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
                 self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
@@ -81,6 +86,11 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertEqual(len(kanban.creates), 1)
                 self.assertFalse(any('issueUpdate' in query for query in authority.mutations))
                 self.assertEqual(kanban.comments, [])
+                if mode.startswith('legacy'):
+                    saved = store.outbox_row(legacy)
+                    self.assertTrue(saved['hold_reason'])
+                    self.assertEqual({key: value for key, value in saved.items() if key != 'hold_reason'},
+                                     {key: value for key, value in before_legacy.items() if key != 'hold_reason'})
 
 
     def test_applied_receipt_cannot_revive_stale_closed_issue(self):
@@ -94,73 +104,88 @@ class DurableCloseoutTests(unittest.TestCase):
             store.enqueue('activity', {'id': ack_id, 'issue_id': ISSUE, 'session_id': SESSION,
                 'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
                 'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
-            store.mark_sent(ack_id, True)
+            # This is a persisted historical success, not a new delivery of the old row.
+            with sqlite3.connect(store.path) as db:
+                db.execute("UPDATE outbox SET state='sent',payload=json_set(payload, '$.applied', 1) WHERE id=?", (ack_id,))
+            self.assertEqual(store.outbox_row(ack_id)['state'], 'sent')
             kanban = FakeKanban()
             bridge = Bridge(store, authority.api(), kanban, profile='synthetic', clock=lambda: 10)
             self.assertFalse(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
             self.assertEqual(kanban.creates, [])
 
-    def test_initial_ack_rechecks_delegation_at_mutation_boundary(self):
+    def test_unverified_legacy_ack_never_reaches_mutation_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
-            authority.sessions[SESSION]['appUser'] = {'id': VIEWER}
             authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
-            api = authority.api(scope={'all_teams': True, 'all_projects': True,
-                'allowed_requester_ids': [USER], 'requester_basis': 'agent_session'})
             store = Store(Path(directory) / 'state.db')
             ack = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
                 'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
                 'content': {'type': 'thought', 'body': 'Received.'}}, at=1)
+            before = store.outbox_row(ack)
+            api, calls = authority.api(), []
             guarded = api.guarded_mutation
             @contextmanager
-            def takeover_before_send(guard):
-                authority.issues[ISSUE]['delegate'] = {'id': 'human'}
+            def observe(guard):
+                calls.append(True)
                 with guarded(guard):
                     yield
-            api.guarded_mutation = takeover_before_send
+            api.guarded_mutation = observe
+            authority.issues[ISSUE]['delegate'] = {'id': 'human'}
             bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 0)
+            saved = store.outbox_row(ack)
+            self.assertTrue(saved['hold_reason'])
+            self.assertEqual({k: v for k, v in saved.items() if k != 'hold_reason'},
+                             {k: v for k, v in before.items() if k != 'hold_reason'})
+            self.assertEqual(calls, [])
             self.assertEqual(authority.mutations, [])
-            self.assertEqual(store.outbox_row(ack)['attempts'], 0)
 
-    def test_prior_uncertain_terminal_write_fences_prioritized_ack(self):
+
+    def test_prior_uncertain_terminal_write_and_legacy_ack_keep_original_history(self):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
-            authority.sessions[SESSION]['appUser'] = {'id': VIEWER}
             authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
-            api = authority.api(scope={'all_teams': True, 'all_projects': True,
-                'allowed_requester_ids': [USER], 'requester_basis': 'agent_session'})
             store = Store(Path(directory) / 'state.db')
-            prior = store.enqueue('status', {'issue_id': ISSUE, 'state': 'done', 'terminal': True,
-                'requester_sessions': {ISSUE: SESSION}}, at=1)
             ack = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
                 'initial_ack': True, 'requester_sessions': {ISSUE: SESSION},
                 'content': {'type': 'thought', 'body': 'Received.'}}, at=2)
-            previous = store.outbox_row(prior)
-            store.rewrite(prior, {**previous['payload'], 'write_started': True}, previous['next_at'])
+            prior = store.enqueue('status', {'issue_id': ISSUE, 'state': 'done', 'terminal': True,
+                'write_started': True, 'requester_sessions': {ISSUE: SESSION}}, at=1)
+            before = {row_id: store.outbox_row(row_id) for row_id in (prior, ack)}
             self.assertTrue(store.issue_reconciliation_blocked(ISSUE))
-            bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
+            bridge = Bridge(store, authority.api(), FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 0)
-            self.assertEqual(store.outbox_row(ack)['state'], 'failed')  # one try: never posts after the hold
+            for row_id in (prior, ack):
+                saved = store.outbox_row(row_id)
+                self.assertTrue(saved['hold_reason'])
+                self.assertEqual({k: v for k, v in saved.items() if k != 'hold_reason'},
+                                 {k: v for k, v in before[row_id].items() if k != 'hold_reason'})
             self.assertEqual(authority.mutations, [])
             self.assertTrue(store.issue_reconciliation_blocked(ISSUE))
+
 
     def test_rate_limited_thought_keeps_its_place_until_the_pause_ends(self):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
             authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
             api = authority.api()
-            original = authority.transport
+            original, attempts = authority.transport, []
             def transport(url, body, headers):
                 if 'agentActivityCreate' in json.loads(body)['query']:
+                    attempts.append(True)
                     return 429, {}, b'{}'
                 return original(url, body, headers)
             api.transport = transport
             store = Store(Path(directory) / 'state.db')
-            thought = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
+            kanban = FakeKanban()
+            task = kanban.create(title='OPS-1: native task')
+            store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
+            thought = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION, 'task_id': task.id,
                 'requester_sessions': {ISSUE: SESSION}, 'content': {'type': 'thought', 'body': 'Working'}}, at=1)
-            bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
+            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
             bridge.flush()
+            self.assertEqual(attempts, [True])
+            self.assertIsNone(store.outbox_row(thought)['hold_reason'])
             self.assertEqual(store.outbox_row(thought)['state'], 'pending')  # nothing is written during the pause
 
     def test_unbound_authorization_failure_is_durable_and_never_borrows_new_owner(self):
@@ -178,8 +203,9 @@ class DurableCloseoutTests(unittest.TestCase):
             bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 0)
             saved = Store(path).outbox_row(old)
-            self.assertIn('requester', saved['payload'].get('authorization_error', '').lower())
-            self.assertEqual(saved['state'], 'failed')
+            self.assertTrue(saved['hold_reason'])
+            self.assertNotIn('authorization_error', saved['payload'])
+            self.assertEqual(saved['state'], 'pending')
             self.assertEqual(saved['attempts'], 0)  # auth checks are not remote-send attempts
             self.assertNotIn('requester_sessions', saved['payload'])
             self.assertEqual(authority.mutations, [])
@@ -194,11 +220,13 @@ class DurableCloseoutTests(unittest.TestCase):
             store = Store(path)
             old = store.enqueue('comment', {'issue_id': ISSUE, 'body': 'Unbound historical notice'}, at=1)
             new = store.enqueue('comment', {'issue_id': ISSUE, 'body': 'Saved review result',
+                'content_action': True, 'unlinked_content': True,
                 'requester_sessions': {ISSUE: SESSION}}, at=2)
             bridge = Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10)
             self.assertEqual(bridge.flush(), 1)
             reopened = Store(path)
-            self.assertEqual(reopened.outbox_row(old)['state'], 'failed')
+            self.assertEqual(reopened.outbox_row(old)['state'], 'pending')
+            self.assertTrue(reopened.outbox_row(old)['hold_reason'])
             self.assertEqual(reopened.outbox_row(old)['attempts'], 0)
             self.assertEqual(reopened.outbox_row(new)['state'], 'sent')
             self.assertEqual(Bridge(reopened, api, FakeKanban(), profile='synthetic',
@@ -237,7 +265,8 @@ class DurableCloseoutTests(unittest.TestCase):
                 self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
             self.assertEqual(store.outbox_row(old)['state'], 'pending')
             bridge.flush()
-            self.assertEqual(store.outbox_row(old)['state'], 'failed')
+            self.assertEqual(store.outbox_row(old)['state'], 'pending')
+            self.assertTrue(store.outbox_row(old)['hold_reason'])
             self.assertEqual(store.outbox_row(old)['attempts'], 0)
             self.assertIsNotNone(store.native_binding(ISSUE, 'synthetic', 'default'))
             self.assertFalse(any('commentCreate' in query for query in authority.mutations))
@@ -297,9 +326,14 @@ class DurableCloseoutTests(unittest.TestCase):
             original = api.update_issue
             api.update_issue = lambda issue_id, fields: sent.append(fields) or original(issue_id, fields)
             store = Store(Path(directory) / 'state.db')
-            store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'claim': False, 'seen': VIEWER,
+            kanban = FakeKanban()
+            task = kanban.create(title='OPS-1: native task')
+            store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
+            row_id = store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'task_id': task.id, 'source_ms': 1767225610000,
                                      'requester_sessions': {ISSUE: SESSION}}, at=1)
-            Bridge(store, api, FakeKanban(), profile='synthetic', clock=lambda: 10).flush()
+            Bridge(store, api, kanban, profile='synthetic', clock=lambda: 1767225610).flush()
+            self.assertEqual(store.outbox_row(row_id)['state'], 'sent')
+            self.assertIsNone(store.outbox_row(row_id)['hold_reason'])
             self.assertEqual(sent, [])  # preserves the human's started state without claiming a delegate
 
     def thread_bridge(self, directory, comments=None, *, fail=False):
@@ -384,12 +418,14 @@ class DurableCloseoutTests(unittest.TestCase):
                 return original(url, body, headers)
             api.transport = transport
             store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
-            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
+            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 1767225610)
+            task = kanban.create(title='OPS-1: native task')
+            store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
             bridge._decline(ISSUE, SESSION, 'Not resuming: this issue is closed.')
-            claim = store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'claim': False, 'seen': VIEWER,
-                                             'requester_sessions': {ISSUE: SESSION}}, at=10)
+            progress = store.enqueue('status', {'issue_id': ISSUE, 'state': 'in_progress', 'task_id': task.id, 'source_ms': 1767225610000,
+                                             'requester_sessions': {ISSUE: SESSION}}, at=1767225610)
             bridge.flush()
-            self.assertEqual(store.outbox_row(claim)['state'], 'sent')  # not held behind the failed reply
+            self.assertEqual(store.outbox_row(progress)['state'], 'sent')  # not held behind the failed reply
             self.assertEqual(store.unreported_failed(), [])  # no endless "gave up" alert
             self.assertEqual(kanban.comments, [])
 
@@ -400,9 +436,9 @@ class DurableCloseoutTests(unittest.TestCase):
             task = kanban.create(initial_status='running')
             kanban.tasks[task.id].status = 'running'
             store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
-            other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': 'other-session',
+            other = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': 'other-session', 'task_id': task.id,
                                                'content': {'type': 'response', 'body': 'elsewhere'}}, at=9_990)
-            store.mark_sent(other, True)
+            self.assertTrue(store.mark_sent(other, True))
             bridge._keepalive(store.get(ISSUE))
             self.assertTrue(any(r['payload'].get('session_id') == SESSION for r in store.pending(ISSUE)))
 
@@ -506,6 +542,40 @@ class DurableCloseoutTests(unittest.TestCase):
             self.assertFalse(bridge._authorize_outbox_effect(pending))
 
 
+
+    def test_new_refusal_notice_has_requester_provenance_without_legacy_execution_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = Authority()
+            store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
+            store.put(ISSUE, 'chat', 'stopped-legacy-owner', run_generation=7)
+            # Seed the pre-upgrade Stop/owner/effect history that the new plugin must retain.
+            with sqlite3.connect(store.path) as db:
+                db.execute("UPDATE work SET ownership_id='retained-owner',stop_requested_at=25,"
+                           "pending_resume=? WHERE issue_id=?", ('{"effect":"unknown"}', ISSUE))
+            before_work = store.get(ISSUE)
+            old = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
+                'session_key': 'stopped-legacy-owner', 'one_try': True,
+                'content': {'type': 'response', 'body': 'Old pending reply'}}, at=1)
+            before_old = store.outbox_row(old)
+            api = authority.api(scope={'all_teams': True, 'all_projects': True,
+                'allowed_requester_ids': [USER], 'requester_basis': 'agent_session'})
+            bridge = Bridge(store, api, kanban, profile='synthetic', clock=lambda: 10)
+            with api.requester_session(SESSION):
+                bridge._decline(ISSUE, SESSION, 'Retained work needs inspection; nothing resumed.')
+            notice = next(row for row in store.pending(ISSUE) if row['id'] != old)
+            self.assertEqual(notice['payload']['reporting_notice_version'], 1)
+            self.assertEqual(notice['payload']['requester_sessions'], {ISSUE: SESSION})
+            for key in ('session_key', 'work_owner', 'task_id', 'claim', 'release', 'admission_id'):
+                self.assertFalse(notice['payload'].get(key), key)
+            self.assertEqual(bridge.flush(), 1)
+            self.assertEqual(store.get(ISSUE), before_work)
+            saved = store.outbox_row(old)
+            self.assertTrue(saved['hold_reason'])
+            self.assertEqual({key: value for key, value in saved.items() if key != 'hold_reason'},
+                             {key: value for key, value in before_old.items() if key != 'hold_reason'})
+            self.assertEqual(store.outbox_row(notice['id'])['state'], 'sent')
+            self.assertEqual(kanban.creates, [])
+            self.assertEqual(kanban.comments, [])
 
     def content_bridge(self, directory):
         authority = Authority()

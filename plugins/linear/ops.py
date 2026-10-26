@@ -6,7 +6,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
-from .store import ADVISORY, Store
+from .store import Store, advisory
 
 RESOLVE = "Check the issue in Linear, then: hermes linear resolve {id} applied|not_applied --evidence \"<what you saw>\""
 def held(write: dict[str, str], cause: str = "") -> str:
@@ -27,8 +27,10 @@ def _rows(db: sqlite3.Connection, sql: str, *args: Any) -> list[sqlite3.Row]:
 
 def needs_resolution(row: Any, payload: dict[str, Any]) -> bool:
     """An uncertain issue write the gateway will not settle by itself: only an operator can say what happened."""
-    return (row["kind"] in ("status", "description") and Store.uncertain(row, payload) and
-            (row["state"] == "failed" or bool(payload.get("reconcile_required"))))
+    held_legacy = bool(row["hold_reason"]) if "hold_reason" in row.keys() else False
+    return (row["kind"] in ("status", "description") and not payload.get("reconciliation") and
+            (held_legacy or Store.uncertain(row, payload) and
+             (row["state"] == "failed" or bool(payload.get("reconcile_required")))))
 
 def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) -> list[dict[str, Any]]:
     """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
@@ -38,11 +40,30 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                       "action": action, "act": act})
     if state.is_file():
         with closing(_read(state)) as db:
-            rows = _rows(db, "SELECT * FROM outbox WHERE state != 'sent' AND NOT " + ADVISORY + " ORDER BY rowid")
+            has_holds = any(row["name"] == "hold_reason" for row in _rows(db, "PRAGMA table_info(outbox)"))
+            rows = _rows(db, "SELECT * FROM outbox WHERE state != 'sent' ORDER BY rowid")
             for row in rows:
                 payload = json.loads(row["payload"])
                 since, issue = float(payload.get("enqueued_at") or row["next_at"]), payload.get("issue_id", "")
-                if needs_resolution(row, payload):
+                reason = row["hold_reason"] if has_holds else None
+                if not reason:
+                    try:
+                        reason = Store._delivery_hold_reason(db, row["kind"], payload)
+                    except sqlite3.OperationalError as exc:
+                        if "no such" not in str(exc):
+                            raise
+                        reason = "Unverified retained delivery needs migration and explicit reconciliation"
+                if reason:
+                    if payload.get("reconciliation"):
+                        add(issue, row["id"], since, "Reconciled delivery history is retained; automatic replay remains disabled",
+                            "Use a new authorized request for any further change.")
+                    else:
+                        action = (RESOLVE.format(id=row["id"]) if row["kind"] in ("status", "description") else
+                                  "Inspect the retained request and native/external effects. Do not replay it; use a new authorized request after reconciliation.")
+                        add(issue, row["id"], since, reason, action, True)
+                elif advisory({"kind": row["kind"], "payload": payload}):
+                    continue
+                elif needs_resolution(row, payload):
                     held = sum(1 for r in rows if json.loads(r["payload"]).get("requires_status_id") == row["id"])
                     add(issue, row["id"], since, f"{row['kind']} write may or may not have reached Linear; it holds "
                         "this issue" + (f" and {held} dependent write(s)" if held else ""), RESOLVE.format(id=row["id"]), True)
@@ -133,10 +154,12 @@ def run(args: Any, state: Path, ingress: Path, profile: str) -> int:
         return 1 if any(item["act"] for item in items) else 0
     if args.linear_command == "resolve":
         store = Store(state) if state.is_file() else None
+        if store:
+            store.delivery_allowed(args.row_id)  # Persist the same hold shown by the read-only status view.
         row = store.outbox_row(args.row_id) if store else None
         done = bool(row and needs_resolution(row, row["payload"]) and store.reconcile_terminal(
             args.row_id, outcome=args.outcome, evidence=args.evidence, at=time.time()))
-        print(f"Recorded {args.outcome} for {args.row_id}; the issue is released." if done else
+        print(f"Recorded {args.outcome} for {args.row_id}; retained execution history will not be replayed." if done else
               f"{args.row_id} does not need resolving now; see: hermes linear status")
         return 0 if done else 1
     done = replay(ingress, profile, args.delivery_id)

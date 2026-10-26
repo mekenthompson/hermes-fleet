@@ -586,6 +586,9 @@ class Bridge:
         if not row:
             self._decline(issue["id"], session_id, "No native task is linked. Delegate durable work explicitly to request one.")
             return
+        if row.get("origin") != "native":
+            self._decline(issue["id"], session_id, "Retained legacy work needs inspection. No task was started or resumed; use current authorized native controls after reconciliation.")
+            return
         marker = str(activity.get("id") or "")
         if not marker:
             self._decline(issue["id"], session_id, "Follow-up held: authoritative activity identity unavailable.")
@@ -597,7 +600,7 @@ class Bridge:
         """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent."""
         if self.authorize_specialist_effect(issue_id):
             self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "one_try": True,
-                               "requester_sessions": {issue_id: session_id},
+                               "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
                                "content": {"type": "response", "body": body}}, at=self.clock())
     def _thread(self, issue_id: str, since_ms: float = 0, until_ms: float = math.inf) -> str:
         """The Linear thread for a detached worker, which cannot read Linear: comments after `since_ms` and before
@@ -1062,7 +1065,9 @@ class Bridge:
                             progress = ((self.store.outbox_row(row["id"]) or {}).get("state") == "failed") or progress
                         log.warning("linear: outbox %s held: %s", row["id"], reason)
                         continue
-                    if row["kind"] != "project_update" and any(
+                    if row["kind"] != "project_update" and not (
+                            self.store.independent_comment(row["kind"], row["payload"]) or
+                            self.store.reporting_notice(row["kind"], row["payload"])) and any(
                             self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
                             for issue_id in self._outbox_scope_issue_ids(row)):
                         continue
@@ -1105,6 +1110,8 @@ class Bridge:
                 self.store.revive_failed(self.clock())
         return sent
     def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False, issue_ids=None) -> None:
+        if not self.store.delivery_allowed(row_id):
+            raise ProjectUpdateDeferred
         prior_started = {}
         @contextmanager
         def guard():
@@ -1164,6 +1171,8 @@ class Bridge:
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:
+        if not self.store.delivery_allowed(row["id"]):
+            raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
         if payload.get("claim") or payload.get("admission_id"):
             raise LinearError("Retained execution admission needs reconciliation; it cannot replay", retryable=False)
@@ -1300,6 +1309,8 @@ class Bridge:
             return self._send_project_update(row["id"])
         return False
     def _send_project_update(self, row_id: str) -> bool:
+        if not self.store.delivery_allowed(row_id):
+            raise ProjectUpdateDeferred
         for _ in range(10):
             current = self.store.outbox_row(row_id)
             if not current or current["state"] != "pending":

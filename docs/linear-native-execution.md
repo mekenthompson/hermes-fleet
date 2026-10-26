@@ -65,6 +65,12 @@ replayed. Preserve their workspaces, checkpoints, PRs and original effect histor
 view names required reconciliation. Unlinked issue operations retain app/workspace/specialist
 authorization independently of those old execution claims.
 
+Retained deliveries receive a separate hold reason before delivery or receipt consumption.
+Holding preserves their original payload, state, attempt count and deadline, including
+orphaned deliveries whose work row is gone. Verified external release does not delete stopped
+work. A new authorized comment can deliver independently; replacing a description still waits
+for any uncertain earlier description effect to be reconciled.
+
 ## Evidence boundaries
 
 The native scenario suite exercises upstream task creation, claiming, lifecycle and comment

@@ -160,12 +160,26 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.assertIn(self.request_id, text)
         self.assertIn('resolve', text)
 
-    def test_held_content_refusal_names_write_and_supported_resolution(self):
+    def test_held_description_refusal_names_write_and_supported_resolution(self):
         self.wedge()
-        reply = self.invoke('add_comment', request_id=str(uuid.uuid4()))
+        reply = self.invoke('update_description', request_id=str(uuid.uuid4()))
         self.assertFalse(reply['ok'])
         self.assertIn(self.request_id, reply['message'])
         self.assertIn(f'hermes linear resolve {self.request_id}', reply['message'])
+        self.assertEqual(self.store.get('issue-1')['owner_ref'], 'chat')
+
+    def test_new_comment_delivers_without_resolving_or_repeating_uncertain_description(self):
+        self.wedge()
+        before = self.row()
+        sent = len(self.mutations())
+        reply = self.invoke('add_comment', request_id=str(uuid.uuid4()))
+        self.assertTrue(reply['ok'])
+        self.assertEqual(self.bridge.flush(), 1)
+        self.assertEqual(len(self.mutations()), sent + 1)
+        self.assertTrue(self.store.issue_reconciliation_blocked('issue-1'))
+        self.assertEqual(self.remote.issues['issue-1']['description'], 'Human changed this after send')
+        self.assertEqual(self.row()['attempts'], before['attempts'])
+        self.assertEqual(self.row()['payload']['body'], before['payload']['body'])
         self.assertEqual(self.store.get('issue-1')['owner_ref'], 'chat')
 
     def test_operator_resolution_releases_once_without_duplicate_effects(self):
