@@ -169,7 +169,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.claim()
         self.bind(platform, self.sid, user="human", chat="chat", thread="thread", scope="scope")
 
-    async def api(self, *, session_id="api-session"):
+    async def api(self, *, session_id="api-session", request_id="api-request"):
         from gateway.session_api import bind_api_session
         from gateway.session_contract import SessionRef
         from hermes_state_runtime import admit_session_input
@@ -178,7 +178,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         payload = {"text": "Take over ABC-1", "api_turn_v1": {"history": None, "settings": {},
             "transfer_auth": {"principal": "principal:fixture:" + "a" * 32, "transport_family": "local-api"}}}
         row = admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="api",
-                                  session_id=self.sid, request_id="api-request", payload=payload)
+                                  session_id=self.sid, request_id=request_id, payload=payload)
         self.admission = row["admission_id"]
         self.claim()
         self.bind("api_server", self.sid, user="api_server")
@@ -339,20 +339,19 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["requester"], {"kind": "native_dispatcher", "original_requester": "unknown"})
         self.assertFalse(evidence["permission_granted"])
 
-    async def test_a2a_privacy_scrub_of_explicit_api_id_fails_exact_inspection(self):
-        from plugins.platforms.a2a import security
-        # Native API binding permits an explicit path-safe ID containing an address. The
-        # third-party egress privacy scrub intentionally alters that otherwise valid ID.
-        await self.api(session_id="fixture@example.invalid")
+    async def test_a2a_explicit_api_ids_stay_private_and_survive_native_framing(self):
+        # Native API permits arbitrary explicit path-safe IDs. They remain private even
+        # when the A2A scrub would intentionally alter them if carried in peer text.
+        await self.api(session_id="fixture@example.invalid", request_id="sk-" + "a" * 40)
         captured = await self.current()
-        self.assertEqual((await self.inspected(captured["reference"]))["requester"]["kind"], "api_credential")
-        wire = json.dumps(captured)
-        scrubbed = security.redact_outbound(wire)
-        self.assertNotEqual(scrubbed, wire)
-        changed = json.loads(scrubbed)["reference"]
-        self.assertNotEqual(changed["session_id"], captured["reference"]["session_id"])
-        with self.assertRaises(transport.Unavailable):
-            await self.inspected(changed)
+        self.assertNotIn("session_id", captured["reference"])
+        self.assertNotIn("input_id", captured["reference"])
+        self.assertNotIn(self.sid, json.dumps(captured))
+        self.assertNotIn(self.row["request_id"], json.dumps(captured))
+        evidence = await self.inspected(self.reference_through_a2a(captured))
+        self.assertEqual(evidence["requester"]["kind"], "api_credential")
+        self.assertEqual(evidence["requester"]["principal"], "principal:fixture:" + "a" * 32)
+        self.assertFalse(evidence["permission_granted"])
 
     async def test_stop_control_receipt_is_never_origin_or_requester_authority(self):
         from hermes_state_runtime import settle_session_input
@@ -363,7 +362,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         evidence = await self.inspected(captured["reference"])
         self.assertEqual(evidence["original_message"], "Take over ABC-1")
         self.assertNotEqual(evidence["requester"]["principal_id"], control["principal_id"])
-        forged = dict(captured["reference"], admission_id=control["admission_id"], input_id=control["request_id"])
+        forged = dict(captured["reference"], admission_id=control["admission_id"])
         with self.assertRaises(transport.Unavailable):
             await self.inspected(forged)
         settle_session_input(self.authority.db, epoch=self.authority.epoch,
@@ -626,7 +625,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kb.unblock_task(self.board, self.task_id))
         await self.kanban(existing=True)
         new = (await self.work_current())["reference"]
-        self.assertNotEqual(old["session_id"], new["session_id"])
+        self.assertNotEqual(old["admission_id"], new["admission_id"])
         self.assertNotEqual(old["work_digest"], new["work_digest"])
         with self.assertRaises(transport.Unavailable):
             await self.work_inspected(old)
@@ -759,7 +758,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 if platform == "api_server":
                     self.assertEqual(evidence["requester"]["kind"], "api_credential")
                     self.assertEqual(evidence["requester"]["principal"], "principal:fixture:" + "a" * 32)
-                self.assertEqual(evidence["reference"]["session_id"], self.sid)
+                self.assertEqual(evidence["reference"]["admission_id"], self.admission)
+                self.assertNotIn("session_id", evidence["reference"])
+                self.assertNotIn("input_id", evidence["reference"])
 
     async def test_native_registered_tool_captures_the_actual_current_caller(self):
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -840,11 +841,17 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_api_without_authenticated_transfer_principal_is_refused(self):
         await self.api()
         payload = self.row["payload"]
-        payload["api_turn_v1"].pop("transfer_auth")
-        self.authority.db._execute_write(lambda c: c.execute(
-            "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
-        with self.assertRaises(transport.Unavailable):
-            await self.current()
+        ref = (await self.current())["reference"]
+        for auth in (None, {"principal": "Ken", "transport_family": "local-api"},
+                     {"principal": "opaque-unknown", "transport_family": "remote-api"}):
+            with self.subTest(auth=auth):
+                payload["api_turn_v1"]["transfer_auth"] = auth
+                self.authority.db._execute_write(lambda c: c.execute(
+                    "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
+                with self.assertRaises(transport.Unavailable):
+                    await self.current()
+                with self.assertRaises(transport.Unavailable):
+                    await self.inspected(ref)
 
     async def test_native_bot_and_caller_identity_mismatch_are_refused(self):
         await self.messaging("telegram")
@@ -877,7 +884,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 set_current_session_id(tip)
                 compressed = (await self.current())["reference"]
                 self.assertEqual(compressed, original)
-                self.assertEqual((await self.inspected(compressed))["reference"]["session_id"], self.sid)
+                self.assertEqual((await self.inspected(compressed))["reference"]["admission_id"], self.admission)
 
     async def test_owner_restart_invalidates_a_previously_valid_reference(self):
         from hermes_state_runtime import begin_runtime_epoch

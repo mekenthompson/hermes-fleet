@@ -133,17 +133,15 @@ The native A2A client redacts outbound text, builds a text Message, and the inbo
 extracts that text and adds its untrusted-peer frame. Guarded model-free cases pass complete
 selector-free reference JSON through those actual native primitives and then independently
 inspect it in the owner. They cover Local, API, Telegram, Slack and dispatcher work without
-invoking SendMessage, network, task creation or a model. This verifies data preservation for
-the tested native ID forms; it does not turn the peer frame into permission or select a host
-deployment. Secret-shaped or injection-shaped caller-supplied IDs may intentionally be scrubbed;
-an altered reference must fail exact owner inspection, never be repaired by guessing an ID.
-The negative control uses an otherwise valid explicit API session ID containing an address:
-local inspection succeeds, the real A2A privacy scrub alters the ID, and exact inspection
-refuses the altered reference. If universal explicit-ID transport is required, the smallest
-candidate change is to omit redundant arbitrary session/request IDs from the existing reference
-and resolve them inside the owner from its native-generated admission ID, retaining the
-epoch/generation/instance/scope checks. That projection change is proposed, not implemented;
-the native scrub must stay enabled.
+invoking SendMessage, network, task creation or a model. References contain only the native-
+generated admission ID and profile/epoch/generation/instance/scope binding (plus a work digest
+for dispatcher work). Arbitrary logical session and request IDs remain private: the owner
+resolves them from the exact admission through its existing read-only getter and verifies the
+current claim and native receipt. Tests include valid explicit API IDs containing an address
+and credential-shaped text, which now survive the unchanged native A2A scrub because those IDs
+are absent from peer data. Unknown, foreign, stale, extra-field or changed references refuse;
+there is no new transport, signature, token or owner registry. Preservation does not turn the
+peer frame into permission or select a host deployment.
 
 Candidate core `c9b8ad4312c99a7e85fd73b0a9f2c0db3ac80a89` records process Stop controls
 as terminal/cancelled admissions under `native-process-stop`, with NULL generation and only

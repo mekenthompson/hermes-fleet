@@ -145,17 +145,19 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
 
 async def _inspect(home, profile, declared, ref=None, context=None):
     async with origin._client(home) as (client, endpoint):
-        snapshot, active = await origin._snapshot(client, home, context.session_id if context else ref["session_id"])
+        from .origin_state import resolve_reference
+        sid = context.session_id if context else await asyncio.to_thread(resolve_reference, home, ref)
+        snapshot, active = await origin._snapshot(client, home, sid)
         active = {**active, "session_id": snapshot["session_id"]}
         evidence, digest = await asyncio.to_thread(_projection, home, profile, active, declared, context)
         observed = reference({"version": origin.VERSION, "kind": "native_work", "profile": profile,
-            "session_id": snapshot["session_id"], "admission_id": active["admission_id"], "input_id": active["input_id"],
+            "admission_id": active["admission_id"],
             "instance_id": endpoint.instance_id, "authority_epoch": endpoint.authority_epoch,
             "execution_generation": snapshot["execution_generation"], "scope_digest": origin._digest(declared),
             "work_digest": digest})
         if endpoint.authority_epoch != active["authority_epoch"] or ref is not None and ref != observed:
             _refuse()
-        after, current = await origin._snapshot(client, home, observed["session_id"])
+        after, current = await origin._snapshot(client, home, snapshot["session_id"])
         repeated, after_digest = await asyncio.to_thread(_projection, home, profile,
             {**current, "session_id": after["session_id"]}, declared, context)
         if after != snapshot or current != {k: v for k, v in active.items() if k != "session_id"} or after_digest != digest:
