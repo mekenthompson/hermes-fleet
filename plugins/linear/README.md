@@ -62,7 +62,10 @@ reflects the last native observation before the existing write boundary; native 
 and control rules continue to apply. Current explicit scope conflicts also hold native
 Stop controls, new event capture and queued publication. The binding, native history and
 queued evidence stay available for inspection; authorized status reads show reconciliation.
-A held project line does not prevent other valid lines from reporting.
+A held native history read preserves that binding's cursor while other work and ordinary
+issue content continue. Original held project lines can report separately as their scope
+becomes valid; later same-session updates do not republish completed lines.
+Uncertain started project requests retain their frozen content and identity.
 Archived tasks and board archives in this native home are inspected as retained history.
 An archived board is never reopened or linked for execution; a completed outcome stays
 history until a deliberate new increment. Intact unrelated archives do not block new work.

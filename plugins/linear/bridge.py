@@ -1397,27 +1397,21 @@ class Bridge:
             with self.lock(row["issue_id"]):
                 if not self.authorize_specialist_effect(row["issue_id"]):
                     continue
-                # Our cursor moves with outbox writes independently of core's claim cursor.
+                # Loading or iterating one task's native history can fail just
+                # like decoding its task row. Keep that entire read/capture path
+                # inside this binding's boundary so later work and flush proceed.
                 try:
                     row, task = self._native_task(row["issue_id"])
-                except LinearError as exc:
-                    log.warning("linear: reporting binding held: %s", exc)
-                    continue
-                captured = (self.store.captured_task_activities(row["issue_id"], row["task_id"], row["owner_ref"])
-                            if row["last_event_id"] == 0 else {})
-                for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], row["last_event_id"]):
-                    # A pre-cursor work row upgrades at zero. Its history may include a
-                    # delivered give-up from an earlier attempt. Reconcile transitions
-                    # with the current task, while still capturing a claimed event that
-                    # describes its current state.
-                    try:
+                    captured = (self.store.captured_task_activities(row["issue_id"], row["task_id"], row["owner_ref"])
+                                if row["last_event_id"] == 0 else {})
+                    for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], row["last_event_id"]):
+                        # Our durable cursor is independent of core's claim cursor.
                         self._task_event(row, event, task.status, captured)
-                    except LinearError as exc:
-                        log.warning("linear: native event reporting held for %s: %s", row["issue_id"], exc)
-                        break
-                    row = self.store.get(row["issue_id"])
-                    if not row or row["last_event_id"] < event.id:
-                        break  # Retry this event before consuming any later event for this binding.
+                        row = self.store.get(row["issue_id"])
+                        if not row or row["last_event_id"] < event.id:
+                            break  # Retry this event before consuming any later one.
+                except LinearError as exc:
+                    log.warning("linear: native reporting binding held: %s", exc)
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
         payload, issue_id = event.payload or {}, row["issue_id"]
@@ -1956,10 +1950,12 @@ class Bridge:
                     continue
                 try:
                     issue = self._effect_issue(issue_id)
+                except RateLimited:
+                    raise  # The app-wide pause still applies to every request.
                 except LinearError as exc:
                     if exc.retryable:
-                        raise
-                    continue  # a removed issue cannot authorize its old line
+                        waiting_lines.add(ident)
+                    continue  # A removed issue cannot authorize its old line.
                 try:
                     task = self._native_effect_task(issue_id, issue)
                 except LinearError:
@@ -1990,7 +1986,7 @@ class Bridge:
                 if payload.get("frozen"):
                     if self.store.project_not_applied(row_id): continue
                     raise ProjectUpdateDeferred
-                if payload.get("followup") or not lines_to_send:
+                if not lines_to_send:
                     raise ProjectUpdateDeferred
                 split = self.store.split_project_update(row_id, payload, self.clock(), waiting_lines)
                 if split is None or split:
