@@ -394,6 +394,132 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.make_bridge().handle_webhook(old)
         self.assertEqual(self.board.get(task_id).current_run_id, next_run.current_run_id)
 
+    def reporting_fixture(self, name):
+        from linear_fake_api import Clock, FakeLinear
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock = Clock()
+        remote = FakeLinear(clock)
+        self.addCleanup(remote.close)
+        remote.add_issue(ISSUE, "OPS-1", project=None)
+        path = self.home / (name + ".db")
+        reporter = Bridge(Store(path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            task_id = kb.create_task(conn, title="Existing native work", assignee="default", initial_status="blocked")
+        reporter.track(ISSUE, task_id)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.unblock_task(conn, task_id)
+        reporter.pump_kanban()
+        return clock, remote, reporter, task_id
+
+    def complete_reported_task(self, clock, task_id):
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.complete_task(conn, task_id, result="Verified investigation found the precise bounded outcome"))
+
+    def test_delayed_progress_and_completion_flush_reaches_done_once(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("delayed-completion")
+        self.complete_reported_task(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(self.board.get(task_id).status, "done")
+        self.assertEqual(remote.state(ISSUE), "Done")
+        self.assertEqual(sum("precise bounded outcome" in body for body in remote.bodies(ISSUE)), 1)
+        self.assertFalse(reporter.store.pending())
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(sum("precise bounded outcome" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_atomic_progress_receipt_survives_restart_before_completion_projection(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock, remote, reporter, task_id = self.reporting_fixture("receipt-restart")
+        self.complete_reported_task(clock, task_id)
+        clock.now += 10
+        self.assertEqual(reporter.flush(), 1)
+        progress = next(row for row in reporter.store.active() if row["issue_id"] == ISSUE)
+        reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Done")
+        self.assertTrue(any("precise bounded outcome" in body for body in remote.bodies(ISSUE)))
+        self.assertEqual(reporter.store.get(ISSUE)["task_id"], progress["task_id"])
+
+    def test_later_human_version_is_preserved_after_own_progress_receipt(self):
+        for change in ("same_state", "assignee", "delegate", "close"):
+            with self.subTest(change=change):
+                clock, remote, reporter, task_id = self.reporting_fixture("human-after-own-" + change)
+                self.complete_reported_task(clock, task_id)
+                clock.now += 10
+                self.assertEqual(reporter.flush(), 1)
+                clock.now += 1
+                if change == "same_state":
+                    remote.set_state(ISSUE, "In Progress")
+                elif change == "assignee":
+                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
+                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                elif change == "delegate":
+                    remote.set_delegate(ISSUE, {"id": "different-agent"})
+                else:
+                    remote.set_state(ISSUE, "Canceled")
+                human = copy.deepcopy(remote.issues[ISSUE])
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.issues[ISSUE], human)
+                self.assertEqual(self.board.get(task_id).status, "done")
+                self.assertFalse(any("precise bounded outcome" in body for body in remote.bodies(ISSUE)))
+
+    def test_unknown_progress_response_has_no_own_receipt_and_requires_reconciliation(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("unknown-progress")
+        before = reporter.store.get(ISSUE)["last_event_id"]
+        self.complete_reported_task(clock, task_id)
+        clock.now += 10
+        remote.lose_next_response = True
+        self.assertEqual(reporter.flush(), 0)
+        self.assertEqual(remote.state(ISSUE), "In Progress")
+        pending = next(row for row in reporter.store.pending() if row["kind"] == "status")
+        self.assertFalse(pending["payload"].get("issue_write_receipt"))
+        reporter.pump_kanban()
+        self.assertTrue(reporter.store.issue_reconciliation_blocked(ISSUE))
+        self.assertEqual(reporter.store.get(ISSUE)["last_event_id"], before)
+        self.assertFalse(any(row["payload"].get("state") == "done" for row in reporter.store.pending()))
+        self.assertEqual(self.board.get(task_id).status, "done")
+
+    def test_failed_completion_capture_does_not_consume_later_events_or_other_bindings(self):
+        import uuid
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock, remote, reporter, task_id = self.reporting_fixture("blocked-capture")
+        reporter.flush()
+        before = reporter.store.get(ISSUE)["last_event_id"]
+        unknown = reporter.store.enqueue("description", {"issue_id": ISSUE, "id": str(uuid.uuid4()), "body": "Unknown effect",
+            "expected_description": "Synthetic issue body", "content_action": True, "unlinked_content": True,
+            "write_started": True}, at=clock())
+        self.complete_reported_task(clock, task_id)
+        with self.board.conn() as conn:
+            kb.edit_task(conn, task_id, title="Clarified native task")
+        remote.add_issue("unaffected", "OPS-2", project=None)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            other = kb.create_task(conn, title="Independent work", assignee="default")
+        reporter.track("unaffected", other)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.complete_task(conn, other, result="Verified independent binding outcome")
+        reporter.pump_kanban()
+        self.assertEqual(reporter.store.get(ISSUE)["last_event_id"], before)
+        self.assertTrue(any(row["payload"].get("issue_id") == "unaffected" and row["payload"].get("state") == "done"
+                            for row in reporter.store.pending()))
+        reporter.store.reconcile_terminal(unknown, outcome="not_applied", evidence="Remote description verified unchanged", at=clock())
+        reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Done")
+        self.assertEqual(remote.state("unaffected"), "Done")
+        self.assertTrue(any("precise bounded outcome" in body for body in remote.bodies(ISSUE)))
+        self.assertGreater(reporter.store.get(ISSUE)["last_event_id"], before)
+
     def test_remote_outage_queues_reporting_and_real_http_delivery_recovers(self):
         from linear_fake_api import Clock, FakeLinear
         from hermes_fleet_linear_plugin.api import LinearAPI

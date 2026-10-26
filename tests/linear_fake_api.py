@@ -102,7 +102,7 @@ class FakeLinear:
     def add_issue(self, issue_id: str, identifier: str, *, project: str | None = "proj-1") -> dict:
         issue = {"id": issue_id, "identifier": identifier, "title": f"Title of {identifier}",
                  "description": "Synthetic issue body", "url": f"https://linear.example/issue/{identifier}",
-                 "updatedAt": self.clock.iso(), "delegate": None, "creator": {"id": "human-1"},
+                 "updatedAt": self.clock.iso(), "delegate": None, "assignee": None, "creator": {"id": "human-1"},
                  "state": dict(STATES[0]),
                  "project": {"id": project} if project else None,
                  "team": {"id": "team-1", "key": "ABC", "states": {"nodes": STATES}}}
@@ -151,7 +151,7 @@ class FakeLinear:
                 issue["delegate"] = (None if fields["delegateId"] is None else
                                      {"id": SELF, "name": "This Agent"} if fields["delegateId"] == SELF else OTHER)
             issue["updatedAt"] = self.clock.iso()
-            return 200, {"data": {"issueUpdate": {"success": True}}}
+            return 200, {"data": {"issueUpdate": {"success": True, "issue": json.loads(json.dumps(issue))}}}
         for mutation, store, entity in (("commentCreate", self.comments, "Comment"),
                                         ("agentActivityCreate", self.activities, "AgentActivity"),
                                         ("projectUpdateCreate", self.project_updates, "ProjectUpdate")):

@@ -182,7 +182,9 @@ class Store:
     @staticmethod
     def uncertain(row, payload: dict[str, Any]) -> bool:
         """An attempted terminal or content write whose remote effect stays unknown until resolved."""
-        return bool((payload.get("terminal") or payload.get("content_action")) and not payload.get("reconciliation") and (
+        return bool((payload.get("terminal") or payload.get("content_action") or
+                     (row["kind"] == "status" and (payload.get("write_started") is True or payload.get("reconcile_required"))))
+                    and not payload.get("reconciliation") and (
             payload.get("reconcile_required") or (row["state"] in ("pending", "failed") and (
                 payload.get("write_started") is True or (row["attempts"] > 0 and "write_started" not in payload)))))
     @classmethod
@@ -246,7 +248,7 @@ class Store:
                     return False
                 if payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                     return False
-            if terminal or row["kind"] in ("description", "project_update"):
+            if terminal or row["kind"] in ("status", "description", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
@@ -513,13 +515,14 @@ class Store:
                 "(state IN ('sent', 'pending') OR (state = 'failed' AND attempts > 0)))) GROUP BY 1, 2",
                 (issue_id, task_id, session_id)).fetchall()
         return Counter({(kind, body): count for kind, body, count in rows})
-    def terminal_captured(self, task_id: str) -> bool:
+    def terminal_captured(self, task_id: str, *, issue_id: str | None = None) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             return bool(db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND "
                                    "json_extract(payload, '$.task_id')=? AND "
+                                   "(? IS NULL OR json_extract(payload, '$.issue_id')=?) AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
-                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id,)).fetchone())
+                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id, issue_id, issue_id)).fetchone())
     def assessment_comment_id(self, issue_id: str, body: str) -> str | None:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
@@ -649,6 +652,15 @@ class Store:
             db.execute("UPDATE outbox SET state = 'sent', payload = json_set(payload, '$.applied', ?) WHERE id = ?",
                        (int(applied), row_id))
             return True
+    def native_status_receipt(self, issue_id: str, task_id: str) -> dict | None:
+        """Read the latest acknowledged native status response from the existing outbox."""
+        with self._tx() as db:
+            self._hold_legacy_outbox(db)
+            row = db.execute("SELECT payload FROM outbox WHERE kind='status' AND state='sent' AND hold_reason IS NULL "
+                             "AND json_extract(payload,'$.applied')=1 AND json_extract(payload,'$.issue_id')=? "
+                             "AND json_extract(payload,'$.task_id')=? AND json_type(payload,'$.issue_write_receipt')='object' "
+                             "ORDER BY rowid DESC LIMIT 1", (issue_id, task_id)).fetchone()
+        return json.loads(row[0])["issue_write_receipt"] if row else None
     def latest_status(self, issue_id: str) -> dict[str, Any] | None:
         """Newest status intent, including a pending or failed closeout."""
         with self._tx() as db:

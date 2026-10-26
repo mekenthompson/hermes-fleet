@@ -19,7 +19,8 @@ from typing import Any, Callable
 MAX_BYTES = 65536
 CONTEXT_FIELDS = ('home', 'profile', 'platform', 'source', 'session_key', 'session_id',
                   'user_id', 'user_id_alt', 'chat_id', 'chat_type', 'thread_id', 'scope_id',
-                  'ui_session_id', 'delegated_child')
+                  'ui_session_id', 'delegated_child', 'native_board', 'native_db_path',
+                  'pinned_board', 'pinned_db_path')
 
 @dataclass(frozen=True)
 class NativeContext:
@@ -37,6 +38,10 @@ class NativeContext:
     scope_id: str = ''
     ui_session_id: str = ''
     delegated_child: bool = False
+    native_board: str = ''
+    native_db_path: str = ''
+    pinned_board: str = ''
+    pinned_db_path: str = ''
 
     def to_wire(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,13 +53,33 @@ class NativeContext:
                 type(value.get('delegated_child')) is not bool):
             raise Unavailable('Linear request has no trusted native session context')
         context = cls(**value)
+        if (bool(context.native_board) != bool(context.native_db_path) or
+                bool(context.pinned_board) != bool(context.pinned_db_path)):
+            raise Unavailable('Linear request has incomplete native board context')
         if (context.home != str(Path(home).resolve(strict=True)) or context.profile != profile or
                 not context.platform or not context.session_key or not context.session_id):
             raise Unavailable('Linear request belongs to another profile or has no native session')
         return context
 
 
-def capture_context() -> NativeContext:
+def native_board_target(board: Any = None) -> tuple[str, str]:
+    """Inspect an existing native target without initializing or creating its board."""
+    from hermes_cli import kanban_db as kb
+    if board is not None and (not isinstance(board, str) or not board.strip()):
+        raise Unavailable('track board must name an existing native board')
+    try:
+        target = board if board is not None else kb.get_current_board()
+        metadata = kb.read_board_metadata(target)
+        slug = metadata['slug']
+        path = Path(kb.kanban_db_path(board=slug)).resolve(strict=True)
+        if not kb.board_exists(slug) or metadata.get('archived') or not path.is_file():
+            raise Unavailable('The native board is missing or archived; inspect existing work')
+        return slug, str(path)
+    except (KeyError, ValueError, OSError) as exc:
+        raise Unavailable('The native board is missing, archived or invalid; inspect existing work') from exc
+
+
+def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
     """Read the context actually bound by upstream producers, never model args or env fallbacks.
 
     Upstream set_session_vars binds the named ContextVars for API and messaging turns. The
@@ -65,7 +90,7 @@ def capture_context() -> NativeContext:
         from gateway.session_context import bound_session_key
         from hermes_constants import get_hermes_home
         from hermes_cli.profiles import profile_matches_home
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import is_delegated_child_process_context, explicit_board_intent_is_pinned
         bound = {var.name: value for var, value in contextvars.copy_context().items()
                  if var.name.startswith('HERMES_SESSION_') or var.name == 'HERMES_UI_SESSION_ID'}
         key = bound_session_key()
@@ -81,6 +106,16 @@ def capture_context() -> NativeContext:
                    'chat_id', 'chat_type', 'thread_id', 'scope_id')}
         fields['ui_session_id'] = read('HERMES_UI_SESSION_ID')
         fields['delegated_child'] = is_delegated_child_process_context()
+        fields.update(native_board='', native_db_path='', pinned_board='', pinned_db_path='')
+        if explicit_board_intent_is_pinned():
+            from hermes_cli import kanban_db as kb
+            fields['pinned_board'] = kb.read_board_metadata(kb.get_current_board())['slug']
+            fields['pinned_db_path'] = str(Path(kb.kanban_db_path()).resolve())
+        if track:
+            fields['native_board'], fields['native_db_path'] = native_board_target(board)
+            if fields['pinned_db_path']:
+                if fields['native_board'] != fields['pinned_board']:
+                    raise Unavailable('The requested native board is outside the caller\'s native board pin')
         home = Path(get_hermes_home()).resolve(strict=True)
         profile = read('HERMES_SESSION_PROFILE') or 'default'
         if not profile_matches_home(profile, home):

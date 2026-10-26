@@ -55,6 +55,11 @@ actual native state; a missing or ambiguous result stays visible without blind r
 The reporting cursor and its remote intents commit together. Native notification cursors are
 not consumed to stand in for that commit.
 
+An existing task can be linked on the native caller's board or an explicitly selected existing
+board. Native scope and worker pins still apply. Its recorded board routes later follow-ups
+and reporting; the configured Linear creation board does not require moving or duplicating
+ordinary or project work. Missing and archived boards are not created or reopened by tracking.
+
 Human issue edits, closure and reassignment are inspected again at remote mutation boundaries.
 Status intents retain the source event time so delayed catch-up cannot overwrite a later
 human decision. Reporting failures queue in the outbox without controlling native execution.

@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 from .api import LinearError
 from .ops import held
+from . import transport
 
 SCHEMA = {
     "name": "linear",
@@ -20,7 +21,8 @@ SCHEMA = {
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["track", "status", "followup", "create_issue", "create_project", "link_issue", "update_description", "add_comment"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
-        "task_id": {"type": "string", "description": "track: existing native task on this profile's configured board."},
+        "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
+        "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},
         "id": {"type": "string", "description": "Caller UUIDv4 for creates, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
         "description": {"type": "string", "description": "Readable Linear Markdown."},
@@ -46,6 +48,49 @@ def _uuid(value: Any) -> str:
 def _text(args: dict, key: str) -> str:
     value = args.get(key)
     return value.strip() if isinstance(value, str) else ""
+
+
+def _check_native_route(bridge: Any, action: str, issue_id: str, context: Any) -> None:
+    """Keep host-native board resolution and worker fences across the service hop."""
+    if action == "track":
+        if not context.native_board or not context.native_db_path:
+            raise LinearError("track requires a native board inspected by the caller's host.")
+        _, path = transport.native_board_target(context.native_board)
+        if path != context.native_db_path:
+            raise LinearError("The service cannot verify the caller's native board; inspect the target.")
+    elif context.pinned_db_path:
+        binding = bridge.store.native_binding(issue_id)
+        if not binding:
+            return
+        if binding["board"] != context.pinned_board:
+            raise LinearError("The linked task is outside the caller's native board pin.")
+        _, path = transport.native_board_target(binding["board"])
+    else:
+        return
+    if context.pinned_db_path and path != context.pinned_db_path:
+        raise LinearError("The linked task is outside the caller's native board pin.")
+
+
+def _content_requester(bridge: Any, issue_id: str, prior: dict | None) -> dict:
+    """Persist the exact requester used by current specialist authorization, never a chat id."""
+    if (getattr(bridge.api, "specialist_scope", None) or {}).get("requester_basis") != "agent_session":
+        return {}
+    if prior is not None:
+        session = (prior["payload"].get("requester_sessions") or {}).get(issue_id)
+    else:
+        resolver = getattr(bridge.api, "requester_session_for_issue", None)
+        session = resolver(issue_id) if callable(resolver) else None
+    if not isinstance(session, str) or not session:
+        raise LinearError("Specialist content needs a verified requester session for this issue; nothing was queued.")
+    sessions = {issue_id: session}
+    # BoundLinearAPI checks the exact session's app, requester allowlist and issue again.
+    # A retry retains its original requester even if the work binding later changes.
+    with bridge.api.requester_session(sessions):
+        issue = bridge.api.issue(issue_id)
+        if issue.get("id") != issue_id:
+            raise LinearError("The verified requester does not authorize this content target.")
+    return {"requester_sessions": sessions}
+
 
 def _plan(bridge: Any, args: dict, action: str) -> str:
     if action == "create_issue":
@@ -89,6 +134,8 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         issue_id = issue["id"]
         if not bridge.authorize_specialist_effect(issue_id):
             return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
+        if action in {"track", "status", "followup"}:
+            _check_native_route(bridge, action, issue_id, context)
         if action == "status":
             return _reply(True, "Current Linear and native reporting state.", issue=issue,
                           native=bridge.native_status(issue_id))
@@ -96,7 +143,8 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             task_id = _text(args, "task_id")
             if not task_id:
                 raise ValueError("track needs an existing task_id.")
-            return _reply(True, "Existing native task linked for reporting.", native=bridge.track(issue_id, task_id))
+            return _reply(True, "Existing native task linked for reporting.",
+                          native=bridge.track(issue_id, task_id, board=context.native_board))
         if action == "followup":
             if context.delegated_child:
                 return _reply(False, "Native delegated children cannot mutate Kanban; return findings to the parent agent.",
@@ -115,7 +163,8 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])
         prior = bridge.store.outbox_row(client_id)
         payload = {"issue_id": issue_id, "body": body, "id": client_id, "content_action": True,
-                   "unlinked_content": True, "write_started": False, "caller_context": context.to_wire()}
+                   "unlinked_content": True, "write_started": False, "caller_context": context.to_wire(),
+                   **_content_requester(bridge, issue_id, prior)}
         kind = "comment"
         if action == "update_description":
             expected = args.get("expected_description")
@@ -132,5 +181,5 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         warning = (" Formatting tip: split this long paragraph into headings and bullets." if
                    len(body) > 500 and "\n" not in body else "")
         return _reply(True, "Content queued durably; Linear delivery is not yet confirmed." + warning, outbox_id=row_id)
-    except (ValueError, LinearError) as exc:
+    except (ValueError, LinearError, transport.Unavailable) as exc:
         return _reply(False, str(exc), code="request_refused")
