@@ -37,6 +37,116 @@ class ExistingWorkScenarios(unittest.TestCase):
     def assign(self):
         self.bridge.handle_webhook(self.fixture.event())
 
+    def edit_issue_marker(self, adapter, task_id):
+        with adapter.conn() as conn:
+            self.assertTrue(native.kb.edit_task(conn, task_id,
+                body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
+
+    def test_native_issue_marker_change_after_discovery_holds_binding_without_replacement(self):
+        adapter, task_id = self.existing()
+        discover = self.board.discover
+        def changed(issue):
+            found = discover(issue)
+            self.edit_issue_marker(adapter, task_id)
+            return found
+        with patch.object(self.board, "discover", side_effect=changed):
+            self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(len(self.fixture.tasks()), 1)
+        self.assertEqual(self.fixture.comments(task_id), [])
+        self.assertIn("OTHER-2", adapter.get(task_id).body)
+
+    def test_bound_native_issue_marker_change_holds_followup_and_preserves_identity_and_run(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            run = native.kb.claim_task(conn, task_id)
+        self.assign()
+        binding = self.store.native_binding(native.ISSUE)
+        self.edit_issue_marker(adapter, task_id)
+        events = [(event.id, event.kind) for event in adapter.history(task_id, 0)]
+        with self.assertRaises(native.LinearError):
+            self.bridge.followup(native.ISSUE, "Instruction for original issue", "changed-after-binding")
+        self.assertEqual(self.store.native_binding(native.ISSUE), binding)
+        self.assertEqual([(event.id, event.kind) for event in adapter.history(task_id, 0)], events)
+        self.assertEqual(self.fixture.comments(task_id), [])
+        current = adapter.get(task_id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (run.current_run_id, run.claim_lock))
+        self.assertTrue(self.bridge.native_status(native.ISSUE)["linked"])
+
+    def test_conflicting_marker_at_final_native_comment_read_holds_delivery(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        comment = adapter.comment
+        def changed(*args, **kwargs):
+            self.edit_issue_marker(adapter, task_id)
+            return comment(*args, **kwargs)
+        with patch.object(adapter, "comment", side_effect=changed), self.assertRaises(native.LinearError):
+            self.bridge.followup(native.ISSUE, "Instruction for original issue", "changed-at-delivery")
+        self.assertEqual(self.fixture.comments(task_id), [])
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        self.assertNotEqual(self.store.native_intent(f"comment:{native.ISSUE}:changed-at-delivery")["state"], "applied")
+
+    def test_newer_stop_at_final_native_comment_read_holds_instruction(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        comment = adapter.comment
+        def stopped(*args, **kwargs):
+            with adapter.conn() as conn:
+                native.kb.block_task(conn, task_id, reason="newer operator Stop", kind="needs_input")
+            return comment(*args, **kwargs)
+        with patch.object(adapter, "comment", side_effect=stopped), self.assertRaises(native.LinearError):
+            self.bridge.followup(native.ISSUE, "Late instruction", "stop-at-delivery")
+        self.assertEqual(adapter.get(task_id).status, "blocked")
+        self.assertEqual(self.fixture.comments(task_id), [])
+        self.assertFalse(any(event.kind == "unblocked" for event in adapter.history(task_id, 0)))
+
+    def test_marker_free_manual_binding_followup_keeps_existing_native_run(self):
+        adapter, task_id = self.existing(body="Ordinary native work without an explicit issue marker")
+        with adapter.conn() as conn:
+            run = native.kb.claim_task(conn, task_id)
+        self.bridge.track(native.ISSUE, task_id)
+        self.bridge.followup(native.ISSUE, "Authorized manual instruction", "manual-no-marker")
+        self.assertEqual(self.fixture.comments(task_id)[-1].body, "Authorized manual instruction")
+        current = adapter.get(task_id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (run.current_run_id, run.claim_lock))
+        self.assertEqual(len(self.fixture.tasks()), 1)
+
+    def test_conflicting_issue_does_not_hold_unrelated_matching_native_followup(self):
+        from test_linear_specialist_authorization import issue_record
+        adapter, task_id = self.existing()
+        self.assign()
+        self.edit_issue_marker(adapter, task_id)
+        other = issue_record(id="issue-valid", identifier="OPS-2", url="https://linear.example/issue/OPS-2")
+        self.fixture.authority.issues[other["id"]] = other
+        valid = native.Kanban("valid-project", profile="default", profile_home=self.fixture.home)
+        task = valid.create(title="Valid unrelated native task", body=f"Linear issue {other['id']}: {other['url']}")
+        with valid.conn() as conn:
+            run = native.kb.claim_task(conn, task.id)
+        self.bridge.track(other["id"], task.id, board="valid-project")
+        with self.assertRaises(native.LinearError):
+            self.bridge.followup(native.ISSUE, "Wrong scoped instruction", "wrong-issue")
+        self.bridge.followup(other["id"], "Valid matching instruction", "valid-issue")
+        with valid.read_conn() as conn:
+            self.assertEqual(native.kb.list_comments(conn, task.id)[-1].body, "Valid matching instruction")
+        current = valid.get(task.id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (run.current_run_id, run.claim_lock))
+        self.assertEqual(self.fixture.comments(task_id), [])
+
+    def test_native_creation_body_change_is_checked_on_fresh_task_before_binding(self):
+        create, tasks = self.board.create, []
+        def changed(**kwargs):
+            task = create(**kwargs)
+            tasks.append(task.id)
+            self.edit_issue_marker(self.board, task.id)
+            return task
+        with patch.object(self.board, "create", side_effect=changed), self.assertRaises(native.LinearError):
+            self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(self.board.get(tasks[0]).status, "blocked")
+        self.assertFalse(any(event.kind == "unblocked" for event in self.board.history(tasks[0], 0)))
+
     def competing_writer(self, database):
         result = subprocess.run([sys.executable, "-c", """
 import sqlite3, sys
