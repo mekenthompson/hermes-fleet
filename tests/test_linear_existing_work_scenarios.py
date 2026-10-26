@@ -235,6 +235,135 @@ connection.close()
         self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
         self.assertEqual(self.archive_bytes(database.parent), before)
 
+    def test_malformed_task_numeric_matrix_keeps_status_and_discovery_errors_scoped(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        from hermes_fleet_linear_plugin import chat
+        database = Path(native.kb.kanban_db_path(board="default"))
+        self.bridge.profile_home = self.fixture.home
+        context = SimpleNamespace(profile="default", home=self.fixture.home, pinned_db_path="")
+        cases = [(column, value) for column in ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+                 for value in (float("inf"), float("-inf"))]
+        cases += [("block_recurrences", float("inf")), ("block_recurrences", "not-an-integer")]
+        for column, value in cases:
+            with self.subTest(column=column, value=value):
+                with closing(connect_tracked(database)) as conn:
+                    original = conn.execute(f"SELECT {column} FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+                    conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, task_id))
+                    conn.commit()
+                    self.assertEqual([row[0] for row in conn.execute("PRAGMA integrity_check")], ["ok"])
+                before = self.archive_bytes(database.parent)
+                try:
+                    result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["issue"]["id"], native.ISSUE)
+                    self.assertFalse(result["native"]["linked"])
+                    with self.assertRaises(native.LinearError):
+                        adapter.get(task_id)
+                    with self.assertRaises(native.LinearError):
+                        adapter.discover(self.issue)
+                    self.assertEqual(self.archive_bytes(database.parent), before)
+                    self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+                finally:
+                    with closing(connect_tracked(database)) as conn:
+                        conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (original, task_id))
+                        conn.commit()
+
+    def test_malformed_history_numeric_matrix_does_not_repair_native_rows(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            native.kb.claim_task(conn, task_id)
+            native.kb.add_comment(conn, task_id, "operator", "Native comment")
+        task = adapter.get(task_id)
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        database = Path(native.kb.kanban_db_path(board="default"))
+        cases = [("task_runs", "started_at", float("inf"), lambda: adapter.evidence_text(task)),
+                 ("task_runs", "ended_at", float("-inf"), lambda: adapter.completion_summary(task)),
+                 ("task_comments", "created_at", float("inf"), lambda: adapter.comment_text(task_id, "operator", 14, 0)),
+                 ("task_events", "created_at", float("inf"), lambda: adapter.history(task_id, 0)),
+                 ("task_events", "run_id", float("inf"), lambda: adapter.history(task_id, 0)),
+                 ("task_events", "run_id", "not-an-integer", lambda: adapter.history(task_id, 0))]
+        for table, column, value, read in cases:
+            with self.subTest(table=table, column=column, value=value):
+                with closing(connect_tracked(database)) as conn:
+                    original = conn.execute(f"SELECT id,{column} FROM {table} WHERE task_id=?", (task_id,)).fetchall()
+                    conn.execute(f"UPDATE {table} SET {column}=? WHERE task_id=?", (value, task_id))
+                    conn.commit()
+                    self.assertEqual([row[0] for row in conn.execute("PRAGMA integrity_check")], ["ok"])
+                before = self.archive_bytes(database.parent)
+                try:
+                    with self.assertRaises(native.LinearError):
+                        read()
+                    self.assertEqual(self.archive_bytes(database.parent), before)
+                finally:
+                    with closing(connect_tracked(database)) as conn:
+                        conn.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", [(row[1], row[0]) for row in original])
+                        conn.commit()
+
+    def test_malformed_nullable_run_identifier_type_error_is_scoped(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            native.kb.claim_task(conn, task_id)
+        task = adapter.get(task_id)
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("ALTER TABLE task_runs RENAME TO original_task_runs")
+            conn.execute("CREATE TABLE task_runs AS SELECT * FROM original_task_runs")
+            conn.execute("UPDATE task_runs SET id=NULL")
+            conn.commit()
+            self.assertEqual([row[0] for row in conn.execute("PRAGMA integrity_check")], ["ok"])
+        before = self.archive_bytes(database.parent)
+        for read in (adapter.evidence_text, adapter.completion_summary, adapter.issue_comment):
+            with self.subTest(reader=read.__name__), self.assertRaises(native.LinearError):
+                read(task)
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def test_nonfinite_task_timestamp_holds_new_admission_without_replacement(self):
+        _, task_id = self.existing()
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (float("inf"), task_id))
+            conn.commit()
+        before = self.archive_bytes(database.parent)
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def test_native_tolerated_timestamp_fallback_remains_readable(self):
+        adapter, task_id = self.existing()
+        self.assign()
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("UPDATE tasks SET created_at='not-a-timestamp', started_at=NULL WHERE id=?", (task_id,))
+            conn.commit()
+        before = self.archive_bytes(database.parent)
+        self.assertIsNone(adapter.get(task_id).created_at)
+        self.assertEqual(adapter.discover(self.issue)[0][1].id, task_id)
+        self.assertTrue(self.bridge.native_status(native.ISSUE)["linked"])
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
+    def test_unrelated_valid_binding_remains_readable_with_nonfinite_task_timestamp(self):
+        from test_linear_specialist_authorization import issue_record
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        other = issue_record(id="issue-other", identifier="OPS-2", url="https://linear.example/issue/OPS-2")
+        self.fixture.authority.issues[other["id"]] = other
+        valid = native.Kanban("valid-project", profile="default", profile_home=self.fixture.home)
+        task = valid.create(title="Unrelated valid task")
+        self.bridge.track(other["id"], task.id, board="valid-project")
+        _, broken = self.existing()
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with closing(connect_tracked(database)) as conn:
+            conn.execute("UPDATE tasks SET created_at=? WHERE id=?", (float("inf"), broken))
+            conn.commit()
+        before = self.archive_bytes(database.parent)
+        self.assertEqual(self.bridge.native_status(other["id"])["task_id"], task.id)
+        self.assertEqual(self.archive_bytes(database.parent), before)
+
     def corrupt_status_index(self):
         adapter, task_id = self.existing()
         database = Path(native.kb.kanban_db_path(board="default"))
