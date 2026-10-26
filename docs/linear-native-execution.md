@@ -47,7 +47,15 @@ The plugin targets the public API at official Hermes
 `5282b788113aef959925397d05252d883cd7c4be`; the plugin does not require the fork's
 invocation-context or profile-service APIs, approval helpers or lifecycle extensions.
 
-On a native host with task-event guards and resume receipts, validated Linear assignments create tasks blocked
+Before new admission, assignments inspect existing native boards in the same authorized home
+for an explicit issue link or canonical issue retry key. A unique local task with a verified
+explicit issue link is linked on its original board and keeps its run; a retry key alone
+requires inspection rather than automatic adoption. Follow-ups then use that task. Linking neither resumes
+stopped work nor restarts completed work. Ambiguous links, another executor or unavailable
+inspection remain scoped coordination cases, with no new worker. This does not establish a
+cross-container handoff route or an atomic guarantee for simultaneous manual task creation.
+
+On a native host with task-event guards and resume receipts, assignments without existing work create tasks blocked
 and activate only against their original creation token. A newer Stop invalidates activation;
 delivery retries retain the same token. A crash after linking can finish admission through
 the existing recovery path. No second execution controller or manual activation is required.
@@ -56,14 +64,14 @@ Older hosts without native task-event guards retain parked assignment behavior a
 the missing capability. Existing parked or legacy records are not automatically adopted.
 Native creation retry lookup remains non-atomic; ambiguous creation is reconciled, not repeated.
 
-Running cancellation is relayed only with verified ordering and a concrete native run ID.
-Cancellation of a queued or otherwise unverified run remains a visible reconciliation request
-for native controls; it is not an effective Stop. A blocked state or an acknowledged request
+On older hosts, running cancellation is relayed only with verified ordering and a concrete
+native run ID; queued cancellation remains a visible reconciliation request for native controls.
+On guarded hosts, native Stop also covers queued work when source ordering can be verified.
+A blocked state or an acknowledged request
 does not prove external processes or effects ended. Native process observation and terminal
 reaping remain necessary. The plugin never kills a PID or clears revoked authority.
 
-Native guarded Stop also covers queued work when source ordering can be verified. Conflicting
-or unverifiable later native controls remain a scoped reconciliation case. Existing native
+Conflicting or unverifiable later native controls remain a scoped reconciliation case. Existing native
 task creation and active linked follow-ups retain their native behavior.
 
 ## Delivery and migration

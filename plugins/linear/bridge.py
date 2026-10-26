@@ -107,6 +107,19 @@ How to work this task:
 3. If you need a human decision, kanban_block with kind needs_input and say exactly what you need.
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
+
+def task_issue_link(task, issue: dict) -> bool:
+    """An explicit issue link, not an incidental mention or execution authority."""
+    url = issue.get("url")
+    if not isinstance(url, str) or not url:
+        return False
+    markers = {f"Linear issue {ref}: {url}" for ref in (issue["id"], issue.get("identifier")) if ref}
+    return any(line.strip() in markers for line in (getattr(task, "body", None) or "").splitlines())
+
+def task_issue_match(task, issue: dict) -> bool:
+    return (getattr(task, "idempotency_key", None) == f"linear:{issue['id']}" or
+            task_issue_link(task, issue))
+
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
     activity, session = event.get("agentActivity") or {}, event.get("agentSession") or {}
@@ -332,6 +345,24 @@ class Kanban:
         with self.conn() as conn:
             ids = [row[0] for row in conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (key,))]
             return [self.kb.get_task(conn, ident) for ident in ids]
+    def discover(self, issue: dict) -> list:
+        """Inspect existing boards in this native home; never enter another profile.
+
+        Native target resolution retains worker/board pins. No board is created
+        for discovery, and an unreadable existing target is not an empty result.
+        """
+        found = []
+        for metadata in self.kb.list_boards(include_archived=False):
+            slug = metadata["slug"]
+            # Default metadata always exists, even in homes without a root DB.
+            if metadata.get("archived") or not Path(self.kb.kanban_db_path(board=slug)).is_file():
+                continue
+            adapter = self.for_board(slug)
+            with adapter.conn() as conn:
+                for task in self.kb.list_tasks(conn):
+                    if task_issue_match(task, issue):
+                        found.append((adapter, task))
+        return found
     def require_task(self, task_id: str):
         task = self.get(task_id)
         if task is None:
@@ -744,6 +775,42 @@ class Bridge:
             return False
         if not getattr(self.kanban, "executor_profile", None):
             raise LinearError("Native executor profile is unverified", retryable=False)
+        # An interrupted creation belongs to its saved request, including its
+        # original activation token. Discovery must not adopt that uncertainty.
+        if self.store.native_intent(f"create:{issue_id}") is None:
+            existing = self.kanban.discover(fresh)
+            if existing:
+                if len(existing) != 1:
+                    self._decline(issue_id, session_id, "Several native tasks explicitly reference this issue. Inspect their work and effects before admitting a replacement; no new task was created.")
+                    return False
+                adapter, task = existing[0]
+                if not task_issue_link(task, fresh):
+                    message = "Native issue retry key collides with work without a verified issue link; inspect before binding or creating replacement work"
+                    self._decline(issue_id, session_id, message)
+                    raise LinearError(message, retryable=False)
+                if task.assignee != adapter.executor_profile:
+                    self._decline(issue_id, session_id, "Existing native work belongs to another executor. Coordinate its checkpoint and verified stop through an authorized route before replacement; no new task was created.")
+                    return False
+                # Re-read native and Linear state at the reporting boundary.
+                task = adapter.require_task(task.id)
+                current = self._effect_issue(issue_id)
+                if ((current.get("delegate") or {}).get("id") != me or
+                        (current.get("state") or {}).get("type") in CLOSED):
+                    return False
+                contract = self.contracts.get((current.get("project") or {}).get("id"))
+                if contract and (task.completion_contract or "local-only") != contract:
+                    self._decline(issue_id, session_id, "Existing native work has a different completion contract. Reconcile its acceptance evidence through native controls before linking; no replacement worker was created or existing work stopped.")
+                    return False
+                if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
+                        adapter.board or "default", owner_ref=session_id,
+                        project_id=(current.get("project") or {}).get("id"), at=stamp):
+                    return False
+                adapter.subscribe(task.id, issue_id)
+                self._pending_assignment_stop(self.store.get(issue_id))
+                task = adapter.require_task(task.id)
+                self.activity(issue_id, session_id, "thought",
+                    f"Existing native task linked on its original board; current state is {task.status}. No replacement worker was created or work resumed. Follow-ups use this task; native controls and effect reconciliation remain authoritative.")
+                return True
         context = "\n\n".join(x for x in (fresh.get("description") or "", self._thread(issue_id, until_ms=stamp), prompt) if x)
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             context = "\n\n".join((context, ASSESSMENT_NOTE)).strip()

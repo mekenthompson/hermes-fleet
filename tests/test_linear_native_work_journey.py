@@ -44,6 +44,14 @@ class NativeWorkJourneyTests(unittest.TestCase):
         self.assertEqual(result["native_task_count"], 1)
         self.assertEqual(result["owner_admissions"], 1)
 
+    def test_assignment_reuses_an_unlinked_executing_chat_task_and_steers_same_worker(self):
+        result = self.journey("reuse")
+        self.assertTrue(result["preexisting_task_reused"])
+        self.assertTrue(result["followup_consumed_same_run"])
+        self.assertTrue(result["owner_restart_did_not_replay"])
+        self.assertEqual(result["native_task_count"], 1)
+        self.assertEqual(result["owner_admissions"], 1)
+
     def test_linear_stop_reaps_owned_worker_and_prevents_later_tool_effect(self):
         result = self.journey("stop")
         self.assertEqual(result["task_status"], "blocked")
@@ -122,13 +130,13 @@ def _child(mode):
                     assert self.server.release.wait(70), "coordinator did not release model boundary"
                     name, args = (("write_file", {"path": str(forbidden), "content": "must-not-exist"})
                                   if mode in ("stop", "handoff") else ("read_file", {"path": str(first)}))
-                elif mode == "complete" and not followup.exists():
+                elif mode in ("complete", "reuse") and not followup.exists():
                     if "FOLLOWUP_NATIVE_SENTINEL" in wire:
                         self.server.saw_followup = True
                         name, args = "write_file", {"path": str(followup), "content": "followup-was-consumed"}
                     else:
                         name, args = "read_file", {"path": str(first)}
-                elif mode == "complete":
+                elif mode in ("complete", "reuse"):
                     name, args = "kanban_complete", {"summary": "Both isolated file effects verified; native operator follow-up applied."}
             message = {"role": "assistant", "content": "Owned journey complete"}
             finish = "stop"
@@ -186,8 +194,17 @@ def _child(mode):
     event = {"type": "AgentSessionEvent", "action": "created",
              "createdAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
              "agentSession": {"id": SESSION, "issue": {"id": ISSUE}, "creatorId": USER}}
-    worker_bridge.handle_webhook(event)
-    task_id = store.get(ISSUE)["task_id"]
+    if mode == "reuse":
+        issue = authority.issues[ISSUE]
+        # Ordinary native work has its own retry key and explicit issue link,
+        # but no local Linear reporting binding when the assignment arrives.
+        task_id = board.create(title=f"{issue['identifier']}: approved ongoing work",
+            body=f"Linear issue {ISSUE}: {issue['url']}\n\n{issue['description']}",
+            created_by="operator", idempotency_key=f"chat-work:{ISSUE}").id
+        assert store.get(ISSUE) is None
+    else:
+        worker_bridge.handle_webhook(event)
+        task_id = store.get(ISSUE)["task_id"]
     assert board.get(task_id).status == "ready"
     dispatch._resolve_hermes_argv = lambda: [sys.executable, "-m", "hermes_cli.main"]
     clients = []
@@ -219,8 +236,13 @@ def _child(mode):
                 restarted_bridge.recover()
                 restarted_bridge.handle_webhook(event)
                 current = kb.get_task(conn, task_id)
+                if mode == "reuse":
+                    receipt["preexisting_task_reused"] = store.get(ISSUE)["task_id"] == task_id
+                    assert receipt["preexisting_task_reused"]
+                    assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+                    assert store.native_intent(f"create:{ISSUE}") is None
                 receipt["plugin_recovery_kept_same_run"] = current.current_run_id == run_id and current.claim_lock == task.claim_lock
-                if mode == "complete":
+                if mode in ("complete", "reuse"):
                     restarted_bridge.followup(ISSUE, "FOLLOWUP_NATIVE_SENTINEL: preserve phase A and write the requested phase B result.",
                                                "isolated-followup-one")
                     # Keep the existing native six-second comment-poll contract real.
