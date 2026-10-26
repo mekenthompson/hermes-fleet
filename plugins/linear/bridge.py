@@ -7,12 +7,14 @@ import inspect
 import logging
 import math
 import re
+import shutil
 import sqlite3
+import tempfile
 import threading
 import uuid
 import time
 from collections import defaultdict
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -231,12 +233,50 @@ class Kanban:
         raise ValueError("linear: no Kanban executor profile matches the service home")
     @contextmanager
     def conn(self):
+        if getattr(self, "history_only", False):
+            with self.history_conn(self.history_db, snapshot=True) as conn:
+                yield conn
+            return
         try:
             transport.native_board_target(self.board or "default")
         except transport.Unavailable as exc:
             raise LinearError(str(exc), retryable=False) from exc
         with closing(self.kc.connect(board=self.board)) as conn:
             yield conn
+    @contextmanager
+    def history_conn(self, path: Path, *, snapshot: bool = False):
+        """Read native rows without creating, migrating or reopening a board."""
+        try:
+            with ExitStack() as stack:
+                if snapshot:
+                    # SQLite mode=ro can still create WAL/SHM sidecars. Keep all
+                    # such files in a disposable copy, including committed WAL
+                    # frames (immutable=1 would silently ignore those frames).
+                    files = (path, Path(str(path) + "-wal"))
+                    def versions():
+                        result = []
+                        for source in files:
+                            if source.is_symlink():
+                                raise ValueError("archive database is a symlink")
+                            if source.exists():
+                                stat = source.stat()
+                                result.append((source.name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+                        return result
+                    before = versions()
+                    temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="linear-native-history-")))
+                    for source in files:
+                        if source.exists():
+                            shutil.copyfile(source, temporary / source.name)
+                    if versions() != before:
+                        raise ValueError("archive changed during inspection")
+                    path = temporary / path.name
+                conn = stack.enter_context(closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)))
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("BEGIN")
+                yield conn
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
     def for_board(self, board: str):
         """An inspected existing board with the same verified executor; never create it."""
         try:
@@ -351,17 +391,62 @@ class Kanban:
         Native target resolution retains worker/board pins. No board is created
         for discovery, and an unreadable existing target is not an empty result.
         """
-        found = []
-        for metadata in self.kb.list_boards(include_archived=False):
+        found, archived = [], set()
+        for metadata in self.kb.list_boards(include_archived=True):
             slug = metadata["slug"]
-            # Default metadata always exists, even in homes without a root DB.
-            if metadata.get("archived") or not Path(self.kb.kanban_db_path(board=slug)).is_file():
+            if metadata.get("archived"):
+                archived.add(slug)
                 continue
+            path = Path(self.kb.kanban_db_path(board=slug))
+            # Only an unconfigured, metadata-free synthesized default may be
+            # genuinely absent in a fresh home using a named creation board.
+            if not path.is_file():
+                if (slug == "default" and self.board != "default" and
+                        not self.kb.board_metadata_path(slug).exists() and
+                        not any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))):
+                    continue
+                raise LinearError(f"Existing native board {slug!r} has no readable database; inspect it before replacement work", retryable=False)
             adapter = self.for_board(slug)
-            with adapter.conn() as conn:
-                for task in self.kb.list_tasks(conn):
+            with adapter.history_conn(path) as conn:
+                for task in self.kb.list_tasks(conn, include_archived=True):
                     if task_issue_match(task, issue):
                         found.append((adapter, task))
+        # Native remove_board preserves board.json in its documented own-home
+        # _archived/<slug>-<timestamp> directory. Its board selector intentionally
+        # refuses the tombstone, so inspect those artifacts strictly read-only.
+        root = self.kb.boards_root() / "_archived"
+        inspected = set()
+        try:
+            if root.is_symlink():
+                raise ValueError("archive root is a symlink")
+            if root.exists():
+                for entry in sorted(root.iterdir()):
+                    if entry.is_symlink():
+                        raise ValueError("archive entry is a symlink")
+                    if not entry.is_dir():
+                        continue
+                    metadata_path, path = entry / "board.json", entry / "kanban.db"
+                    if (metadata_path.is_symlink() or path.is_symlink() or
+                            entry.resolve(strict=True).parent != root.resolve(strict=True) or
+                            path.resolve(strict=True).parent != entry.resolve(strict=True) or
+                            metadata_path.resolve(strict=True).parent != entry.resolve(strict=True)):
+                        raise ValueError("archive path is outside its native directory")
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                    slug = metadata.get("slug") if isinstance(metadata, dict) else None
+                    if (not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", slug) or
+                            not re.fullmatch(re.escape(slug) + r"-\d+(?:-\d+)?", entry.name)):
+                        raise ValueError("archive board identity is ambiguous")
+                    adapter = copy.copy(self)
+                    adapter.board, adapter.history_only, adapter.history_db = slug, True, path
+                    with adapter.conn() as conn:
+                        for task in self.kb.list_tasks(conn, include_archived=True):
+                            if task_issue_match(task, issue):
+                                found.append((adapter, task))
+                    inspected.add(slug)
+            if archived - inspected:
+                raise ValueError("archived board history is unavailable")
+        except (OSError, ValueError) as exc:
+            raise LinearError("Archived native history is unavailable or its identity is ambiguous; inspect it before replacement work", retryable=False) from exc
         return found
     def require_task(self, task_id: str):
         task = self.get(task_id)
@@ -778,7 +863,11 @@ class Bridge:
         # An interrupted creation belongs to its saved request, including its
         # original activation token. Discovery must not adopt that uncertainty.
         if self.store.native_intent(f"create:{issue_id}") is None:
-            existing = self.kanban.discover(fresh)
+            try:
+                existing = self.kanban.discover(fresh)
+            except LinearError as exc:
+                self._decline(issue_id, session_id, str(exc))
+                return False
             if existing:
                 if len(existing) != 1:
                     self._decline(issue_id, session_id, "Several native tasks explicitly reference this issue. Inspect their work and effects before admitting a replacement; no new task was created.")
@@ -791,6 +880,12 @@ class Bridge:
                 if task.assignee != adapter.executor_profile:
                     self._decline(issue_id, session_id, "Existing native work belongs to another executor. Coordinate its checkpoint and verified stop through an authorized route before replacement; no new task was created.")
                     return False
+                if getattr(adapter, "history_only", False) or task.status == "archived":
+                    completed = any(event.kind == "completed" for event in adapter.history(task.id, 0))
+                    self._decline(issue_id, session_id,
+                        f"Existing native history has status {task.status}" + (" and records an earlier completed outcome" if completed else "") +
+                        ". Review its saved progress or explicitly create a new increment. No archived board was reopened, task linked or work restarted.")
+                    return True
                 # Re-read native and Linear state at the reporting boundary.
                 task = adapter.require_task(task.id)
                 current = self._effect_issue(issue_id)

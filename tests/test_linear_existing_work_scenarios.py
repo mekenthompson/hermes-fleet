@@ -1,4 +1,9 @@
 """Native issue discovery before assignment admission; no client-UAT claim."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
 import unittest
 from unittest.mock import patch
 
@@ -145,9 +150,9 @@ class ExistingWorkScenarios(unittest.TestCase):
                 raise native.LinearError("Existing native target unavailable", retryable=False)
             return original(board)
         with patch.object(self.board, "for_board", side_effect=denied):
-            with self.assertRaises(native.LinearError):
-                self.assign()
+            self.assign()
         self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertIsNone(self.store.get(native.ISSUE))
 
     def test_configured_project_acceptance_is_not_downgraded_by_reuse(self):
         adapter, task_id = self.existing()
@@ -163,6 +168,186 @@ class ExistingWorkScenarios(unittest.TestCase):
         self.assign()
         self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
         self.assertEqual(len(self.fixture.tasks()), 1)
+
+    def archive_board(self, *, assignee="default", body=None):
+        adapter, task_id = self.existing(board="project-work", assignee=assignee, body=body)
+        with adapter.conn() as conn:
+            native.kb.complete_task(conn, task_id, result="Original completed outcome")
+        result = native.kb.remove_board("project-work", archive=True)
+        return Path(result["new_path"]), task_id
+
+    def archive_bytes(self, path):
+        return {str(item.relative_to(path)): hashlib.sha256(item.read_bytes()).hexdigest()
+                for item in path.rglob("*") if item.is_file()}
+
+    def test_completed_archived_task_is_history_without_replacement_or_false_unfinished_report(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            native.kb.complete_task(conn, task_id, result="Original completed outcome")
+            native.kb.archive_task(conn, task_id)
+        before = [(event.id, event.kind) for event in adapter.history(task_id, 0)]
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(adapter.get(task_id).status, "archived")
+        self.assertEqual([(event.id, event.kind) for event in adapter.history(task_id, 0)], before)
+        self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+                            for row in self.store.pending(native.ISSUE)))
+
+    def test_archived_board_history_is_read_without_reopening_linking_or_file_changes(self):
+        path, _ = self.archive_board()
+        before = self.archive_bytes(path)
+        connect = self.board.kc.connect
+        def no_archive_connect(*args, **kwargs):
+            self.assertNotEqual(kwargs.get("board"), "project-work")
+            return connect(*args, **kwargs)
+        with patch.object(self.board.kc, "connect", side_effect=no_archive_connect):
+            self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(self.fixture.tasks(), [])
+        self.assertEqual(self.archive_bytes(path), before)
+        self.assertTrue(native.kb.read_board_metadata("project-work")["archived"])
+        self.assertFalse(Path(native.kb.kanban_db_path(board="project-work")).exists())
+
+    def test_archive_snapshot_reads_committed_wal_without_mutating_archive_files(self):
+        adapter, task_id = self.existing(board="project-work")
+        with adapter.conn() as conn:
+            native.kb.complete_task(conn, task_id, result="Completed result committed in WAL")
+            path = Path(native.kb.remove_board("project-work", archive=True)["new_path"])
+            self.assertGreater((path / "kanban.db-wal").stat().st_size, 0)
+            before = self.archive_bytes(path)
+            self.assign()
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertEqual(self.fixture.tasks(), [])
+            self.assertEqual(self.archive_bytes(path), before)
+            self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+                                for row in self.store.pending(native.ISSUE)))
+
+    def test_archive_reader_enforces_query_only(self):
+        path, _ = self.archive_board()
+        before = self.archive_bytes(path)
+        [(adapter, _)] = self.board.discover(self.issue)
+        with adapter.conn() as conn:
+            self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute("DELETE FROM tasks")
+        self.assertEqual(self.archive_bytes(path), before)
+
+    def test_archive_changing_during_snapshot_is_not_treated_as_absent_work(self):
+        path, _ = self.archive_board()
+        from hermes_fleet_linear_plugin import bridge as module
+        copyfile = module.shutil.copyfile
+        def changed(source, destination):
+            result = copyfile(source, destination)
+            if Path(source) == path / "kanban.db":
+                stat = Path(source).stat()
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            return result
+        with patch.object(module.shutil, "copyfile", side_effect=changed):
+            self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.fixture.tasks(), [])
+
+    def test_unrelated_intact_archived_board_does_not_block_new_authorized_assignment(self):
+        path, _ = self.archive_board(body="Linear issue OTHER-1: https://linear.example/issue/OTHER-1")
+        before = self.archive_bytes(path)
+        self.assign()
+        self.assertEqual(len(self.fixture.tasks()), 1)
+        self.assertIsNotNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.archive_bytes(path), before)
+
+    def test_archive_metadata_wrong_slug_is_not_trusted_or_treated_as_empty(self):
+        path, _ = self.archive_board()
+        metadata = path / "board.json"
+        raw = json.loads(metadata.read_text())
+        raw["slug"] = "another-board"
+        metadata.write_text(json.dumps(raw))
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.fixture.tasks(), [])
+
+    def test_archive_database_symlink_is_not_followed(self):
+        path, _ = self.archive_board()
+        database = path / "kanban.db"
+        saved = database.with_name("saved.db")
+        database.rename(saved)
+        database.symlink_to(saved)
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.fixture.tasks(), [])
+
+    def test_foreign_executor_archive_is_read_as_history_without_implicit_transfer(self):
+        path, _ = self.archive_board(assignee="different-local-profile")
+        before = self.archive_bytes(path)
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.fixture.tasks(), [])
+        self.assertEqual(self.archive_bytes(path), before)
+
+    def test_unavailable_registered_database_holds_only_replacement_and_is_not_recreated(self):
+        adapter, task_id = self.existing(board="project-work")
+        with adapter.conn() as conn:
+            original = native.kb.claim_task(conn, task_id)
+        database = Path(native.kb.kanban_db_path(board="project-work"))
+        saved = database.with_name("temporarily-unavailable.db")
+        database.rename(saved)
+        try:
+            self.assign()
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+            self.assertEqual(self.bridge.native_status(native.ISSUE)["status"], "unlinked")
+            self.assertEqual(self.fixture.tasks(), [])
+            # Inspection failure does not install a global native execution gate.
+            self.board.create(title="Unrelated approved work")
+        finally:
+            saved.rename(database)
+        current = adapter.get(task_id)
+        self.assertEqual((current.status, current.current_run_id, current.claim_lock),
+                         (original.status, original.current_run_id, original.claim_lock))
+
+    def test_unavailable_archived_database_is_not_treated_as_empty(self):
+        path, _ = self.archive_board()
+        (path / "kanban.db").rename(path / "temporarily-unavailable.db")
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(self.fixture.tasks(), [])
+
+    def test_discovery_does_not_truncate_older_archived_linked_work(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            native.kb.complete_task(conn, task_id, result="Original completed outcome")
+            native.kb.archive_task(conn, task_id)
+            for index in range(205):
+                native.kb.create_task(conn, title=f"Unrelated {index}", priority=10, assignee="default")
+        self.assign()
+        self.assertIsNone(self.store.get(native.ISSUE))
+        self.assertEqual(len(self.fixture.tasks()), 206)
+
+    def test_synthesized_absent_default_in_fresh_named_board_home_allows_assignment(self):
+        home = self.fixture.home / "fresh-home"
+        home.mkdir()
+        with patch.dict(os.environ, {"HERMES_HOME": str(home), "HERMES_KANBAN_HOME": str(home), "HERMES_PROFILE": "default"}):
+            board = native.Kanban("linear-inbox", profile="default", profile_home=home)
+            store = native.Store(home / "linear.db")
+            bridge = native.Bridge(store, self.fixture.authority.api(scope=None), board, profile="default")
+            default = Path(native.kb.kanban_db_path(board="default"))
+            self.assertFalse(default.exists())
+            bridge.handle_webhook(self.fixture.event())
+            self.assertIsNotNone(store.get(native.ISSUE))
+            self.assertFalse(default.exists())
+
+    def test_missing_previously_configured_default_is_not_fresh_setup(self):
+        database = Path(native.kb.kanban_db_path(board="default"))
+        saved = database.with_name("temporarily-unavailable.db")
+        database.rename(saved)
+        try:
+            self.assign()
+            self.assertFalse(database.exists())
+            self.assertIsNone(self.store.get(native.ISSUE))
+        finally:
+            saved.rename(database)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,12 @@ executor, or an unavailable existing board require scoped inspection, never a re
 worker or access to another profile's private state. A conflicting configured project
 completion contract requires acceptance reconciliation; reuse cannot downgrade it.
 Incidental issue mentions are not links.
+Archived tasks and board archives in this native home are inspected as retained history.
+An archived board is never reopened or linked for execution; a completed outcome stays
+history until a deliberate new increment. Intact unrelated archives do not block new work.
+Unavailable or ambiguous history holds the affected replacement while ordinary reads and
+unrelated native work remain available. A missing database for an existing board is not an
+empty board; a fresh named-board setup may still have no synthesized default database.
 Agents creating issue-related native work should preserve the explicit issue line and use
 the canonical retry key when available; the user does not supply these internal arguments.
 

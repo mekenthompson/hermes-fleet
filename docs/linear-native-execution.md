@@ -54,6 +54,12 @@ requires inspection rather than automatic adoption. Follow-ups then use that tas
 stopped work nor restarts completed work. Ambiguous links, another executor or unavailable
 inspection remain scoped coordination cases, with no new worker. This does not establish a
 cross-container handoff route or an atomic guarantee for simultaneous manual task creation.
+Discovery includes archived tasks and own-home board archives as retained history, without
+reopening or linking archived boards for execution. Completed history does not request a
+replacement. An intact unrelated archive permits new admission; unavailable or ambiguous
+history holds only the affected replacement. A missing existing board database is an
+inspection failure, while a genuinely absent synthesized default in a fresh named-board
+setup is allowed.
 
 On a native host with task-event guards and resume receipts, assignments without existing work create tasks blocked
 and activate only against their original creation token. A newer Stop invalidates activation;
