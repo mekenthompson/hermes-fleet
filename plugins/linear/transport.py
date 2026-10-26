@@ -79,17 +79,43 @@ def native_board_target(board: Any = None) -> tuple[str, str]:
         raise Unavailable('The native board is missing, archived or invalid; inspect existing work') from exc
 
 
+def _native_profile(profile: str, home: Path) -> str:
+    """Resolve the host's standalone launch label without accepting a foreign profile.
+
+    A one-home container can be launched as an agent label even though its native
+    filesystem profile is ``default``. Only that process's exact configured label
+    may name its own home this way; routed homes and existing other profiles may not.
+    """
+    from hermes_constants import get_routing_process_hermes_home
+    from hermes_cli.profiles import (get_active_profile_name, normalize_profile_name,
+                                     profile_exists, profile_matches_home, validate_profile_name)
+    if profile_matches_home(profile, home):
+        return profile
+    launch = os.getenv('HERMES_PROFILE') or os.getenv('HERMES_AGENT_PROFILE') or ''
+    try:
+        launch = normalize_profile_name(launch)
+        validate_profile_name(launch)
+    except ValueError:
+        launch = ''
+    native = get_active_profile_name()
+    if (not launch or profile != launch or profile_exists(profile) or
+            home != Path(get_routing_process_hermes_home()).resolve(strict=True) or
+            not profile_matches_home(native, home)):
+        raise Unavailable('The native session profile does not match its Hermes home')
+    return native
+
+
 def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
     """Read the context actually bound by upstream producers, never model args or env fallbacks.
 
     Upstream set_session_vars binds the named ContextVars for API and messaging turns. The
     public bound_session_key excludes environment fallback; copy_context excludes it for every
-    other field too. Profile/home are independently resolved by the native host.
+    other caller field too. Process configuration can only normalize an already-bound launch
+    label to the native profile/home; it cannot supply a missing caller or session.
     """
     try:
         from gateway.session_context import bound_session_key
         from hermes_constants import get_hermes_home
-        from hermes_cli.profiles import profile_matches_home
         from agent.delegation_context import is_delegated_child_process_context, explicit_board_intent_is_pinned
         bound = {var.name: value for var, value in contextvars.copy_context().items()
                  if var.name.startswith('HERMES_SESSION_') or var.name == 'HERMES_UI_SESSION_ID'}
@@ -117,9 +143,7 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
                 if fields['native_board'] != fields['pinned_board']:
                     raise Unavailable('The requested native board is outside the caller\'s native board pin')
         home = Path(get_hermes_home()).resolve(strict=True)
-        profile = read('HERMES_SESSION_PROFILE') or 'default'
-        if not profile_matches_home(profile, home):
-            raise Unavailable('The native session profile does not match its Hermes home')
+        profile = _native_profile(read('HERMES_SESSION_PROFILE') or 'default', home)
         return NativeContext.from_wire({'home': str(home), 'profile': profile, **fields}, home, profile)
     except (ImportError, OSError) as exc:
         raise Unavailable('This Hermes host cannot provide native session/profile context') from exc
