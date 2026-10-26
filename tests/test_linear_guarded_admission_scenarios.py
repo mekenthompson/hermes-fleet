@@ -46,11 +46,11 @@ class GuardedAdmissionScenarios(unittest.TestCase):
 
     def test_stop_between_inspection_and_activation_wins(self):
         activate = self.board.activate
-        def stopped(task_id, expected_event_id):
+        def stopped(task_id, expected_event_id, **kwargs):
             with self.board.conn() as conn:
                 self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="operator Stop", kind="needs_input",
                                                         expected_event_id=expected_event_id))
-            return activate(task_id, expected_event_id)
+            return activate(task_id, expected_event_id, **kwargs)
         with patch.object(self.board, "activate", side_effect=stopped):
             task_id = self.assign()
         self.assertEqual(self.board.get(task_id).status, "blocked")
@@ -69,8 +69,8 @@ class GuardedAdmissionScenarios(unittest.TestCase):
 
     def test_lost_activation_reply_reconciles_same_cas_without_second_transition(self):
         activate = self.board.activate
-        def lost(task_id, expected_event_id):
-            self.assertTrue(activate(task_id, expected_event_id))
+        def lost(task_id, expected_event_id, **kwargs):
+            self.assertTrue(activate(task_id, expected_event_id, **kwargs))
             raise ConnectionError("lost native activation reply")
         with patch.object(self.board, "activate", side_effect=lost):
             with self.assertRaises(ConnectionError):
@@ -82,8 +82,8 @@ class GuardedAdmissionScenarios(unittest.TestCase):
 
     def test_newer_stop_after_lost_activation_reply_is_never_refreshed_away(self):
         activate = self.board.activate
-        def lost(task_id, expected_event_id):
-            self.assertTrue(activate(task_id, expected_event_id))
+        def lost(task_id, expected_event_id, **kwargs):
+            self.assertTrue(activate(task_id, expected_event_id, **kwargs))
             raise ConnectionError("lost native activation reply")
         with patch.object(self.board, "activate", side_effect=lost):
             with self.assertRaises(ConnectionError):
@@ -138,10 +138,10 @@ class GuardedAdmissionScenarios(unittest.TestCase):
                 saw_none.set()
                 self.assertTrue(continue_stop.wait(5))
             return row
-        def after_stop(task_id, token):
+        def after_stop(task_id, token, **kwargs):
             continue_stop.set()
             self.assertTrue(stop_done.wait(5))
-            return activate(task_id, token)
+            return activate(task_id, token, **kwargs)
         stamp = time.time()
         def stop():
             try:
@@ -175,8 +175,8 @@ class GuardedAdmissionScenarios(unittest.TestCase):
     def test_lost_activation_receipt_still_accepts_current_same_second_stop(self):
         now = int(time.time()) + 0.1
         activate = self.board.activate
-        def lost(task_id, token):
-            self.assertTrue(activate(task_id, token))
+        def lost(task_id, token, **kwargs):
+            self.assertTrue(activate(task_id, token, **kwargs))
             raise ConnectionError("lost successful native response")
         with patch("time.time", return_value=now), patch.object(self.board, "activate", side_effect=lost):
             with self.assertRaises(ConnectionError):

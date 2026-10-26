@@ -341,8 +341,10 @@ class Kanban:
     def get(self, task_id: str):
         with self.read_conn() as conn:
             return self.kb.get_task(conn, task_id)
-    def subscribe(self, task_id: str, issue_id: str) -> None:
+    def subscribe(self, task_id: str, issue_id: str, *, issue: dict | None = None) -> None:
         with self.conn() as conn:
+            if issue is not None:
+                require_task_issue_scope(self.require_task(task_id), issue)
             self.kn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=issue_id)
     def subscribe_parent(self, task_id: str, profile: str, route: dict) -> None:
         with self.conn() as conn:
@@ -374,8 +376,10 @@ class Kanban:
         metadata = run.metadata if run else None
         body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
         return body if isinstance(body, str) else ""
-    def block(self, task_id: str, reason: str, *, run_id: int | None = None) -> bool:
+    def block(self, task_id: str, reason: str, *, run_id: int | None = None, issue: dict | None = None) -> bool:
         with self.conn() as conn:
+            if issue is not None:
+                require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input", expected_run_id=run_id)
 
     @property
@@ -396,8 +400,10 @@ class Kanban:
             return events[1].id
         return None
 
-    def activate(self, task_id: str, expected_event_id: int) -> bool:
+    def activate(self, task_id: str, expected_event_id: int, *, issue: dict | None = None) -> bool:
         with self.conn() as conn:
+            if issue is not None:
+                require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id,
                                        request_id=self.activation_request_id(task_id, expected_event_id))
 
@@ -412,8 +418,10 @@ class Kanban:
                     (after[0].payload or {}).get("expected_event_id") == expected_event_id)
 
     def stop(self, task_id: str, reason: str, *, expected_event_id: int,
-             run_id: int | None = None) -> bool:
+             run_id: int | None = None, issue: dict | None = None) -> bool:
         with self.conn() as conn:
+            if issue is not None:
+                require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                                       expected_run_id=run_id, expected_event_id=expected_event_id)
 
@@ -593,7 +601,10 @@ class Bridge:
         """Queue reporting; retained execution claims are held for reconciliation at delivery."""
         if not self.authorize_specialist_effect(issue_id):
             return ""
-        route = self._alert_route(row or self.store.get(issue_id))
+        row = row or self.store.get(issue_id)
+        if row and row.get("origin") == "native":
+            self._native_effect_task(issue_id)
+        route = self._alert_route(row)
         return self.store.enqueue("status", {"issue_id": issue_id, "state": state, "claim": claim, "seen": seen,
                                              "terminal": terminal, "source_ms": source_ms, **route}, at=self.clock())
     def _alert_route(self, row: dict[str, Any] | None) -> dict[str, Any]:
@@ -617,6 +628,9 @@ class Bridge:
                 terminal: bool = False, requires_status_id: str = "", takeover: bool = False) -> str:
         if not self.authorize_specialist_effect(issue_id):
             return ""
+        work = row or self.store.get(issue_id)
+        if work and work.get("origin") == "native":
+            self._native_effect_task(issue_id)
         return self.store.enqueue("comment", {"issue_id": issue_id, "body": body,
                                        "terminal": terminal, "requires_status_id": requires_status_id,
                                        "takeover": takeover,
@@ -625,6 +639,9 @@ class Bridge:
                  *, row: dict[str, Any] | None = None) -> str:
         if not self.authorize_specialist_effect(issue_id):
             return ""
+        work = row or self.store.get(issue_id)
+        if work and work.get("origin") == "native":
+            self._native_effect_task(issue_id)
         return self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id,
                                         "content": {"type": kind, "body": body},
                                         **self._alert_route(row or self.store.get(issue_id))}, at=self.clock())
@@ -651,7 +668,7 @@ class Bridge:
                       terminal, requires_status_id) -> bool:
         binding = self.store.native_binding(issue_id)
         if binding:
-            self._binding_adapter(issue_id)
+            self._native_effect_task(issue_id)
             session_id = self._project_batch(binding, session_id)
         return self.store.queue_project_update({"issue_id": f"update:{session_id}:{project_id or issue_id}",
                                          "session_id": session_id, "session_key": session_key,
@@ -817,6 +834,9 @@ class Bridge:
             if self._assignment_activation(row):
                 return
             task = self.native_status(issue["id"])
+            if task.get("reconciliation_required"):
+                self._decline(issue["id"], session_id, task["message"])
+                return
             self._decline(issue["id"], session_id, f"Existing work: {task.get('status')}. Use native task controls to resume stopped work.")
             return
         self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}")
@@ -867,7 +887,7 @@ class Bridge:
             return  # Ordinary linked issues have no Agent Session keepalive contract.
         if self.clock() - self.store.last_activity_at(row["issue_id"], row["owner_ref"]) < 25 * 60 - self.recheck_every:
             return
-        task = self._binding_adapter(row["issue_id"]).require_task(row["task_id"])
+        task = self._native_effect_task(row["issue_id"])
         if task.status in ("running", "ready"):
             kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
                                                     else "Waiting for native execution", "Native work remains active", ephemeral=True)
@@ -875,13 +895,14 @@ class Bridge:
 
     def _unfinished(self, row: dict, *, event_id: int | None = None) -> None:
         issue_id = row["issue_id"]
+        self._native_effect_task(issue_id)
         adapter = self._binding_adapter(issue_id)
         latest = [event.id for event in adapter.history(row["task_id"], 0) if event.kind == "archived"]
         if event_id is not None and latest and event_id != max(latest):
-            self.store.capture_event(issue_id, event_id, [], at=self.clock())
+            self._capture_native_event(issue_id, event_id, [], at=self.clock())
             return
         if self.store.terminal_captured(row["task_id"], issue_id=issue_id):
-            self.store.capture_event(issue_id, event_id, [], at=self.clock())
+            self._capture_native_event(issue_id, event_id, [], at=self.clock())
             return
         completed = [event for event in adapter.history(row["task_id"], 0) if event.kind == "completed"]
         if completed:
@@ -889,7 +910,7 @@ class Bridge:
             writes = [("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                 "content": {"type": "response", "body": "Native task archived with a prior completion in its history. Inspect the native result and evidence; no new work was started."},
                 **self._alert_route(row)})]
-            self.store.capture_event(issue_id, event_id, self._report_writes(row, writes), at=self.clock())
+            self._capture_native_event(issue_id, event_id, self._report_writes(row, writes), at=self.clock())
             return
         body = "Kanban task archived without accepted completion evidence. Work remains unfinished."
         route = {"task_id": row["task_id"], "terminal": True, "owner_issue_id": issue_id}
@@ -958,7 +979,7 @@ class Bridge:
                         adapter.board or "default", owner_ref=session_id,
                         project_id=(current.get("project") or {}).get("id"), at=stamp):
                     return False
-                adapter.subscribe(task.id, issue_id)
+                adapter.subscribe(task.id, issue_id, issue=current)
                 self._pending_assignment_stop(self.store.get(issue_id))
                 task = adapter.require_task(task.id)
                 self.activity(issue_id, session_id, "thought",
@@ -1015,7 +1036,7 @@ class Bridge:
             self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
             return False
         self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
-        self.kanban.subscribe(task.id, issue_id)
+        self.kanban.subscribe(task.id, issue_id, issue=fresh)
         if self._assignment_activation(self.store.get(issue_id)):
             return True
         unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
@@ -1084,7 +1105,7 @@ class Bridge:
             self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. No new activation was attempted; inspect native worker and effect state.")
             return True
         require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
-        accepted = adapter.activate(row["task_id"], token)
+        accepted = adapter.activate(row["task_id"], token, issue=issue)
         owned_activation = accepted
         if not accepted:
             # A lost successful reply or another operator may have transitioned
@@ -1168,6 +1189,29 @@ class Bridge:
         row = self.store.get(issue_id)
         adapter = self._binding_adapter(issue_id)
         return row, adapter.require_task(row["task_id"])
+    def _native_effect_task(self, issue_id: str, issue: dict | None = None):
+        _, task = self._native_task(issue_id)
+        # Marker-free authorized manual work can still be captured while Linear
+        # is offline. Explicit lines require the authoritative canonical issue.
+        if issue is None and task_issue_scope(task, {"id": issue_id})[1]:
+            issue = self._effect_issue(issue_id)
+        require_task_issue_scope(task, issue if issue is not None else {"id": issue_id})
+        return task
+
+    def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
+        try:
+            self._native_effect_task(issue_id)
+        except LinearError as exc:
+            log.warning("linear: native event capture held for %s: %s", issue_id, exc)
+            return False
+        return self.store.capture_event(issue_id, event_id, writes, at=at, forget=forget)
+
+    def _require_outbox_native_scope(self, row, issue_ids=None):
+        if not row["payload"].get("task_id"):
+            return  # Authorized independent content and refusal notices have no task effect.
+        for issue_id in issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row):
+            self._native_effect_task(issue_id)
+
     def native_status(self, issue_id: str) -> dict:
         # Observe the revision before subsequent state reads. A concurrent change
         # can then cause only a safe stale-token refusal, never bless an unseen link.
@@ -1186,7 +1230,13 @@ class Bridge:
             return {"issue_id": issue_id, "linked": False, "status": "changed",
                     "local": local, "binding_revision": revision,
                     "message": "Reporting link changed during inspection; read current state again."}
-        return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status,
+        reconciliation = {}
+        try:
+            if task_issue_scope(task, {"id": issue_id})[1]:
+                require_task_issue_scope(task, self._effect_issue(issue_id))
+        except LinearError as exc:
+            reconciliation = {"reconciliation_required": True, "message": str(exc)}
+        return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status, **reconciliation,
                 "run_id": task.current_run_id, "profile": task.assignee,
                 "board": binding["board"], "local": local,
                 "binding_revision": revision}
@@ -1243,6 +1293,11 @@ class Bridge:
             return
         if stamp < float(row["last_updated_at"]):
             return
+        try:
+            require_task_issue_scope(task, issue)
+        except LinearError as exc:
+            self._decline(row["issue_id"], session_id, str(exc))
+            return
         if getattr(adapter, "guarded_controls", False):
             return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
         key = f"stop:{row['issue_id']}:{activity_id}"
@@ -1269,7 +1324,12 @@ class Bridge:
             self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
             self._decline(row["issue_id"], session_id, "Stop needs a current native task control; no run-scoped ordering was available.")
             return
-        adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id)
+        try:
+            adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id, issue=issue)
+        except LinearError as exc:
+            self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
+            self._decline(row["issue_id"], session_id, str(exc))
+            return
         latest = adapter.require_task(task.id)
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
@@ -1298,6 +1358,12 @@ class Bridge:
                 # A later explicit resume stays authoritative; do not repeat Stop.
                 self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
                 return
+            try:
+                require_task_issue_scope(task, self._effect_issue(issue_id))
+            except LinearError as exc:
+                self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
+                self._decline(issue_id, session_id, str(exc))
+                return
             if task.status in ("done", "archived", "triage"):
                 stopped = True
                 break
@@ -1314,8 +1380,13 @@ class Bridge:
                 return
             if not events:
                 break
-            stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
-                                   run_id=task.current_run_id)
+            try:
+                stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
+                                       run_id=task.current_run_id, issue=self._effect_issue(issue_id))
+            except LinearError as exc:
+                self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
+                self._decline(issue_id, session_id, str(exc))
+                return
             if stopped:
                 break
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "stopped": stopped})
@@ -1339,7 +1410,11 @@ class Bridge:
                     # delivered give-up from an earlier attempt. Reconcile transitions
                     # with the current task, while still capturing a claimed event that
                     # describes its current state.
-                    self._task_event(row, event, task.status, captured)
+                    try:
+                        self._task_event(row, event, task.status, captured)
+                    except LinearError as exc:
+                        log.warning("linear: native event reporting held for %s: %s", row["issue_id"], exc)
+                        break
                     row = self.store.get(row["issue_id"])
                     if not row or row["last_event_id"] < event.id:
                         break  # Retry this event before consuming any later event for this binding.
@@ -1348,17 +1423,18 @@ class Bridge:
         payload, issue_id = event.payload or {}, row["issue_id"]
         if not self.authorize_specialist_effect(issue_id):
             return
+        self._native_effect_task(issue_id)
         if event.kind == "archived":
             if task_status == "archived":
                 self._unfinished(row, event_id=event.id)
             else:
-                self.store.capture_event(issue_id, event.id, [], at=self.clock())
+                self._capture_native_event(issue_id, event.id, [], at=self.clock())
             return
         if event.kind == "completed":
             if task_status == "done":
                 self._finished(row, event_id=event.id)
             else:
-                self.store.capture_event(issue_id, event.id, [], at=self.clock())
+                self._capture_native_event(issue_id, event.id, [], at=self.clock())
             return
         writes: list[tuple[str, dict[str, Any]]] = []
         route = self._alert_route(row)
@@ -1413,7 +1489,7 @@ class Bridge:
                 (event.kind == "block_loop_detected" and task_status != "triage") or
                 (event.kind == "unblocked" and task_status not in ("todo", "ready", "review", "running"))): writes = []
         writes = self._report_writes(row, writes)
-        self.store.capture_event(issue_id, event.id, writes, at=self.clock(), forget=False)
+        self._capture_native_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     @staticmethod
     def _report_writes(row: dict, writes: list) -> list:
         if row.get("owner_ref"):
@@ -1429,16 +1505,16 @@ class Bridge:
         writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source * 1000} if kind == "status" and source is not None else {})})
                   for kind, payload in self._report_writes(row, writes)]
         # Cursor and reporting intents commit together, including completion.
-        return self.store.capture_event(issue_id, event_id, writes, at=at)
+        return self._capture_native_event(issue_id, event_id, writes, at=at)
     def _finished(self, row: dict[str, Any], *, event_id: int | None = None) -> None:
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
         adapter = self._binding_adapter(row["issue_id"])
-        task = adapter.require_task(row["task_id"])
+        task = self._native_effect_task(row["issue_id"])
         latest = [event.id for event in adapter.history(task.id, 0) if event.kind == "completed"]
         if task.status != "done" or (event_id is not None and latest and event_id != max(latest)):
             if event_id is not None:
-                self.store.capture_event(row["issue_id"], event_id, [], at=self.clock())
+                self._capture_native_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
         evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
@@ -1656,9 +1732,15 @@ class Bridge:
             payload = (row or {}).get("payload", {})
             admission_id = payload.get("admission_id")
             if row and not self._authorize_outbox_effect(row, issue_ids): raise ProjectUpdateDeferred
-            work = self.store.get(payload.get("issue_id", ""))
-            if work and work.get("origin") == "native" and payload.get("task_id"):
-                self._native_task(work["issue_id"])
+            if row:
+                try:
+                    self._require_outbox_native_scope(row, issue_ids)
+                except LinearError:
+                    if row["kind"] == "project_update":
+                        # The existing unstarted-create path can reproject and
+                        # split held lines; an uncertain send remains frozen.
+                        raise ProjectUpdateDeferred from None
+                    raise
             if payload.get("initial_ack"):
                 issue = self._effect_issue(payload["issue_id"])
                 if ((self._specialist_scope_active() and
@@ -1725,6 +1807,8 @@ class Bridge:
             if not self._receipt_scope(payload, payload["issue_write_receipt"]):
                 self._hold_terminal(row, "Persisted status receipt no longer matches its reporting scope")
             return True  # The atomic mutation response already proves this effect; never send it again.
+        if kind != "project_update":
+            self._require_outbox_native_scope(row)
         if kind == "status":
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])
@@ -1876,6 +1960,11 @@ class Bridge:
                     if exc.retryable:
                         raise
                     continue  # a removed issue cannot authorize its old line
+                try:
+                    task = self._native_effect_task(issue_id, issue)
+                except LinearError:
+                    waiting_lines.add(ident)
+                    continue
                 terminal_id = payload.get("terminal_lines", {}).get(ident)
                 if not terminal_id and payload.get("terminal") and \
                         (issue["id"] == payload.get("owner_issue_id") or len(payload["lines"]) == 1):
@@ -1891,7 +1980,7 @@ class Bridge:
                     raise LinearError(f"claim for {ident} is still pending")
                 delegate = (issue.get("delegate") or {}).get("id")
                 released = delegate is None and terminal_id and self.store.verified_release(terminal_id)
-                if ((not self._report_delegate_allowed(issue, payload) and not released) or
+                if ((not self._report_delegate_allowed(issue, {**payload, "task_id": task.id}) and not released) or
                         (issue.get("state") or {}).get("type") == "canceled" or
                         ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
                     continue

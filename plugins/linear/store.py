@@ -985,6 +985,13 @@ class Store:
                 ident = next(iter(part["terminal_lines"]), None)
                 part["owner_issue_id"] = part["line_issues"].get(ident, "") if ident else ""
                 part["requires_status_id"] = part["terminal_lines"].get(ident, "") if ident else ""
+                if part.get("task_id"):
+                    # Each split keeps a native reporting anchor belonging to
+                    # its own lines, never the removed sibling's task identity.
+                    work = db.execute("SELECT task_id FROM work WHERE issue_id=? AND origin='native'",
+                                      (part["resolve"],)).fetchone()
+                    if work:
+                        part["task_id"] = work["task_id"]
             db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(ready), row_id))
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
                        (str(uuid.uuid4()), json.dumps(deferred), row["next_at"]))
