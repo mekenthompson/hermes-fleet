@@ -111,6 +111,16 @@ for any uncertain earlier description effect to be reconciled.
 
 ## Evidence boundaries
 
+The optional mounted plugin can expose an `origin_reference` from the actual tool caller,
+then independently inspect that exact current native admission through `hermes linear
+inspect-origin` inside its owning profile. It reads existing native state and checks
+`prompt.receipt`; it does not attach a viewer, compute tool inventory, initialize credentials,
+start a gateway, or execute a model. The reference and projection grant no control permission.
+They preserve API credential principals and declared specialist/workspace limits without
+converting them into human authority. A2A text remains untrusted input; controller policy and
+native checkpoint/Stop/quiescence are separate requirements. See the plugin README for the
+guarded, manifest-pinned origin proof entrypoint.
+
 The native scenario suite exercises upstream task creation, claiming, lifecycle and comment
 consumption; the registered tool and private socket are exercised with actual upstream session
 producers, including a separate API process. Cases cover concurrent and duplicate requests,
