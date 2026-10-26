@@ -2,7 +2,8 @@
 import hashlib
 import json
 import os
-from contextlib import closing
+import select
+from contextlib import closing, contextmanager
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -53,6 +54,76 @@ finally:
     connection.close()
 """, str(database)], capture_output=True, text=True, timeout=3, check=True)
         return result.stdout.strip()
+
+    @contextmanager
+    def dirty_spill_writer(self, database, task_id):
+        """Separate SQLite writer flushes uncommitted pages, then waits for rollback."""
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        with closing(connect_tracked(database)) as seed:
+            self.assertEqual(seed.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+            seed.execute("CREATE TABLE spill(value TEXT)")
+            seed.executemany("INSERT INTO spill VALUES (?)", [("s" * 10000,)] * 200)
+            seed.commit()
+        script = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute('PRAGMA cache_size=1')
+connection.execute('PRAGMA cache_spill=1')
+connection.execute('BEGIN EXCLUSIVE')
+connection.execute("UPDATE tasks SET body=?, title='UNCOMMITTED' WHERE id=?", ('x'*62, sys.argv[2]))
+connection.execute('UPDATE spill SET value=?', ('z'*10000,))
+print('ready', flush=True)
+input()
+connection.rollback()
+connection.close()
+"""
+        child = subprocess.Popen([sys.executable, "-u", "-c", script, str(database), task_id],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(select.select([child.stdout], [], [], 5)[0], "spill writer did not become ready")
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            yield child
+        finally:
+            if child.poll() is None:
+                child.communicate("\n", timeout=5)
+            self.assertEqual(child.returncode, 0)
+
+    def test_other_process_dirty_spill_is_not_visible_to_history_read(self):
+        adapter, task_id = self.existing()
+        original = adapter.get(task_id)
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with self.dirty_spill_writer(database, task_id):
+            self.assertEqual(self.competing_writer(database), "locked")
+            started = time.monotonic()
+            with self.assertRaises(native.LinearError):
+                with adapter.history_conn(database, snapshot=True) as conn:
+                    self.fail(f"Read uncommitted source: {native.kb.get_task(conn, task_id).title}")
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(self.competing_writer(database), "locked")
+        restored = adapter.get(task_id)
+        self.assertEqual((restored.title, restored.body), (original.title, original.body))
+
+    def test_dirty_spill_discovery_holds_replacement_then_rollback_reuses_original_run(self):
+        adapter, task_id = self.existing()
+        with adapter.conn() as conn:
+            original = native.kb.claim_task(conn, task_id)
+        database = Path(native.kb.kanban_db_path(board="default"))
+        discover = self.board.discover
+        with self.dirty_spill_writer(database, task_id) as child:
+            def inspect_then_rollback(issue):
+                try:
+                    return discover(issue)
+                finally:
+                    child.communicate("\n", timeout=5)
+            with patch.object(self.board, "discover", side_effect=inspect_then_rollback):
+                self.assign()
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+        self.assertEqual(len(self.fixture.tasks()), 1)
+        self.assign()
+        self.assertEqual(self.store.get(native.ISSUE)["task_id"], task_id)
+        current = adapter.get(task_id)
+        self.assertEqual((current.current_run_id, current.claim_lock), (original.current_run_id, original.claim_lock))
 
     def test_live_delete_transaction_keeps_competing_writer_excluded_after_inspection_and_reader_close(self):
         _, task_id = self.existing()
@@ -109,6 +180,25 @@ finally:
                 with offline_file_access(database):
                     self.fail("plugin source reader must fence raw file access")
         self.assertFalse(has_live_connection(database))
+
+    def test_reporting_native_reads_preserve_database_journal_mode_and_committed_bytes(self):
+        adapter, task_id = self.existing()
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        database = Path(native.kb.kanban_db_path(board="default"))
+        with closing(connect_tracked(database)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        before = self.archive_bytes(database.parent)
+        task = adapter.get(task_id)
+        adapter.history(task_id, 0)
+        adapter.evidence_text(task)
+        adapter.completion_summary(task)
+        adapter.issue_comment(task)
+        adapter.comment_text(task_id, "operator", 1, 0)
+        adapter.find_comment(task_id, "unrelated", "marker")
+        adapter.find_created(f"chat-work:{native.ISSUE}")
+        self.assertEqual(self.archive_bytes(database.parent), before)
+        with closing(connect_tracked(database.as_uri() + "?mode=ro", uri=True)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "delete")
 
     def test_running_unlinked_chat_task_is_reused_and_followup_keeps_its_run(self):
         adapter, task_id = self.existing()
@@ -256,8 +346,11 @@ finally:
         return Path(result["new_path"]), task_id
 
     def archive_bytes(self, path):
+        # SQLite owns its WAL-index cache and empty WAL bookkeeping; neither
+        # contains committed native data. Retain exact hashes of DB/WAL data.
         return {str(item.relative_to(path)): hashlib.sha256(item.read_bytes()).hexdigest()
-                for item in path.rglob("*") if item.is_file()}
+                for item in path.rglob("*") if item.is_file() and not item.name.endswith("-shm")
+                and not (item.name.endswith("-wal") and item.stat().st_size == 0)}
 
     def test_completed_archived_task_is_history_without_replacement_or_false_unfinished_report(self):
         adapter, task_id = self.existing()
@@ -289,7 +382,7 @@ finally:
         self.assertTrue(native.kb.read_board_metadata("project-work")["archived"])
         self.assertFalse(Path(native.kb.kanban_db_path(board="project-work")).exists())
 
-    def test_archive_snapshot_reads_committed_wal_without_mutating_archive_files(self):
+    def test_archived_read_transaction_includes_committed_wal_without_changing_native_data(self):
         adapter, task_id = self.existing(board="project-work")
         database = Path(native.kb.kanban_db_path(board="project-work"))
         # Native runtime safety may deliberately choose DELETE on older SQLite.
@@ -324,20 +417,18 @@ finally:
                 conn.execute("DELETE FROM tasks")
         self.assertEqual(self.archive_bytes(path), before)
 
-    def test_archive_changing_during_snapshot_is_not_treated_as_absent_work(self):
-        path, _ = self.archive_board()
-        from hermes_fleet_linear_plugin import bridge as module
-        copyfile = module.shutil.copyfile
-        def changed(source, destination):
-            result = copyfile(source, destination)
-            if Path(source) == path / "kanban.db":
-                stat = Path(source).stat()
-                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
-            return result
-        with patch.object(module.shutil, "copyfile", side_effect=changed):
+    def test_archived_exclusive_spill_holds_replacement_and_rollback_restores_history(self):
+        path, task_id = self.archive_board()
+        with self.dirty_spill_writer(path / "kanban.db", task_id):
             self.assign()
+            self.assertIsNone(self.store.get(native.ISSUE))
+            self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
+            self.assertEqual(self.fixture.tasks(), [])
+        self.assign()
         self.assertIsNone(self.store.get(native.ISSUE))
         self.assertEqual(self.fixture.tasks(), [])
+        self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+                            for row in self.store.pending(native.ISSUE)))
 
     def test_unrelated_intact_archived_board_does_not_block_new_authorized_assignment(self):
         path, _ = self.archive_board(body="Linear issue OTHER-1: https://linear.example/issue/OTHER-1")
@@ -441,11 +532,11 @@ finally:
             bridge.handle_webhook(self.fixture.event())
             self.assertIsNotNone(store.get(native.ISSUE))
 
-    def test_existing_wal_database_startup_and_validation_do_not_create_source_sidecars(self):
+    def test_existing_wal_history_read_preserves_committed_data_with_native_sqlite_cache_files(self):
         self.existing()
         database = Path(native.kb.kanban_db_path(board="default"))
-        # Persist WAL mode without live connections/sidecars. Validation must
-        # create any SQLite WAL/SHM artifacts only in its disposable snapshot.
+        # Native SQLite may create its standard WAL-index cache; committed
+        # database and WAL data must remain unchanged.
         with closing(sqlite3.connect(database)) as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
         before = self.archive_bytes(database.parent)
@@ -455,29 +546,19 @@ finally:
         restarted.discover(self.issue)
         self.assertEqual(self.archive_bytes(database.parent), before)
 
-    def test_transient_wal_copy_race_retries_a_fresh_snapshot_without_source_mutation(self):
-        _, task_id = self.existing()
+    def test_wal_read_transaction_keeps_committed_view_across_another_process_commit(self):
+        adapter, task_id = self.existing()
         database = Path(native.kb.kanban_db_path(board="default"))
-        from hermes_fleet_linear_plugin import bridge as module
-        copyfile, attempted = module.shutil.copyfile, []
-        def transient(source, destination):
-            if str(source).endswith("-wal") and not attempted:
-                attempted.append(source)
-                raise FileNotFoundError("native checkpoint raced the snapshot copy")
-            return copyfile(source, destination)
-        with closing(sqlite3.connect(database, isolation_level=None)) as conn:
-            conn.row_factory = sqlite3.Row
-            self.assertEqual(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        with closing(connect_tracked(database)) as conn:
             self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
-            conn.execute("PRAGMA wal_autocheckpoint=0")
-            native.kb.complete_task(conn, task_id, result="Committed native outcome")
-            before = self.archive_bytes(database.parent)
-            with patch.object(module.shutil, "copyfile", side_effect=transient):
-                [(_, task)] = self.board.discover(self.issue)
-            self.assertEqual(task.id, task_id)
-            self.assertEqual(task.status, "done")
-            self.assertEqual(len(attempted), 1)
-            self.assertEqual(self.archive_bytes(database.parent), before)
+        with adapter.history_conn(database) as reader:
+            original = native.kb.get_task(reader, task_id)
+            script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE tasks SET title=? WHERE id=?', ('New committed title',sys.argv[2])); c.commit(); c.close()"
+            subprocess.run([sys.executable, "-c", script, str(database), task_id], timeout=3, check=True)
+            self.assertEqual(native.kb.get_task(reader, task_id).title, original.title)
+        with adapter.history_conn(database) as reader:
+            self.assertEqual(native.kb.get_task(reader, task_id).title, "New committed title")
 
     def test_missing_previously_configured_default_is_not_fresh_setup(self):
         database = Path(native.kb.kanban_db_path(board="default"))
@@ -506,7 +587,10 @@ finally:
                        "corrupt": b"not a SQLite database", "read-refused": saved.read_bytes()}[kind]
             database.write_bytes(content)
         before = database.read_bytes()
-        names = set(database.parent.iterdir())
+        def data_names():
+            return {item for item in database.parent.iterdir() if item.name != database.name + "-shm"
+                    and not (item.name == database.name + "-wal" and item.stat().st_size == 0)}
+        names = data_names()
         if kind == "read-refused":
             database.chmod(0)
         adapter.kc._INITIALIZED_PATHS.discard(str(database.resolve()))
@@ -524,7 +608,7 @@ finally:
             self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
             with self.assertRaises(native.LinearError):
                 restarted.get(task_id)
-            self.assertEqual(set(database.parent.iterdir()), names)
+            self.assertEqual(data_names(), names)
         finally:
             database.chmod(0o600)
             after = database.read_bytes()

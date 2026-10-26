@@ -60,10 +60,12 @@ Unavailable or ambiguous history holds the affected replacement while ordinary r
 unrelated native work remain available. A missing database for an existing board is not an
 empty board; a fresh named-board setup may still have no synthesized default database.
 Plugin restart preserves missing, empty, damaged or unreadable existing native data. Native
-operations inspect through the host's tracked read-only SQLite connection when native
-handles are live, or a disposable snapshot copied under its atomic offline-file guard.
-Inspection preserves native transaction locks; EXCLUSIVE contention refuses inspection
-after a finite timeout. Startup never initializes an existing file. Authorized issue reads remain available even
+operations inspect through the host's tracked read-only SQLite connections and read
+transactions. SQLite supplies consistent committed snapshots and preserves transaction
+locks across processes; contention refuses inspection after a finite timeout. Reads never
+initialize, migrate, repair or change committed database, WAL or event data. SQLite may
+create or update its standard `-shm` WAL-index cache and empty `-wal` bookkeeping file.
+Startup never initializes an existing file. Authorized issue reads remain available even
 when native evidence is unavailable or outside the caller's board pin; that evidence and
 native mutations stay fenced. Restoring data needs no new activation marker or service reset.
 Agents creating issue-related native work should preserve the explicit issue line and use
