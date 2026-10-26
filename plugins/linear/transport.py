@@ -13,14 +13,81 @@ import stat
 import struct
 import threading
 from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 MAX_BYTES = 65536
-CONTEXT_FIELDS = ('profile', 'platform', 'session_key', 'session_id', 'run_generation')
-TRANSFER_FIELDS = ('browser_control_provider', 'browser_control_subject', 'user_message',
-                   'ui_session_id', 'api_control_principal', 'api_control_transport_family',
-                   'api_conversation_key')
+CONTEXT_FIELDS = ('home', 'profile', 'platform', 'source', 'session_key', 'session_id',
+                  'user_id', 'user_id_alt', 'chat_id', 'chat_type', 'thread_id', 'scope_id',
+                  'ui_session_id', 'delegated_child')
+
+@dataclass(frozen=True)
+class NativeContext:
+    home: str
+    profile: str
+    platform: str
+    source: str
+    session_key: str
+    session_id: str
+    user_id: str = ''
+    user_id_alt: str = ''
+    chat_id: str = ''
+    chat_type: str = ''
+    thread_id: str = ''
+    scope_id: str = ''
+    ui_session_id: str = ''
+    delegated_child: bool = False
+
+    def to_wire(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_wire(cls, value: Any, home: Path, profile: str) -> NativeContext:
+        if (not isinstance(value, dict) or set(value) != set(CONTEXT_FIELDS) or
+                any(not isinstance(v, str) or len(v) > 4096 for k, v in value.items() if k != 'delegated_child') or
+                type(value.get('delegated_child')) is not bool):
+            raise Unavailable('Linear request has no trusted native session context')
+        context = cls(**value)
+        if (context.home != str(Path(home).resolve(strict=True)) or context.profile != profile or
+                not context.platform or not context.session_key or not context.session_id):
+            raise Unavailable('Linear request belongs to another profile or has no native session')
+        return context
+
+
+def capture_context() -> NativeContext:
+    """Read the context actually bound by upstream producers, never model args or env fallbacks.
+
+    Upstream set_session_vars binds the named ContextVars for API and messaging turns. The
+    public bound_session_key excludes environment fallback; copy_context excludes it for every
+    other field too. Profile/home are independently resolved by the native host.
+    """
+    try:
+        from gateway.session_context import bound_session_key
+        from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import profile_matches_home
+        from agent.delegation_context import is_delegated_child_process_context
+        bound = {var.name: value for var, value in contextvars.copy_context().items()
+                 if var.name.startswith('HERMES_SESSION_') or var.name == 'HERMES_UI_SESSION_ID'}
+        key = bound_session_key()
+        def read(name):
+            value = bound.get(name)
+            if not isinstance(value, str):
+                raise Unavailable('The native host did not bind session context for this tool call')
+            return value
+        if not key or key != read('HERMES_SESSION_KEY'):
+            raise Unavailable('Linear needs a native host-bound session; model identity is not accepted')
+        fields = {name: read('HERMES_SESSION_' + name.removeprefix('session_').upper()) for name in
+                  ('platform', 'source', 'session_key', 'session_id', 'user_id', 'user_id_alt',
+                   'chat_id', 'chat_type', 'thread_id', 'scope_id')}
+        fields['ui_session_id'] = read('HERMES_UI_SESSION_ID')
+        fields['delegated_child'] = is_delegated_child_process_context()
+        home = Path(get_hermes_home()).resolve(strict=True)
+        profile = read('HERMES_SESSION_PROFILE') or 'default'
+        if not profile_matches_home(profile, home):
+            raise Unavailable('The native session profile does not match its Hermes home')
+        return NativeContext.from_wire({'home': str(home), 'profile': profile, **fields}, home, profile)
+    except (ImportError, OSError) as exc:
+        raise Unavailable('This Hermes host cannot provide native session/profile context') from exc
 
 class Unavailable(RuntimeError):
     pass
@@ -71,11 +138,11 @@ def request(home: Path, payload: dict[str, Any], *, timeout: float = 20.0) -> An
         raise
     except (OSError, ValueError) as exc:
         if sent:
-            raise Uncertain('Linear request may have been captured; reconcile ownership before retrying') from exc
+            raise Uncertain('Linear request may have been captured; inspect delivery before retrying with the same request id') from exc
         raise Unavailable('The Linear gateway service is not available on this profile') from exc
 
 class Server:
-    def __init__(self, home: Path, profile: str, chat: Callable, turn_end: Callable) -> None:
+    def __init__(self, home: Path, profile: str, chat: Callable) -> None:
         self.home = Path(home).resolve(strict=True)
         parent = _private_parent(self.home, create=True)
         self.path = parent / 'chat.sock'
@@ -101,33 +168,11 @@ class Server:
             if payload.get('home') != str(self.home):
                 raise ValueError('Linear request belongs to another profile home')
             if op == 'chat':
-                context = payload.get('context'); args = payload.get('args')
-                if not isinstance(context, dict) or set(context) != set(CONTEXT_FIELDS) or not isinstance(args, dict):
-                    raise ValueError('Linear request has no bound invocation context')
-                transfer_auth = payload.get('transfer_auth')
-                if args.get('action') in ('transfer', 'resume_transfer'):
-                    if not isinstance(transfer_auth, dict) or set(transfer_auth) != set(TRANSFER_FIELDS):
-                        raise ValueError('Linear transfer has no host instruction and identity')
-                    try:
-                        from gateway.chat_execution_recovery import ChatExecutionStore
-                    except ImportError:
-                        return json.dumps({'ok': False, 'code': 'capability_unavailable',
-                                           'message': 'This Agent runtime cannot verify a serialized chat turn.'})
-                    verifier = getattr(ChatExecutionStore(self.home), 'worker_process_matches', None)
-                    if not callable(verifier):
-                        return json.dumps({'ok': False, 'code': 'capability_unavailable',
-                                           'message': 'This Agent runtime cannot verify a serialized chat turn.'})
-                    if not verifier(context.get('session_key'), context.get('run_generation'),
-                                    context.get('session_id'), peer_pid):
-                        return json.dumps({'ok': False, 'code': 'unverified_host_turn',
-                                           'message': 'Transfer needs a current Agent worker in this profile.'})
-                    context = {**context, **transfer_auth, '_serialized_transport': True}
-                else:
-                    context = dict(context)
-                return chat(args, SimpleNamespace(**context))
-            if op == 'turn_end' and isinstance(payload.get('session_id'), str):
-                turn_end(payload['session_id'])
-                return {'ok': True}
+                context = NativeContext.from_wire(payload.get('context'), self.home, profile)
+                args = payload.get('args')
+                if not isinstance(args, dict):
+                    raise ValueError('Linear request args must be an object')
+                return chat(args, context)
             raise ValueError('Unknown Linear transport operation')
         class Handler(socketserver.StreamRequestHandler):
             def handle(inner):
@@ -173,10 +218,7 @@ class Server:
             pass
 
 def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
-    # Identity is copied from the immutable host argument, never from model args.
-    snapshot = {field: getattr(context, field, None) for field in CONTEXT_FIELDS}
-    payload = {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
-               'args': args, 'context': snapshot}
-    if args.get('action') in ('transfer', 'resume_transfer'):
-        payload['transfer_auth'] = {field: getattr(context, field, '') for field in TRANSFER_FIELDS}
-    return request(home, payload)
+    # Only capture_context() at the registered tool boundary produces this snapshot.
+    validated = NativeContext.from_wire(context.to_wire(), home, context.profile)
+    return request(home, {'op': 'chat', 'home': str(Path(home).resolve(strict=True)),
+                          'args': args, 'context': validated.to_wire()})

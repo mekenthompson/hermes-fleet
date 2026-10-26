@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 
 from linear_fake_api import load_plugin
 
@@ -158,14 +159,24 @@ class OwnIdentityCreateTests(unittest.TestCase):
             client.link_issue("OPS-1", "OTHER-2", "blocks")
         self.assertFalse(any(query.lstrip().startswith("mutation") for query in calls))
 
+    def test_authoritative_agent_session_wrong_app_is_refused_for_all_scopes(self):
+        from test_linear_specialist_authorization import Authority, SESSION, SCOPE
+        authority = Authority()
+        authority.sessions[SESSION]['appUser'] = {'id': 'foreign-app'}
+        for scope in (None, SCOPE, {**SCOPE, 'requester_basis': 'agent_session'}):
+            with self.subTest(scope=scope), self.assertRaises(LinearError):
+                authority.api(scope=scope).agent_session(SESSION)
+        self.assertEqual(authority.mutations, [])
+
     def test_chat_create_does_not_require_an_existing_issue_or_start_tracking(self) -> None:
         self.assertEqual(chat.SCHEMA["parameters"]["required"], ["action"])
         self.assertIn("create_issue", chat.SCHEMA["parameters"]["properties"]["action"]["enum"])
         self.assertIn("create_project", chat.SCHEMA["parameters"]["properties"]["action"]["enum"])
         self.assertIn("link_issue", chat.SCHEMA["parameters"]["properties"]["action"]["enum"])
 
-        class Context:
-            session_key, session_id, profile, platform, run_generation = "chat", "chat-id", "alpha", "telegram", 1
+        from hermes_fleet_linear_plugin.transport import NativeContext
+        context = NativeContext(home=str(Path.cwd()), profile="alpha", platform="telegram", source="telegram",
+                                session_key="chat", session_id="chat-id")
 
         class API:
             def create_issue(self, *args, **kwargs):
@@ -175,7 +186,7 @@ class OwnIdentityCreateTests(unittest.TestCase):
                 raise AssertionError("create must not look up or track an issue")
 
         class Bridge:
-            api, profile = API(), "alpha"
+            api, profile, profile_home = API(), "alpha", Path.cwd()
 
             def chat_profile_matches(self, profile, platform=""):
                 return profile == self.profile
@@ -183,7 +194,7 @@ class OwnIdentityCreateTests(unittest.TestCase):
             def status(self, *args, **kwargs):
                 raise AssertionError("create must not track")
 
-        reply = json.loads(chat.handle(Bridge(), {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "OPS"}, Context()))
+        reply = json.loads(chat.handle(Bridge(), {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "OPS"}, context))
         self.assertTrue(reply["ok"])
         self.assertIn("undelegated", reply["message"])
 

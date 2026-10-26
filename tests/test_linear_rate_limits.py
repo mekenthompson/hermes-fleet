@@ -108,23 +108,21 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_startup_cooldown_wait_can_be_stopped_without_admitting_work(self):
-        services = {}
         class Context:
             def get_config(self, key, default=None):
                 return {"enabled": True, "identity": {"viewer_id": "app-a", "organization_id": "org-a"}}.get(key, default)
             def register_tool(self, **kwargs): pass
             def register_hook(self, *args): pass
-            def register_profile_service(self, name, factory): services[name] = factory
-        plugin.register(Context())
+        context = Context()
         async def run(directory):
-            stop = asyncio.Event()
+            stop = threading.Event()
             loop = asyncio.get_running_loop()
             def limited(*args):
                 loop.call_soon_threadsafe(stop.set)
                 raise RateLimited(time.time() + 120)
             with patch.object(plugin.BoundLinearAPI, "viewer_id", side_effect=limited), patch.object(plugin, "Store") as store, \
                     patch.object(plugin, "token_provider", return_value=lambda: "t"):
-                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), stop_event=stop)), 5)
+                await asyncio.wait_for(plugin._reporting_loop(context, Path(directory), stop, {}), 5)
                 store.assert_not_called()
         with tempfile.TemporaryDirectory() as directory: asyncio.run(run(directory))
 
@@ -151,16 +149,15 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_startup_retries_identity_after_cooldown_before_recovery(self):
-        services, attempts = {}, []
+        attempts = []
         class Context:
             def get_config(self, key, default=None):
                 return {"enabled": True, "identity": {"viewer_id": "app-a", "organization_id": "org-a"}}.get(key, default)
             def register_tool(self, **kwargs): pass
             def register_hook(self, *args): pass
-            def register_profile_service(self, name, factory): services[name] = factory
-        plugin.register(Context())
+        context = Context()
         async def run(directory):
-            stop, bridge = asyncio.Event(), Mock()
+            stop, bridge = threading.Event(), Mock()
             def identity(api):
                 attempts.append(time.time())
                 if len(attempts) == 1: api.paused_until = time.time() + 0.01
@@ -170,8 +167,9 @@ class RateLimitTests(unittest.TestCase):
                 return bridge
             with patch.object(plugin.BoundLinearAPI, "verify_identity", identity), \
                     patch.object(plugin, "Bridge", side_effect=create_bridge), patch.object(plugin, "Kanban"), \
-                    patch.object(plugin, "token_provider", return_value=lambda: "t"):
-                await asyncio.wait_for(services["linear"](SimpleNamespace(profile_home=Path(directory), profile_name="alpha", stop_event=stop)), 5)
-                bridge.recover.assert_called_once()
+                    patch.object(plugin, "token_provider", return_value=lambda: "t"), \
+                    patch.dict(__import__("sys").modules, {"hermes_cli.profiles": SimpleNamespace(get_active_profile_name=lambda: "default")}):
+                await asyncio.wait_for(plugin._reporting_loop(context, Path(directory), stop, {}), 5)
+                bridge.recover.assert_not_called()
             self.assertGreaterEqual(attempts[1] - attempts[0], 0.01)
         with tempfile.TemporaryDirectory() as directory: asyncio.run(run(directory))

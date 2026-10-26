@@ -30,6 +30,7 @@ class FakeContext:
     def __init__(self, settings: dict) -> None:
         self.settings, self.tools, self.hooks, self.services = settings, [], [], []
         self.cli_commands, self.commands = [], []
+        self.unloads = []
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
@@ -40,8 +41,8 @@ class FakeContext:
     def register_hook(self, name, callback):
         self.hooks.append(name)
 
-    def register_profile_service(self, name, factory):
-        self.services.append(name)
+    def on_unload(self, callback):
+        self.unloads.append(callback)
 
     def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
         self.cli_commands.append(name)
@@ -118,12 +119,13 @@ class LinearPluginUnitTests(unittest.TestCase):
         on = FakeContext({"enabled": True})
         plugin.register(on)
         self.assertEqual([t["name"] for t in on.tools], ["linear"])
-        self.assertTrue(on.tools[0]["inject_invocation_context"])
+        self.assertNotIn("inject_invocation_context", on.tools[0])
         self.assertIn("update_description", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])
         self.assertIn("add_comment", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])
         self.assertIn("expected_description", on.tools[0]["schema"]["parameters"]["properties"])
-        self.assertIn("headings", on.tools[0]["schema"]["parameters"]["properties"]["body"]["description"])
-        self.assertEqual((on.hooks, on.services), (["on_session_end"], ["linear"]))
+        self.assertIn("execution grant", on.tools[0]["schema"]["parameters"]["properties"]["body"]["description"])
+        self.assertNotIn("on_session_end", on.hooks)
+        self.assertEqual(on.services, [])
         self.assertEqual((on.cli_commands, on.commands), (["linear"], ["linear-status"]))
         self.assertEqual((idle.cli_commands, idle.commands), ([], []))
         contract = json.loads((ROOT / "contracts" / "plugins.json").read_text(encoding="utf-8"))
@@ -131,7 +133,7 @@ class LinearPluginUnitTests(unittest.TestCase):
 
     def test_production_file_inventory(self) -> None:
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
-                         ["README.md", "__init__.py", "admission.py", "api.py", "bridge.py", "chat.py", "chat_transfer.py", "oauth.py", "ops.py", "plugin.yaml",
+                         ["README.md", "__init__.py", "api.py", "bridge.py", "chat.py", "oauth.py", "ops.py", "plugin.yaml",
                           "store.py", "transport.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:
@@ -279,51 +281,13 @@ class LinearPluginUnitTests(unittest.TestCase):
                 db.execute("INSERT INTO work VALUES ('i', 'chat', 'chat-key', NULL, NULL, 0)")
             store = Store(path)
             self.assertEqual(store.get("i")["stop_requested_at"], 0)
-            store.update("i", panel_note="Need input", stop_requested_at=123)
+            store.update("i", panel_note="Need input")
+            with self.assertRaises(ValueError):
+                store.update("i", stop_requested_at=0)
             self.assertEqual(Store(path).get("i")["panel_note"], "Need input")
 
-    def test_legacy_chat_generation_stays_null_and_kanban_cannot_be_targeted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.db"
-            with sqlite3.connect(path) as db:
-                db.execute("CREATE TABLE work (issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, "
-                           "owner_ref TEXT NOT NULL, task_id TEXT, project_id TEXT, "
-                           "last_updated_at REAL NOT NULL DEFAULT 0)")
-                db.execute("INSERT INTO work VALUES ('old', 'chat', 'chat-key', NULL, NULL, 0)")
-            store = Store(path)
-            self.assertIsNone(store.get("old")["run_generation"])
-            self.assertIsNone(store.capture_chat_stop("old", "linear-s", "activity-1", "alpha", at=100))
-            store.put("board", "kanban", "linear-s", task_id="task")
-            self.assertIsNone(store.capture_chat_stop("board", "linear-s", "activity-2", "alpha", at=100))
 
-    def test_stop_intent_is_durable_idempotent_and_keeps_original_generation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.db"
-            store = Store(path)
-            store.put("i", "chat", "chat-key", run_generation=7)
-            store.update("i", linear_session_id="linear-s")
-            first = store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=100)
-            self.assertEqual(first["run_generation"], 7)
-            self.assertEqual(first["session_key"], "chat-key")
-            store.update("i", run_generation=8)
-            self.assertEqual(store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=101)["id"], first["id"])
-            self.assertEqual(Store(path).stop_intents()[0]["run_generation"], 7)
-            self.assertEqual(len(store.stop_intents()), 1)
 
-    def test_stop_guard_rolls_back_if_intent_insert_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.db"
-            store = Store(path)
-            store.put("i", "chat", "chat-key", run_generation=7)
-            store.update("i", linear_session_id="linear-s")
-            with sqlite3.connect(path) as db:
-                db.execute("CREATE TRIGGER fail_stop BEFORE INSERT ON chat_stop BEGIN "
-                           "SELECT RAISE(ABORT, 'synthetic crash'); END")
-            with self.assertRaises(sqlite3.IntegrityError):
-                store.capture_chat_stop("i", "linear-s", "activity-1", "alpha", at=100, stamp=100_000)
-            self.assertEqual(store.get("i")["stop_requested_at"], 0)
-            self.assertEqual(store.stop_intents(), [])
-            self.assertEqual(store.pending(), [])
 
 
 
@@ -414,98 +378,6 @@ class ConnectOAuthTests(unittest.TestCase):
 RESTART = "[Linear] The gateway restarted while you were working on a Linear issue."
 
 
-class ChatRestartRecoveryTests(unittest.TestCase):
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.clock = Clock()
-        self.linear = FakeLinear(self.clock)
-        self.addCleanup(self.linear.close)
-        self.linear.add_issue("iss-1", "ABC-1")
-        self.linear.set_delegate("iss-1", {"id": SELF, "name": "This Agent"})
-        self.linear.set_state("iss-1", "Blocked")
-        self.store = Store(Path(tmp.name) / "state.db")
-        self.injected: list[str] = []
-        self.inject_ok = True
-        api = linear_api.LinearAPI(lambda: "synthetic-token", endpoint=self.linear.url, clock=self.clock)
-        self.bridge = Bridge(self.store, api, None, profile="alpha", inject=self._inject, clock=self.clock)
-
-    def _inject(self, _key: str, text: str) -> bool:
-        self.injected.append(text)
-        return self.inject_ok
-
-    def _own(self) -> None:
-        self.assertTrue(self.store.put("iss-1", "chat", "chat-key", run_generation=4))
-
-    def _status(self, state: str, at: float, *, sent: bool = True, failed: bool = False) -> str:
-        row_id = self.store.enqueue("status", {"issue_id": "iss-1", "state": state, "session_key": "chat-key"}, at=at)
-        self.assertTrue(row_id)
-        if failed:
-            self.store.mark(row_id, "failed")
-        elif sent:
-            self.store.mark_sent(row_id, True)
-        return row_id
-
-    def _restarts(self) -> list[str]:
-        return [text for text in self.injected if text.startswith(RESTART)]
-
-    def test_blocked_closeout_is_not_reinjected_across_restarts(self) -> None:
-        self._own()
-        self._status("in_progress", 10)
-        for at, sent, failed in ((20, False, False), (30, True, False), (40, False, True)):
-            self.injected.clear()
-            self._status("blocked", at, sent=sent, failed=failed)
-            self.bridge._recover_chats()
-            self.bridge._recover_chats()
-            with self.subTest(at=at, sent=sent, failed=failed):
-                self.assertEqual(self._restarts(), [])
-                self.assertIsNotNone(self.store.get("iss-1"))
-                self.assertEqual(self.store.get("iss-1")["owner_ref"], "chat-key")
-
-    def test_successful_restart_notice_is_delivered_once_per_execution(self) -> None:
-        self.linear.set_state("iss-1", "In Progress")
-        self._own()
-        self._status("in_progress", 10)
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 1)
-        self._status("in_progress", 20)
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 2)
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 2)
-
-    def test_lost_session_is_not_retried_after_the_row_is_released(self) -> None:
-        self.linear.set_state("iss-1", "In Progress")
-        self._own()
-        self._status("in_progress", 10)
-        self.inject_ok = False
-        self.bridge._recover_chats()
-        self.assertIsNone(self.store.get("iss-1"))
-        delivered = len(self.injected)
-        self.inject_ok = True
-        self.bridge._recover_chats()
-        self.assertEqual(len(self.injected), delivered)
-
-    def test_new_execution_after_blocked_closeout_notifies_once(self) -> None:
-        self._own()
-        self._status("blocked", 10)
-        self.bridge._recover_chats()
-        self.assertEqual(self._restarts(), [])
-        self.linear.set_state("iss-1", "In Progress")
-        self._status("in_progress", 20)
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        self.assertEqual(len(self._restarts()), 1)
-
-    def test_paused_stop_notice_is_delivered_once(self) -> None:
-        self._own()
-        self.assertTrue(self.store.update("iss-1", stop_requested_at=5))
-        self.bridge._recover_chats()
-        self.bridge._recover_chats()
-        stops = [text for text in self.injected if text.startswith("[Linear] Stop was requested")]
-        self.assertEqual(len(stops), 1)
-        self.assertEqual(self._restarts(), [])
 
 
 if __name__ == "__main__":

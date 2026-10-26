@@ -24,12 +24,14 @@ class _Context:
     session_key = session_id = "chat"
     profile = "alpha"
     platform = "slack"
-    run_generation = 1
+    home = "/synthetic/native-home"
 
 
 class _Bridge:
     def __init__(self, api) -> None:
         self.api = api
+        self.profile = "alpha"
+        self.profile_home = _Context.home
 
     def chat_profile_matches(self, profile, platform=""):
         return True
@@ -74,7 +76,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
             with self.assertRaises(linear_api.LinearError) as caught:
                 api.graphql("query Marked { viewer { id } }")
             lookup = json.loads(chat.handle(
-                _Bridge(api), {"action": "start", "issue": "ABC-1"}, _Context()))
+                _Bridge(api), {"action": "status", "issue": "ABC-1"}, _Context()))
             created = json.loads(chat.handle(
                 _Bridge(api),
                 {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "HF"},
@@ -115,7 +117,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
         logger, handler, records, previous = self._records()
         try:
             reply = json.loads(chat.handle(
-                _Bridge(api), {"action": "start", "issue": "ABC-1"}, _Context()))
+                _Bridge(api), {"action": "status", "issue": "ABC-1"}, _Context()))
         finally:
             self._release(logger, handler, previous)
 

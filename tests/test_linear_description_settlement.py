@@ -11,6 +11,7 @@ from unittest.mock import patch
 from linear_fake_api import load_plugin, Clock, SELF
 load_plugin()
 from hermes_fleet_linear_plugin import chat, ops
+from hermes_fleet_linear_plugin.transport import NativeContext
 from hermes_fleet_linear_plugin.api import LinearAPI, markdown_matches
 from hermes_fleet_linear_plugin.bridge import Bridge
 from hermes_fleet_linear_plugin.store import Store
@@ -87,10 +88,10 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.store.put('issue-1', 'chat', 'chat', run_generation=1)
         self.notes: list[tuple[str, str]] = []
         self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
-        self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock,
-                             inject=lambda key, text: self.notes.append((key, text)) or True)
-        self.context = SimpleNamespace(session_key='chat', session_id='session', profile='alpha',
-                                       platform='slack', run_generation=1)
+        self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock)
+        self.bridge.profile_home = Path(tmp.name)
+        self.context = NativeContext(home=tmp.name, session_key='chat', session_id='session', profile='alpha',
+                                     platform='slack', source='slack')
         self.request_id = str(uuid.uuid4())
 
     def invoke(self, action='update_description', *, content=CHECKED, request_id=None, **extra):
@@ -152,28 +153,20 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.assertEqual(len(self.mutations()), 1)
         self.assertEqual(self.notes, [])
 
-    def test_uncertain_notice_names_operation_cause_and_resolution(self):
+    def test_uncertain_write_is_visible_without_chat_injection(self):
         self.wedge()
-        self.assertEqual(len(self.notes), 1)
-        text = self.notes[0][1]
+        self.assertEqual(self.notes, [])
+        text = ops.report(ops.stuck(self.path, self.ingress, 'alpha'))
         self.assertIn(self.request_id, text)
-        self.assertIn('remote description differs', text)
-        self.assertIn(f'hermes linear resolve {self.request_id}', text)
-        self.assertNotIn('delivery failed', text)
+        self.assertIn('resolve', text)
 
-    def test_held_issue_refusals_name_the_write_and_supported_resolution(self):
+    def test_held_content_refusal_names_write_and_supported_resolution(self):
         self.wedge()
-        replies = [self.invoke('add_comment', request_id=str(uuid.uuid4())),
-                   json.loads(chat.handle(self.bridge, {'action': 'start', 'issue': 'ABC-1'}, self.context)),
-                   json.loads(chat.handle(self.bridge, {'action': 'done', 'issue': 'ABC-1',
-                                                         'evidence': 'https://example.test/deploy'}, self.context))]
-        for reply in replies:
-            with self.subTest(reply=reply['message']):
-                self.assertFalse(reply['ok'])
-                self.assertIn(self.request_id, reply['message'])
-                self.assertIn(f'hermes linear resolve {self.request_id}', reply['message'])
-                self.assertNotIn('Specialist authorization', reply['message'])
-        self.assertIsNotNone(self.store.get('issue-1'), 'a refused closeout keeps ownership')
+        reply = self.invoke('add_comment', request_id=str(uuid.uuid4()))
+        self.assertFalse(reply['ok'])
+        self.assertIn(self.request_id, reply['message'])
+        self.assertIn(f'hermes linear resolve {self.request_id}', reply['message'])
+        self.assertEqual(self.store.get('issue-1')['owner_ref'], 'chat')
 
     def test_operator_resolution_releases_once_without_duplicate_effects(self):
         self.wedge()

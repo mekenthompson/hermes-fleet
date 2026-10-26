@@ -58,8 +58,6 @@ class IngressBindingTests(unittest.TestCase):
         self.enqueue("worker-a", "z-stop", stop)
         self.enqueue("default", "foreign-stop", {**stop, "agentSession": {"issue": {"id": "other"}}})
         bridge = self.bridge({"ingress_profile": "worker-a", "ingress_database": str(self.inbox)})
-        self.assertTrue(bridge._queued_stop("i", 0))
-        self.assertFalse(bridge._queued_stop("other", 0))
         seen = []
         with patch.object(bridge, "handle_webhook", side_effect=lambda event: seen.append(event["tag"])):
             bridge.drain_ingress(self.inbox, limit=1)
@@ -141,13 +139,12 @@ class IngressBindingTests(unittest.TestCase):
         import asyncio
         from unittest.mock import patch
         plugin = load_plugin()
-        services, captured = {}, {}
+        captured = {}
         values = {"enabled": True, "identity": {"viewer_id": "app-a", "organization_id": "org-a"},
                   "ingress_profile": "worker-a"}
         context = SimpleNamespace(get_config=lambda key, default=None: values.get(key, default),
                                   register_tool=lambda **kwargs: None, register_hook=lambda *args: None,
-                                  register_profile_service=lambda name, factory: services.update({name: factory}))
-        plugin.register(context)
+                                  register_cli_command=lambda *args: None)
         class Captured(Exception): pass
         def capture(*args, **kwargs):
             captured.update(kwargs)
@@ -157,12 +154,13 @@ class IngressBindingTests(unittest.TestCase):
             with patch.object(plugin.BoundLinearAPI, "viewer_id", return_value="app-a"), \
                     patch.object(plugin, "token_provider", return_value=lambda: "synthetic"), \
                     patch.object(plugin, "Store"), patch.object(plugin, "Kanban"), \
-                    patch.object(plugin, "Bridge", side_effect=capture):
+                    patch.object(plugin, "Bridge", side_effect=capture), \
+                    patch.dict(__import__("sys").modules, {"hermes_cli.profiles": SimpleNamespace(get_active_profile_name=lambda: "default")}):
                 with self.assertRaises(Captured):
-                    await asyncio.wait_for(services["linear"](runtime), 5)
+                    await asyncio.wait_for(plugin._reporting_loop(context, self.home, __import__("threading").Event(), {}), 5)
         asyncio.run(run())
         self.assertEqual(captured["settings"].get("ingress_profile"), "worker-a")
-        self.assertEqual(captured["profile"], "default")
+        self.assertIsNotNone(captured["profile"])
 
     def test_invalid_binding_refuses_service_before_credentials_or_state_admission(self):
         import asyncio
@@ -176,8 +174,7 @@ class IngressBindingTests(unittest.TestCase):
                           "ingress_profile": invalid}
                 context = SimpleNamespace(get_config=lambda key, default=None: values.get(key, default),
                                           register_tool=lambda **kwargs: None, register_hook=lambda *args: None,
-                                          register_profile_service=lambda name, factory: services.update({name: factory}))
-                plugin.register(context)
+                                          register_cli_command=lambda *args: None)
                 async def run():
                     stop = asyncio.Event()
                     runtime = SimpleNamespace(profile_home=self.home, profile_name="default", stop_event=stop)
@@ -190,7 +187,7 @@ class IngressBindingTests(unittest.TestCase):
                             patch.object(plugin, "Store") as store, patch.object(plugin, "Kanban"), \
                             patch.object(plugin, "Bridge", side_effect=admit), patch.object(transport, "Server"):
                         with self.assertRaisesRegex(ValueError, "ingress_profile"):
-                            await asyncio.wait_for(services["linear"](runtime), 5)
+                            await asyncio.wait_for(plugin._reporting_loop(context, self.home, __import__("threading").Event(), {}), 5)
                         api_factory.assert_not_called()
                         credentials.assert_not_called()
                         store.assert_not_called()

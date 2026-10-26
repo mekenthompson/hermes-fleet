@@ -1,7 +1,7 @@
 name: linear
 kind: standalone
-version: 1.0.0
-description: Linear as the human work record; this profile's Kanban board runs the work
+version: 2.0.0
+description: Linear records and reporting linked to native Hermes tasks
 author: Hermes Fleet Contributors
 provides_tools:
   - linear
