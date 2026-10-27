@@ -216,7 +216,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     source = "saved_native_binding" if bound else "native_history_discovery"
     bound, reader = _discover(home, issue, native_profile, native_profile, metadata, bound)
     path = kb.kanban_db_path(board=bound["board"]).resolve(strict=True)
-    receipts, owners, worker_evidence = [], [], []
+    receipts, owners, worker_evidence, native_lineages = [], [], [], []
     with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
         from .bridge import task_issue_match, native_text_row
         with db._read_ctx() as native:
@@ -315,10 +315,16 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      "native_admission_not_settled")
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
-            _require(all(r["status"] == "terminal" and r.get("outcome") in _SETTLED_ADMISSION_OUTCOMES
-                         for r in list_session_admissions(db, session_id=sid, pending_only=False)), "native_session_has_unsettled_work")
             with db._read_ctx() as native:
+                children = native.execute("SELECT execution_id,session_id,status FROM worker_executions WHERE execution_id>=? AND execution_id<?",
+                                          descendant_range("admission-worker:" + admission["admission_id"])).fetchall()
+                _require(all(child["status"] == "terminal" for child in children), "native_child_spawner_unsettled")
+                roots = {sid, *(child["session_id"] for child in children)}
+                # Admissions and Stop markers use exact session IDs; neither
+                # their helpers nor a settled parent discharge a physical child.
                 lineage = runtime_lineage(native, sid)
+                for target in roots - {sid}:
+                    lineage.update(runtime_lineage(native, target))
                 # Validate every retained owned row before the native active-only
                 # filter. These are worker_executions' canonical CHECK states;
                 # a corrupted/future status is not evidence of settlement.
@@ -326,17 +332,20 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                              for row in native.execute("SELECT status FROM worker_executions "
                                  "WHERE session_id IN (SELECT value FROM json_each(?))",
                                  (json.dumps(sorted(lineage)),))), "native_worker_state_unreadable")
-                _require(not worker_states(native, sid), "native_worker_or_spawner_unsettled")
+                _require(not any(worker_states(native, target) for target in roots), "native_worker_or_spawner_unsettled")
                 executor = native.execute("SELECT status,owner_epoch,generation FROM worker_executions WHERE execution_id=?",
                                           ("admission-worker:" + admission["admission_id"],)).fetchone()
                 _require(executor and tuple(executor) == ("terminal", admission["owner_epoch"], admission["generation"]),
                          "native_executor_settlement_missing")
-                children = native.execute("SELECT session_id,status FROM worker_executions WHERE execution_id>=? AND execution_id<?",
-                                          descendant_range("admission-worker:" + admission["admission_id"])).fetchall()
-                _require(all(child["status"] == "terminal" for child in children), "native_child_spawner_unsettled")
                 epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
                 _require(epoch is not None, "native_owner_unknown")
-            _require(getter(db, sid) is None, "native_stop_checkpoint_pending")
+            retained = [row for target in sorted(lineage)
+                        for row in list_session_admissions(db, session_id=target, pending_only=False)]
+            _require(all(row["status"] == "terminal" and row.get("outcome") in _SETTLED_ADMISSION_OUTCOMES
+                         for row in retained), "native_session_has_unsettled_work")
+            _require(all(getter(db, target) is None for target in lineage), "native_stop_checkpoint_pending")
+            native_lineages.append({"sessions": sorted(lineage), "admissions": retained,
+                                    "children": [dict(child) for child in children]})
             relevant = [e for e in events if e["run_id"] == run_id and e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
             _require(any(e["kind"] == "worker_bound" for e in relevant)
                      and any(e["kind"] in {"spawned", "worker_registered"} for e in relevant), "worker_binding_evidence_missing")
@@ -363,7 +372,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                       "stop_checkpoint": "clear", "scope": declared, "discovery_source": source,
                       "owner_epoch": epoch[0], "owner_instance_id": epoch[1]}
         digest = origin._digest({"binding": bound, "task": dict(task), "events": [dict(e) for e in events], "runs": [dict(run) for run in runs],
-                                 "receipts": receipts, "projection": projection})
+                                 "receipts": receipts, "native_lineages": native_lineages, "projection": projection})
         return projection, receipts, digest
 
 
