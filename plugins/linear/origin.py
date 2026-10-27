@@ -119,13 +119,15 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
 def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
          context: NativeContext | None = None, api=None) -> dict:
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:
-        _refuse("Native origin inspection needs the synchronous tool or owner CLI boundary.")
-    try:
-        return asyncio.run(_inspect(home, profile, declared_scope, ref, context, api))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            run = asyncio.run
+        else:
+            # Provider SDKs can call a synchronous tool from their own event loop.
+            # Reuse Core's bounded bridge, which preserves native profile context.
+            from model_tools import _run_async as run
+        return run(_inspect(home, profile, declared_scope, ref, context, api))
     except Unavailable:
         raise
     except (RuntimeError, OSError, ValueError, ImportError, KeyError, TypeError, sqlite3.DatabaseError) as exc:
