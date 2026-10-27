@@ -1460,3 +1460,62 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         with patch("hermes_cli.process_identity.worker_birth", side_effect=[worker_birth(psutil.Process()), worker_birth(psutil.Process()) + 1]):
             self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+
+    async def test_cleanup_accepts_actual_settled_admission_and_control_outcomes(self):
+        from hermes_state_runtime import (admit_session_input, claim_session_input,
+            list_session_admissions, settle_session_input, steer_session_input)
+        await self.stopped_issue()
+        self.cancelled_control()
+        for outcome in ("completed", "interrupted", "rejected", "failed"):
+            with self.subTest(outcome=outcome):
+                receiving = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                    principal_id=self.conn.actor.subject, session_id=self.sid, request_id="settled-history-" + outcome,
+                    payload={"text": "Finite native history outcome"})
+                claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+                self.assertEqual(claimed["admission_id"], receiving["admission_id"])
+                transferred = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                    principal_id=self.conn.actor.subject, session_id=self.sid, request_id="transfer-history-" + outcome,
+                    payload={"text": "Finite bounded clarification"})
+                steer_session_input(self.authority.db, epoch=self.authority.epoch,
+                    admission_id=transferred["admission_id"], generation=claimed["generation"])
+                # A terminal row carrying a live native steering transfer is still held.
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                settle_session_input(self.authority.db, epoch=self.authority.epoch,
+                    admission_id=receiving["admission_id"], generation=claimed["generation"], outcome=outcome,
+                    _transfers={transferred["admission_id"]: True})
+                self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        retained = list_session_admissions(self.authority.db, session_id=self.sid, pending_only=False)
+        self.assertEqual({row["outcome"] for row in retained},
+                         {"completed", "interrupted", "rejected", "failed", "cancelled", "steered"})
+
+    async def test_cleanup_malformed_or_independent_unknown_admission_outcome_is_held(self):
+        from hermes_state_runtime import (admit_session_input, claim_session_input,
+            list_session_admissions, settle_session_input)
+        await self.stopped_issue()
+        control = self.cancelled_control()
+        for outcome in (None, "unknown", "unrecognized-state", "steering", "", "COMPLETED", b"completed", b"\xff", 123):
+            with self.subTest(outcome=outcome):
+                self.authority.db._execute_write(lambda conn: conn.execute(
+                    "UPDATE session_admissions SET outcome=? WHERE admission_id=?", (outcome, control["admission_id"])))
+                result = await self.cleanup_inspected()
+                self.assertFalse(result["quiescence_proven"])
+                self.assertEqual(result["reason"], "native_session_has_unsettled_work")
+                self.assertFalse(result["permission_granted"])
+        # A later legitimate completion cannot discharge an independently unknown row.
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET outcome='unknown' WHERE admission_id=?", (control["admission_id"],)))
+        valid = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            principal_id=self.conn.actor.subject, session_id=self.sid, request_id="later-valid-history",
+            payload={"text": "Finite later native completion"})
+        claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+        self.assertEqual(claimed["admission_id"], valid["admission_id"])
+        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+            admission_id=valid["admission_id"], generation=claimed["generation"], outcome="completed")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (control["admission_id"],)))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        bad = [row for row in list_session_admissions(self.authority.db, session_id=self.sid, pending_only=False)
+               if row["admission_id"] == control["admission_id"]]
+        self.assertEqual((bad[0]["status"], bad[0]["outcome"]), ("unknown", "unknown"))

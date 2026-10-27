@@ -24,6 +24,14 @@ _SETTLED_RUN_STATUSES = frozenset({
 })
 
 
+# Native hermes_state_runtime writers: settle_session_input,
+# cancel_session_input and settle_steer_transfers. STEERING is in-flight even
+# though its row is terminal; unknown or future outcomes are not settlement.
+_SETTLED_ADMISSION_OUTCOMES = frozenset({
+    "completed", "interrupted", "rejected", "failed", "cancelled", "steered",
+})
+
+
 class Unknown(RuntimeError):
     pass
 
@@ -268,7 +276,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      "native_admission_not_settled")
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
-            _require(all(r["status"] == "terminal" and r.get("outcome") not in {"steering"}
+            _require(all(r["status"] == "terminal" and r.get("outcome") in _SETTLED_ADMISSION_OUTCOMES
                          for r in list_session_admissions(db, session_id=sid, pending_only=False)), "native_session_has_unsettled_work")
             with db._read_ctx() as native:
                 lineage = runtime_lineage(native, sid)

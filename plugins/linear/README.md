@@ -386,8 +386,11 @@ key or conflicting event/run ownership can be treated as positive foreign eviden
 
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
-terminal native admissions and worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. Worker births use the actual current native
+terminal native admissions with recognized settled outcomes and worker/child ledger,
+confirmed clear native Stop checkpoints, and recorded interpreter and
+submitter identities proven gone or recycled. A terminal label with a missing, unknown or
+unrecognized outcome remains held; native cancelled and settled steering histories do not
+clear any other run, worker, scope or Stop obligation. Worker births use the actual current native
 instantiation epoch and native birth validation/comparison. Positive reuse of a live PID
 also requires this exact attempt's fully matched original native `owner_admitted` PID and
 `worker_birth` receipt. A legacy fingerprint cannot distinguish historical Linux boot ticks
