@@ -382,9 +382,12 @@ rules as ordinary discovery, without creating or adopting a reporting link. Opti
 issue metadata for explicit marker matching; it is discovery data and grants no authority.
 Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown. Existing
 saved links never skip native discovery across retained boards. Another matching executor,
-including archived work, holds proof. The selected board's strict SDK history, predicate-key
-preflight and native event decoding share one tracked read transaction. Native-normalized
-owned keys must agree with SQLite's actual task/run predicates before filtering; a readable
+including archived work, holds proof. The selected board's strict SDK history, current task
+issue-scope check, predicate-key preflight and native event decoding share one tracked read
+transaction. An explicit conflicting issue marker stays unknown even when a saved link or
+idempotency key selects that task. Marker-free
+authorized manual links and repeated matching canonical ID/identifier aliases remain valid.
+Native-normalized owned keys must agree with SQLite's actual task/run predicates before filtering; a readable
 BLOB alias is unknown rather than an omitted attempt. The checks preserve raw SQLite
 equality/order and unrelated readable foreign records, without repairing any keys.
 No filtered-out opaque key or conflicting event/run ownership is positive foreign evidence.

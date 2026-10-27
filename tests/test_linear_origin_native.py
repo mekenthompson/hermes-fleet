@@ -302,7 +302,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["policy"]["cwd"], cwd)
         self.assertFalse(evidence["permission_granted"])
 
-    async def kanban(self, *, existing=False):
+    async def kanban(self, *, existing=False, idempotency_key=None):
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import _sqlite_connect
         if not existing:
@@ -318,7 +318,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(self.board.close)
             self.task_id = kb.create_task(self.board, title="Take over ABC-1", body="Finish the remaining checks",
                 assignee="default", created_by="fixture-agent", tenant="tenant", workspace_kind="dir",
-                workspace_path=str(self.home), skills=[])
+                workspace_path=str(self.home), skills=[], idempotency_key=idempotency_key)
         task = kb.claim_task(self.board, self.task_id, claimer="fixture-host:CLAIM_PRIVATE_SENTINEL")
         self.assertIsNotNone(task)
         self.work_context = {"board": "default", "db": str(self.board_path), "task_id": task.id,
@@ -371,13 +371,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertLess(old, worker_birth(psutil.Process()))
         return old
 
-    async def stopped_issue(self, *, existing=False):
+    async def stopped_issue(self, *, existing=False, idempotency_key=None):
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         from hermes_fleet_linear_plugin.store import Store
         from gateway import session_ancillary
-        await self.kanban(existing=existing)
+        await self.kanban(existing=existing, idempotency_key=idempotency_key)
         # Finite native state fixtures: real register/adopt/finish and admission settlement;
         # no actual model, process launch, owner bootstrap or production Stop.
         executor = "admission-worker:" + self.admission
@@ -407,11 +407,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         getter.start()
         self.addCleanup(getter.stop)
 
-    async def cleanup_inspected(self, *, stop_id=None):
+    async def cleanup_inspected(self, *, stop_id=None, metadata=None):
         from agent import runtime_session_store
         with patch.object(runtime_session_store, "_worker_process", False):
             return await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default",
-                                           self.stop_id if stop_id is None else stop_id, self.settings)
+                                           self.stop_id if stop_id is None else stop_id, self.settings, metadata)
 
     def cancelled_control(self):
         """Pinned-fae final-row adapter for candidate c9b8ad4's atomic Stop writer.
@@ -678,6 +678,102 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.settings, {"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue"})
         self.assertEqual(result["reason"], "native_history_match_missing_or_ambiguous")
         self.assertIsNone(self.linear_store.get("issue-one"))
+
+    async def test_cleanup_task_scope_holds_saved_and_idempotency_conflicts(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue(idempotency_key="linear:issue-one")
+        metadata = {"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue/ABC-1"}
+        own = "Linear issue ABC-1: " + metadata["url"]
+        conflicts = ["Linear issue OTHER-2: https://linear.example/issue/OTHER-2",
+                     own + "\nLinear issue OTHER-2: https://linear.example/issue/OTHER-2",
+                     "Linear issue ABC-1: https://linear.example/issue/other"]
+        for body in conflicts:
+            with self.subTest(body=body):
+                self.assertTrue(kb.edit_task(self.board, self.task_id, body=body))
+                before = [tuple(row) for row in self.board.execute("SELECT * FROM tasks")]
+                evidence = await self.cleanup_inspected(metadata=metadata)
+                self.assertEqual(evidence["reason"], "native_task_issue_scope_conflict")
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertFalse(evidence["permission_granted"])
+                self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM tasks")], before)
+        # A native idempotency key still selects the conflicting executor when
+        # no reporting link exists; explicit conflict must not become absence.
+        with self.linear_store._tx() as db:
+            db.execute("DELETE FROM metadata WHERE key='native-binding:issue-one'")
+            db.execute("DELETE FROM work WHERE issue_id='issue-one'")
+        self.assertEqual((await self.cleanup_inspected(metadata=metadata))["reason"], "native_task_issue_scope_conflict")
+
+    async def test_cleanup_task_scope_preserves_manual_alias_and_foreign_controls(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _set_worker_pid
+        await self.stopped_issue()
+        metadata = {"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue/ABC-1"}
+        foreign = kb.create_task(self.board, title="Foreign retained work", assignee="default",
+            idempotency_key="linear:another-issue", body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
+        claimed = kb.claim_task(self.board, foreign, claimer="fixture-foreign-worker")
+        _set_worker_pid(self.board, foreign, os.getpid(), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        for body in ("Manual work with an incidental OTHER-2 reference",
+                     "\n".join(["Linear issue issue-one: " + metadata["url"],
+                                 "Linear issue ABC-1: " + metadata["url"],
+                                 "Linear issue ABC-1: " + metadata["url"]])):
+            with self.subTest(body=body):
+                self.assertTrue(kb.edit_task(self.board, self.task_id, body=body))
+                before = [tuple(row) for row in self.board.execute("SELECT * FROM tasks")]
+                evidence = await self.cleanup_inspected(metadata=metadata)
+                self.assertTrue(evidence["quiescence_proven"], evidence)
+                self.assertFalse(evidence["permission_granted"])
+                self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM tasks")], before)
+        # Without independently supplied URL metadata, an explicit marker
+        # remains unproved; no parser or alias grammar is added by cleanup.
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_task_scope_conflict_arriving_after_discovery_is_unknown(self):
+        from contextlib import closing
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import _sqlite_connect
+        from hermes_fleet_linear_plugin.bridge import Kanban
+        await self.stopped_issue(idempotency_key="linear:issue-one")
+        discover = Kanban.discover
+        changed = False
+        def change_after_discovery(reader, issue):
+            nonlocal changed
+            found = discover(reader, issue)
+            if not changed:
+                changed = True
+                with closing(_sqlite_connect(self.board_path)) as writer:
+                    writer.row_factory = __import__("sqlite3").Row
+                    self.assertTrue(kb.edit_task(writer, self.task_id,
+                        body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
+            return found
+        with patch.object(Kanban, "discover", change_after_discovery):
+            evidence = await self.cleanup_inspected()
+        self.assertEqual(evidence["reason"], "native_task_issue_scope_conflict")
+
+    async def test_cleanup_task_scope_and_binding_changes_during_owner_receipt_are_unknown(self):
+        from hermes_cli import kanban_db as kb
+        import uuid
+        await self.stopped_issue()
+        def conflict(_method, _params):
+            self.before_rpc = None
+            self.assertTrue(kb.edit_task(self.board, self.task_id,
+                body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
+        self.before_rpc = conflict
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_task_issue_scope_conflict")
+        self.assertTrue(kb.edit_task(self.board, self.task_id, body="Authorized marker-free manual task"))
+        def same_scope_edit(_method, _params):
+            self.before_rpc = None
+            self.assertTrue(kb.edit_task(self.board, self.task_id, body="Updated authorized manual instruction"))
+        self.before_rpc = same_scope_edit
+        self.assertEqual((await self.cleanup_inspected())["reason"], "cleanup_evidence_changed")
+        def link_change(_method, _params):
+            self.before_rpc = None
+            revision = self.linear_store.binding_revision("issue-one")
+            self.assertIsNotNone(self.linear_store.replace_native_binding("issue-one", self.task_id, "default", "default",
+                expected_revision=revision, request_id=str(uuid.uuid4()), owner_ref="session-new",
+                requester_activity="activity-new", at=2))
+        self.before_rpc = link_change
+        self.assertEqual((await self.cleanup_inspected())["reason"], "cleanup_evidence_changed")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
     async def test_cleanup_foreign_binding_and_scope_fence_are_not_authority(self):
         await self.stopped_issue()
