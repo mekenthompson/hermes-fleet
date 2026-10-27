@@ -178,7 +178,7 @@ def _run(home, profile, declared, ref=None, context=None):
         return asyncio.run(_inspect(home, profile, declared, ref, context))
     except Unavailable:
         raise
-    except (RuntimeError, OSError, ValueError, ImportError, KeyError, TypeError, sqlite3.DatabaseError) as exc:
+    except (RuntimeError, OSError, ValueError, ImportError, KeyError, IndexError, TypeError, sqlite3.DatabaseError) as exc:
         raise Unavailable("Current native work evidence is unavailable; no permission was granted.") from exc
 
 
