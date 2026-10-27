@@ -413,6 +413,42 @@ class CleanupLineage(base.OriginScenarios):
             (foreign["admission_id"],)))
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
+    async def test_lineage_native_physical_admission_join_cannot_hide_behind_foreign_target(self):
+        import json
+        from gateway.session_settlement_recovery import _mark_unknown
+        from hermes_state_runtime import claim_session_input, _linked_worker_admission
+        await self.stopped_issue()
+        foreign = "foreign-logical-target"
+        self.authority.db.create_session(foreign, source="local")
+        row = self.admit(foreign, "foreign-target-physical-join")
+        claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=foreign)
+        self.assertEqual(row["admission_id"], claimed["admission_id"])
+        # Genuine foreign native work is outside this task's scope.
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def target_lineage(target):
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET lineage_json=? WHERE admission_id=?",
+                (json.dumps([target]), row["admission_id"])))
+        # Explicit retained identity fault: prove the actual native adoption
+        # predicate sees this as an owned physical claim before testing cleanup.
+        target_lineage(self.sid)
+        with self.authority.db._read_ctx() as conn:
+            linked = _linked_worker_admission(conn, self.sid, self.row["generation"], self.authority.epoch,
+                                              ("started", "unknown"))
+        self.assertEqual(linked["admission_id"], row["admission_id"])
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_session_has_unsettled_work")
+        self.assertEqual(_mark_unknown(self.authority, claimed), "unknown")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        target_lineage(foreign)
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET payload_json='not-json' WHERE admission_id=?", (row["admission_id"],)))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def arriving(_method, _params):
+            self.before_rpc = None
+            target_lineage(self.sid)
+        self.before_rpc = arriving
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_session_has_unsettled_work")
+
 
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(CleanupLineage(name) for name in loader.getTestCaseNames(CleanupLineage)
