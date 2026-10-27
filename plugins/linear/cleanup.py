@@ -41,6 +41,33 @@ def _require(value, reason):
         raise Unknown(reason)
 
 
+def _control_only_run(run, events, native_profile, stop_id):
+    """Recognize only the native block writer's never-claimed zero-duration row.
+
+    _end_run retains a real attempt's claim and worker identity. The native
+    _synthesize_ended_run instead inserts these fields as NULL, with one block
+    event and no claimed/admitted/worker history. Missing attempt evidence alone
+    is never a reason to exclude a run from execution checks.
+    """
+    from hermes_cli.kanban_db import BLOCK_RECURRENCE_LIMIT
+    if not (run["status"] == run["outcome"] == "blocked"
+            and run["profile"] in (None, native_profile) and run["step_key"] is None
+            and type(run["started_at"]) is int and run["started_at"] > 0
+            and type(run["ended_at"]) is int and run["ended_at"] == run["started_at"]
+            and isinstance(run["summary"], str) and bool(run["summary"])
+            and all(run[key] is None for key in ("claim_lock", "claim_expires", "worker_pid",
+                "worker_started_at", "max_runtime_seconds", "last_heartbeat_at", "metadata", "error"))):
+        return False
+    linked = [event for event in events if event["run_id"] == run["id"]]
+    if len(linked) != 1 or linked[0]["kind"] != "blocked" or linked[0]["id"] > stop_id:
+        return False
+    payload = json.loads(linked[0]["payload"])
+    return (set(payload) == {"kind", "source_status", "reason", "recurrences"}
+            and payload.get("kind") == "needs_input" and payload.get("source_status") in {"ready", "review"}
+            and type(payload.get("recurrences")) is int and 0 < payload["recurrences"] < BLOCK_RECURRENCE_LIMIT
+            and payload.get("reason") == run["summary"])
+
+
 @contextmanager
 def _read(path):
     from hermes_cli.sqlite_safe_read import connect_tracked
@@ -392,15 +419,20 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         workers = [e for e in events if e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
         _require(bindings and all(e["id"] < stop_id for e in bindings), "admission_after_stop_or_missing")
         _require(all(e["run_id"] in by_run for e in bindings + workers), "attempt_event_run_unknown")
+        controls = {run["id"] for run in runs if _control_only_run(run, events, native_profile, stop_id)}
         # A submitter can spawn before native admission. Inspect every retained run
         # and worker event before requiring admission evidence; absence is never safety.
         for run in runs:
+            if run["id"] in controls:
+                continue
             native_run = kb.Run.from_row(native_text_row(run, "id", "task_id", "status", "profile", "ended_at"))
             _require(native_run.status in _SETTLED_RUN_STATUSES
                      and native_run.ended_at is not None and native_run.profile == native_profile, "run_not_settled")
         for worker in workers:
             _require(worker["id"] < stop_id, "late_worker_binding_after_stop")
         for run in runs:
+            if run["id"] in controls:
+                continue
             admitted = [e for e in bindings if e["run_id"] == run["id"]]
             _require(len(admitted) == 1, "attempt_native_admission_missing_or_ambiguous")
             event = admitted[0]
@@ -473,6 +505,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         projection = {"issue_id": issue, "board": bound["board"], "task_id": bound["task_id"],
                       "stop_event_id": stop_id, "latest_event_id": events[-1]["id"],
                       "attempts": worker_evidence, "scoped_checkpoint": checkpoint,
+                      "control_only_runs": sorted(controls),
                       "stop_checkpoint": "clear", "scope": declared, "discovery_source": source,
                       "owner_epoch": epoch[0], "owner_instance_id": epoch[1]}
         digest = origin._digest({"binding": bound, "task": dict(task), "events": [dict(e) for e in events], "runs": [dict(run) for run in runs],

@@ -444,7 +444,13 @@ No filtered-out opaque key or conflicting event/run ownership is positive foreig
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions with recognized settled outcomes and worker/child ledger,
 confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. Admission and Stop checks cover the native
+submitter identities proven gone or recycled. A native Stop on an unclaimed ready or Review
+card can also record a control-only blocked run. The inspector lists it in `control_only_runs`
+only when its exact zero-duration row has no step, claim, lease, process, heartbeat, runtime, metadata or error fields
+and has exactly one matching native block event, with no execution events. Such a row
+does not replace an executed attempt's admission or worker evidence. Any other row stays
+subject to the full execution checks, including missing or ambiguous owner evidence.
+Admission and Stop checks cover the native
 compression lineage of every attempt, every retained execution in that scope and all of
 their descendant session lineages. The read repeats that discovery until no new session or
 execution remains; terminal extra compute roots participate too. Before native lineage resolution, only
