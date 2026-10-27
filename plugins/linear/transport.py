@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 MAX_BYTES = 65536
-CONTEXT_FIELDS = ('home', 'profile', 'platform', 'source', 'session_key', 'session_id',
+CONTEXT_FIELDS = ('home', 'profile', 'platform', 'source', 'session_key', 'session_id', 'message_id',
                   'user_id', 'user_id_alt', 'chat_id', 'chat_type', 'thread_id', 'scope_id',
                   'ui_session_id', 'delegated_child', 'native_board', 'native_db_path',
                   'pinned_board', 'pinned_db_path')
@@ -30,6 +30,7 @@ class NativeContext:
     source: str
     session_key: str
     session_id: str
+    message_id: str = ''
     user_id: str = ''
     user_id_alt: str = ''
     chat_id: str = ''
@@ -48,6 +49,8 @@ class NativeContext:
 
     @classmethod
     def from_wire(cls, value: Any, home: Path, profile: str) -> NativeContext:
+        if isinstance(value, dict) and set(value) == set(CONTEXT_FIELDS) - {'message_id'}:
+            value = {**value, 'message_id': ''}  # Older ordinary RPC clients carry no Activity proof.
         if (not isinstance(value, dict) or set(value) != set(CONTEXT_FIELDS) or
                 any(not isinstance(v, str) or len(v) > 4096 for k, v in value.items() if k != 'delegated_child') or
                 type(value.get('delegated_child')) is not bool):
@@ -159,7 +162,7 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
         if not key or key != read('HERMES_SESSION_KEY'):
             raise Unavailable('Linear needs a native host-bound session; model identity is not accepted')
         fields = {name: read('HERMES_SESSION_' + name.removeprefix('session_').upper()) for name in
-                  ('platform', 'source', 'session_key', 'session_id', 'user_id', 'user_id_alt',
+                  ('platform', 'source', 'session_key', 'session_id', 'message_id', 'user_id', 'user_id_alt',
                    'chat_id', 'chat_type', 'thread_id', 'scope_id')}
         fields['ui_session_id'] = read('HERMES_UI_SESSION_ID')
         fields['delegated_child'] = is_delegated_child_process_context()

@@ -75,25 +75,30 @@ def _check_native_route(bridge: Any, action: str, issue_id: str, context: Any) -
         raise LinearError("The linked task is outside the caller's native board pin.")
 
 
-def _content_requester(bridge: Any, issue_id: str, prior: dict | None) -> dict:
+def _content_requester(bridge: Any, issue_id: str, prior: dict | None, session: str | None = None,
+                       activity: str | None = None) -> dict:
     """Persist the exact requester used by current specialist authorization, never a chat id."""
     if (getattr(bridge.api, "specialist_scope", None) or {}).get("requester_basis") != "agent_session":
         return {}
     if prior is not None:
         session = (prior["payload"].get("requester_sessions") or {}).get(issue_id)
-    else:
+        activity = (prior["payload"].get("requester_activities") or {}).get(issue_id)
+    elif session is None:
         resolver = getattr(bridge.api, "requester_session_for_issue", None)
         session = resolver(issue_id) if callable(resolver) else None
+        activity_resolver = getattr(bridge.api, "requester_activity_for_issue", None)
+        activity = activity_resolver(issue_id) if callable(activity_resolver) else None
     if not isinstance(session, str) or not session:
         raise LinearError("Specialist content needs a verified requester session for this issue; nothing was queued.")
     sessions = {issue_id: session}
+    activities = {issue_id: activity} if activity else {}
     # BoundLinearAPI checks the exact session's app, requester allowlist and issue again.
     # A retry retains its original requester even if the work binding later changes.
-    with bridge.api.requester_session(sessions):
+    with bridge.api.requester_session(sessions, activity_id=activities or None):
         issue = bridge.api.issue(issue_id)
         if issue.get("id") != issue_id:
             raise LinearError("The verified requester does not authorize this content target.")
-    return {"requester_sessions": sessions}
+    return {"requester_sessions": sessions, **({"requester_activities": activities} if activities else {})}
 
 
 def _plan(bridge: Any, args: dict, action: str) -> str:
@@ -118,6 +123,18 @@ def _plan(bridge: Any, args: dict, action: str) -> str:
     return _reply(True, "Linked issues.", relation=bridge.api.link_issue(issue, related, relation))
 
 def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
+    if (getattr(context, "platform", None) != "linear" or bridge is None
+            or context.profile != bridge.profile or str(context.home) != str(bridge.profile_home)):
+        return _handle(bridge, args, context)
+    from .native_input import requester_scope
+    try:
+        with requester_scope(bridge, context):
+            return _handle(bridge, args, context)
+    except (LinearError, transport.Unavailable) as exc:
+        return _reply(False, str(exc), code="request_refused")
+
+
+def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     if bridge is None:
         return _reply(False, "The Linear service is not running on this profile.", code="service_unavailable")
     # The registered handler captures host context. Model args never supply it.
@@ -159,6 +176,9 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
                 raise ValueError("track replace must be a boolean.")
             return _reply(True, "Existing native task linked for reporting; execution state was not changed.",
                           native=bridge.track(issue_id, task_id, board=context.native_board, replace=replace,
+                              requester_session=context.thread_id if context.platform == "linear" else None,
+                              requester_activity=(context.message_id if context.platform == "linear" and
+                                  context.message_id != context.thread_id else None),
                               expected_revision=args.get("expected_binding_revision"),
                               request_id=_uuid(args.get("id")) if replace else None))
         if action == "followup":
@@ -180,7 +200,10 @@ def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         prior = bridge.store.outbox_row(client_id)
         payload = {"issue_id": issue_id, "body": body, "id": client_id, "content_action": True,
                    "unlinked_content": True, "write_started": False, "caller_context": context.to_wire(),
-                   **_content_requester(bridge, issue_id, prior)}
+                   **_content_requester(bridge, issue_id, prior,
+                                        context.thread_id if getattr(context, "platform", None) == "linear" else None,
+                                        context.message_id if getattr(context, "platform", None) == "linear" and
+                                        context.message_id != context.thread_id else None)}
         kind = "comment"
         if action == "update_description":
             expected = args.get("expected_description")

@@ -638,8 +638,10 @@ class Bridge:
         self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
+        self.native_ingress = None
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
+            api.requester_activity_for_issue = self._requester_activity_for_issue
     def _requester_session_for_issue(self, issue_id: str):
         row = self.store.get(issue_id) or {}
         return row.get("owner_ref") if row.get("origin") == "native" else row.get("linear_session_id")
@@ -665,6 +667,14 @@ class Bridge:
             return get_hermes_home().resolve(strict=True) == home
         except (OSError, RuntimeError):
             return False
+    def _requester_activity_for_issue(self, issue_id: str, work: dict | None = None):
+        binding = self.store.native_binding(issue_id)
+        work = work or self.store.get(issue_id)
+        if (not binding or not work or work.get("origin") != "native" or
+                binding.get("task_id") != work.get("task_id") or
+                binding.get("requester_session_id") != work.get("owner_ref")):
+            return None
+        return binding.get("requester_activity_id")
     def lock(self, issue_id: str) -> threading.Lock:
         with self._guard:
             return self._locks[issue_id]
@@ -720,6 +730,9 @@ class Bridge:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             session = row.get("owner_ref") if row["origin"] == "native" else row.get("linear_session_id")
             binding = {"requester_sessions": {row["issue_id"]: session}}
+            activity = self._requester_activity_for_issue(row["issue_id"], row)
+            if activity:
+                binding["requester_activities"] = {row["issue_id"]: activity}
         if row["origin"] == "chat":
             return {"session_key": row["owner_ref"], **binding}
         return {**({"task_id": row["task_id"]} if row.get("task_id") else {}), **binding}
@@ -832,9 +845,23 @@ class Bridge:
     @contextmanager
     def _outbox_requester_scope(self, row):
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
-            with self.api.requester_session(row["payload"].get("requester_sessions") or {}): yield
+            with self.api.requester_session(row["payload"].get("requester_sessions") or {},
+                    activity_id=row["payload"].get("requester_activities") or None): yield
         else: yield
     def _authorize_outbox_effect(self, row: dict[str, Any], issue_ids=None) -> bool:
+        if self.store.conversation_reply(row["kind"], row["payload"]):
+            payload = row["payload"]
+            try:
+                with self.api.requester_session(payload["session_id"],
+                        activity_id=(payload.get("requester_activities") or {}).get(payload["issue_id"])):
+                    session = self.api.agent_session(payload["session_id"])
+                    self._effect_issue(payload["issue_id"])
+            except RateLimited:
+                raise
+            except LinearError:
+                return False
+            if session["issue"]["id"] != payload["issue_id"]:
+                return False
         if not self._specialist_scope_active(): return True
         targets = issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row)
         with self._outbox_requester_scope(row):
@@ -880,15 +907,15 @@ class Bridge:
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
         log.warning("linear: specialist authorization refused: %s", exc)
-    def handle_webhook(self, event: dict[str, Any]) -> None:
+    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
                 with self.api.requester_session((event.get("agentSession") or {}).get("id")):
-                    return self._handle_webhook(event)
+                    return self._handle_webhook(event, assignment_prompt=assignment_prompt)
             if event.get("type") == "Issue" and not self.store.get((event.get("data") or {}).get("id")):
                 return
-        self._handle_webhook(event)
-    def _handle_webhook(self, event: dict[str, Any]) -> None:
+        self._handle_webhook(event, assignment_prompt=assignment_prompt)
+    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
@@ -918,7 +945,7 @@ class Bridge:
             if row and stamp < float(row["last_updated_at"]):
                 return
             if event.get("action") == "created":
-                self._delegated(event, issue, session_id, row)
+                self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
                     self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
@@ -937,7 +964,8 @@ class Bridge:
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
 
-    def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None) -> None:
+    def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
+                   *, assignment_prompt: str = "") -> None:
         if row:
             if self._assignment_activation(row):
                 return
@@ -947,7 +975,7 @@ class Bridge:
                 return
             self._decline(issue["id"], session_id, f"Existing work: {task.get('status')}. Use native task controls to resume stopped work.")
             return
-        self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}")
+        self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
@@ -1256,14 +1284,15 @@ class Bridge:
                         for event in after[1:]))
         return False
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
-              requester_session: str | None = None, replace: bool = False,
+              requester_session: str | None = None, requester_activity: str | None = None, replace: bool = False,
               expected_revision: str | None = None, request_id: str | None = None) -> dict:
         with self.lock(issue_id):
             return self._track(issue_id, task_id, board=board, requester_session=requester_session,
+                               requester_activity=requester_activity,
                                replace=replace, expected_revision=expected_revision, request_id=request_id)
 
     def _track(self, issue_id: str, task_id: str, *, board: str | None,
-               requester_session: str | None, replace: bool,
+               requester_session: str | None, requester_activity: str | None, replace: bool,
                expected_revision: str | None, request_id: str | None) -> dict:
         # A reporting link is not an execution grant or a conflicting remote
         # mutation. Retained uncertain effects remain held independently.
@@ -1276,14 +1305,15 @@ class Bridge:
         if replace:
             binding = self.store.replace_native_binding(issue_id, task_id, adapter.executor_profile,
                 adapter.board or "default", expected_revision=expected_revision, request_id=request_id,
-                owner_ref=requester_session or "", project_id=(issue.get("project") or {}).get("id"),
+                owner_ref=requester_session or "", requester_activity=requester_activity,
+                project_id=(issue.get("project") or {}).get("id"),
                 at=self.clock() * 1000)
             if not binding:
                 raise LinearError("Reporting link changed or its scope was refused; inspect current issue and native work before retrying", retryable=False)
             return {"issue_id": issue_id, "task_id": task.id, "status": task.status,
                     "reporting_only": True, "history_preserved": True}
         if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
-                adapter.board or "default", owner_ref=requester_session or "",
+                adapter.board or "default", owner_ref=requester_session or "", requester_activity=requester_activity,
                 project_id=(issue.get("project") or {}).get("id"), at=self.clock() * 1000):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
@@ -1806,7 +1836,7 @@ class Bridge:
                         log.warning("linear: outbox %s held: %s", row["id"], reason)
                         continue
                     if row["kind"] != "project_update" and not (
-                            self.store.independent_comment(row["kind"], row["payload"]) or
+                            self.store.independent_message(row["kind"], row["payload"]) or
                             self.store.reporting_notice(row["kind"], row["payload"])) and any(
                             self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
                             for issue_id in self._outbox_scope_issue_ids(row)):
@@ -2189,7 +2219,14 @@ class Bridge:
             for agent, delivery, payload, received, attempts in rows:
                 status = "imported"
                 try:
-                    self.handle_webhook(json.loads(payload))
+                    event = json.loads(payload)
+                    if self.native_ingress is not None and isinstance(event, dict) and event.get("type") == "AgentSessionEvent":
+                        from .native_input import InboxDelivery
+                        routed = self.native_ingress(InboxDelivery(
+                            Path(database), self.ingress_profile, agent, delivery, payload))
+                        if routed:
+                            continue  # Only the native committed-input hook may ACK it.
+                    self.handle_webhook(event)
                 except (ValueError, TypeError):
                     status = "invalid"
                 except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly

@@ -101,10 +101,20 @@ class Store:
     @staticmethod
     def unlinked_content(kind: str, payload: dict[str, Any]) -> bool:
         """An ordinary content request carries no retained execution identity."""
-        return (kind in ("comment", "description") and payload.get("content_action") is True
+        content_kind = kind in ("comment", "description") or Store.conversation_reply(kind, payload)
+        return (content_kind and payload.get("content_action") is True
                 and payload.get("unlinked_content") is True and not any(payload.get(key) for key in (
                     "work_owner", "session_key", "admission_id", "claim", "release", "task_id",
                     "stop_intent_id", "requires_status_id", "terminal")))
+    @staticmethod
+    def conversation_reply(kind: str, payload: dict[str, Any]) -> bool:
+        content = payload.get("content") or {}
+        return (kind == "activity" and type(payload.get("native_reply_version")) is int
+                and payload["native_reply_version"] == 1 and isinstance(content, dict)
+                and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
+                and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
+                and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
+                and content.get("type") in ("response", "error") and isinstance(content.get("body"), str))
     @staticmethod
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1
@@ -116,6 +126,9 @@ class Store:
     def independent_comment(cls, kind: str, payload: dict[str, Any]) -> bool:
         # Adding a new authorized comment does not resolve or repeat an earlier mutation.
         return kind == "comment" and cls.unlinked_content(kind, payload)
+    @classmethod
+    def independent_message(cls, kind: str, payload: dict[str, Any]) -> bool:
+        return (kind == "comment" or cls.conversation_reply(kind, payload)) and cls.unlinked_content(kind, payload)
     @classmethod
     def _delivery_hold_reason(cls, db: sqlite3.Connection, kind: str, payload: dict[str, Any]) -> str | None:
         if cls.unlinked_content(kind, payload):
@@ -240,7 +253,7 @@ class Store:
             if self.reporting_notice(row["kind"], payload):
                 pass  # Informational replies do not repeat or resolve any earlier effect.
             elif payload.get("content_action"):
-                if not self.independent_comment(row["kind"], payload) and any(self._unresolved_terminal(db, target, except_id=row_id) for target in targets):
+                if not self.independent_message(row["kind"], payload) and any(self._unresolved_terminal(db, target, except_id=row_id) for target in targets):
                     return False
             else:
                 if not self._effect_admitted(db, *targets, except_id=row_id):
@@ -327,12 +340,17 @@ class Store:
             return None
         return binding
     def bind_native(self, issue_id: str, task_id: str, profile: str, board: str | None,
-                    owner_ref: str = "", project_id: str | None = None, *, at: float) -> bool:
+                    owner_ref: str = "", project_id: str | None = None, *,
+                    requester_activity: str | None = None, at: float) -> bool:
         """Link an inspected task without claiming, resuming or adopting legacy work."""
         if any(not isinstance(value, str) or not value.strip() for value in (issue_id, task_id, profile)):
             raise ValueError("native binding needs an issue, task and profile")
         binding = {"issue_id": issue_id, "task_id": task_id, "profile": profile,
                    "board": board or "default"}
+        if requester_activity is not None:
+            if not owner_ref or not isinstance(requester_activity, str) or not requester_activity or requester_activity == owner_ref:
+                raise ValueError("native reporting needs distinct session and Activity coordinates")
+            binding.update(requester_session_id=owner_ref, requester_activity_id=requester_activity)
         with self._tx() as db:
             work = db.execute("SELECT origin,task_id FROM work WHERE issue_id=?", (issue_id,)).fetchone()
             prior = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-binding:{issue_id}",)).fetchone()
@@ -386,7 +404,8 @@ class Store:
                     changed = True
     def replace_native_binding(self, issue_id: str, task_id: str, profile: str, board: str | None, *,
                                expected_revision: str, request_id: str, owner_ref: str = "",
-                               project_id: str | None = None, at: float) -> dict[str, Any] | None:
+                               project_id: str | None = None, requester_activity: str | None = None,
+                               at: float) -> dict[str, Any] | None:
         """Explicitly replace reporting after caller inspection, never native execution.
 
         Archive the exact prior projection in the existing immutable intent. Uncertain
@@ -408,6 +427,10 @@ class Store:
                 any(char not in "0123456789abcdef" for char in expected_revision)):
             raise ValueError("reporting replacement needs an inspected binding revision")
         binding = {"issue_id": issue_id, "task_id": task_id, "profile": profile, "board": board or "default"}
+        if requester_activity is not None:
+            if not owner_ref or not isinstance(requester_activity, str) or not requester_activity or requester_activity == owner_ref:
+                raise ValueError("native reporting needs distinct session and Activity coordinates")
+            binding.update(requester_session_id=owner_ref, requester_activity_id=requester_activity)
         request = {"binding": binding, "expected_revision": expected_revision,
                    "owner_ref": owner_ref, "project_id": project_id}
         key = f"track:{issue_id}:{request_id}"
@@ -431,8 +454,9 @@ class Store:
             work = previous["work"] or {}
             old_binding = json.loads(previous["native_binding"]) if previous["native_binding"] else {}
             same_target = (isinstance(old_binding, dict) and work.get("origin") == "native" and work.get("task_id") == task_id and
-                           all(old_binding.get(field) == value for field, value in binding.items()))
-            unchanged = same_target and work.get("owner_ref") == owner_ref and work.get("project_id") == project_id
+                           all(old_binding.get(field) == binding[field] for field in ("issue_id", "task_id", "profile", "board")))
+            unchanged = (same_target and old_binding == binding and work.get("owner_ref") == owner_ref
+                         and work.get("project_id") == project_id)
             if not unchanged:
                 self._hold_superseded_reports(db, issue_id)
                 if same_target:
@@ -574,10 +598,11 @@ class Store:
                         prior = json.loads(existing["payload"])
                         if existing["state"] in ("pending", "failed") and not prior.get("frozen"):
                             prior["lines"].update(payload["lines"])
-                            for key in ("line_issues", "terminal_lines", "requester_sessions"):
+                            for key in ("line_issues", "terminal_lines"):
                                 prior.setdefault(key, {}).update(payload.get(key, {}))
+                            self._merge_requesters(prior, payload)
                             prior.update({key: value for key, value in payload.items()
-                                          if key not in ("lines", "line_issues", "terminal_lines", "requester_sessions")})
+                                          if key not in ("lines", "line_issues", "terminal_lines", "requester_sessions", "requester_activities")})
                             prior["enqueued_at"] = at
                             db.execute("UPDATE outbox SET payload = ?, next_at = MAX(next_at, ?) WHERE id = ?",
                                        (json.dumps(prior), at + float(payload.get("quiet", 0)), existing["id"]))
@@ -678,7 +703,7 @@ class Store:
                 raise ValueError("outbox id reused with conflicting content")
             targets = self._targets(payload)
             if payload.get("content_action"):
-                if not self._admitted(db, *targets) or (not self.independent_comment(kind, payload) and
+                if not self._admitted(db, *targets) or (not self.independent_message(kind, payload) and
                         any(self._unresolved_terminal(db, target) for target in targets)): return ""
             elif self.reporting_notice(kind, payload):
                 if not self._admitted(db, *targets): return ""
@@ -855,6 +880,19 @@ class Store:
             row = db.execute("SELECT * FROM outbox WHERE id = ?", (row_id,)).fetchone()
         return {**dict(row), "payload": json.loads(row["payload"])} if row else None
     @staticmethod
+    def _merge_requesters(prior, payload):
+        # An existing member retains its original evidence coordinates, including
+        # legacy creator-based evidence. A later Activity cannot thaw its request.
+        if not payload.get("requester_sessions"):
+            return
+        sessions = prior.setdefault("requester_sessions", {})
+        for issue, session in payload.get("requester_sessions", {}).items():
+            if issue not in sessions:
+                sessions[issue] = session
+                activity = (payload.get("requester_activities") or {}).get(issue)
+                if activity:
+                    prior.setdefault("requester_activities", {})[issue] = activity
+    @staticmethod
     def _requester_conflict(prior, payload):
         old, new = prior.get("requester_sessions") or {}, payload.get("requester_sessions") or {}
         return bool(old) != bool(new) or any(key in old and old[key] != value for key, value in new.items())
@@ -879,8 +917,7 @@ class Store:
                 if not self._admitted(db, *self._targets(prior)): return False
                 prior["lines"].update(payload["lines"])
                 prior.setdefault("line_issues", {}).update(payload.get("line_issues", {}))
-                if payload.get("requester_sessions"):
-                    prior.setdefault("requester_sessions", {}).update(payload["requester_sessions"])
+                self._merge_requesters(prior, payload)
                 if payload.get("terminal"):
                     prior["terminal"] = True
                     prior["owner_issue_id"] = payload.get("owner_issue_id")

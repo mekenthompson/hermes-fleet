@@ -78,8 +78,21 @@ class BoundLinearAPI(LinearAPI):
                            ("target_session", session_id), ("target_project", project_id)):
             if value is not None: values[key] = value
         return self._scope(**values)
-    def requester_session(self, session_id):
-        return self._scope(requester_session_id=session_id)
+    def requester_session(self, session_id, *, activity_id=None):
+        """Bind provider coordinates, never a human identity or cached authorization.
+
+        A later Activity is re-read on every session authorization. The original
+        session creator remains unchanged, including an unknown creator.
+        """
+        if activity_id is not None:
+            pairs = ([(session_id.get(issue), activity) for issue, activity in activity_id.items()]
+                     if isinstance(session_id, dict) and isinstance(activity_id, dict) else [(session_id, activity_id)])
+            if not pairs or any(not isinstance(session, str) or not session
+                    or not isinstance(activity, str) or not activity or activity == session
+                    for session, activity in pairs):
+                raise ValueError("An Activity binding needs distinct exact session and Activity IDs")
+        return self._scope(requester_session_id=session_id if session_id is not None else {},
+                           requester_activity=(session_id, activity_id) if activity_id else None)
     def verify_identity(self):
         self._verified_credential(self.token)
     def _verified_credential(self, provider):
@@ -133,13 +146,21 @@ class BoundLinearAPI(LinearAPI):
             session_id = getattr(self._graphql_permit, "requester_session_id", None)
             bound_effect = isinstance(session_id, dict)
             if bound_effect: session_id = session_id.get(issue["id"])
-            if not session_id and not bound_effect:
+            fallback = session_id is None and not bound_effect
+            activity_id = None
+            if fallback:
                 resolver = getattr(self, "requester_session_for_issue", None)
                 session_id = resolver(issue["id"]) if callable(resolver) else None
+                activity_resolver = getattr(self, "requester_activity_for_issue", None)
+                activity_id = activity_resolver(issue["id"]) if callable(activity_resolver) else None
             if not isinstance(session_id, str) or not session_id:
                 raise LinearError("Linear specialist authorization needs a bound requester session")
             try:
-                session = self.agent_session(session_id)
+                if fallback:
+                    with self.requester_session(session_id, activity_id=activity_id):
+                        session = self.agent_session(session_id)
+                else:
+                    session = self.agent_session(session_id)
             except LinearError as exc:
                 raise LinearError(str(exc), retryable=exc.retryable, authoritative_issue_id=issue["id"]) from exc
             requester_ok = session["issue"]["id"] == issue["id"]
@@ -192,6 +213,15 @@ class BoundLinearAPI(LinearAPI):
         issue = session.get("issue")
         creator = session.get("creator")
         creator_id = creator.get("id") if isinstance(creator, dict) else None
+        activity_binding = getattr(self._graphql_permit, "requester_activity", None)
+        if activity_binding:
+            bound_session, bound_activity = activity_binding
+            if isinstance(bound_session, dict):
+                issue_id = issue.get("id") if isinstance(issue, dict) else None
+                bound_session, bound_activity = bound_session.get(issue_id), bound_activity.get(issue_id)
+            if bound_session == session_id and bound_activity:
+                activity = self._agent_activity_actor(bound_activity, session_id)
+                creator_id = activity["user"]["id"]  # authorization actor only; never rewrite creator
         if not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue["id"].strip():
             raise LinearError("Linear Agent Session requester or issue is outside specialist scope", retryable=False)
         if self.specialist_scope is None:
@@ -217,6 +247,11 @@ class BoundLinearAPI(LinearAPI):
                               authoritative_issue_id=issue["id"])
         return session
     def agent_activity(self, activity_id, session_id):
+        activity = self._agent_activity_actor(activity_id, session_id)
+        if self.specialist_scope is None:
+            self.agent_session(session_id)  # current app and issue/workspace restrictions
+        return activity
+    def _agent_activity_actor(self, activity_id, session_id):
         query = ("query AgentActivityAuthorization($id: String!) { agentActivity(id: $id) "
                  "{ id user { id } agentSession { id } } }")
         with self._permit_specialist_operation():
@@ -227,13 +262,10 @@ class BoundLinearAPI(LinearAPI):
         if (not isinstance(activity, dict) or activity.get("id") != activity_id or
                 not isinstance(session, dict) or session.get("id") != session_id):
             raise LinearError("Linear Agent Activity could not be authoritatively resolved", retryable=False)
-        if self.specialist_scope is None:
-            self.agent_session(session_id)  # current app and issue/workspace restrictions
-            if not isinstance(user_id, str) or not user_id or user_id == self.identity["viewer_id"]:
-                raise LinearError("Linear Agent Activity has no verified human actor", retryable=False,
-                                  authoritative_session_id=session_id)
-            return activity
-        if not isinstance(user_id, str) or user_id not in self.specialist_scope["allowed_requester_ids"]:
+        if not isinstance(user_id, str) or not user_id or user_id == self.identity["viewer_id"]:
+            raise LinearError("Linear Agent Activity has no verified human actor", retryable=False,
+                              authoritative_session_id=session_id)
+        if self.specialist_scope is not None and user_id not in self.specialist_scope["allowed_requester_ids"]:
             raise LinearError("Linear Agent Activity actor is outside specialist scope", retryable=False, authoritative_session_id=session_id)
         return activity
     def update_issue(self, issue_id, fields):
@@ -361,6 +393,9 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                                             profile_home=home), profile=profile_name,
                     settings=settings)
     bridge.profile_home = home
+    if running.get("native_requested"):
+        from .native_input import route_delivery
+        bridge.native_ingress = lambda delivery: route_delivery(running, delivery)
     ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
     server = None
     try:
@@ -404,6 +439,9 @@ def register(ctx: Any) -> None:
         return
     from . import transport
     running: dict[str, Any] = {}
+    if hasattr(ctx, "register_platform"):
+        from .native_input import register_platform
+        register_platform(ctx, running)
 
     def active_home():
         from hermes_constants import get_hermes_home
