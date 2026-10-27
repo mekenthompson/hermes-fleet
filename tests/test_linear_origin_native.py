@@ -221,9 +221,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         from gateway.session_context import reset_session_vars, set_current_session_id
         reset_session_vars()
         set_current_session_id(self.sid)
+        import psutil
+        from hermes_cli.process_identity import worker_birth
         with kb.write_txn(self.board):
             kb._append_event(self.board, task.id, "owner_admitted", {"db": str(self.home / "state.db"),
-                "session_id": self.sid, "request_id": self.row["request_id"], "pid": os.getpid(), "birth": 123},
+                "session_id": self.sid, "request_id": self.row["request_id"], "pid": os.getpid(),
+                "birth": worker_birth(psutil.Process())},
                 run_id=task.current_run_id)
             kb._append_event(self.board, task.id, "worker_bound", {"pid": os.getpid(), "claim_lock": task.claim_lock},
                 run_id=task.current_run_id)
@@ -237,6 +240,24 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     def process_witness(self, start):
         from gateway.drain_control import current_instantiation_epoch
         return f"{current_instantiation_epoch()}|{start}"
+
+    def original_worker_birth(self, birth):
+        # Finite PID-reuse fixture: preserve the exact native admission/run
+        # coordinates while supplying a known earlier native monotonic birth.
+        event = self.board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted'",
+                                   (self.task_id, self.work_context["run_id"])).fetchone()
+        marker = json.loads(event["payload"])
+        marker["birth"] = birth
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(marker), event["id"]))
+
+    def earlier_native_birth(self):
+        import psutil
+        from hermes_cli.process_identity import worker_birth
+        # Native PID 1 supplies an actual earlier boot-relative sample; no
+        # process launch, fabricated units or live ownership change occurs.
+        old = worker_birth(psutil.Process(1))
+        self.assertLess(old, worker_birth(psutil.Process()))
+        return old
 
     async def stopped_issue(self, *, existing=False):
         from hermes_cli import kanban_db as kb
@@ -463,6 +484,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         bound(real)
         self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
         bound(self.process_witness(1))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.original_worker_birth(self.earlier_native_birth())
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertEqual(evidence["attempts"][0]["workers"][0]["fate"], "recycled")
@@ -1016,7 +1039,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
         evidence = await self.cleanup_inspected()
         self.assertFalse(evidence["quiescence_proven"])
-        self.assertEqual(evidence["reason"], "old_worker_alive")
+        # Original native admission binding is validated before any positive
+        # live-PID reuse proof; this spawned-but-unadmitted attempt stays held.
+        self.assertEqual(evidence["reason"], "attempt_native_admission_missing_or_ambiguous")
         self.assertFalse(evidence["permission_granted"])
 
     async def test_cleanup_unadmitted_attempt_without_recorded_worker_is_unknown(self):
@@ -1294,6 +1319,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Retained spawn/run records use canonical current-epoch fixture births;
         # the actual native comparator still proves known recycled and gone IDs.
         bound(os.getpid(), self.process_witness(1))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.original_worker_birth(self.earlier_native_birth())
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         bound(99999997, self.process_witness(1))
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
@@ -1343,10 +1370,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         with patch("hermes_cli.process_identity.worker_birth", side_effect=PermissionError("finite unreadable native birth")):
             self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
         bound(self.process_witness(1))
-        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
-        # An honestly old fallback-scale witness can also prove recycling.
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        # An old fallback number alone cannot prove reuse across clock steps.
         epoch = direct.split("|")[0]
         bound(epoch + "|" + str(round((process_birth(psutil.Process(pid)) - 10) * 100)))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.original_worker_birth(self.earlier_native_birth())
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         # Changing the native identity during the independent observation is unknown.
         with patch("hermes_cli.kanban_db_dispatch._process_fingerprint", side_effect=[direct, self.process_witness(1)]):
@@ -1382,3 +1411,52 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(evidence["reason"], "worker_identity_unreadable")
                     self.assertFalse(evidence["permission_granted"])
         self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+
+
+    async def test_cleanup_duplicate_checkpoint_keys_and_unknown_run_states_hold_proof(self):
+        await self.stopped_issue()
+        checkpoint = self.home / "processes.json"
+        route = self.authority.sessions[self.sid].route
+        for pair in (("session_key", route), ("parent_session_id", self.sid), ("systemd_unit", "owned-scope")):
+            with self.subTest(pair=pair):
+                key, value = pair
+                checkpoint.write_text('[{"session_key":' + json.dumps(route) + ',"parent_session_id":' + json.dumps(self.sid)
+                    + ',' + json.dumps(key) + ':' + json.dumps(value) + ',' + json.dumps(key) + ':"foreign"}]')
+                result = await self.cleanup_inspected()
+                self.assertEqual(result["reason"], "checkpoint_duplicate_key")
+                self.assertFalse(result["quiescence_proven"])
+        checkpoint.unlink()
+        for status in ("unrecognized-state", "running", "unknown", "", "BLOCKED"):
+            with self.subTest(status=status):
+                self.board.execute("UPDATE task_runs SET status=? WHERE id=?", (status, self.work_context["run_id"]))
+                result = await self.cleanup_inspected()
+                self.assertEqual(result["reason"], "run_not_settled")
+                self.assertFalse(result["quiescence_proven"])
+        for status in cleanup._SETTLED_RUN_STATUSES:
+            with self.subTest(status=status):
+                self.board.execute("UPDATE task_runs SET status=? WHERE id=?", (status, self.work_context["run_id"]))
+                self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_live_reuse_requires_original_matching_native_monotonic_receipt(self):
+        import psutil
+        from hermes_cli.process_identity import worker_birth
+        await self.stopped_issue()
+        # A mismatching legacy fingerprint is not an original monotonic witness.
+        self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+            (json.dumps({"pid": os.getpid(), "started_at": self.process_witness(1),
+                         "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        event = self.board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='owner_admitted'", (self.task_id,)).fetchone()
+        original = json.loads(event["payload"])
+        for changes in ({"birth": None}, {"birth": True}, {"birth": 0}, {"birth": float("nan")},
+                        {"birth": "1"}, {"pid": True}, {"pid": 1}):
+            with self.subTest(changes=changes):
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps({**original, **changes}), event["id"]))
+                result = await self.cleanup_inspected()
+                self.assertFalse(result["quiescence_proven"])
+                self.assertEqual(result["reason"], "worker_identity_unproven")
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(original), event["id"]))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+        self.original_worker_birth(self.earlier_native_birth())
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        with patch("hermes_cli.process_identity.worker_birth", side_effect=[worker_birth(psutil.Process()), worker_birth(psutil.Process()) + 1]):
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
