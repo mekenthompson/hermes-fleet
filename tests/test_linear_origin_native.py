@@ -234,13 +234,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def work_inspected(self, ref):
         return await asyncio.to_thread(work.inspect, ref, self.settings)
 
-    async def stopped_issue(self):
+    async def stopped_issue(self, *, existing=False):
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         from hermes_fleet_linear_plugin.store import Store
         from gateway import session_ancillary
-        await self.kanban()
+        await self.kanban(existing=existing)
         # Finite native state fixtures: real register/adopt/finish and admission settlement;
         # no actual model, process launch, owner bootstrap or production Stop.
         executor = "admission-worker:" + self.admission
@@ -988,3 +988,95 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(evidence["reason"], "checkpoint_ownership_ambiguous")
                 self.assertFalse(evidence["permission_granted"])
                 self.assertNotIn("unresolved-private-scope", json.dumps(evidence))
+
+    async def test_cleanup_native_spawn_before_admission_stays_unknown(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _set_worker_pid, _process_fingerprint
+        from gateway import session_ancillary
+        getter = getattr(session_ancillary, "process_stop_pending", None)
+        await self.stopped_issue()
+        # Use the real candidate getter when supported; the release pin retains
+        # the explicitly labelled read-only fixture getter from stopped_issue.
+        if getter is not None:
+            self.enterContext(patch.object(session_ancillary, "process_stop_pending", getter))
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="transient", reason="temporary retry"))
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        task = kb.claim_task(self.board, self.task_id, claimer="fixture-second-claim")
+        self.assertIsNotNone(task)
+        _set_worker_pid(self.board, self.task_id, os.getpid(), run_id=task.current_run_id, claim_lock=task.claim_lock)
+        self.assertIsNotNone(_process_fingerprint(os.getpid()))
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="Stop before native admission"))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        evidence = await self.cleanup_inspected()
+        self.assertFalse(evidence["quiescence_proven"])
+        self.assertEqual(evidence["reason"], "old_worker_alive")
+        self.assertFalse(evidence["permission_granted"])
+
+    async def test_cleanup_unadmitted_attempt_without_recorded_worker_is_unknown(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="transient"))
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        task = kb.claim_task(self.board, self.task_id, claimer="fixture-unadmitted-claim")
+        self.assertIsNotNone(task)
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="unadmitted Stop"))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        evidence = await self.cleanup_inspected()
+        self.assertFalse(evidence["quiescence_proven"])
+        self.assertEqual(evidence["reason"], "attempt_native_admission_missing_or_ambiguous")
+
+    async def test_cleanup_two_admitted_attempts_check_old_run_state_and_worker(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        old = dict(self.board.execute("SELECT * FROM task_runs WHERE id=?", (self.work_context["run_id"],)).fetchone())
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        # A reason-free parked transient transition resets the native recurrence
+        # policy without synthesizing an unexecuted handoff run.
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="transient"))
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        await self.stopped_issue(existing=True)
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(len(evidence["attempts"]), 2)
+        for changes in ({"status": "running"}, {"status": "unknown"}, {"ended_at": None}, {"profile": "foreign"},
+                        {"worker_pid": os.getpid(), "worker_started_at": _process_fingerprint(os.getpid())}):
+            with self.subTest(changes=changes):
+                for key, value in changes.items():
+                    self.board.execute("UPDATE task_runs SET " + key + "=? WHERE id=?", (value, old["id"]))
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                for key in changes:
+                    self.board.execute("UPDATE task_runs SET " + key + "=? WHERE id=?", (old[key], old["id"]))
+        old_binding = dict(self.board.execute("SELECT * FROM task_events WHERE run_id=? AND kind='owner_admitted'",
+                                              (old["id"],)).fetchone())
+        self.board.execute("DELETE FROM task_events WHERE id=?", (old_binding["id"],))
+        self.assertEqual((await self.cleanup_inspected())["reason"], "attempt_native_admission_missing_or_ambiguous")
+        columns = ",".join(old_binding)
+        self.board.execute("INSERT INTO task_events (" + columns + ") VALUES (" + ",".join("?" for _ in old_binding) + ")",
+                           tuple(old_binding.values()))
+        def old_run_change(method, params):
+            self.before_rpc = None
+            self.board.execute("UPDATE task_runs SET summary='changed while inspecting' WHERE id=?", (old["id"],))
+        self.before_rpc = old_run_change
+        self.assertEqual((await self.cleanup_inspected())["reason"], "cleanup_evidence_changed")
+
+    async def test_cleanup_orphan_and_ambiguous_attempt_events_never_disappear(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        for kind in ("owner_admitted", "spawned", "worker_registered", "worker_bound"):
+            with self.subTest(kind=kind), kb.write_txn(self.board):
+                kb._append_event(self.board, self.task_id, kind,
+                    {"pid": 99999999, "started_at": "fixture-boot|2"}, run_id=999999)
+            evidence = await self.cleanup_inspected()
+            self.assertFalse(evidence["quiescence_proven"])
+            self.board.execute("DELETE FROM task_events WHERE id=(SELECT MAX(id) FROM task_events WHERE task_id=?)", (self.task_id,))
+        binding = self.board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='owner_admitted'", (self.task_id,)).fetchone()
+        with kb.write_txn(self.board):
+            kb._append_event(self.board, self.task_id, "owner_admitted", json.loads(binding["payload"]), run_id=binding["run_id"])
+        self.assertEqual((await self.cleanup_inspected())["reason"], "admission_after_stop_or_missing")
+        token = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=token))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertEqual((await self.cleanup_inspected())["reason"], "attempt_native_admission_missing_or_ambiguous")

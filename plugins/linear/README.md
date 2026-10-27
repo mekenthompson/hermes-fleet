@@ -381,11 +381,13 @@ issue metadata for explicit marker matching; it is discovery data and grants no 
 Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown.
 
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
-claim, matching frozen owner/run/admission/executor records, terminal native admissions and
-worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
+claim, matching frozen owner/run/admission/executor records for every retained task attempt,
+terminal native admissions and worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
 submitter identities proven gone or recycled. Scoped process checkpoints must also contain
 no live or unconfirmed scope. Only positively foreign records are excluded;
-missing, partial or conflicting route/owner attribution remains unknown. Reads use native tracked SQLite
+missing, partial or conflicting route/owner attribution remains unknown. An attempt that
+spawned before native admission, orphan worker events, or any unverified older attempt also
+remain unknown; a later admitted attempt cannot hide them. Reads use native tracked SQLite
 transactions, never database copies. Receipts and the entire scoped observation are checked
 again before returning. A newer Stop, unblock, late worker binding, owner change or changed
 reporting link invalidates the old observation. Reinspect immediately before later effects.
