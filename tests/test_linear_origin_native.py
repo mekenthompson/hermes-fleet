@@ -465,7 +465,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertLess(old, worker_birth(psutil.Process()))
         return old
 
-    async def stopped_issue(self, *, existing=False, idempotency_key=None):
+    async def stopped_issue(self, *, existing=False, idempotency_key=None, review_stop=False):
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
@@ -489,8 +489,17 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                              run_id=self.work_context["run_id"])
             self.board.execute("UPDATE task_runs SET worker_pid=99999999,worker_started_at=? WHERE id=?",
                                (self.process_witness(2), self.work_context["run_id"]))
+        if review_stop:
+            self.assertTrue(kb.request_review(self.board, self.task_id, summary="fixture review",
+                                             expected_run_id=self.work_context["run_id"]))
+            if review_stop == "ready":
+                self.assertTrue(kb.reopen_review_task(self.board, self.task_id))
+            else:
+                self.assertTrue(kb.assign_task(self.board, self.task_id, None))
         self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="fixture Stop"))
         self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        if review_stop:
+            self.assertTrue(kb.assign_task(self.board, self.task_id, "default"))
         self.linear_state = self.home / "linear" / "state.db"
         self.linear_store = Store(self.linear_state)
         self.assertTrue(self.linear_store.bind_native("issue-one", self.task_id, "default", "default", at=1))
@@ -643,6 +652,105 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         damaged = await self.cleanup_inspected()
         self.assertFalse(damaged["quiescence_proven"])
         self.assertEqual(damaged["reason"], "cleanup_evidence_unavailable")
+
+    async def test_cleanup_native_review_stop_control_row_preserves_executed_attempt_proof(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue(review_stop=True)
+        rows = self.board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (self.task_id,)).fetchall()
+        self.assertEqual(len(rows), 2)
+        control = rows[-1]
+        self.assertEqual((control["profile"], control["status"], control["outcome"], control["claim_lock"]),
+                         (None, "blocked", "blocked", None))
+        self.assertEqual(control["started_at"], control["ended_at"])
+        board_before = {table: [tuple(row) for row in self.board.execute("SELECT * FROM " + table)]
+                        for table in ("tasks", "task_runs", "task_events")}
+        native_before = self.authority.db._read_all("SELECT * FROM session_admissions")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertFalse(evidence["permission_granted"])
+        self.assertEqual([attempt["run_id"] for attempt in evidence["attempts"]], [rows[0]["id"]])
+        self.assertEqual(evidence["control_only_runs"], [control["id"]])
+        for table, before in board_before.items():
+            self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], before)
+        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), native_before)
+        event = self.board.execute("SELECT * FROM task_events WHERE run_id=?", (control["id"],)).fetchone()
+        def changed_control(_method, _params):
+            self.before_rpc = None
+            payload = {**json.loads(event["payload"]), "reason": "changed control"}
+            self.board.execute("UPDATE task_runs SET summary=? WHERE id=?", (payload["reason"], control["id"]))
+            self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), event["id"]))
+        self.before_rpc = changed_control
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_runs SET summary=? WHERE id=?", (control["summary"], control["id"]))
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (event["payload"], event["id"]))
+        # A later native reaffirmed Stop remains a fresh checkpoint over the same history.
+        latest = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="fixture Stop again",
+                                     expected_event_id=latest))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_native_review_stop_control_row_from_assigned_ready_card(self):
+        await self.stopped_issue(review_stop="ready")
+        control = self.board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC", (self.task_id,)).fetchone()
+        self.assertEqual(control["profile"], "default")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(evidence["control_only_runs"], [control["id"]])
+        self.assertEqual(len(evidence["attempts"]), 1)
+
+    async def test_cleanup_native_review_stop_control_lookalikes_remain_unknown(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue(review_stop=True)
+        control = self.board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC", (self.task_id,)).fetchone()
+        mutations = {"profile": "foreign", "step_key": "execution", "status": "done", "outcome": "completed",
+            "claim_lock": "retained-claim", "claim_expires": 1, "worker_pid": 99999999,
+            "worker_started_at": self.process_witness(1), "max_runtime_seconds": 1, "last_heartbeat_at": 1,
+            "started_at": control["started_at"] - 1, "ended_at": control["ended_at"] + 1,
+            "summary": "different reason", "metadata": "{}", "error": "execution error"}
+        for field, changed in mutations.items():
+            with self.subTest(field=field):
+                self.board.execute(f"UPDATE task_runs SET {field}=? WHERE id=?", (changed, control["id"]))
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                self.board.execute(f"UPDATE task_runs SET {field}=? WHERE id=?", (control[field], control["id"]))
+        event = self.board.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=?",
+                                   (self.task_id, control["id"])).fetchone()
+        original = json.loads(event["payload"])
+        for changed in ({k: v for k, v in original.items() if k != "source_status"},
+                        {**original, "source_status": "running"}, {**original, "reason": "other reason"},
+                        *({**original, "recurrences": value} for value in (None, 0, True, kb.BLOCK_RECURRENCE_LIMIT)),
+                        {**original, "reaffirmed": True}):
+            self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(changed), event["id"]))
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (event["payload"], event["id"]))
+        for kind in ("claimed", "owner_admitted", "spawned", "worker_bound", "blocked", "unknown_future_event"):
+            with self.subTest(event=kind):
+                with kb.write_txn(self.board):
+                    kb._append_event(self.board, self.task_id, kind, original, run_id=control["id"])
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                latest = kb.list_events(self.board, self.task_id)[-1].id
+                self.board.execute("DELETE FROM task_events WHERE id=?", (latest,))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_control_row_never_substitutes_for_missing_or_ambiguous_attempt_owner(self):
+        await self.stopped_issue(review_stop=True)
+        admitted = self.board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='owner_admitted'",
+                                      (self.task_id,)).fetchone()
+        self.board.execute("UPDATE task_events SET kind='unverified_owner' WHERE id=?", (admitted["id"],))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_events SET kind='owner_admitted' WHERE id=?", (admitted["id"],))
+        claimed = self.board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='claimed'",
+                                     (self.task_id,)).fetchone()
+        self.board.execute("UPDATE task_events SET kind='owner_admitted',payload=? WHERE id=?",
+                           (admitted["payload"], claimed["id"]))
+        ambiguous = await self.cleanup_inspected()
+        self.assertFalse(ambiguous["quiescence_proven"])
+        self.assertEqual(ambiguous["reason"], "attempt_native_admission_missing_or_ambiguous")
+        self.board.execute("UPDATE task_events SET kind='claimed',payload=? WHERE id=?", (claimed["payload"], claimed["id"]))
+        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.authority.db.set_meta("fixture.pending.stop." + self.sid, None)
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
     async def test_cleanup_optional_native_event_absence_is_compatible_and_scoped(self):
         from hermes_cli import kanban_db as kb
