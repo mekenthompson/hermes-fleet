@@ -396,7 +396,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["policy"]["cwd"], cwd)
         self.assertFalse(evidence["permission_granted"])
 
-    async def kanban(self, *, existing=False, idempotency_key=None, intent="queue"):
+    async def kanban(self, *, existing=False, idempotency_key=None, intent="queue", claimer="fixture-host:CLAIM_PRIVATE_SENTINEL"):
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import _sqlite_connect
         if not existing:
@@ -413,7 +413,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.task_id = kb.create_task(self.board, title="Take over ABC-1", body="Finish the remaining checks",
                 assignee="default", created_by="fixture-agent", tenant="tenant", workspace_kind="dir",
                 workspace_path=str(self.home), skills=[], idempotency_key=idempotency_key)
-        task = kb.claim_task(self.board, self.task_id, claimer="fixture-host:CLAIM_PRIVATE_SENTINEL")
+        task = kb.claim_task(self.board, self.task_id, claimer=claimer)
         self.assertIsNotNone(task)
         self.work_context = {"board": "default", "db": str(self.board_path), "task_id": task.id,
             "run_id": task.current_run_id, "claim_lock": task.claim_lock, "profile": "default",
@@ -465,13 +465,14 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertLess(old, worker_birth(psutil.Process()))
         return old
 
-    async def stopped_issue(self, *, existing=False, idempotency_key=None, review_stop=False):
+    async def stopped_issue(self, *, existing=False, idempotency_key=None, review_stop=False,
+                            claimer="fixture-host:CLAIM_PRIVATE_SENTINEL"):
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         from hermes_fleet_linear_plugin.store import Store
         from gateway import session_ancillary
-        await self.kanban(existing=existing, idempotency_key=idempotency_key)
+        await self.kanban(existing=existing, idempotency_key=idempotency_key, claimer=claimer)
         # Finite native state fixtures: real register/adopt/finish and admission settlement;
         # no actual model, process launch, owner bootstrap or production Stop.
         executor = "admission-worker:" + self.admission
@@ -510,11 +511,102 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         getter.start()
         self.addCleanup(getter.stop)
 
-    async def cleanup_inspected(self, *, stop_id=None, metadata=None):
+    async def cleanup_inspected(self, *, stop_id=None, metadata=None, ingress=None):
         from agent import runtime_session_store
         with patch.object(runtime_session_store, "_worker_process", False):
             return await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default",
-                                           self.stop_id if stop_id is None else stop_id, self.settings, metadata)
+                                           self.stop_id if stop_id is None else stop_id, self.settings, metadata, ingress=ingress)
+
+    def reap_fixture_terminal_workers(self):
+        from hermes_cli import kanban_db_dispatch as dispatcher
+        import time
+        def no_signal(_pid, _signal):
+            raise AssertionError("source fixture must not signal any process")
+        after_grace = int(time.time()) + dispatcher.TERMINAL_WORKER_REAP_GRACE_SECONDS + 1
+        with patch.object(dispatcher.time, "time", return_value=after_grace):
+            self.assertEqual(dispatcher.reap_terminal_workers(self.board, signal_fn=no_signal), [])
+
+    async def test_cleanup_native_terminal_reaper_cleared_slots_still_requires_every_event_fate(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue(review_stop=True, claimer=kb._host_prefix() + "CLAIM_PRIVATE_SENTINEL")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        before = [tuple(row) for row in self.board.execute("SELECT * FROM task_events ORDER BY id")]
+        self.reap_fixture_terminal_workers()
+        run = self.board.execute("SELECT * FROM task_runs WHERE id=?", (self.work_context["run_id"],)).fetchone()
+        self.assertEqual((run["worker_pid"], run["worker_started_at"]), (None, None))
+        self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM task_events ORDER BY id")], before)
+        result = await self.cleanup_inspected()
+        self.assertTrue(result["quiescence_proven"], result)
+        original = self.board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spawned'",
+                                      (self.task_id,)).fetchone()
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        live = {"pid": os.getpid(), "started_at": _process_fingerprint(os.getpid())}
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(live), original["id"]))
+        result = await self.cleanup_inspected()
+        self.assertFalse(result["quiescence_proven"])
+        self.assertEqual(result["reason"], "old_worker_alive")
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (original["payload"], original["id"]))
+        for pid, birth in ((99999999, None), (None, self.process_witness(2)), (99999997, self.process_witness(2))):
+            self.board.execute("UPDATE task_runs SET worker_pid=?,worker_started_at=? WHERE id=?",
+                               (pid, birth, run["id"]))
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_runs SET worker_pid=NULL,worker_started_at=NULL WHERE id=?", (run["id"],))
+        self.board.execute("UPDATE task_events SET kind='unverified_submitter' WHERE id=?", (original["id"],))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_events SET kind='spawned' WHERE id=?", (original["id"],))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_host_namespace_disposition_keeps_fresh_native_stop_and_scope_checks(self):
+        from gateway.drain_control import current_instantiation_epoch
+        from test_linear_namespace_dispositions import receipt_fixture, root_metadata
+        from hermes_state_runtime import admit_session_input
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue(review_stop=True, claimer=kb._host_prefix() + "CLAIM_PRIVATE_SENTINEL")
+        self.reap_fixture_terminal_workers()
+        original_epoch = current_instantiation_epoch()
+        boot, _, start = original_epoch.rpartition(":")
+        changed_epoch = boot + ":" + str(int(start) + 1)
+        ingress, leaf, receipt = receipt_fixture(self.home, original_epoch)
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=changed_epoch):
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+            # The real UID1000-created file has no host receipt authority.
+            untrusted = await self.cleanup_inspected(ingress=ingress)
+            self.assertFalse(untrusted["quiescence_proven"])
+        actual_reader = cleanup._namespace_disposition
+        def fixture_reader(*args):
+            # Explicit synthetic root custody; real descriptor/file/native owner
+            # reads. This source fixture is not an actual host disposal proof.
+            with root_metadata():
+                return actual_reader(*args)
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=changed_epoch), \
+                patch.object(cleanup, "_namespace_disposition", side_effect=fixture_reader):
+            proven = await self.cleanup_inspected(ingress=ingress)
+            self.assertTrue(proven["quiescence_proven"], proven)
+            self.assertFalse(proven["permission_granted"])
+            self.assertTrue(all(worker["fate"] == "namespace_disposed"
+                                for attempt in proven["attempts"] for worker in attempt["workers"]))
+            self.assertFalse((await self.cleanup_inspected(stop_id=self.stop_id - 1, ingress=ingress))["quiescence_proven"])
+            self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+            self.assertFalse((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
+            self.authority.db.set_meta("fixture.pending.stop." + self.sid, None)
+            def changed_receipt(_method, _params):
+                self.before_rpc = None
+                leaf.chmod(0o640)
+                leaf.write_text(json.dumps({**receipt, "container_id": "b" * 64}))
+                leaf.chmod(0o440)
+            self.before_rpc = changed_receipt
+            raced = await self.cleanup_inspected(ingress=ingress)
+            self.assertFalse(raced["quiescence_proven"])
+            self.assertEqual(raced["reason"], "cleanup_evidence_changed")
+            leaf.chmod(0o640)
+            leaf.write_text(json.dumps(receipt))
+            leaf.chmod(0o440)
+            self.assertTrue((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
+            # A disposed old namespace never settles newly queued native work.
+            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                principal_id=self.conn.actor.subject, session_id=self.sid, request_id="still-pending",
+                payload={"text": "Do not run this source fixture"})
+            self.assertFalse((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
 
     def cancelled_control(self):
         """Pinned-fae final-row adapter for candidate c9b8ad4's atomic Stop writer.
