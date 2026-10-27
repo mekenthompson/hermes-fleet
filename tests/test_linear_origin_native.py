@@ -465,7 +465,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         bound(None)
         self.assertEqual((await self.cleanup_inspected())["reason"], "worker_identity_missing")
 
-    async def test_cleanup_scoped_checkpoint_retains_foreign_records_and_recycled_pids(self):
+    async def test_cleanup_scoped_checkpoint_retains_owned_obligations_and_foreign_records(self):
         from gateway.status import get_process_start_time
         await self.stopped_issue()
         route = self.authority.sessions[self.sid].route
@@ -474,19 +474,21 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         own = {"session_key": route, "parent_session_id": self.sid, "pid": os.getpid(),
                "host_start_time": get_process_start_time(os.getpid()), "pid_scope": "host"}
         path = self.home / "processes.json"
-        path.write_text(json.dumps([foreign, own]))
-        self.assertEqual((await self.cleanup_inspected())["reason"], "scoped_process_alive")
-        own["host_start_time"] = 1
-        path.write_text(json.dumps([foreign, own]))
-        before = path.read_bytes()
+        for changes in ({}, {"host_start_time": 1}, {"pid": 99999997}, {"systemd_unit": "pending-native-scope"}):
+            with self.subTest(changes=changes):
+                path.write_text(json.dumps([foreign, {**own, **changes}]))
+                before = path.read_bytes()
+                evidence = await self.cleanup_inspected()
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertEqual(evidence["reason"], "scoped_process_cleanup_unknown")
+                self.assertNotIn("FOREIGN_SCOPE_PRIVATE", json.dumps(evidence))
+                self.assertEqual(path.read_bytes(), before)
+        # A recycled legacy leader cannot discharge native ownership either.
+        # Success requires native retirement of the attributed obligation.
+        path.write_text(json.dumps([foreign]))
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
-        self.assertEqual(evidence["scoped_checkpoint"], {"scoped_records": 1, "recycled_records": 1})
-        self.assertNotIn("FOREIGN_SCOPE_PRIVATE", json.dumps(evidence))
-        self.assertEqual(path.read_bytes(), before)
-        own["systemd_unit"] = "pending-native-scope"
-        path.write_text(json.dumps([foreign, own]))
-        self.assertEqual((await self.cleanup_inspected())["reason"], "scoped_process_cleanup_unknown")
+        self.assertEqual(evidence["scoped_checkpoint"], {"scoped_records": 0, "recycled_records": 0})
 
     async def test_cleanup_new_stop_unblock_foreign_binding_and_late_spawner_invalidate(self):
         from hermes_cli import kanban_db as kb
@@ -1080,3 +1082,66 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=token))
         self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
         self.assertEqual((await self.cleanup_inspected())["reason"], "attempt_native_admission_missing_or_ambiguous")
+
+    async def test_cleanup_retained_native_job_scope_requires_native_owner_retirement(self):
+        from gateway import session_ancillary
+        from hermes_cli import kanban_db as kb
+        getter = getattr(session_ancillary, "process_stop_pending", None)
+        await self.stopped_issue()
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="transient"))
+        self.assertTrue(kb.unblock_task(self.board, self.task_id))
+        await self.stopped_issue(existing=True)
+        if getter is not None:
+            self.enterContext(patch.object(session_ancillary, "process_stop_pending", getter))
+        entry = {"session_id": "proc_cleanup_fixture", "session_key": self.authority.sessions[self.sid].route,
+                 "parent_session_id": self.sid, "owner_task_id": self.sid, "pid": 99999997,
+                 "host_start_time": 123, "pid_scope": "host", "native_job_scope": True}
+        checkpoint = self.home / "processes.json"
+        receipt_path = self.home / "logs" / "process-output" / "proc_cleanup_fixture.scope.exit"
+        receipt_path.parent.mkdir(parents=True)
+        # Adversarial receipt-like fixtures, never an actual kernel exit claim.
+        # Even a structurally affirmative file cannot replace native retirement:
+        # pending reader/output ownership settlement also retains the checkpoint.
+        positive = {"version": 1, "pid": entry["pid"], "birth": entry["host_start_time"],
+                    "quiescent": True, "exit_code": 0}
+        receipts = [None, "malformed", {**positive, "quiescent": False}, {**positive, "pid": 99999996},
+                    {**positive, "birth": 124}, {**positive, "exit_code": None}, positive]
+        for receipt in receipts:
+            with self.subTest(receipt=receipt):
+                if receipt is None:
+                    receipt_path.unlink(missing_ok=True)
+                else:
+                    receipt_path.write_text(receipt if isinstance(receipt, str) else json.dumps(receipt))
+                checkpoint.write_text(json.dumps([entry]))
+                before = checkpoint.read_bytes()
+                evidence = await self.cleanup_inspected()
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertEqual(evidence["reason"], "scoped_process_cleanup_unknown")
+                self.assertFalse(evidence["permission_granted"])
+                self.assertEqual(checkpoint.read_bytes(), before)
+        for flag in (1, 0, None, "false", "true"):
+            with self.subTest(flag=flag):
+                checkpoint.write_text(json.dumps([{**entry, "native_job_scope": flag,
+                                                  "pid": os.getpid(), "host_start_time": 1}]))
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        # Model only the owner's later checkpoint retirement in this finite
+        # fixture; inspection itself never performs cleanup or writes the file.
+        checkpoint.write_text("[]")
+        retired = await self.cleanup_inspected()
+        self.assertTrue(retired["quiescence_proven"], retired)
+        self.assertEqual(len(retired["attempts"]), 2)
+        # A positively foreign managed scope is preserved and excluded, never
+        # used to discharge the inspected task or exposed in its evidence.
+        checkpoint.write_text(json.dumps([{**entry, "session_key": "foreign", "parent_session_id": "foreign",
+                                          "owner_task_id": "foreign"}]))
+        before = checkpoint.read_bytes()
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        self.assertEqual(checkpoint.read_bytes(), before)
+        def newly_retained(method, params):
+            self.before_rpc = None
+            checkpoint.write_text(json.dumps([entry]))
+        self.before_rpc = newly_retained
+        raced = await self.cleanup_inspected()
+        self.assertFalse(raced["quiescence_proven"])
+        self.assertEqual(raced["reason"], "scoped_process_cleanup_unknown")

@@ -387,7 +387,11 @@ submitter identities proven gone or recycled. Scoped process checkpoints must al
 no live or unconfirmed scope. Only positively foreign records are excluded;
 missing, partial or conflicting route/owner attribution remains unknown. An attempt that
 spawned before native admission, orphan worker events, or any unverified older attempt also
-remain unknown; a later admitted attempt cannot hide them. Reads use native tracked SQLite
+remain unknown; a later admitted attempt cannot hide them. Any attributed retained process checkpoint,
+including a legacy host process or native job scope, stays unknown even if its leader is gone
+or recycled or an affirmative-looking exit file exists. Only the native owner can retire
+that checkpoint after scope cleanup, reader finalization and durable ownership/output settlement. Reconcile through that owner's existing native
+Stop/recovery path; this read-only command never performs retirement. Reads use native tracked SQLite
 transactions, never database copies. Receipts and the entire scoped observation are checked
 again before returning. A newer Stop, unblock, late worker binding, owner change or changed
 reporting link invalidates the old observation. Reinspect immediately before later effects.
