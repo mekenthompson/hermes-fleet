@@ -387,7 +387,9 @@ key or conflicting event/run ownership can be treated as positive foreign eviden
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions and worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. Scoped process checkpoints must also contain
+submitter identities proven gone or recycled. Worker births use the actual current native
+instantiation epoch and native birth validation/comparison. Missing, malformed, unreadable
+or unproved older-epoch witnesses stay unknown for native-owner reconciliation. Scoped process checkpoints must also contain
 no live or unconfirmed scope. Only positively foreign records are excluded;
 missing, partial or conflicting route/owner attribution remains unknown. An attempt that
 spawned before native admission, orphan worker events, or any unverified older attempt also

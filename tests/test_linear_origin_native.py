@@ -234,6 +234,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def work_inspected(self, ref):
         return await asyncio.to_thread(work.inspect, ref, self.settings)
 
+    def process_witness(self, start):
+        from gateway.drain_control import current_instantiation_epoch
+        return f"{current_instantiation_epoch()}|{start}"
+
     async def stopped_issue(self, *, existing=False):
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
@@ -253,11 +257,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                              generation=self.row["generation"], outcome="interrupted")
         with kb.write_txn(self.board):
             self.board.execute("UPDATE task_events SET payload=? WHERE kind='worker_bound' AND task_id=?",
-                (json.dumps({"pid": 99999998, "started_at": "fixture-boot|1", "claim_lock": self.work_context["claim_lock"]}), self.task_id))
-            kb._append_event(self.board, self.task_id, "spawned", {"pid": 99999999, "started_at": "fixture-boot|2"},
+                (json.dumps({"pid": 99999998, "started_at": self.process_witness(1), "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+            kb._append_event(self.board, self.task_id, "spawned", {"pid": 99999999, "started_at": self.process_witness(2)},
                              run_id=self.work_context["run_id"])
-            self.board.execute("UPDATE task_runs SET worker_pid=99999999,worker_started_at='fixture-boot|2' WHERE id=?",
-                               (self.work_context["run_id"],))
+            self.board.execute("UPDATE task_runs SET worker_pid=99999999,worker_started_at=? WHERE id=?",
+                               (self.process_witness(2), self.work_context["run_id"]))
         self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="fixture Stop"))
         self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
         self.linear_state = self.home / "linear" / "state.db"
@@ -458,7 +462,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 (json.dumps({"pid": os.getpid(), "started_at": fingerprint, "claim_lock": self.work_context["claim_lock"]}), self.task_id))
         bound(real)
         self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
-        bound("fixture-previous-boot|1")
+        bound(self.process_witness(1))
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertEqual(evidence["attempts"][0]["workers"][0]["fate"], "recycled")
@@ -500,7 +504,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         with kb.write_txn(self.board):
             kb._append_event(self.board, self.task_id, "worker_bound", {"pid": 99999998,
-                "started_at": "fixture|1", "claim_lock": self.work_context["claim_lock"]}, run_id=self.work_context["run_id"])
+                "started_at": self.process_witness(1), "claim_lock": self.work_context["claim_lock"]}, run_id=self.work_context["run_id"])
         self.assertEqual((await self.cleanup_inspected())["reason"], "late_worker_binding_after_stop")
         self.assertTrue(kb.unblock_task(self.board, self.task_id))
         self.assertEqual((await self.cleanup_inspected())["reason"], "task_not_currently_stopped")
@@ -1070,7 +1074,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         for kind in ("owner_admitted", "spawned", "worker_registered", "worker_bound"):
             with self.subTest(kind=kind), kb.write_txn(self.board):
                 kb._append_event(self.board, self.task_id, kind,
-                    {"pid": 99999999, "started_at": "fixture-boot|2"}, run_id=999999)
+                    {"pid": 99999999, "started_at": self.process_witness(2)}, run_id=999999)
             evidence = await self.cleanup_inspected()
             self.assertFalse(evidence["quiescence_proven"])
             self.board.execute("DELETE FROM task_events WHERE id=(SELECT MAX(id) FROM task_events WHERE task_id=?)", (self.task_id,))
@@ -1255,3 +1259,41 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
         kb.remove_board(slug, archive=True)
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_native_birth_validation_refuses_malformed_and_unreadable_witnesses(self):
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        real = _process_fingerprint(os.getpid())
+        self.assertIsNotNone(real)
+        epoch, start = real.split("|")
+        def bound(pid, fingerprint):
+            self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+                (json.dumps({"pid": pid, "started_at": fingerprint, "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        malformed = [None, True, False, 0, 1, "", "unverified", "|", "|1", "previous-unproved-epoch|1",
+                     *(epoch + "|" + value for value in ("", "True", "False", "0", "-1", "nan", "inf", "-inf", "1e9999", "1|2"))]
+        for witness in malformed:
+            with self.subTest(witness=witness):
+                bound(os.getpid(), witness)
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        # Invalid identity never becomes a gone-process proof either.
+        bound(99999997, "|")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        for pid in (True, False, 0, -1, None, str(os.getpid())):
+            with self.subTest(pid=pid):
+                bound(pid, real)
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        for number in (start, str(float(start)), "+" + start):
+            with self.subTest(number=number):
+                bound(os.getpid(), epoch + "|" + number)
+                self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+        bound(os.getpid(), real)
+        with patch("hermes_cli.kanban_db_dispatch._process_fingerprint", return_value=None):
+            self.assertEqual((await self.cleanup_inspected())["reason"], "worker_identity_unreadable")
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=""):
+            self.assertEqual((await self.cleanup_inspected())["reason"], "worker_identity_unreadable")
+        # Retained spawn/run records use canonical current-epoch fixture births;
+        # the actual native comparator still proves known recycled and gone IDs.
+        bound(os.getpid(), self.process_witness(1))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        bound(99999997, self.process_witness(1))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])

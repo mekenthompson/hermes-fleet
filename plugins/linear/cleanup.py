@@ -75,16 +75,29 @@ def _discover(home, issue, profile, native_profile, metadata, bound=None):
 
 
 def _pid_gone(pid, fingerprint):
-    """Use native restart-stable fingerprints; no signals or process recovery."""
-    from hermes_cli.kanban_db_dispatch import _process_fingerprint, UNVERIFIED_WORKER_FINGERPRINT
+    """Compose native epoch and birth validation; never infer identity from junk."""
+    from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_db import _pid_alive
-    _require(type(pid) is int and pid > 0 and isinstance(fingerprint, str)
-             and "|" in fingerprint and fingerprint != UNVERIFIED_WORKER_FINGERPRINT, "worker_identity_missing")
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import _start_times_agree
+    _require(type(pid) is int and pid > 0, "worker_identity_missing")
+    epoch = current_instantiation_epoch()
+    _require(isinstance(epoch, str) and epoch, "worker_identity_unreadable")
+    def birth(witness, reason):
+        _require(isinstance(witness, str) and witness.count("|") == 1, reason)
+        recorded_epoch, _, start = witness.partition("|")
+        _require(recorded_epoch == epoch, reason)
+        try:
+            valid = _start_times_agree(start, start)
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        _require(valid, reason)
+        return start
+    recorded = birth(fingerprint, "worker_identity_missing")
     if not _pid_alive(pid):
         return "gone"
-    current = _process_fingerprint(pid)
-    _require(current is not None, "worker_identity_unreadable")
-    _require(current != fingerprint, "old_worker_alive")
+    current = birth(_process_fingerprint(pid), "worker_identity_unreadable")
+    _require(not _start_times_agree(current, recorded), "old_worker_alive")
     return "recycled"
 
 
