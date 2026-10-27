@@ -381,8 +381,11 @@ issue metadata for explicit marker matching; it is discovery data and grants no 
 Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown. Existing
 saved links never skip native discovery across retained boards. Another matching executor,
 including archived work, holds proof. The selected board's strict SDK history, predicate-key
-preflight and native event decoding share one tracked read transaction; no filtered-out opaque
-key or conflicting event/run ownership can be treated as positive foreign evidence.
+preflight and native event decoding share one tracked read transaction. Native-normalized
+owned keys must agree with SQLite's actual task/run predicates before filtering; a readable
+BLOB alias is unknown rather than an omitted attempt. The checks preserve raw SQLite
+equality/order and unrelated readable foreign records, without repairing any keys.
+No filtered-out opaque key or conflicting event/run ownership is positive foreign evidence.
 
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
