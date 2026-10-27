@@ -141,13 +141,28 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         events = board.execute("SELECT id,run_id,kind,payload FROM task_events WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
         stops = [e for e in events if e["kind"] == "blocked" and (json.loads(e["payload"] or "{}" ).get("kind") == "needs_input")]
         _require(stops and stops[-1]["id"] == stop_id, "stop_event_changed")
+        runs = board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
+        by_run = {run["id"]: run for run in runs}
         bindings = [e for e in events if e["kind"] == "owner_admitted"]
+        workers = [e for e in events if e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
         _require(bindings and all(e["id"] < stop_id for e in bindings), "admission_after_stop_or_missing")
-        for event in bindings:
-            run_id, marker = event["run_id"], json.loads(event["payload"])
-            run = board.execute("SELECT * FROM task_runs WHERE task_id=? AND id=?", (task["id"], run_id)).fetchone()
-            _require(run and run["status"] not in {"running", "unknown"} and run["ended_at"] is not None
-                     and run["profile"] == native_profile, "run_not_settled")
+        _require(all(e["run_id"] in by_run for e in bindings + workers), "attempt_event_run_unknown")
+        # A submitter can spawn before native admission. Inspect every retained run
+        # and worker event before requiring admission evidence; absence is never safety.
+        for run in runs:
+            _require(run["status"] not in {"running", "unknown"}
+                     and run["ended_at"] is not None and run["profile"] == native_profile, "run_not_settled")
+            if run["worker_pid"] is not None or run["worker_started_at"] is not None:
+                _pid_gone(run["worker_pid"], run["worker_started_at"])
+        for worker in workers:
+            _require(worker["id"] < stop_id, "late_worker_binding_after_stop")
+            data = json.loads(worker["payload"])
+            _pid_gone(data.get("pid"), data.get("started_at"))
+        for run in runs:
+            admitted = [e for e in bindings if e["run_id"] == run["id"]]
+            _require(len(admitted) == 1, "attempt_native_admission_missing_or_ambiguous")
+            event = admitted[0]
+            run_id, marker = run["id"], json.loads(event["payload"])
             sid = marker["session_id"]
             _require(Path(marker["db"]).resolve() == home / "state.db", "foreign_native_owner")
             saved = local_receipt(db, sid)
@@ -205,7 +220,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                       "attempts": worker_evidence, "scoped_checkpoint": checkpoint,
                       "stop_checkpoint": "clear", "scope": declared, "discovery_source": source,
                       "owner_epoch": epoch[0], "owner_instance_id": epoch[1]}
-        digest = origin._digest({"binding": bound, "task": dict(task), "events": [dict(e) for e in events],
+        digest = origin._digest({"binding": bound, "task": dict(task), "events": [dict(e) for e in events], "runs": [dict(run) for run in runs],
                                  "receipts": receipts, "projection": projection})
         return projection, receipts, digest
 
