@@ -16,13 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent-source", type=Path, required=True)
+    parser.add_argument("--expected-revision", help="Explicit immutable candidate Core revision; default is the release manifest pin")
     args = parser.parse_args()
     source = args.agent_source.resolve(strict=True)
     manifest = json.loads((ROOT / "release/agent-image-manifest.json").read_text())
     actual = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain"], check=True, capture_output=True, text=True).stdout.strip()
-    if actual != manifest["revision"] or dirty:
-        parser.error("Use the clean manifest-pinned native source")
+    if actual != (args.expected_revision or manifest["revision"]) or dirty:
+        parser.error("Use the clean native source at the exact expected revision")
     real_home = Path.home()
     with tempfile.TemporaryDirectory(prefix="linear-origin-proof-") as temporary:
         home = Path(temporary)
@@ -38,12 +39,18 @@ def main():
         from linear_origin_guard import Guard
         guard = Guard(home, real_home)
         guard.install()
+        class NoGatewayBootstrap:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname in {"gateway.run", "run_agent"}:
+                    guard.deny("gateway/model bootstrap import: " + fullname)
+                return None
+        sys.meta_path.insert(0, NoGatewayBootstrap())
         # Packaged Hermes carries build provenance; a source checkout would probe git while
         # importing provider declarations. Use the already verified immutable fixture identity.
         sys.path.insert(0, str(source))
         from hermes_cli import version_info
         version_info._cached_version_info = version_info.VersionInfo("fixture", "fixture", 0, actual, None, "ci")
-        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_origin_native.py")
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_origin*_native.py")
         result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
         # A caught guard refusal is still a failed proof: it must never become green by fallback.
         if guard.violations:

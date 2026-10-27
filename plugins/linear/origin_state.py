@@ -85,14 +85,24 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
             source, event = native["source"], native["event"]
             platform = source.get("platform")
             identity = [source.get(k) for k in ("profile", "platform", "chat_id", "thread_id", "user_id")]
-            if (platform not in {"telegram", "slack"} or source.get("is_bot") is not False
-                    or not source.get("user_id") or event.get("allow_gateway_control") is not True
+            linear = platform == "linear"
+            if (platform not in {"telegram", "slack", "linear"} or source.get("is_bot") is not False
+                    or not source.get("user_id") or event.get("allow_gateway_control") is not (False if linear else True)
                     or "automation" in native or event.get("inherit_channel_pin") is True
+                    or event.get("structured_control") is not None or "native_stop_v1" in payload
                     or row["principal_id"] != "messaging:" + json.dumps(identity, separators=(",", ":"))):
                 _refuse("The admission is not ordinary authenticated human messaging input.")
             requester.update(kind="messaging", platform=platform, user_id=source["user_id"],
                              chat_id=source.get("chat_id"), thread_id=source.get("thread_id"),
                              scope_id=source.get("scope_id"))
+            if linear:
+                message = event.get("message_id")
+                if (any(not isinstance(source.get(k), str) or not source[k] for k in ("scope_id", "chat_id", "thread_id"))
+                        or message is not None and (not isinstance(message, str) or not message or len(message) > 4096)
+                        or source.get("message_id") != message or event.get("user_id") != source["user_id"]
+                        or source["scope_id"] != declared_scope["linear"].get("organization_id")):
+                    _refuse("The native Linear input has no exact provider message/source identity.")
+                requester["message_id"] = message
             if context and (context.platform != platform or context.session_key != native.get("route")
                             or any(getattr(context, k) != str(source.get(k) or "")
                                    for k in ("user_id", "chat_id", "thread_id", "scope_id"))):
