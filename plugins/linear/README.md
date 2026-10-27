@@ -315,7 +315,7 @@ actorless and typed Stop inputs cannot become human-origin references. If an
 already-running scoped `BoundLinearAPI` is available, the edge freshly verifies
 the original Activity author (or the assignment Session creator), current app,
 issue, organization and specialist limits through its existing read methods.
-It never constructs an API client, fetches credentials or starts a service.
+It never constructs an API client, initializes a credential source or starts a service.
 
 The result states `provider_verification.state: verified` or `needed`. A later
 owner CLI process normally has no existing provider API and reports `needed`;

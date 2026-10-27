@@ -143,18 +143,14 @@ are absent from peer data. Unknown, foreign, stale, extra-field or changed refer
 there is no new transport, signature, token or owner registry. Preservation does not turn the
 peer frame into permission or select a host deployment.
 
-Candidate core `c9b8ad4312c99a7e85fd73b0a9f2c0db3ac80a89` records process Stop controls
-as terminal/cancelled admissions under `native-process-stop`, with NULL generation and only
-`process_completion` identity plus route in the payload. These records target the logical
-owner-admitted session, not a physical worker SID. They are neither original messages nor human
-consent. The current-generation origin selector excludes them; stopped-work cleanup accepts
-their terminal state while still requiring the exact Kanban execution admission, worker/process
-settlement and a clear supported Stop checkpoint. Pinned-fae tests adapt that final row shape
-explicitly; they do not execute or establish acceptance of the unaccepted corrective writer.
-
-This branch still awaits rebasing onto accepted PR224. Its temporary old-base read-only history
-override must then be removed in favor of the accepted canonical tracked read transaction and
-discovery implementation, with validation rerun on the integrated source.
+Process Stop records are control evidence, never original human messages or consent.
+Stopped-work cleanup still requires the exact Kanban execution admission, worker/process
+settlement and a clear supported Stop checkpoint. Guarded cases run against both the release
+manifest pin and an explicitly selected clean candidate with persisted Stop checkpoints;
+older-core getter fixtures do not establish acceptance or deployment of another writer.
+Inspection reuses the accepted canonical tracked read transaction and discovery implementation
+while preserving its no-create construction boundary. Outcome acceptance still requires the
+actual native owner, current authorization and separate physical quiescence verification.
 
 The native scenario suite exercises upstream task creation, claiming, lifecycle and comment
 consumption; the registered tool and private socket are exercised with actual upstream session
