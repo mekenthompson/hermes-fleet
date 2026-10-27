@@ -440,6 +440,38 @@ BLOB alias is unknown rather than an omitted attempt. The checks preserve raw SQ
 equality/order and unrelated readable foreign records, without repairing any keys.
 No filtered-out opaque key or conflicting event/run ownership is positive foreign evidence.
 
+The optional host namespace-disposal transport is the existing protected ingress directory's
+`namespace-dispositions/<sha256(epoch UTF-8)>.json` sibling directory. Every ancestor must be
+root-owned, nonwritable by group/others and nonsymlink. The receipt directory is `root:1000`
+mode `0750`; each single-link regular receipt is `root:1000` mode `0440`, opened without
+following symlinks and limited to 16 KiB. Neither the group-writable ingress SQLite bytes, plugin metadata, model
+arguments nor an arbitrary file can provide this proof. No new mount or credential is needed.
+
+Version 1 has exactly these fields (all identifiers below are synthetic):
+
+```json
+{"version":1,"kind":"pid_namespace_disposed","deployment_profile":"specialist","native_profile":"default","home":"/opt/data","home_dev":123,"home_ino":456,"epoch":"00000000-0000-0000-0000-000000000001:12345","container_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","host_pid1":23456,"pid1_start_ticks":12345,"pid_namespace_inode":34567,"host_pid_namespace_inode":45678,"pid_mode":"private","old_instance_disposed":true,"pid1_gone":true}
+```
+
+The host producer captures the selected old service/container, its live PID1 birth and private
+PID namespace, and the declared profile's actual bind-volume identity **before** stopping it.
+The host and old container must agree on `/opt/data` device/inode. It publishes atomically only
+after proving that exact old host PID1 birth gone under isolated PID mode. The old container
+may be absent, present stopped, or restarted with a distinct new PID1/private namespace and
+consistent profile/home binding. Contradictory Docker/kernel state, a name change, failed
+inspection or unreadable identity is insufficient. Gateway-only restart keeps PID1 and needs no receipt.
+Linux terminates a PID namespace's remaining processes when its init exits and prevents new
+processes entering that dead namespace; see [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html).
+It never overwrites a conflicting receipt. The epoch's final integer equals `pid1_start_ticks`;
+the two namespace inodes must differ. Integer fields exclude booleans; `home_dev` is nonnegative,
+other integer identities are positive. `old_instance_disposed` and `pid1_gone` are literal true.
+
+The consumer binds the protected inbox/deployment profile, current native profile and canonical
+home, actual current home device/inode, and exact retained worker epoch. It still performs all
+current Stop, admission, scope, descendant and effect checks. A namespace disposition proves
+only physical fate; it cannot mark an external effect successful or authorize more work.
+Legacy observations made before this producer existed are not automatically imported or backdated.
+
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions with recognized settled outcomes and worker/child ledger,

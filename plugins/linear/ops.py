@@ -162,7 +162,8 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
             metadata = json.loads(args.issue_json) if args.issue_json else None
         except ValueError:
             metadata = {}  # The projection reports a bounded unknown without executing a selector.
-        result = cleanup.inspect(state, args.issue_id, profile, args.expected_stop_event_id, origin_settings or {}, metadata)
+        result = cleanup.inspect(state, args.issue_id, profile, args.expected_stop_event_id, origin_settings or {}, metadata,
+                                 ingress=ingress)
         print(json.dumps(result))
         return 0 if result["quiescence_proven"] else 1
     if args.linear_command in {"inspect-origin", "inspect-work"}:

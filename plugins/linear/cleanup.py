@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing, contextmanager
+import hashlib
 import json
 import os
 import stat
 from pathlib import Path
 import sqlite3
+import uuid
 
 from . import origin
 from .transport import Unavailable, native_json_object
@@ -31,6 +33,17 @@ _SETTLED_ADMISSION_OUTCOMES = frozenset({
     "completed", "interrupted", "rejected", "failed", "cancelled", "steered",
 })
 
+# Host lifecycle evidence shares the existing protected per-profile ingress
+# mount. These are immutable physical facts, never execution or consent grants.
+NAMESPACE_DISPOSITION_DIRECTORY = "namespace-dispositions"
+NAMESPACE_DISPOSITION_VERSION = 1
+NAMESPACE_DISPOSITION_MAX_BYTES = 16384
+NAMESPACE_DISPOSITION_FIELDS = frozenset({
+    "version", "kind", "deployment_profile", "native_profile", "home", "home_dev", "home_ino",
+    "epoch", "container_id", "host_pid1", "pid1_start_ticks", "pid_namespace_inode",
+    "host_pid_namespace_inode", "pid_mode", "old_instance_disposed", "pid1_gone",
+})
+
 
 class Unknown(RuntimeError):
     pass
@@ -39,6 +52,82 @@ class Unknown(RuntimeError):
 def _require(value, reason):
     if not value:
         raise Unknown(reason)
+
+
+def _namespace_disposition(ingress, home, deployment_profile, native_profile, epoch):
+    """Read only the host-owned receipt in this profile's protected inbox."""
+    _require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
+             "namespace_disposition_unsupported")
+    directory = Path(ingress).parent / NAMESPACE_DISPOSITION_DIRECTORY
+    path = directory / (hashlib.sha256(epoch.encode("utf-8")).hexdigest() + ".json")
+    _require(path.is_absolute() and ".." not in path.parts, "namespace_disposition_unavailable")
+    descriptors = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(path.anchor, flags)
+        descriptors.append(fd)
+        for index, part in enumerate(path.parts[1:-1]):
+            info = os.fstat(fd)
+            _require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                     "namespace_disposition_custody_unproven")
+            fd = os.open(part, flags, dir_fd=fd)
+            descriptors.append(fd)
+            if index >= len(path.parts) - 4:  # Protected profile and receipt directories.
+                info = os.fstat(fd)
+                _require(info.st_uid == 0 and info.st_gid == 1000
+                         and stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o750,
+                         "namespace_disposition_custody_unproven")
+        info = os.fstat(fd)
+        _require(info.st_uid == 0 and stat.S_ISDIR(info.st_mode) and not info.st_mode & 0o022,
+                 "namespace_disposition_custody_unproven")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=fd)
+        descriptors.append(fd)
+        info = os.fstat(fd)
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 1000
+                 and stat.S_IMODE(info.st_mode) == 0o440 and info.st_nlink == 1
+                 and 0 < info.st_size <= NAMESPACE_DISPOSITION_MAX_BYTES,
+                 "namespace_disposition_custody_unproven")
+        raw = os.read(fd, info.st_size + 1)
+        _require(len(raw) == info.st_size, "namespace_disposition_unavailable")
+    except OSError as exc:
+        raise Unknown("namespace_disposition_unavailable") from exc
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            _require(key not in result, "namespace_disposition_invalid")
+            result[key] = value
+        return result
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    _require(isinstance(value, dict) and set(value) == NAMESPACE_DISPOSITION_FIELDS,
+             "namespace_disposition_invalid")
+    _require(all(isinstance(value[key], str) and value[key] for key in
+                 ("kind", "deployment_profile", "native_profile", "home", "epoch", "container_id", "pid_mode")),
+             "namespace_disposition_invalid")
+    _require(type(value["version"]) is int and value["version"] == NAMESPACE_DISPOSITION_VERSION
+             and value["kind"] == "pid_namespace_disposed" and value["pid_mode"] == "private"
+             and value["old_instance_disposed"] is True and value["pid1_gone"] is True,
+             "namespace_disposition_invalid")
+    _require(type(value["home_dev"]) is int and value["home_dev"] >= 0
+             and all(type(value[key]) is int and value[key] > 0 for key in
+                 ("home_ino", "host_pid1", "pid1_start_ticks", "pid_namespace_inode", "host_pid_namespace_inode")),
+             "namespace_disposition_invalid")
+    boot, separator, start = epoch.rpartition(":")
+    _require(separator == ":" and str(uuid.UUID(boot)) == boot and start == str(value["pid1_start_ticks"])
+             and value["epoch"] == epoch and value["pid_namespace_inode"] != value["host_pid_namespace_inode"],
+             "namespace_disposition_invalid")
+    container = value["container_id"]
+    _require(isinstance(container, str) and len(container) == 64
+             and all(c in "0123456789abcdef" for c in container), "namespace_disposition_invalid")
+    home_info = home.stat()
+    _require(stat.S_ISDIR(home_info.st_mode)
+             and value["deployment_profile"] == deployment_profile == Path(ingress).parent.name
+             and value["native_profile"] == native_profile and value["home"] == str(home)
+             and (value["home_dev"], value["home_ino"]) == (home_info.st_dev, home_info.st_ino),
+             "namespace_disposition_scope_mismatch")
+    return {"epoch": epoch, "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def _control_only_run(run, events, native_profile, stop_id):
@@ -122,7 +211,7 @@ def _discover(home, issue, profile, native_profile, metadata, bound=None):
     return bound, reader.for_board(bound["board"])
 
 
-def _pid_gone(pid, fingerprint, owner=None):
+def _pid_gone(pid, fingerprint, owner=None, *, disposition=None):
     """Compose native epoch and birth validation; never infer identity from junk."""
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_db import _pid_alive
@@ -131,17 +220,21 @@ def _pid_gone(pid, fingerprint, owner=None):
     _require(type(pid) is int and pid > 0, "worker_identity_missing")
     epoch = current_instantiation_epoch()
     _require(isinstance(epoch, str) and epoch, "worker_identity_unreadable")
-    def birth(witness, reason):
+    def birth(witness, reason, *, same_epoch=True):
         _require(isinstance(witness, str) and witness.count("|") == 1, reason)
         recorded_epoch, _, start = witness.partition("|")
-        _require(recorded_epoch == epoch, reason)
+        _require(not same_epoch or recorded_epoch == epoch, reason)
         try:
             valid = _start_times_agree(start, start)
         except (TypeError, ValueError, OverflowError):
             valid = False
         _require(valid, reason)
         return start
-    recorded = birth(fingerprint, "worker_identity_missing")
+    recorded = birth(fingerprint, "worker_identity_missing", same_epoch=False)
+    recorded_epoch = fingerprint.partition("|")[0]
+    if recorded_epoch != epoch:
+        _require(disposition is not None and disposition(recorded_epoch), "worker_identity_missing")
+        return "namespace_disposed"
     if not _pid_alive(pid):
         return "gone"
     current = birth(_process_fingerprint(pid), "worker_identity_unreadable")
@@ -329,7 +422,7 @@ def _require_owned_admissions(native, rows, epoch):
                  "native_admission_state_unreadable")
 
 
-def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
+def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata, ingress=None):
     from hermes_cli import kanban_db as kb
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
@@ -347,6 +440,12 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     bound, reader = _discover(home, issue, native_profile, native_profile, metadata, bound)
     path = kb.kanban_db_path(board=bound["board"]).resolve(strict=True)
     receipts, owners, worker_evidence, native_lineages = [], [], [], []
+    namespace_evidence = {}
+    def disposed(epoch):
+        if epoch not in namespace_evidence:
+            namespace_evidence[epoch] = _namespace_disposition(ingress, home, binding_profile, native_profile, epoch)
+        return True
+    disposition = disposed if ingress is not None else None
     with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
         from .bridge import task_issue_match, require_task_issue_scope, native_text_row, native_event_payload
         from .api import LinearError
@@ -460,7 +559,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      and admission["payload"].get("kanban_card_v1") == {"board": bound["board"], "task_id": task["id"], "run_id": run_id},
                      "native_admission_not_settled")
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
-                _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
+                _pid_gone(run["worker_pid"], run["worker_started_at"], marker, disposition=disposition)
             with db._read_ctx() as native:
                 lineage, native_workers, children, lineage_inputs = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
                 epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
@@ -487,14 +586,21 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      and any(e["kind"] in {"spawned", "worker_registered"} for e in relevant), "worker_binding_evidence_missing")
             observed = []
             submitters = [json.loads(e["payload"]) for e in relevant if e["kind"] in {"spawned", "worker_registered"}]
-            _require(any(p.get("pid") == run["worker_pid"] and p.get("started_at") == run["worker_started_at"] for p in submitters),
+            # Native terminal reaping clears BOTH mutable PID slots after exit;
+            # its immutable event cohort remains. Never infer fate from NULLs:
+            # every submitter and interpreter below still needs physical proof.
+            cleared = run["worker_pid"] is None and run["worker_started_at"] is None
+            _require((cleared and isinstance(run["claim_lock"], str) and bool(run["claim_lock"]))
+                     or (run["worker_pid"] is not None and run["worker_started_at"] is not None
+                         and any(p.get("pid") == run["worker_pid"] and p.get("started_at") == run["worker_started_at"] for p in submitters)),
                      "submitter_run_identity_missing")
             for worker in relevant:
                 data = json.loads(worker["payload"])
                 _require(worker["id"] < stop_id, "late_worker_binding_after_stop")
                 if worker["kind"] == "worker_bound":
                     _require(data.get("claim_lock") == frozen.get("claim_lock"), "worker_claim_mismatch")
-                observed.append({"kind": worker["kind"], "fate": _pid_gone(data.get("pid"), data.get("started_at"), marker)})
+                observed.append({"kind": worker["kind"], "fate": _pid_gone(data.get("pid"), data.get("started_at"), marker,
+                                                                         disposition=disposition)})
             worker_evidence.append({"run_id": run_id, "workers": observed,
                 "scope": {key: frozen.get(key) for key in ("profile", "workspace", "branch", "tenant", "skills")}})
             owners.append(({saved["route"], *lineage}, {*lineage, *(child["session_id"] for child in children)}))
@@ -509,26 +615,28 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                       "stop_checkpoint": "clear", "scope": declared, "discovery_source": source,
                       "owner_epoch": epoch[0], "owner_instance_id": epoch[1]}
         digest = origin._digest({"binding": bound, "task": dict(task), "events": [dict(e) for e in events], "runs": [dict(run) for run in runs],
-                                 "receipts": receipts, "native_lineages": native_lineages, "projection": projection})
+                                 "receipts": receipts, "native_lineages": native_lineages, "projection": projection,
+                                 "namespace_dispositions": namespace_evidence})
         return projection, receipts, digest
 
 
-async def _inspect(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
+async def _inspect(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata, ingress=None):
     async with origin._client(home) as (client, endpoint):
-        before, rows, digest = await asyncio.to_thread(_snapshot, home, state, issue, binding_profile, native_profile, stop_id, declared, metadata)
+        before, rows, digest = await asyncio.to_thread(_snapshot, home, state, issue, binding_profile, native_profile, stop_id, declared, metadata, ingress)
         _require(before["owner_epoch"] == endpoint.authority_epoch and before["owner_instance_id"] == endpoint.instance_id,
                  "native_owner_changed")
         for row in rows:
             receipt = await client.rpc("prompt.receipt", session_id=row["session_id"], admission_id=row["admission_id"])
             _require(all(receipt.get(k) == row[k] for k in ("admission_id", "status", "outcome", "authority_epoch", "execution_generation"))
                      and receipt.get("ref") == {"profile_id": str(home), "session_id": row["session_id"]}, "native_receipt_changed")
-        after, _, repeated = await asyncio.to_thread(_snapshot, home, state, issue, binding_profile, native_profile, stop_id, declared, metadata)
+        after, _, repeated = await asyncio.to_thread(_snapshot, home, state, issue, binding_profile, native_profile, stop_id, declared, metadata, ingress)
         _require(digest == repeated and before == after, "cleanup_evidence_changed")
         return {**after, "owner_instance_id": endpoint.instance_id, "owner_epoch": endpoint.authority_epoch,
                 "evidence_digest": digest, "quiescence_proven": True, "permission_granted": False}
 
 
-def inspect(state: Path, issue: str, binding_profile: str, stop_id: int, settings: dict, metadata: dict | None = None) -> dict:
+def inspect(state: Path, issue: str, binding_profile: str, stop_id: int, settings: dict, metadata: dict | None = None,
+            *, ingress: Path | None = None) -> dict:
     """Explicit owner CLI boundary; selects only a current saved Linear/native binding."""
     try:
         from hermes_constants import get_hermes_home
@@ -547,7 +655,7 @@ def inspect(state: Path, issue: str, binding_profile: str, stop_id: int, setting
             pass
         else:
             raise Unknown("synchronous_owner_cli_required")
-        return asyncio.run(_inspect(home, state, issue, binding_profile, get_active_profile_name(), stop_id, origin.scope(settings), metadata))
+        return asyncio.run(_inspect(home, state, issue, binding_profile, get_active_profile_name(), stop_id, origin.scope(settings), metadata, ingress))
     except (Unknown, Unavailable, OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError, ImportError, sqlite3.DatabaseError) as exc:
         reason = str(exc) if isinstance(exc, Unknown) else "cleanup_evidence_unavailable"
         return {"issue_id": issue, "stop_event_id": stop_id, "quiescence_proven": False,
