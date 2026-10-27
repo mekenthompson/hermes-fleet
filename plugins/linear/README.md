@@ -262,6 +262,9 @@ retry reconciliation. Structured Stop reaches native conversation control and th
 linked task; an accepted control receipt does not prove physical cleanup. Replies
 remain queued until the existing scoped sender confirms publication. Prior uncertain
 effects stay held while unrelated authorized discussion continues.
+Creator-null assignment acknowledgment requires a verified durable admission or
+known original supersession from the existing native dispatcher. Held scope and
+uncertain creation remain pending; retry never repeats an unknown create.
 Stop acknowledgment also requires a verified task-control outcome, a durable unbound
 Stop, or positive supersession evidence. Held or unknown controls retain the provider
 delivery and original task/board/event/run coordinates; retries can recognize their

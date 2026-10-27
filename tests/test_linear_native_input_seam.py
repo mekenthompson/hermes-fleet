@@ -579,6 +579,90 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.rows()), 1)
         self.assertEqual(self.rows()[0]["request_id"], "startup-input")
 
+    async def test_actorless_assignment_scope_fence_retains_original_delivery(self):
+        self.provider.sessions[self.SESSION]["creator"] = None
+        self.bridge.store.fence_scope(self.ISSUE, "Retained original authorization fence", at=1)
+        event = self.event("actorless-fenced", "", action="created")
+        event["agentSession"].pop("creatorId")
+        raw = await self.deliver_raw("actorless-fenced", event)
+        await self.until(lambda: all(f.done() for f in self.adapter._submitted.values()))
+        for _ in range(3):
+            await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+            await asyncio.sleep(.02)
+        self.assertEqual(self.inbox_row("actorless-fenced")[1:3], (raw, "pending"))
+        self.assertTrue(self.bridge.store.scope_fenced(self.ISSUE))
+        self.assertIsNone(self.bridge.store.get(self.ISSUE))
+        self.assertEqual(self.board.discover(self.provider.issues[self.ISSUE]), [])
+        self.assertEqual(self.rows(), [])
+
+    async def test_actorless_unknown_creation_retry_cannot_ack_or_repeat_create(self):
+        self.provider.sessions[self.SESSION]["creator"] = None
+        with self.board.conn() as conn:
+            conn.execute("CREATE TRIGGER fixture_refuse_create BEFORE INSERT ON tasks "
+                         "BEGIN SELECT RAISE(ABORT, 'finite native create refusal'); END")
+        event = self.event("actorless-unknown", "", action="created")
+        event["agentSession"].pop("creatorId")
+        raw = await self.deliver_raw("actorless-unknown", event)
+        await self.until(lambda: all(f.done() for f in self.adapter._submitted.values()))
+        self.assertEqual(self.inbox_row("actorless-unknown")[2], "pending")
+        with self.board.conn() as conn:
+            conn.execute("DROP TRIGGER fixture_refuse_create")
+        original = self.bridge.store.native_intent("create:" + self.ISSUE)["payload"]
+        for _ in range(5):
+            await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+            await asyncio.sleep(.02)
+        intent = self.bridge.store.native_intent("create:" + self.ISSUE)
+        self.assertEqual(intent["state"], "reconcile")
+        self.assertEqual(intent["payload"], original)
+        self.assertEqual(self.inbox_row("actorless-unknown")[1:3], (raw, "pending"))
+        self.assertIsNone(self.bridge.store.get(self.ISSUE))
+        self.assertEqual(self.board.discover(self.provider.issues[self.ISSUE]), [])
+        self.assertEqual(self.rows(), [])
+
+    async def test_actorless_committed_create_response_loss_reconciles_before_ack(self):
+        self.provider.sessions[self.SESSION]["creator"] = None
+        event = self.event("actorless-lost-response", "", action="created")
+        event["agentSession"].pop("creatorId")
+        create = self.board.create
+        created = []
+        def lost_response(**kwargs):
+            created.append(create(**kwargs))
+            raise ConnectionError("finite create response loss")
+        with patch.object(self.board, "create", side_effect=lost_response) as request:
+            raw = await self.deliver_raw("actorless-lost-response", event)
+            await self.until(lambda: all(f.done() for f in self.adapter._submitted.values()))
+            self.assertEqual(self.inbox_row("actorless-lost-response")[2], "pending")
+            self.assertEqual(request.call_count, 1)
+        self.assertIsNone(self.bridge.store.get(self.ISSUE))
+        self.assertEqual(self.board.get(created[0].id).status, "blocked")
+        with patch.object(self.board, "create", side_effect=AssertionError("must reconcile original create")):
+            for _ in range(5):
+                await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+                await asyncio.sleep(.02)
+            await self.until(lambda: self.inbox_row("actorless-lost-response")[2] == "imported")
+        self.assertEqual(self.bridge.store.get(self.ISSUE)["task_id"], created[0].id)
+        self.assertEqual(self.bridge.store.native_intent("create:" + self.ISSUE)["state"], "applied")
+        self.assertEqual(len(self.board.discover(self.provider.issues[self.ISSUE])), 1)
+        self.assertEqual(self.inbox_row("actorless-lost-response")[1], raw)
+        self.assertEqual(self.rows(), [])
+
+    async def test_known_pre_cutoff_assignment_is_consumed_without_revival(self):
+        self.provider.sessions[self.SESSION]["creator"] = None
+        event = self.event("actorless-stale", "", action="created")
+        event["agentSession"].pop("creatorId")
+        self.bridge.activation_cutoff_ms = 2000000000000
+        await self.deliver_raw("actorless-stale", event)
+        await self.until(lambda: self.inbox_row("actorless-stale")[2] == "imported")
+        self.assertIsNone(self.bridge.store.get(self.ISSUE))
+        self.assertIsNone(self.bridge.store.native_intent("create:" + self.ISSUE))
+        self.assertEqual(self.rows(), [])
+
+    async def test_ignored_nonwork_webhook_still_acknowledges_without_native_work(self):
+        await self.deliver_raw("nonwork-update", {"type": "Issue", "action": "update", "data": {"id": self.ISSUE}})
+        await self.until(lambda: self.inbox_row("nonwork-update")[2] == "imported")
+        self.assertIsNone(self.bridge.store.get(self.ISSUE))
+        self.assertEqual(self.rows(), [])
+
     async def test_actorless_assignment_uses_one_native_coordination_task_and_unknown_requester(self):
         from hermes_cli import kanban_db as kb
         from hermes_fleet_linear_plugin.native_input import ACTORLESS_COORDINATION

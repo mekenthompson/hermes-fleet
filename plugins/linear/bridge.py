@@ -947,7 +947,7 @@ class Bridge:
             if row and stamp < float(row["last_updated_at"]):
                 return True  # A newer reporting/admission observation superseded this input.
             if event.get("action") == "created":
-                self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt)
+                return self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
                     self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
@@ -966,17 +966,17 @@ class Bridge:
                 self._prompted(event, issue, session_id, row, activity)
 
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
-                   *, assignment_prompt: str = "") -> None:
+                   *, assignment_prompt: str = "") -> bool:
         if row:
             if self._assignment_activation(row):
-                return
+                return True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
                 self._decline(issue["id"], session_id, task["message"])
-                return
+                return False
             self._decline(issue["id"], session_id, f"Existing work: {task.get('status')}. Use native task controls to resume stopped work.")
-            return
-        self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
+            return True  # The original durable binding was verified; do not resume it.
+        return self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
