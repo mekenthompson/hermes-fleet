@@ -682,19 +682,27 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         from hermes_state_runtime import settle_session_input
         await self.local()
         interactive = (await self.current())["reference"]
-        # fae has no persisted checkpoint getter. An in-flight direct Stop may still have a
-        # started receipt; it must produce UNKNOWN evidence, never an absence-of-Stop claim.
+        supported = callable(getattr(session_ancillary, "process_stop_pending", None))
+        # An in-flight Stop retains a started receipt. A supported pending
+        # checkpoint refuses; the older ABI reports unknown, never clear.
+        # Adopt only a finite interrupt endpoint so the older Core does not
+        # need its unrelated gateway bootstrap to inspect a cached-agent slot.
+        self.authority.adopt_agent(self.sid, self.row["generation"], SimpleNamespace(interrupt=lambda *args: None))
         await self.authority.interrupt(self.conn.actor, self.ref, self.row["generation"])
-        evidence = await self.inspected(interactive)
-        self.assertEqual(evidence["stop_evidence"]["state"], "unknown")
-        self.assertFalse(evidence["stop_evidence"]["quiescence_proven"])
+        if supported:
+            with self.assertRaises(transport.Unavailable):
+                await self.inspected(interactive)
+        else:
+            evidence = await self.inspected(interactive)
+            self.assertEqual(evidence["stop_evidence"]["state"], "unknown")
+            self.assertFalse(evidence["stop_evidence"]["quiescence_proven"])
         settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.inspected(interactive)
         await self.kanban()
         current = (await self.work_current())["reference"]
-        self.assertEqual((await self.work_inspected(current))["stop_evidence"]["state"], "unknown")
+        self.assertEqual((await self.work_inspected(current))["stop_evidence"]["state"], "clear" if supported else "unknown")
         # The corrective core's existing getter reads a single native meta checkpoint. Test
         # that optional ABI against real native RO state, without changing the pinned core.
         key = "fixture.pending.stop." + self.sid

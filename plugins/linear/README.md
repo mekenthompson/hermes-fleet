@@ -308,6 +308,22 @@ runtime tool inventory, initializes credentials, starts a gateway, or runs a mod
 API credential principals remain API credential principals; they are not attributed to a
 named human. Recheck current native state before any subsequent control operation.
 
+Ordinary native Linear input uses a separate, bounded evidence branch. It checks
+the committed human actor, organization, issue, Agent Session and original
+provider message ID with gateway command/control flags disabled. Bot, automated,
+actorless and typed Stop inputs cannot become human-origin references. If an
+already-running scoped `BoundLinearAPI` is available, the edge freshly verifies
+the original Activity author (or the assignment Session creator), current app,
+issue, organization and specialist limits through its existing read methods.
+It never constructs an API client, fetches credentials or starts a service.
+
+The result states `provider_verification.state: verified` or `needed`. A later
+owner CLI process normally has no existing provider API and reports `needed`;
+an earlier gateway check does not establish later provider freshness. Missing
+original provider IDs also report `needed` rather than inventing a selector.
+Such evidence cannot by itself support cross-owner replacement. Ordinary reads
+and existing native Telegram, Slack and local origin inspection remain usable.
+
 References and inspection results grant no permission, prove no worker stopped, and establish
 no new cross-profile route. A peer may communicate a reference as untrusted input; an operator
 must independently inspect its original instruction and apply existing requester, profile,
