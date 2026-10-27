@@ -198,6 +198,40 @@ def _checkpoint(home, owners):
     return {"scoped_records": 0, "recycled_records": 0}
 
 
+def _runtime_scope(native, session_id, execution_id):
+    """Close over retained native sessions and executions inside one read snapshot."""
+    from hermes_state_runtime_workers import runtime_lineage, descendant_range
+    sessions, workers, children, inspected = set(), {}, {}, set()
+    pending_sessions, pending_roots = {session_id}, {execution_id}
+    columns = "execution_id,session_id,status,kind,owner_epoch,generation,last_sequence"
+    while pending_sessions or pending_roots:
+        discovered = set()
+        for target in sorted(pending_sessions):
+            discovered.update(runtime_lineage(native, target))
+        discovered.difference_update(sessions)
+        sessions.update(discovered)
+        for row in native.execute(f"SELECT {columns} FROM worker_executions "
+                                  "WHERE session_id IN (SELECT value FROM json_each(?)) ORDER BY execution_id",
+                                  (json.dumps(sorted(discovered)),)):
+            workers[row["execution_id"]] = dict(row)
+            pending_roots.add(row["execution_id"])
+        pending_sessions = set()
+        roots, pending_roots = pending_roots - inspected, set()
+        for root in sorted(roots):
+            inspected.add(root)
+            for row in native.execute(f"SELECT {columns} FROM worker_executions "
+                                      "WHERE execution_id>=? AND execution_id<? ORDER BY execution_id",
+                                      descendant_range(root)):
+                workers[row["execution_id"]] = children[row["execution_id"]] = dict(row)
+                pending_sessions.add(row["session_id"])
+                pending_roots.add(row["execution_id"])
+        pending_sessions.difference_update(sessions)
+        pending_roots.difference_update(inspected)
+    # Each session component and retained execution root is inspected once;
+    # the fixed snapshot, not an invented depth cap, bounds this traversal.
+    return sessions, [workers[key] for key in sorted(workers)], [children[key] for key in sorted(children)]
+
+
 def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
     from hermes_cli import kanban_db as kb
     from hermes_state import SessionDB
@@ -205,7 +239,6 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     from hermes_state_keys import local_identity
     from hermes_state_runtime import (RuntimeStoreError, _text as runtime_identity,
                                       find_session_admission, list_session_admissions)
-    from hermes_state_runtime_workers import runtime_lineage, worker_states, descendant_range
     from gateway.session_policy import restore_policy
     from gateway import session_ancillary
     getter = getattr(session_ancillary, "process_stop_pending", None)
@@ -316,23 +349,13 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
             with db._read_ctx() as native:
-                children = native.execute("SELECT execution_id,session_id,status FROM worker_executions WHERE execution_id>=? AND execution_id<?",
-                                          descendant_range("admission-worker:" + admission["admission_id"])).fetchall()
+                lineage, native_workers, children = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
                 _require(all(child["status"] == "terminal" for child in children), "native_child_spawner_unsettled")
-                roots = {sid, *(child["session_id"] for child in children)}
-                # Admissions and Stop markers use exact session IDs; neither
-                # their helpers nor a settled parent discharge a physical child.
-                lineage = runtime_lineage(native, sid)
-                for target in roots - {sid}:
-                    lineage.update(runtime_lineage(native, target))
-                # Validate every retained owned row before the native active-only
-                # filter. These are worker_executions' canonical CHECK states;
+                # Validate every retained owned row's canonical CHECK state;
                 # a corrupted/future status is not evidence of settlement.
                 _require(all(row["status"] in ("registered", "running", "unknown", "terminal")
-                             for row in native.execute("SELECT status FROM worker_executions "
-                                 "WHERE session_id IN (SELECT value FROM json_each(?))",
-                                 (json.dumps(sorted(lineage)),))), "native_worker_state_unreadable")
-                _require(not any(worker_states(native, target) for target in roots), "native_worker_or_spawner_unsettled")
+                             for row in native_workers), "native_worker_state_unreadable")
+                _require(all(row["status"] == "terminal" for row in native_workers), "native_worker_or_spawner_unsettled")
                 executor = native.execute("SELECT status,owner_epoch,generation FROM worker_executions WHERE execution_id=?",
                                           ("admission-worker:" + admission["admission_id"],)).fetchone()
                 _require(executor and tuple(executor) == ("terminal", admission["owner_epoch"], admission["generation"]),
@@ -345,7 +368,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                          for row in retained), "native_session_has_unsettled_work")
             _require(all(getter(db, target) is None for target in lineage), "native_stop_checkpoint_pending")
             native_lineages.append({"sessions": sorted(lineage), "admissions": retained,
-                                    "children": [dict(child) for child in children]})
+                                    "workers": native_workers, "children": children})
             relevant = [e for e in events if e["run_id"] == run_id and e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
             _require(any(e["kind"] == "worker_bound" for e in relevant)
                      and any(e["kind"] in {"spawned", "worker_registered"} for e in relevant), "worker_binding_evidence_missing")
