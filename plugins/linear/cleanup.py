@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from contextlib import closing, contextmanager
 import json
+import os
+import stat
 from pathlib import Path
 import sqlite3
 
@@ -79,7 +81,7 @@ def _pid_gone(pid, fingerprint):
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_db import _pid_alive
     from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import _start_times_agree
+    from gateway.status import _start_times_agree, start_time_fingerprints_match
     _require(type(pid) is int and pid > 0, "worker_identity_missing")
     epoch = current_instantiation_epoch()
     _require(isinstance(epoch, str) and epoch, "worker_identity_unreadable")
@@ -97,16 +99,41 @@ def _pid_gone(pid, fingerprint):
     if not _pid_alive(pid):
         return "gone"
     current = birth(_process_fingerprint(pid), "worker_identity_unreadable")
-    _require(not _start_times_agree(current, recorded), "old_worker_alive")
+    # Linux's native fingerprint may fall back from boot ticks to epoch
+    # centiseconds on a transient /proc read failure. Neither persisted witness
+    # identifies which source produced it: compare both native representations
+    # rather than interpreting a source change as PID reuse.
+    import psutil
+    from hermes_cli.process_identity import process_birth, worker_birth
+    process = psutil.Process(pid)
+    epoch_birth = round(process_birth(process) * 100)
+    readings = [epoch_birth]
+    if psutil.LINUX:
+        readings.append(worker_birth(process) * os.sysconf("SC_CLK_TCK"))
+    _require(all(_start_times_agree(value, value) for value in readings), "worker_identity_unreadable")
+    _require(any(start_time_fingerprints_match(float(current), value) for value in readings),
+             "worker_identity_unreadable")
+    _require(not any(start_time_fingerprints_match(float(recorded), value) for value in readings),
+             "old_worker_alive")
+    # Recheck the native identity after the independent reads; a changing
+    # incarnation or source that neither reading explains stays uncertain.
+    repeated = birth(_process_fingerprint(pid), "worker_identity_unreadable")
+    _require(any(start_time_fingerprints_match(float(repeated), value) for value in readings),
+             "worker_identity_unreadable")
     return "recycled"
 
 
 def _checkpoint(home, owners):
     """Read the canonical scoped checkpoint only; never recover or load a process manager."""
     path = home / "processes.json"
-    if not path.exists():
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return {"scoped_records": 0, "recycled_records": 0}
-    _require(path.is_file() and path.stat().st_size <= 1024 * 1024, "checkpoint_unreadable")
+    # A dangling symlink is a retained obligation, not genuine absence. Never
+    # follow a checkpoint link or treat inaccessible metadata as an empty file.
+    _require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024,
+             "checkpoint_unreadable")
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
     _require(isinstance(entries, list), "checkpoint_unreadable")
     for entry in entries:
