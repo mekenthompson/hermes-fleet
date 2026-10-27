@@ -1571,3 +1571,61 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(row["task_id"], bytes)
         self.assertEqual(kb.Run.from_row(row).task_id, other)
         self.assertIsNone(self.board.execute("SELECT id FROM task_runs WHERE task_id=?", (other,)).fetchone())
+
+
+    async def test_cleanup_corrupted_retained_owned_worker_statuses_are_unknown(self):
+        import sqlite3
+        from hermes_state_runtime import register_worker_execution
+        await self.stopped_issue()
+        extra = "retained-owned-compute"
+        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id=extra,
+            session_id=self.sid, generation=self.row["generation"], kind="compute", adoption_secret="fixture-extra")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        # Ordinary native storage rejects these states. The fault below models
+        # corrupted retained state explicitly, never a valid native write path.
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE worker_executions SET status='unreadable' WHERE execution_id=?", (extra,)))
+        for status in ("unreadable", "", b"running", b"\xff", 123):
+            with self.subTest(status=status):
+                def corrupt(conn):
+                    conn.execute("PRAGMA ignore_check_constraints=ON")
+                    try:
+                        conn.execute("UPDATE worker_executions SET status=? WHERE execution_id=?", (status, extra))
+                    finally:
+                        conn.execute("PRAGMA ignore_check_constraints=OFF")
+                self.authority.db._execute_write(corrupt)
+                before = self.authority.db._execute_write(lambda conn: conn.execute(
+                    "SELECT status FROM worker_executions WHERE execution_id=?", (extra,)).fetchone()[0])
+                result = await self.cleanup_inspected()
+                self.assertFalse(result["quiescence_proven"])
+                self.assertEqual(result["reason"], "native_worker_state_unreadable")
+                self.assertFalse(result["permission_granted"])
+                after = self.authority.db._execute_write(lambda conn: conn.execute(
+                    "SELECT status FROM worker_executions WHERE execution_id=?", (extra,)).fetchone()[0])
+                self.assertEqual(before, after)
+
+    async def test_cleanup_valid_extra_terminal_workers_and_foreign_scope_remain_readable(self):
+        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution
+        await self.stopped_issue()
+        owned = dict(epoch=self.authority.epoch, execution_id="retained-terminal-compute",
+                     session_id=self.sid, generation=self.row["generation"])
+        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-owned")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_worker_or_spawner_unsettled")
+        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-owned")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_worker_or_spawner_unsettled")
+        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        foreign = self.sid + "-unrelated-worker-scope"
+        self.authority.db.create_session(foreign, source="local")
+        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id="unrelated-compute",
+            session_id=foreign, generation=0, kind="compute", adoption_secret="fixture-foreign")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def corrupt_foreign(conn):
+            conn.execute("PRAGMA ignore_check_constraints=ON")
+            try:
+                conn.execute("UPDATE worker_executions SET status='unreadable' WHERE execution_id='unrelated-compute'")
+            finally:
+                conn.execute("PRAGMA ignore_check_constraints=OFF")
+        self.authority.db._execute_write(corrupt_foreign)
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
