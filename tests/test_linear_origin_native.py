@@ -550,6 +550,159 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(damaged["quiescence_proven"])
         self.assertEqual(damaged["reason"], "cleanup_evidence_unavailable")
 
+    async def test_cleanup_optional_native_event_absence_is_compatible_and_scoped(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        optional = self.board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='claimed'",
+                                      (self.task_id,)).fetchone()
+        self.assertIsNotNone(optional)
+        foreign = kb.create_task(self.board, title="Unrelated work", assignee="default", created_by="fixture-agent")
+        kb._append_event(self.board, foreign, "blocked", None)
+        self.board.execute("UPDATE task_events SET payload='[]' WHERE task_id=? AND kind='blocked'", (foreign,))
+        foreign_rows = [tuple(row) for row in self.board.execute("SELECT * FROM task_events WHERE task_id=?", (foreign,))]
+        for raw in (None, "null"):
+            with self.subTest(raw=raw):
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, optional["id"]))
+                try:
+                    event = kb.Event.from_row(self.board.execute("SELECT * FROM task_events WHERE id=?", (optional["id"],)).fetchone())
+                    self.assertIsNone(event.payload)
+                    result = await self.cleanup_inspected()
+                    self.assertTrue(result["quiescence_proven"], result)
+                    self.assertFalse(result["permission_granted"])
+                    self.assertEqual(self.board.execute("SELECT payload FROM task_events WHERE id=?", (optional["id"],)).fetchone()[0], raw)
+                    self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM task_events WHERE task_id=?", (foreign,))], foreign_rows)
+                finally:
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (optional["payload"], optional["id"]))
+                # A nonempty retained optional map changing during owner readback
+                # invalidates that read; its stable native absence remains supported.
+                self.assertTrue(json.loads(optional["payload"]))
+                def arriving(_method, _params):
+                    self.before_rpc = None
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, optional["id"]))
+                self.before_rpc = arriving
+                try:
+                    result = await self.cleanup_inspected()
+                    self.assertEqual(result["state"], "unknown")
+                    self.assertEqual(result["reason"], "cleanup_evidence_changed")
+                    self.assertFalse(result["permission_granted"])
+                    self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+                finally:
+                    self.before_rpc = None
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (optional["payload"], optional["id"]))
+        for raw in ("[]", "1", '"scalar"'):
+            with self.subTest(unsupported=raw):
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, optional["id"]))
+                try:
+                    result = await self.cleanup_inspected()
+                    self.assertEqual(result["state"], "unknown")
+                    self.assertFalse(result["quiescence_proven"])
+                finally:
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (optional["payload"], optional["id"]))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_required_native_event_absence_is_unknown_in_owner_cli_and_readback(self):
+        import argparse
+        from agent import runtime_session_store
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import ops
+        await self.stopped_issue()
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        parser = argparse.ArgumentParser()
+        ops.setup(parser)
+        args = parser.parse_args(["inspect-cleanup", "issue-one", "--expected-stop-event-id", str(self.stop_id)])
+        required = self.board.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? AND "
+                                      "(id=? OR kind IN ('owner_admitted','spawned','worker_bound'))",
+                                      (self.task_id, self.stop_id)).fetchall()
+        self.assertEqual({row["kind"] for row in required}, {"blocked", "owner_admitted", "spawned", "worker_bound"})
+        for event in required:
+            for raw in (None, "null"):
+                with self.subTest(kind=event["kind"], raw=raw):
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, event["id"]))
+                    try:
+                        decoded = kb.Event.from_row(self.board.execute("SELECT * FROM task_events WHERE id=?", (event["id"],)).fetchone())
+                        self.assertIsNone(decoded.payload)
+                        result = await self.cleanup_inspected()
+                        self.assertEqual(result["state"], "unknown")
+                        self.assertFalse(result["quiescence_proven"])
+                        self.assertFalse(result["permission_granted"])
+                        with patch.object(runtime_session_store, "_worker_process", False), patch("builtins.print") as printed:
+                            rc = await asyncio.to_thread(ops.run, args, self.linear_state, self.home / "unused", "default", origin_settings=self.settings)
+                        cli = json.loads(printed.call_args.args[0])
+                        self.assertEqual(rc, 1)
+                        self.assertEqual(cli["state"], "unknown")
+                        self.assertFalse(cli["quiescence_proven"])
+                        self.assertFalse(cli["permission_granted"])
+                        self.assertEqual(self.board.execute("SELECT payload FROM task_events WHERE id=?", (event["id"],)).fetchone()[0], raw)
+                    finally:
+                        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (event["payload"], event["id"]))
+                    self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+                    def arriving(_method, _params):
+                        self.before_rpc = None
+                        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, event["id"]))
+                    self.before_rpc = arriving
+                    try:
+                        changed = await self.cleanup_inspected()
+                        self.assertEqual(changed["state"], "unknown")
+                        self.assertFalse(changed["quiescence_proven"])
+                        self.assertFalse(changed["permission_granted"])
+                    finally:
+                        self.before_rpc = None
+                        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (event["payload"], event["id"]))
+                    self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_required_native_event_absence_never_skips_newer_blocked_control(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        old_id = self.stop_id
+        old_payload = self.board.execute("SELECT payload FROM task_events WHERE id=?", (old_id,)).fetchone()[0]
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=old_id))
+        self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
+        new_payload = self.board.execute("SELECT payload FROM task_events WHERE id=?", (self.stop_id,)).fetchone()[0]
+        for raw in (None, "null"):
+            with self.subTest(raw=raw):
+                # Only the latest actual blocked control selects the current Stop;
+                # missing metadata in an older control is not a blanket refusal.
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, old_id))
+                try:
+                    self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+                    self.assertEqual((await self.cleanup_inspected(stop_id=old_id))["state"], "unknown")
+                finally:
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (old_payload, old_id))
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, self.stop_id))
+                try:
+                    for selector in (old_id, self.stop_id):
+                        result = await self.cleanup_inspected(stop_id=selector)
+                        self.assertEqual(result["state"], "unknown")
+                        self.assertFalse(result["quiescence_proven"])
+                        self.assertFalse(result["permission_granted"])
+                finally:
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (new_payload, self.stop_id))
+                self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        for raw in (None, "null"):
+            current = self.stop_id
+            written = {}
+            def arriving(_method, _params):
+                self.before_rpc = None
+                self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", expected_event_id=current))
+                newest = kb.list_events(self.board, self.task_id)[-1]
+                written.update(id=newest.id, payload=json.dumps(newest.payload))
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (raw, newest.id))
+            self.before_rpc = arriving
+            try:
+                result = await self.cleanup_inspected()
+                self.assertEqual(result["state"], "unknown")
+                self.assertFalse(result["quiescence_proven"])
+                self.assertFalse(result["permission_granted"])
+                fresh = await self.cleanup_inspected(stop_id=written["id"])
+                self.assertEqual(fresh["state"], "unknown")
+                self.assertFalse(fresh["quiescence_proven"])
+            finally:
+                self.before_rpc = None
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (written["payload"], written["id"]))
+                self.stop_id = written["id"]
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
     async def test_cleanup_unsupported_pending_and_live_admission_are_unknown(self):
         from gateway import session_ancillary
         await self.stopped_issue()

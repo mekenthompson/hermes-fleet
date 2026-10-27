@@ -321,7 +321,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     path = kb.kanban_db_path(board=bound["board"]).resolve(strict=True)
     receipts, owners, worker_evidence, native_lineages = [], [], [], []
     with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
-        from .bridge import task_issue_match, require_task_issue_scope, native_text_row
+        from .bridge import task_issue_match, require_task_issue_scope, native_text_row, native_event_payload
         from .api import LinearError
         with db._read_ctx() as native:
             # Pin this existing mode=ro connection for the preflight and all
@@ -382,9 +382,10 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      or (key["selected_task"] == 1 and key["selected_run"] == 1),
                      "attempt_event_task_mismatch")
         events = [{"id": event.id, "run_id": event.run_id, "kind": event.kind,
-                   "payload": json.dumps(event.payload)} for event in reader.history_rows(board, task["id"])]
-        stops = [e for e in events if e["kind"] == "blocked" and (json.loads(e["payload"] or "{}" ).get("kind") == "needs_input")]
-        _require(stops and stops[-1]["id"] == stop_id, "stop_event_changed")
+                   "payload": json.dumps(native_event_payload(event))} for event in reader.history_rows(board, task["id"])]
+        stops = [e for e in events if e["kind"] == "blocked"]
+        _require(stops and stops[-1]["id"] == stop_id
+                 and json.loads(stops[-1]["payload"]).get("kind") == "needs_input", "stop_event_changed")
         runs = board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
         by_run = {run["id"]: run for run in runs}
         bindings = [e for e in events if e["kind"] == "owner_admitted"]
