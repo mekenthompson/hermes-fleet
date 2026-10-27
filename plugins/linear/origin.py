@@ -78,6 +78,18 @@ async def _snapshot(client, home: Path, session_id: str) -> tuple[dict, dict]:
     return snapshot, row
 
 
+async def _projection(home: Path, ref: dict, snapshot: dict, current: dict,
+                      declared_scope: dict, context: NativeContext | None, api) -> dict:
+    from .origin_state import _evidence, stop_evidence
+    evidence = await asyncio.to_thread(_evidence, home, ref,
+        {**current, "session_id": snapshot["session_id"]}, declared_scope, context)
+    if evidence["requester"].get("platform") == "linear":
+        from .origin_provider import verify
+        evidence["provider_verification"] = await asyncio.to_thread(verify, evidence["requester"], declared_scope, api)
+    evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
+    return evidence
+
+
 async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | None,
                    context: NativeContext | None = None, api=None) -> dict:
     async with _client(home) as (client, endpoint):
@@ -92,21 +104,16 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
                 or ref is not None and observed != ref):
             _refuse()
         ref = reference(observed)
-        from .origin_state import _evidence, stop_evidence
-        evidence = await asyncio.to_thread(_evidence, home, ref,
-            {**current, "session_id": snapshot["session_id"]}, declared_scope, context)
-        if evidence["requester"].get("platform") == "linear":
-            from .origin_provider import verify
-            evidence["provider_verification"] = await asyncio.to_thread(verify, evidence["requester"], declared_scope, api)
-        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
-        # Recheck after the state read: Stop, settlement, restart or a new turn invalidates the result.
+        evidence = await _projection(home, ref, snapshot, current, declared_scope, context, api)
+        # Recheck the exact returned projection after owner readback, not just its IDs.
+        # Native workspace/policy or retained requester/text changes invalidate evidence too.
         after, active = await _snapshot(client, home, snapshot["session_id"])
-        if (after.get("authority_epoch") != ref["authority_epoch"]
-                or after.get("execution_generation") != ref["execution_generation"]
-                or active.get("admission_id") != ref["admission_id"]):
+        if after != snapshot or active != current:
             _refuse()
-        evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
-        return evidence
+        repeated = await _projection(home, ref, after, active, declared_scope, context, api)
+        if repeated != evidence:
+            _refuse()
+        return repeated
 
 
 def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
