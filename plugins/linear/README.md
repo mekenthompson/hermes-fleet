@@ -407,7 +407,9 @@ its native schema and writer contract, including kind, counters and referenced s
 Historical terminal epochs/generations and terminal sequence zero remain valid; malformed
 retained records remain unknown. Selected admission records use the native identity and
 JSON validators before primary payload field access, recognized intents and native counter
-contracts, preserving resultless controls and nullable legacy terminal metadata. The native worker/admission physical-lineage
+contracts, preserving resultless controls and nullable legacy terminal metadata. Frozen
+Kanban context and saved binding metadata pass the existing JSON-object decoder before
+field access; arrays, null and scalars stay unknown without state repair. The native worker/admission physical-lineage
 join also checks for started or unknown claims whose logical target differs. Unrelated
 foreign payloads remain outside these checks. Runtime ownership selectors must retain
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report

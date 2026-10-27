@@ -833,6 +833,69 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["state"], "unknown")
         self.assertFalse(evidence["permission_granted"])
 
+    async def test_cleanup_native_policy_context_mapping_is_checked_before_access(self):
+        from hermes_state_local import local_receipt, POLICY_PREFIX
+        from gateway.session_policy import restore_policy
+        await self.stopped_issue()
+        original = local_receipt(self.authority.db, self.sid)
+        def context(value):
+            receipt = json.loads(json.dumps(original))
+            receipt["policy"]["kanban_json"] = json.dumps(value)
+            # The actual native policy decoder accepts this retained field's
+            # encoded value; cleanup must decode its consumed mapping itself.
+            self.assertEqual(restore_policy(receipt["policy"]).kanban_json, json.dumps(value))
+            encoded = json.dumps(receipt)
+            self.authority.db.set_meta(POLICY_PREFIX + self.sid, encoded)
+            return encoded
+        for value in ([], None, "scalar", True, 1, 0.5):
+            with self.subTest(value=value):
+                encoded = context(value)
+                evidence = await self.cleanup_inspected()
+                self.assertEqual(evidence["state"], "unknown")
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertFalse(evidence["permission_granted"])
+                self.assertEqual(self.authority.db.get_meta(POLICY_PREFIX + self.sid), encoded)
+        saved = json.loads(original["policy"]["kanban_json"])
+        for value in (saved, {**saved, "opaque": {"nested": [None, {}, []]}}):
+            context(value)
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def arriving(_method, _params):
+            self.before_rpc = None
+            context([])
+        self.before_rpc = arriving
+        evidence = await self.cleanup_inspected()
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertFalse(evidence["quiescence_proven"])
+
+    async def test_cleanup_saved_binding_mapping_is_checked_before_access(self):
+        await self.stopped_issue()
+        original = self.linear_store.native_binding("issue-one")
+        def binding(value):
+            encoded = json.dumps(value)
+            with self.linear_store._tx() as db:
+                db.execute("UPDATE metadata SET value=? WHERE key='native-binding:issue-one'", (encoded,))
+            return encoded
+        for value in ([], None, "scalar", True, 1, 0.5):
+            with self.subTest(value=value):
+                encoded = binding(value)  # Explicit fault in the actual Store writer's row.
+                evidence = await self.cleanup_inspected()
+                self.assertEqual(evidence["state"], "unknown")
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertFalse(evidence["permission_granted"])
+                with self.linear_store._tx() as db:
+                    self.assertEqual(db.execute("SELECT value FROM metadata WHERE key='native-binding:issue-one'").fetchone()[0], encoded)
+        for value in (original, {**original, "opaque": {"nested": [None, {}, []]}}):
+            binding(value)
+            self.assertEqual(self.linear_store.native_binding("issue-one"), value)
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def arriving(_method, _params):
+            self.before_rpc = None
+            binding([])
+        self.before_rpc = arriving
+        evidence = await self.cleanup_inspected()
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertFalse(evidence["quiescence_proven"])
+
     async def test_work_current_preserves_unknown_requester_and_selective_privacy(self):
         from hermes_cli import kanban_db as kb
         await self.kanban()
