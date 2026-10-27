@@ -315,6 +315,11 @@ actorless and typed Stop inputs cannot become human-origin references. If an
 already-running scoped `BoundLinearAPI` is available, the edge freshly verifies
 the original Activity author (or the assignment Session creator), current app,
 issue, organization and specialist limits through its existing read methods.
+A later allowed human Activity can verify independently of a missing assignment
+creator. The shared `requester_session(..., activity_id=...)` context binds only
+exact provider IDs; each read or effect retry freshly checks that Activity, and
+never rewrites the original creator or grants permission. Without a current
+Activity binding, an unknown session requester stays unknown.
 It never constructs an API client, initializes a credential source or starts a service.
 
 The result states `provider_verification.state: verified` or `needed`. A later
@@ -379,7 +384,8 @@ Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown.
 claim, matching frozen owner/run/admission/executor records, terminal native admissions and
 worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
 submitter identities proven gone or recycled. Scoped process checkpoints must also contain
-no live or unconfirmed scope; foreign records are retained. Reads use native tracked SQLite
+no live or unconfirmed scope. Only positively foreign records are excluded;
+missing, partial or conflicting route/owner attribution remains unknown. Reads use native tracked SQLite
 transactions, never database copies. Receipts and the entire scoped observation are checked
 again before returning. A newer Stop, unblock, late worker binding, owner change or changed
 reporting link invalidates the old observation. Reinspect immediately before later effects.

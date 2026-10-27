@@ -92,9 +92,15 @@ def _checkpoint(home, owners):
     for entry in entries:
         _require(isinstance(entry, dict), "checkpoint_ownership_ambiguous")
         route = entry.get("session_key")
-        owner = entry.get("parent_session_id") or entry.get("owner_task_id") or entry.get("task_id")
-        if not any(route in keys and owner in ids for keys, ids in owners):
-            continue  # Foreign records are neither exposed nor modified.
+        attributed = [entry[key] for key in ("parent_session_id", "owner_task_id", "task_id")
+                      if entry.get(key) is not None]
+        complete = bool(attributed) and all(isinstance(value, str) and value
+                                           and value == value.strip() for value in (route, *attributed))
+        if (complete and all(route not in keys for keys, _ in owners)
+                and all(owner not in ids for owner in attributed for _, ids in owners)):
+            continue  # Only positively foreign records can be excluded.
+        _require(complete and any(route in keys and all(owner in ids for owner in attributed)
+                                  for keys, ids in owners), "checkpoint_ownership_ambiguous")
         matched += 1
         _require(entry.get("pid_scope", "host") == "host" and not entry.get("wsl_chain")
                  and not entry.get("systemd_unit") and not entry.get("_scope_stop_pending"), "scoped_process_cleanup_unknown")
