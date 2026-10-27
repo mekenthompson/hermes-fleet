@@ -462,7 +462,7 @@ def register(ctx: Any) -> None:
                     raise transport.Unavailable("origin_reference accepts no identity, session or task selectors.")
                 from . import origin
                 return chat._reply(True, "Current native origin reference; it grants no control permission.",
-                                   **origin.current(context, origin_settings()))
+                                   **origin.current(context, origin_settings(), api=getattr(running.get("bridge"), "api", None)))
             bridge = running.get("bridge")
             if bridge is not None:
                 return chat.handle(bridge, args, context)
@@ -486,7 +486,8 @@ def register(ctx: Any) -> None:
         return {key: ctx.get_config(key) for key in ("identity", "specialist_scope")}
     if hasattr(ctx, "register_cli_command"):
         ctx.register_cli_command("linear", "Show and resolve held Linear reporting", ops.setup,
-                                 lambda args: ops.run(args, *paths(), origin_settings=origin_settings()))
+                                 lambda args: ops.run(args, *paths(), origin_settings=origin_settings(),
+                                     origin_api=getattr(running.get("bridge"), "api", None)))
     if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):
         ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths())),
                              description="Show held Linear reporting and reconciliation")

@@ -79,7 +79,7 @@ async def _snapshot(client, home: Path, session_id: str) -> tuple[dict, dict]:
 
 
 async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | None,
-                   context: NativeContext | None = None) -> dict:
+                   context: NativeContext | None = None, api=None) -> dict:
     async with _client(home) as (client, endpoint):
         from .origin_state import resolve_reference
         sid = context.session_id if context else await asyncio.to_thread(resolve_reference, home, ref)
@@ -95,6 +95,9 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
         from .origin_state import _evidence, stop_evidence
         evidence = await asyncio.to_thread(_evidence, home, ref,
             {**current, "session_id": snapshot["session_id"]}, declared_scope, context)
+        if evidence["requester"].get("platform") == "linear":
+            from .origin_provider import verify
+            evidence["provider_verification"] = await asyncio.to_thread(verify, evidence["requester"], declared_scope, api)
         evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
         # Recheck after the state read: Stop, settlement, restart or a new turn invalidates the result.
         after, active = await _snapshot(client, home, snapshot["session_id"])
@@ -107,7 +110,7 @@ async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | N
 
 
 def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
-         context: NativeContext | None = None) -> dict:
+         context: NativeContext | None = None, api=None) -> dict:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -115,23 +118,24 @@ def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
     else:
         _refuse("Native origin inspection needs the synchronous tool or owner CLI boundary.")
     try:
-        return asyncio.run(_inspect(home, profile, declared_scope, ref, context))
+        return asyncio.run(_inspect(home, profile, declared_scope, ref, context, api))
     except Unavailable:
         raise
     except (RuntimeError, OSError, ValueError, ImportError, KeyError, TypeError, sqlite3.DatabaseError) as exc:
         raise Unavailable("Native origin evidence is unavailable; inspect the owning runtime before continuing.") from exc
 
 
-def current(context: NativeContext, settings: dict) -> dict:
+def current(context: NativeContext, settings: dict, *, api=None) -> dict:
     if context.delegated_child:
         _refuse("A delegated child cannot supply the originating user's request.")
-    if context.platform not in {"local", "api_server", "telegram", "slack"}:
+    if context.platform not in {"local", "api_server", "telegram", "slack", "linear"}:
         _refuse("This surface cannot supply an ordinary native origin reference.")
-    evidence = _run(Path(context.home), context.profile, scope(settings), None, context)
-    return {"reference": evidence["reference"], "permission_granted": False}
+    evidence = _run(Path(context.home), context.profile, scope(settings), None, context, api)
+    return {"reference": evidence["reference"], "permission_granted": False,
+            **({"provider_verification": evidence["provider_verification"]} if "provider_verification" in evidence else {})}
 
 
-def inspect(value: Any, settings: dict) -> dict:
+def inspect(value: Any, settings: dict, *, api=None) -> dict:
     """Owner CLI only. Caller supplies a reference, never another home or database path."""
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_active_profile_name
@@ -139,4 +143,4 @@ def inspect(value: Any, settings: dict) -> dict:
     home = Path(get_hermes_home()).resolve(strict=True)
     if ref["profile"] != get_active_profile_name():
         _refuse("The reference belongs to another native profile.")
-    return _run(home, ref["profile"], scope(settings), ref)
+    return _run(home, ref["profile"], scope(settings), ref, api=api)

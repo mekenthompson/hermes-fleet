@@ -53,11 +53,9 @@ def _discover(home, issue, profile, native_profile, metadata):
     class ReadOnlyDiscovery(Kanban):
         def __init__(self):
             # Bypass the ordinary adapter's create/migrate constructor. Its existing discovery
-            # algorithm and matching rules remain unchanged; every history read is tracked RO.
+            # algorithm and inherited strict tracked read-only history reader remain unchanged.
             self.kb, self.board = kb, kb.get_current_board()
             self.executor_profile, self.profile_home = native_profile, home
-        def history_conn(self, path, *, snapshot=False):
-            return _read(path)
     found = ReadOnlyDiscovery().discover(metadata or {"id": issue})
     _require(len(found) == 1, "native_history_match_missing_or_ambiguous")
     adapter, task = found[0]

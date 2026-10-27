@@ -155,7 +155,7 @@ def setup(parser: Any) -> None:
     cleanup.add_argument("--expected-stop-event-id", required=True, type=int)
     cleanup.add_argument("--issue-json", help="Optional independently inspected issue id/identifier/url for native marker discovery; grants no permission")
 
-def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None) -> int:
+def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None, origin_api=None) -> int:
     if args.linear_command == "inspect-cleanup":
         from . import cleanup
         try:
@@ -170,7 +170,8 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         from .transport import Unavailable
         try:
             projection = work if args.linear_command == "inspect-work" else origin
-            result = projection.inspect(json.loads(args.reference_json), origin_settings or {})
+            options = {"api": origin_api} if projection is origin and origin_api is not None else {}
+            result = projection.inspect(json.loads(args.reference_json), origin_settings or {}, **options)
         except (Unavailable, ValueError, ImportError, OSError, RuntimeError) as exc:
             print(json.dumps({"ok": False, "message": str(exc), "permission_granted": False}))
             return 1
