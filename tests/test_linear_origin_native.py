@@ -1297,3 +1297,57 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         bound(99999997, self.process_witness(1))
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+
+    async def test_cleanup_retained_symlink_and_unreadable_checkpoint_are_unknown(self):
+        await self.stopped_issue()
+        checkpoint = self.home / "processes.json"
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        checkpoint.symlink_to(self.home / "missing-process-records.json")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "checkpoint_unreadable")
+        checkpoint.unlink()
+        checkpoint.write_text("[]")
+        original = Path.lstat
+        def unreadable(path, *args, **kwargs):
+            if path == checkpoint:
+                raise PermissionError("finite unreadable checkpoint metadata")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "lstat", unreadable):
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_native_linux_birth_sources_never_prove_live_pid_recycled(self):
+        import psutil
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        from hermes_cli.process_identity import process_birth
+        self.assertTrue(psutil.LINUX, "this Linux source-fault fixture requires its actual platform")
+        await self.stopped_issue()
+        pid = os.getpid()
+        direct = _process_fingerprint(pid)
+        original = Path.read_text
+        def unreadable_stat(path, *args, **kwargs):
+            if path == Path("/proc/" + str(pid) + "/stat"):
+                raise PermissionError("finite direct-stat read failure")
+            return original(path, *args, **kwargs)
+        def bound(witness):
+            self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+                (json.dumps({"pid": pid, "started_at": witness, "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        bound(direct)
+        with patch.object(Path, "read_text", unreadable_stat):
+            fallback = _process_fingerprint(pid)
+            self.assertNotEqual(direct, fallback)
+            self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+        # Persist the actual fallback, then inspect with the actual direct read restored.
+        bound(fallback)
+        self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
+        with patch("hermes_cli.process_identity.worker_birth", side_effect=PermissionError("finite unreadable native birth")):
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        bound(self.process_witness(1))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # An honestly old fallback-scale witness can also prove recycling.
+        epoch = direct.split("|")[0]
+        bound(epoch + "|" + str(round((process_birth(psutil.Process(pid)) - 10) * 100)))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # Changing the native identity during the independent observation is unknown.
+        with patch("hermes_cli.kanban_db_dispatch._process_fingerprint", side_effect=[direct, self.process_witness(1)]):
+            self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
