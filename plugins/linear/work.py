@@ -59,7 +59,8 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
     """Coordinates come ONLY from the owner's saved policy. No file snapshots or raw DB reads."""
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
-    from hermes_state_runtime import get_session_admission, _json
+    from hermes_state_runtime import get_session_admission
+    from .origin_state import current_admission
     from gateway.session_policy import restore_policy
     from hermes_state_keys import local_identity
     from hermes_cli.sqlite_safe_read import connect_tracked
@@ -73,12 +74,13 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
         frozen = native_json_object(policy.kanban_json)
         requested = native_json_object(policy.request_json)
         row = get_session_admission(db, admission_id=current["admission_id"])
-        if (row is None or row["target_session_id"] != sid or row["status"] != "started"
-                or row["outcome"] is not None or row["owner_epoch"] != current["authority_epoch"]
+        header = current_admission(row)
+        if header != current["admission_header"]:
+            _refuse()
+        if (row["target_session_id"] != sid or row["owner_epoch"] != current["authority_epoch"]
                 or row["generation"] != current["execution_generation"]
                 or row["principal_id"] != saved["principal_id"]):
             _refuse()
-        _json(row["payload"])
         board, tid, run, lock = (frozen[k] for k in ("board", "task_id", "run_id", "claim_lock"))
         if (any(not isinstance(v, str) or not v for v in (board, tid, lock)) or type(run) is not int
                 or frozen["profile"] != profile or Path(resolve_profile_env(profile)).resolve() != home
@@ -138,7 +140,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
                             "branch": frozen["branch"], "tenant": frozen["tenant"], "skills": frozen["skills"]},
                   "stop_evidence": stop_evidence(home, sid), "permission_granted": False}
         # Claim tokens, DB paths, unrelated worker context and private history never leave this function.
-        digest = origin._digest({"policy": frozen, "principal": saved["principal_id"],
+        digest = origin._digest({"policy": frozen, "principal": saved["principal_id"], "admission_header": header,
                                  "task_scope": {key: task[key] for key in ("workspace_kind", "project_id", "completion_contract",
                                       "skills", "model_override", "provider_override", "reasoning_effort")},
                                  "admitted": admitted, "bound": bound, "projection": result})
