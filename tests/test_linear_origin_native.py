@@ -207,7 +207,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             context = PluginContext(PluginManifest(name="linear", source="user",
                 path=str(Path(plugin.__file__).parent)), self.tool_manager)
             plugin.register(context)
-            self.addCleanup(registry.deregister, "linear", scope=str(self.home))
+            self.addCleanup(self.tool_manager.unload)
             self.assertIsNotNone(registry.get_entry("linear", scope=str(self.home)))
 
         async def provider_callback():
@@ -1190,6 +1190,119 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                            origin_settings=self.settings)
         self.assertEqual(code, 0)
         self.assertFalse(json.loads(printed.call_args.args[0])["permission_granted"])
+
+    def registered_linear(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from hermes_cli.plugins_loader import run_with_load_deadline
+        from tools.registry import registry
+        self.config["plugins"] = {"entries": {"linear": {"settings": {"enabled": True, **self.settings}}}}
+        (self.home / "config.yaml").write_text(json.dumps(self.config))
+        manager = PluginManager(scope_key=str(self.home))
+        context = PluginContext(PluginManifest(name="linear"), manager)
+        self.addCleanup(manager.unload)
+        # Real discovery registers on a deadline thread with copied ContextVars.
+        run_with_load_deadline("linear", context, lambda: plugin.register(context))
+        return manager, registry
+
+    async def test_native_kanban_bootstrap_exposes_only_work_reference_before_session_binding(self):
+        from gateway.session_kanban import bind_worker_context
+        from gateway.session_context import reset_session_vars, set_current_session_id
+        from gateway.session_policy import policy_scope, restore_policy
+        from hermes_state_local import local_receipt
+        from hermes_fleet_linear_plugin import chat
+        await self.kanban()
+        original_schema = json.loads(json.dumps(chat.SCHEMA))
+        original_cwd = Path.cwd()
+        self.addCleanup(os.chdir, original_cwd)
+        # Same native ordering as managed_worker.execute: adopted process marker,
+        # validated claim binding, discovery, then AIAgent's current session ID.
+        reset_session_vars()
+        policy_data = local_receipt(self.authority.db, self.sid)["policy"]
+        bind_worker_context({"policy": policy_data})
+        manager, registry = self.registered_linear()
+        names = {"linear", "linear_work_reference"}
+        self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear"])
+        entry = registry.get_entry("linear_work_reference", scope=str(self.home))
+        self.assertEqual(entry.schema["parameters"], {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["work_reference"]}},
+            "required": ["action"], "additionalProperties": False})
+        self.assertEqual(entry.description, entry.schema["description"])
+        for guidance in ("metadata.issue_comment", "gateway reporting outbox", "coordinator", "unknown"):
+            self.assertIn(guidance, entry.description)
+        self.assertEqual(chat.SCHEMA, original_schema)
+        with policy_scope(restore_policy(policy_data)):
+            self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear_work_reference"])
+            from model_tools import get_tool_definitions, handle_function_call
+            definitions = get_tool_definitions(enabled_toolsets=["linear"], quiet_mode=True,
+                                               skip_tool_search_assembly=True)
+            self.assertEqual([d["function"]["name"] for d in definitions if d["function"]["name"] in names],
+                             ["linear_work_reference"])
+            from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+            for execution in (delegated_child_context(), non_dispatcher_owned_context()):
+                with execution:
+                    definitions = get_tool_definitions(enabled_toolsets=["linear"], quiet_mode=True,
+                                                       skip_tool_search_assembly=True)
+                    self.assertEqual([d["function"]["name"] for d in definitions if d["function"]["name"] in names],
+                                     ["linear"])
+                definitions = get_tool_definitions(enabled_toolsets=["linear"], quiet_mode=True,
+                                                   skip_tool_search_assembly=True)
+                self.assertEqual([d["function"]["name"] for d in definitions if d["function"]["name"] in names],
+                                 ["linear_work_reference"])
+            set_current_session_id(self.sid)
+            result = json.loads(await asyncio.to_thread(handle_function_call, "tool_call", {"calls": [{
+                "name": "linear_work_reference", "arguments": {"action": "work_reference"}}]},
+                enabled_tools=["linear_work_reference"], enabled_toolsets=["linear"], session_id=self.sid))
+            self.assertTrue(result["ok"], result)
+            evidence = await self.work_inspected(result["reference"])
+            self.assertFalse(evidence["permission_granted"])
+            self.assertEqual(evidence["requester"]["original_requester"], "unknown")
+            denied = json.loads(await asyncio.to_thread(entry.handler, {"action": "work_reference", "issue": "ABC-1"}))
+            self.assertFalse(denied["ok"])
+            # Inventory reduction grants no chat transport or remote mutation rights.
+            denied = json.loads(await asyncio.to_thread(entry.handler, {"action": "status", "issue": "ABC-1"}))
+            self.assertFalse(denied["ok"])
+            self.assertIn("native host-bound session", denied["message"])
+        self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear"])
+        manager.unload()
+
+    async def test_linear_worker_inventory_does_not_change_ordinary_or_other_execution_contexts(self):
+        from agent import runtime_session_store
+        from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+        from gateway.session_policy import policy_scope, restore_policy
+        from hermes_state_local import local_receipt
+        from hermes_fleet_linear_plugin import chat
+        await self.local()
+        original_schema = json.loads(json.dumps(chat.SCHEMA))
+        manager, registry = self.registered_linear()
+        names = {"linear", "linear_work_reference"}
+        def ordinary_inventory():
+            definitions = registry.get_definitions(names)
+            self.assertEqual([d["function"]["name"] for d in definitions], ["linear"])
+            self.assertEqual(definitions[0]["function"], original_schema)
+        # Ordinary managed coordinators also adopt; stray task hints are not identity.
+        with patch.object(runtime_session_store, "_worker_process", True), patch.dict(os.environ, {"HERMES_KANBAN_TASK": "stray"}):
+            ordinary_inventory()
+            policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+            for source in ("gui", "slack", "telegram"):
+                with policy_scope(replace(policy, source=source)):
+                    ordinary_inventory()
+        # A task environment hint alone cannot turn an owner into a registered worker.
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "forged"}), patch.object(runtime_session_store, "_worker_process", False):
+            ordinary_inventory()
+        await self.kanban()
+        policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+        with policy_scope(policy):
+            self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear_work_reference"])
+            for execution in (delegated_child_context(), non_dispatcher_owned_context()):
+                with execution:
+                    ordinary_inventory()
+                    entry = registry.get_entry("linear_work_reference", scope=str(self.home))
+                    denied = json.loads(await asyncio.to_thread(entry.handler, {"action": "work_reference"}))
+                    self.assertFalse(denied["ok"])
+                self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear_work_reference"])
+        ordinary_inventory()
+        self.assertEqual(chat.SCHEMA, original_schema)
+        manager.unload()
 
     async def test_selected_admission_native_constructor_and_known_header_controls(self):
         from hermes_state_runtime import admit_session_input, cancel_session_input, RuntimeStoreError

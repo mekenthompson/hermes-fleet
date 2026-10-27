@@ -119,7 +119,7 @@ class LinearPluginUnitTests(unittest.TestCase):
         self.assertEqual((idle.tools, idle.hooks, idle.services), ([], [], []))
         on = FakeContext({"enabled": True})
         plugin.register(on)
-        self.assertEqual([t["name"] for t in on.tools], ["linear"])
+        self.assertEqual([t["name"] for t in on.tools], ["linear", "linear_work_reference"])
         self.assertNotIn("inject_invocation_context", on.tools[0])
         self.assertIn("update_description", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])
         self.assertIn("add_comment", on.tools[0]["schema"]["parameters"]["properties"]["action"]["enum"])

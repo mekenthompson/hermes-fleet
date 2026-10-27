@@ -369,6 +369,20 @@ registered tool separately accepts `{"action":"work_reference"}` with no other f
 worker-only capture requires native worker registration, the actually bound session ID and
 the dispatcher-owned process; it does not require or fabricate a chat platform or requester.
 The current task/run/claim coordinates come only from the owner's frozen Kanban policy.
+Native Kanban workers see only `linear_work_reference({"action":"work_reference"})` in the
+Linear tool inventory. The ordinary `linear` action remains compatible for existing callers.
+Inventory follows the native launch policy at tool selection; environment hints grant nothing.
+Workers execute and report through native Kanban, putting the Linear report in `kanban_complete`
+`metadata.issue_comment`; the existing gateway outbox publishes it. A coordinator with a
+native chat session checks remote issue and project publication. Queued reporting does
+not establish publication or prevent the worker from completing verified local work.
+Ordinary chat coordinators retain the full Linear tool inventory and native session checks.
+This selection relies on the native managed-worker bootstrap: plugin registration precedes
+policy binding, and the first model tool inventory is read inside the immutable launch
+`policy_scope`. The availability predicates bypass the registry's TTL cache. Core's outer
+quiet-mode inventory memo does not track policy binding: a caller that reads that inventory
+before binding policy can retain the ordinary schema afterward. Arbitrary policy changes
+within one interpreter are not supported by this plugin-only change.
 An authorized operator can inspect this typed reference inside the same owning profile:
 
 ```sh
