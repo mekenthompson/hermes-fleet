@@ -233,7 +233,7 @@ def _runtime_scope(native, session_id, execution_id):
 
 
 def _require_owned_workers(native, workers, epoch):
-    from hermes_state_runtime import _session
+    from hermes_state_runtime import _session, _linked_worker_admission
     # worker_executions' native CHECK/NOT NULL contract and the actual writers:
     # register binds an integer epoch/generation; begin_runtime_epoch starts at
     # one, session generations start at zero and only advance, and receipt
@@ -248,6 +248,10 @@ def _require_owned_workers(native, workers, epoch):
                  and type(row["generation"]) is int and 0 <= row["generation"] <= session["runtime_generation"]
                  and type(row["last_sequence"]) is int and row["last_sequence"] >= 0,
                  "native_worker_state_unreadable")
+        # Native adoption also joins the admission's physical lineage, not only
+        # its logical target. A foreign target cannot hide this active claim.
+        _require(_linked_worker_admission(native, row["session_id"], row["generation"], row["owner_epoch"],
+                                          ("started", "unknown")) is None, "native_session_has_unsettled_work")
 
 
 def _require_owned_admissions(native, rows, epoch):
