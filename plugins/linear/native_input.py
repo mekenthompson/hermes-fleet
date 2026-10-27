@@ -142,8 +142,6 @@ def project_input(bridge, event) -> NativeInput | None:
     with api.requester_session(session_id, activity_id=activity_id) if scope else nullcontext():
         session = api.agent_session(session_id)
         issue, activity = bridge._specialist_session_event(event, issue_id, session_id)
-    if bridge.store.scope_fenced(issue_id):
-        raise LinearError("Linear input scope requires reconciliation", retryable=False)
     if (session.get("issue") or {}).get("id") != issue["id"]:
         raise LinearError("Linear input changed its owning issue", retryable=False)
 
@@ -231,8 +229,23 @@ def requester_scope(bridge, context):
 
 
 def _handle_control(bridge, original, projected):
-    with bridge.api.requester_session(projected.session_id, activity_id=projected.message_id):
-        bridge.handle_webhook(original)
+    with bridge.api.requester_session(projected.session_id, activity_id=projected.message_id), bridge.lock(projected.issue_id):
+        binding = bridge.store.native_binding(projected.issue_id)
+        accepted = False
+        try:
+            accepted = bridge.handle_webhook(original)
+        finally:
+            key = f"stop:{projected.issue_id}:{projected.message_id}"
+            if accepted is not True and binding and bridge.store.native_intent(key) is None:
+                # An unreadable/denied first attempt must not acquire a fresh
+                # task generation when this same provider control is retried.
+                bridge.store.native_intent_prepare(key, {"kind": "stop", "issue_id": projected.issue_id,
+                    "task_id": binding["task_id"], "profile": binding["profile"], "board": binding["board"],
+                    "stamp": projected.timestamp_ms, "control": "native-event-guard-v1",
+                    "expected_event_id": None, "run_id": None})
+                bridge.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native task Stop was not verified"})
+        if accepted is not True:
+            raise LinearError("Native task Stop is held or unverified; provider delivery remains pending")
 
 
 def native_supported():

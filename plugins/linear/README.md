@@ -262,6 +262,13 @@ retry reconciliation. Structured Stop reaches native conversation control and th
 linked task; an accepted control receipt does not prove physical cleanup. Replies
 remain queued until the existing scoped sender confirms publication. Prior uncertain
 effects stay held while unrelated authorized discussion continues.
+Stop acknowledgment also requires a verified task-control outcome, a durable unbound
+Stop, or positive supersession evidence. Held or unknown controls retain the provider
+delivery and original task/board/event/run coordinates; retries can recognize their
+native receipt but cannot acquire a new task generation. A retained authorization
+fence still holds task and content effects. Independently authorized status reads
+and conversation replies remain available, with fresh source authorization on each
+reply attempt; they do not clear the fence or replay its effects.
 
 Source and component checks do not establish deployment or client acceptance. The
 JTBD outcome cases still require actual Linear, Desktop, Slack and Telegram evidence.
