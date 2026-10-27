@@ -250,6 +250,28 @@ def _require_owned_workers(native, workers, epoch):
                  "native_worker_state_unreadable")
 
 
+def _require_owned_admissions(native, rows, epoch):
+    from hermes_state_runtime import RuntimeStoreError, _text, _json, _session
+    for row in rows:
+        try:
+            for key in ("admission_id", "request_id", "principal_id", "target_session_id"):
+                _text(row[key])
+            _json(row["payload"])
+        except RuntimeStoreError as exc:
+            raise Unknown("native_admission_state_unreadable") from exc
+        session = _session(native, row["target_session_id"])
+        # admit/import use these native identities, dict payloads and intents.
+        # Legacy terminal generations and resultless cancellations may be NULL.
+        _require(type(row["seq"]) is int and row["seq"] > 0
+                 and row["intent"] in ("queue", "steer", "redirect")
+                 and (row["owner_epoch"] is None or
+                      (type(row["owner_epoch"]) is int and 0 < row["owner_epoch"] <= epoch))
+                 and type(session["runtime_generation"]) is int and session["runtime_generation"] >= 0
+                 and (row["generation"] is None or
+                      (type(row["generation"]) is int and 0 <= row["generation"] <= session["runtime_generation"])),
+                 "native_admission_state_unreadable")
+
+
 def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
     from hermes_cli import kanban_db as kb
     from hermes_state import SessionDB
@@ -382,6 +404,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                         for row in list_session_admissions(db, session_id=target, pending_only=False)]
             _require(all(row["status"] == "terminal" and row.get("outcome") in _SETTLED_ADMISSION_OUTCOMES
                          for row in retained), "native_session_has_unsettled_work")
+            with db._read_ctx() as native:
+                _require_owned_admissions(native, retained, epoch[0])
             _require(all(getter(db, target) is None for target in lineage), "native_stop_checkpoint_pending")
             native_lineages.append({"sessions": sorted(lineage), "admissions": retained,
                                     "workers": native_workers, "children": children})

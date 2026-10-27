@@ -261,7 +261,7 @@ class CleanupLineage(base.OriginScenarios):
             conn.execute("PRAGMA writable_schema=ON")
             try:
                 conn.execute("UPDATE sqlite_schema SET sql=? WHERE name='worker_executions'",
-                             (schema.replace(" NOT NULL", ""),))
+                             (schema.replace("TEXT NOT NULL", "TEXT").replace("INTEGER NOT NULL", "INTEGER"),))
                 version = conn.execute("PRAGMA schema_version").fetchone()[0]
                 conn.execute("PRAGMA schema_version=" + str(version + 1))
             finally:
@@ -319,6 +319,99 @@ class CleanupLineage(base.OriginScenarios):
         finally:
             self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_native_admission_payloads_intents_and_legacy_nulls_remain_valid(self):
+        import json
+        from hermes_state_runtime import (RuntimeStoreError, _import_legacy_row,
+            admit_session_input, cancel_session_input)
+        await self.stopped_issue()
+        for intent in ("queue", "steer", "redirect"):
+            row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                principal_id=" ", session_id=self.sid, request_id="native-intent-" + intent,
+                payload={"arbitrary_payload": {"nested": [None, True, 2]}, "text": None}, intent=intent)
+            cancel_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=row["admission_id"])
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        for index, (outcome, generation) in enumerate((("completed", None), ("cancelled", None),
+                                                      ("steered", None), ("completed", self.row["generation"] + 7))):
+            legacy = dict(admission_id="finite-legacy-null-" + str(index), target_session_id=self.sid, root=self.sid,
+                lineage=json.dumps([self.sid]), payload=json.dumps({}), status="terminal", generation=generation, outcome=outcome)
+            self.authority.db._execute_write(lambda conn: _import_legacy_row(conn, legacy, self.authority.epoch, "legacy"))
+        # Nullable terminal epoch is permitted by the retained native schema;
+        # it is not substituted for the exact primary executor/owner proof.
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET owner_epoch=NULL WHERE admission_id='finite-legacy-null-0'"))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        for payload in ([], None, {"not_finite": float("nan")}):
+            with self.subTest(payload=payload), self.assertRaises(RuntimeStoreError):
+                admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="native",
+                    session_id=self.sid, request_id="invalid-native-payload", payload=payload)
+
+    async def test_lineage_owned_admission_consumed_fields_require_native_contracts(self):
+        from hermes_state_runtime import cancel_session_input
+        await self.stopped_issue()
+        row = self.admit(self.sid, "owned-admission-schema-fault")
+        cancel_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=row["admission_id"])
+        original = self.authority.db._read_all("SELECT rowid AS native_rowid,* FROM session_admissions WHERE admission_id=?",
+                                             (row["admission_id"],))[0]
+        def allow_null_faults(conn):
+            schema = conn.execute("SELECT sql FROM sqlite_schema WHERE name='session_admissions'").fetchone()[0]
+            conn.execute("PRAGMA writable_schema=ON")
+            try:
+                conn.execute("UPDATE sqlite_schema SET sql=? WHERE name='session_admissions'",
+                             (schema.replace("TEXT NOT NULL", "TEXT").replace("INTEGER NOT NULL", "INTEGER"),))
+                version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                conn.execute("PRAGMA schema_version=" + str(version + 1))
+            finally:
+                conn.execute("PRAGMA writable_schema=OFF")
+        self.authority.db._execute_write(allow_null_faults)
+        def update(column, value, seq=None):
+            def write(conn):
+                conn.execute("PRAGMA ignore_check_constraints=ON")
+                try:
+                    conn.execute(f"UPDATE session_admissions SET {column}=? WHERE seq=?",
+                                 (value, original["seq"] if seq is None else seq))
+                finally:
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+            self.authority.db._execute_write(write)
+        cases = {"intent": ("future-native-intent", b"queue", None),
+                 "admission_id": ("", b"opaque-id", None), "request_id": ("", b"opaque-request", None),
+                 "principal_id": ("", b"opaque-principal", None),
+                 "owner_epoch": (0, -1, self.authority.epoch + 1, 1.5, b"1"),
+                 "generation": (-1, self.row["generation"] + 1, 1.5, b"1"),
+                 "payload_json": ("[]", "null", "1", '{"not_finite":NaN}')}
+        for column, values in cases.items():
+            for value in values:
+                with self.subTest(column=column, value=value):
+                    update(column, value)
+                    try:
+                        before = self.authority.db._read_all("SELECT * FROM session_admissions WHERE seq=?", (original["seq"],))
+                        result = await self.cleanup_inspected()
+                        self.assertFalse(result["quiescence_proven"])
+                        self.assertEqual(result["reason"], "native_admission_state_unreadable")
+                        self.assertEqual(before, self.authority.db._read_all("SELECT * FROM session_admissions WHERE seq=?", (original["seq"],)))
+                    finally:
+                        update(column, original[column])
+        for seq in (0, -1):
+            with self.subTest(seq=seq):
+                update("seq", seq)
+                try:
+                    self.assertEqual((await self.cleanup_inspected())["reason"], "native_admission_state_unreadable")
+                finally:
+                    update("seq", original["seq"], seq=seq)
+        def arriving(_method, _params):
+            self.before_rpc = None
+            update("intent", "future-native-intent")
+        self.before_rpc = arriving
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_admission_state_unreadable")
+        update("intent", original["intent"])
+        self.authority.db.create_session("foreign-admission-schema-session", source="local")
+        foreign = self.admit("foreign-admission-schema-session", "foreign-admission-schema-fault")
+        # Payload/record defects with positively foreign selectors remain outside
+        # this inspection; do not parse or repair unrelated foreign payloads.
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET payload_json='not-json',principal_id=NULL WHERE admission_id=?",
+            (foreign["admission_id"],)))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
 
 def load_tests(loader, tests, pattern):
