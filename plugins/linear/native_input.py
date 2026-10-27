@@ -326,7 +326,10 @@ def create_adapter(config, running):
             if projected is None:
                 # Creator-null assignments keep the existing native dispatcher.
                 prompt = ACTORLESS_COORDINATION if original.get("action") == "created" else ""
-                await asyncio.to_thread(bridge.handle_webhook, original, assignment_prompt=prompt)
+                accepted = await asyncio.to_thread(bridge.handle_webhook, original, assignment_prompt=prompt)
+                if (original.get("type") == "AgentSessionEvent" and original.get("action") == "created"
+                        and accepted is not True):
+                    raise LinearError("Native assignment admission is held or unknown; provider delivery remains pending")
                 await asyncio.to_thread(delivery.acknowledge)
                 with self._relay_lock:
                     self._submitted.pop(self._delivery_key(delivery), None)
