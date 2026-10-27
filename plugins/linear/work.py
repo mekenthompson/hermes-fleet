@@ -13,7 +13,7 @@ import time
 from typing import Any
 
 from . import origin
-from .transport import Unavailable
+from .transport import Unavailable, native_json_object
 
 FIELDS = origin.REFERENCE_FIELDS | {"kind", "work_digest"}
 
@@ -59,7 +59,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
     """Coordinates come ONLY from the owner's saved policy. No file snapshots or raw DB reads."""
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
-    from hermes_state_runtime import get_session_admission
+    from hermes_state_runtime import get_session_admission, _json
     from gateway.session_policy import restore_policy
     from hermes_state_keys import local_identity
     from hermes_cli.sqlite_safe_read import connect_tracked
@@ -70,13 +70,15 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
         policy = restore_policy(saved["policy"])
         if policy.source != "kanban" or not policy.kanban_json or saved["profile_id"] != str(home):
             _refuse()
-        frozen = json.loads(policy.kanban_json)
+        frozen = native_json_object(policy.kanban_json)
+        requested = native_json_object(policy.request_json)
         row = get_session_admission(db, admission_id=current["admission_id"])
         if (row is None or row["target_session_id"] != sid or row["status"] != "started"
                 or row["outcome"] is not None or row["owner_epoch"] != current["authority_epoch"]
                 or row["generation"] != current["execution_generation"]
                 or row["principal_id"] != saved["principal_id"]):
             _refuse()
+        _json(row["payload"])
         board, tid, run, lock = (frozen[k] for k in ("board", "task_id", "run_id", "claim_lock"))
         if (any(not isinstance(v, str) or not v for v in (board, tid, lock)) or type(run) is not int
                 or frozen["profile"] != profile or Path(resolve_profile_env(profile)).resolve() != home
@@ -89,7 +91,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
                 or row["payload"].get("kanban_card_v1") != card
                 or row["payload"].get("text") != "work kanban task " + tid
                 or any(key in row["payload"] for key in ("native_text_v1", "api_turn_v1", "cli_turn_v1", "cron_v1", "local_automation_v1"))
-                or any(json.loads(policy.request_json).get(k) != v for k, v in {"source": "kanban", **card}.items())):
+                or any(requested.get(k) != v for k, v in {"source": "kanban", **card}.items())):
             _refuse()
     # This connection participates in native lock tracking. URI mode=ro + query_only + explicit
     # read transaction preserve SQLite locking and ensure every joined record is one snapshot.
@@ -117,7 +119,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
         def event(kind):
             found = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? ORDER BY id DESC LIMIT 1",
                                  (tid, run, kind)).fetchone()
-            return json.loads(found[0]) if found else {}
+            return (native_json_object(found[0], allow_null=True) or {}) if found else {}
         skills = json.loads(task["skills"] or "[]")
         if event("claimed").get("source_status") == "review":
             skills = list(dict.fromkeys([*skills, "sdlc-review"]))

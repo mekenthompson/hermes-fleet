@@ -327,6 +327,10 @@ API credential principals remain API credential principals; they are not attribu
 named human. Inspection repeats the exact requester, text, workspace/policy, scope,
 Stop evidence and applicable provider verification after owner readback; a changed
 projection is refused. Recheck current native state before any subsequent control operation.
+Consumed admission payloads, native messaging source/event objects and turn/settings
+envelopes pass the existing native mapping validator before field access. Optional native
+author decoding and absent/null optional settings retain their existing semantics; malformed
+arrays and scalars fail as unavailable evidence rather than escaping the owner command.
 
 Ordinary native Linear input uses a separate, bounded evidence branch. It checks
 the committed human actor, organization, issue, Agent Session and original
@@ -373,6 +377,10 @@ context and transcript history are excluded. A successor run needs its own fresh
 Stopped, settled, superseded, expired or changed work invalidates an earlier reference.
 
 Work evidence reports `requester.kind: native_dispatcher`, `original_requester: unknown` and
+uses the existing JSON-object decoder for frozen policy/request data and consumed claim,
+admission and worker-binding event metadata. Native absent/null event metadata retains its
+empty-object meaning; required ownership fields must still verify independently. Malformed
+mapping shapes are refused on both reads without repairing retained state. It returns
 `permission_granted: false`. Native cards do not bind the original human/API principal or an
 approved issue scope. Generated task text is work content; it is never human consent. Any
 controller must apply its independently authorized profile, issue, specialist and workspace
