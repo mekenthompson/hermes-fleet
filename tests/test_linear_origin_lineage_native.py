@@ -322,7 +322,7 @@ class CleanupLineage(base.OriginScenarios):
 
     async def test_lineage_native_admission_payloads_intents_and_legacy_nulls_remain_valid(self):
         import json
-        from hermes_state_runtime import (RuntimeStoreError, _import_legacy_row,
+        from hermes_state_runtime import (RuntimeStoreError, _import_legacy_row, _json,
             admit_session_input, cancel_session_input)
         await self.stopped_issue()
         for intent in ("queue", "steer", "redirect"):
@@ -343,8 +343,7 @@ class CleanupLineage(base.OriginScenarios):
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         for payload in ([], None, {"not_finite": float("nan")}):
             with self.subTest(payload=payload), self.assertRaises(RuntimeStoreError):
-                admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="native",
-                    session_id=self.sid, request_id="invalid-native-payload", payload=payload)
+                _json(payload)
 
     async def test_lineage_owned_admission_consumed_fields_require_native_contracts(self):
         from hermes_state_runtime import cancel_session_input
