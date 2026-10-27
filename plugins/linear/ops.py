@@ -28,7 +28,7 @@ def _rows(db: sqlite3.Connection, sql: str, *args: Any) -> list[sqlite3.Row]:
 def needs_resolution(row: Any, payload: dict[str, Any]) -> bool:
     """An uncertain issue write the gateway will not settle by itself: only an operator can say what happened."""
     held_legacy = bool(row["hold_reason"]) if "hold_reason" in row.keys() else False
-    return (row["kind"] in ("status", "description") and not payload.get("reconciliation") and
+    return (row["kind"] in ("status", "description", "delegate") and not payload.get("reconciliation") and
             (held_legacy or Store.uncertain(row, payload) and
              (row["state"] == "failed" or bool(payload.get("reconcile_required")))))
 
@@ -58,7 +58,7 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                         add(issue, row["id"], since, "Reconciled delivery history is retained; automatic replay remains disabled",
                             "Use a new authorized request for any further change.")
                     else:
-                        action = (RESOLVE.format(id=row["id"]) if row["kind"] in ("status", "description") else
+                        action = (RESOLVE.format(id=row["id"]) if row["kind"] in ("status", "description", "delegate") else
                                   "Inspect the retained request and native/external effects. Do not replay it; use a new authorized request after reconciliation.")
                         add(issue, row["id"], since, reason, action, True)
                 elif advisory({"kind": row["kind"], "payload": payload}):
@@ -67,7 +67,7 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     held = sum(1 for r in rows if json.loads(r["payload"]).get("requires_status_id") == row["id"])
                     add(issue, row["id"], since, f"{row['kind']} write may or may not have reached Linear; it holds "
                         "this issue" + (f" and {held} dependent write(s)" if held else ""), RESOLVE.format(id=row["id"]), True)
-                elif row["kind"] in ("status", "description") and Store.uncertain(row, payload):
+                elif row["kind"] in ("status", "description", "delegate") and Store.uncertain(row, payload):
                     late = now - since > 3600  # a send held this long is not settling by itself
                     add(issue, row["id"], since, f"{row['kind']} write is {'held unsent' if late else 'being sent'}; it holds "
                         "this issue", "Check the gateway log for what holds it." if late else "Settles on its next send.", late)
@@ -141,7 +141,7 @@ def replay(ingress: Path, profile: str, delivery_id: str) -> bool:
 def setup(parser: Any) -> None:
     sub = parser.add_subparsers(dest="linear_command", required=True)
     sub.add_parser("status", help="List held Linear work and the next step").add_argument("--json", action="store_true")
-    resolve = sub.add_parser("resolve", help="Record the verified outcome of an uncertain status or description write")
+    resolve = sub.add_parser("resolve", help="Record the verified outcome of an uncertain status, description or delegate write")
     resolve.add_argument("row_id")
     resolve.add_argument("outcome", choices=("applied", "not_applied"))
     resolve.add_argument("--evidence", required=True, help="What you checked in Linear")

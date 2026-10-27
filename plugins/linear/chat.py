@@ -17,6 +17,9 @@ SCHEMA = {
         "status reports the existing task and retained reconciliation records. "
         "followup adds an operator comment to active native work; requires issue, body and UUID id. "
         "Use native Kanban controls for an explicit resume, cancellation or new task. "
+        "delegate_self routes future Linear input to this app after native work has been coordinated; "
+        "requires an existing native link, id, expected_binding_revision, expected_delegate_id and expected_updated_at. "
+        "It preserves the human assignee and never starts or transfers execution. "
         "origin_reference accepts only action and returns the current authenticated native input reference; "
         "it grants no control permission and must be independently inspected by the owner. "
         "work_reference accepts only action and identifies the current native dispatcher-owned work; "
@@ -25,13 +28,15 @@ SCHEMA = {
         "a task link or chat claim. Description replacement requires the exact expected_description. "
         "Reuse the same UUID id and content after a lost mutation response."),
     "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["track", "status", "followup", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
+        "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
         "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},
         "replace": {"type": "boolean", "description": "track: explicitly replace a prior reporting link after inspecting actual work. Does not transfer execution or prove the old worker stopped."},
-        "expected_binding_revision": {"type": "string", "description": "track with replace: exact native.binding_revision from a fresh status read."},
-        "id": {"type": "string", "description": "Caller UUIDv4 for creates, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
+        "expected_binding_revision": {"type": "string", "description": "track with replace or delegate_self: exact native.binding_revision from a fresh status read."},
+        "expected_delegate_id": {"type": ["string", "null"], "description": "delegate_self: exact current issue.delegate.id, or null if undelegated."},
+        "expected_updated_at": {"type": "string", "description": "delegate_self: exact issue.updatedAt from a fresh status read; optimistic preflight, not remote compare-and-swap."},
+        "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
         "description": {"type": "string", "description": "Readable Linear Markdown."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
@@ -172,8 +177,26 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
                           native=native)
         if not bridge.authorize_specialist_effect(issue_id):
             return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
-        if action in {"track", "followup"}:
+        if action in {"track", "followup", "delegate_self"}:
             _check_native_route(bridge, action, issue_id, context)
+        if action == "delegate_self":
+            if context.delegated_child:
+                return _reply(False, "Return routing changes to the parent agent.", code="native_scope_refused")
+            client_id = _uuid(args.get("id"))
+            if "expected_delegate_id" not in args or (args["expected_delegate_id"] is not None and
+                    (not isinstance(args["expected_delegate_id"], str) or not args["expected_delegate_id"])):
+                raise ValueError("delegate_self requires expected_delegate_id, including null when undelegated.")
+            if not _text(args, "expected_updated_at") or not _text(args, "expected_binding_revision"):
+                raise ValueError("Read status first; delegate_self requires the current issue timestamp and binding revision.")
+            prior = bridge.store.outbox_row(client_id)
+            requester = _content_requester(bridge, issue_id, prior,
+                context.thread_id if context.platform == "linear" else None,
+                context.message_id if context.platform == "linear" and context.message_id != context.thread_id else None)
+            result = bridge.queue_delegate_self(issue_id, client_id,
+                expected_delegate_id=args["expected_delegate_id"], expected_updated_at=args["expected_updated_at"],
+                expected_binding_revision=args["expected_binding_revision"],
+                caller_context=context.to_wire(), requester=requester)
+            return _reply(True, "Agent routing queued durably; confirm delivery before continuing native work.", outbox_id=result)
         if action == "track":
             task_id = _text(args, "task_id")
             if not task_id:

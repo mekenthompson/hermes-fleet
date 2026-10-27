@@ -192,7 +192,7 @@ class Store:
         """Attempted terminal writes, oldest first, whose effect stays unknown until an explicit durable resolution."""
         if not issue_id or issue_id.startswith("update:"):
             return []
-        rows = db.execute("SELECT id, kind, state, attempts, payload FROM outbox WHERE kind IN ('status','description') AND "
+        rows = db.execute("SELECT id, kind, state, attempts, payload FROM outbox WHERE kind IN ('status','description','delegate') AND "
                           "json_extract(payload, '$.issue_id')=? ORDER BY rowid", (issue_id,)).fetchall()
         return [{"id": row["id"], "kind": row["kind"]} for row in rows
                 if row["id"] != except_id and Store.uncertain(row, json.loads(row["payload"]))]
@@ -265,10 +265,24 @@ class Store:
                     return False
                 if payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                     return False
-            if terminal or row["kind"] in ("status", "description", "project_update"):
+            if terminal or row["kind"] in ("status", "description", "delegate", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
+    def delegate_not_applied(self, row_id: str, *, started_before: bool | None) -> bool:
+        """Only an affirmative HTTP rejection can undo this attempt's send marker."""
+        if started_before is not False:
+            return False
+        with self._tx() as db:
+            row = db.execute("SELECT kind,state,payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not row or row["kind"] != "delegate" or row["state"] != "pending":
+                return False
+            payload = json.loads(row["payload"])
+            if payload.get("delegate_routing_version") != 1 or payload.get("reconcile_required") or payload.get("delegate_receipt"):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('false')) WHERE id=?", (row_id,))
+            return True
+
     def reconcile_terminal(self, row_id: str, *, outcome: str, evidence: str, at: float) -> bool:
         """Record an operator's verified remote outcome; keep the attempted receipt intact."""
         if outcome not in ("applied", "not_applied") or not evidence.strip():
@@ -276,7 +290,7 @@ class Store:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             row = db.execute("SELECT kind, state, attempts, payload, hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
-            if not row or row["kind"] not in ("status", "description"): return False
+            if not row or row["kind"] not in ("status", "description", "delegate"): return False
             payload = json.loads(row["payload"])
             if payload.get("reconciliation") or not self.uncertain(row, payload) and not row["hold_reason"]: return False
             payload["reconciliation"] = {"outcome": outcome, "evidence": evidence.strip(), "at": at}
@@ -285,7 +299,8 @@ class Store:
                 payload["applied"] = int(outcome == "applied")
                 # External release verification is not proof that retained execution ended.
                 # Keep its checkpoints, Stop and ownership/effect history unchanged.
-            state = "sent" if payload.get("release") and payload.get("applied") else "failed"
+            state = "sent" if (payload.get("release") and payload.get("applied") or
+                               row["kind"] == "delegate" and outcome == "applied") else "failed"
             db.execute("UPDATE outbox SET payload=?, state=? WHERE id=?", (json.dumps(payload), state, row_id))
             return True
     @staticmethod
@@ -702,6 +717,10 @@ class Store:
             existing = db.execute("SELECT kind, payload FROM outbox WHERE id=?", (row_id,)).fetchone()
             if existing:
                 saved = json.loads(existing["payload"])
+                if kind == "delegate" and any(saved.get(key) != payload.get(key) for key in (
+                        "target_delegate_id", "expected_delegate_id", "expected_updated_at",
+                        "expected_binding_revision", "native_binding", "task_id", "delegate_routing_version")):
+                    raise ValueError("outbox id reused with conflicting delegate routing")
                 if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in  # a stamped work_owner is not the caller's
                         ("issue_id", "body", "expected_description", "id", "session_key", "work_owner") if k in payload or k != "work_owner"):
                     return row_id

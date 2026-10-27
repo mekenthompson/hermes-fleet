@@ -1392,6 +1392,79 @@ class Bridge:
                 "run_id": task.current_run_id, "profile": task.assignee,
                 "board": binding["board"], "local": local,
                 "binding_revision": revision}
+    def queue_delegate_self(self, issue_id: str, request_id: str, *, expected_delegate_id: str | None,
+                            expected_updated_at: str, expected_binding_revision: str,
+                            caller_context: dict, requester: dict) -> str:
+        """Change only Linear routing, after the caller has inspected native work."""
+        with self.lock(issue_id):
+            prior = self.store.outbox_row(request_id)
+            binding = self.store.native_binding(issue_id)
+            if not prior and self.store.binding_revision(issue_id) != expected_binding_revision:
+                raise LinearError("Native reporting link changed; inspect current work before routing it", retryable=False)
+            payload = {"id": request_id, "issue_id": issue_id, "content_action": True,
+                       "delegate_routing_version": 1, "write_started": False,
+                       "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": expected_delegate_id,
+                       "expected_updated_at": expected_updated_at, "expected_binding_revision": expected_binding_revision,
+                       "native_binding": binding, "task_id": (binding or {}).get("task_id"),
+                       "caller_context": caller_context, **requester}
+            if not prior:
+                self._delegate_preflight(payload)
+            row_id = self.store.enqueue("delegate", payload, at=self.clock())
+            if not row_id:
+                raise LinearError("An uncertain issue write needs reconciliation before routing changes", retryable=False)
+            return row_id
+
+    def _delegate_preflight(self, payload: dict) -> dict:
+        issue_id = payload["issue_id"]
+        if (payload.get("delegate_routing_version") != 1 or not payload.get("native_binding") or
+                payload.get("target_delegate_id") != self.api.viewer_id() or
+                self.store.native_binding(issue_id) != payload["native_binding"]):
+            raise LinearError("Native reporting link or app identity changed; inspect current work", retryable=False)
+        issue = self._effect_issue(issue_id)
+        task = self._native_effect_task(issue_id, issue)
+        if task.id != payload.get("task_id") or task.status in ("done", "archived"):
+            raise LinearError("Native work has ended or changed; inspect its history", retryable=False)
+        if (issue.get("state") or {}).get("type") in CLOSED:
+            raise LinearError("Issue is closed; no routing change was made", retryable=False)
+        if ((issue.get("delegate") or {}).get("id") != payload["expected_delegate_id"] or
+                issue.get("updatedAt") != payload["expected_updated_at"]):
+            raise LinearError("Linear changed; read current status before routing work", retryable=False)
+        return issue
+
+    def _send_delegate(self, row: dict) -> bool:
+        payload = row["payload"]
+        receipt = payload.get("delegate_receipt")
+        if receipt:
+            if (receipt.get("issue_id") != payload["issue_id"] or
+                    receipt.get("delegate_id") != payload["target_delegate_id"] or not receipt.get("updated_at")):
+                self._hold_terminal(row, "Delegate receipt does not match this request; reconcile it")
+            return True
+        current = self._effect_issue(payload["issue_id"])
+        if (current.get("delegate") or {}).get("id") == payload["target_delegate_id"]:
+            # Desired-state readback settles a lost response without another mutation.
+            return True
+        if payload.get("write_started") is not False:
+            self._hold_terminal(row, "Prior delegate change is uncertain; inspect Linear before another mutation")
+        self._delegate_preflight(payload)
+        response = {}
+        try:
+            self._mutate_outbox(row["id"], lambda: response.update(
+                issue=self.api.update_issue(payload["issue_id"], {"delegateId": payload["target_delegate_id"]})))
+        except RateLimited:
+            self.store.delegate_not_applied(row["id"], started_before=False)
+            raise
+        applied = response.get("issue")
+        if not isinstance(applied, dict):
+            applied = self._effect_issue(payload["issue_id"])
+        if (applied.get("id") != payload["issue_id"] or
+                (applied.get("delegate") or {}).get("id") != payload["target_delegate_id"] or not applied.get("updatedAt")):
+            self._hold_terminal(row, "Delegate change could not be verified; inspect Linear before retrying")
+        fresh = self.store.outbox_row(row["id"])
+        self.store.rewrite(row["id"], {**fresh["payload"], "delegate_receipt": {
+            "issue_id": applied["id"], "delegate_id": payload["target_delegate_id"],
+            "updated_at": applied["updatedAt"]}}, fresh["next_at"])
+        return True
+
     def followup(self, issue_id: str, body: str, request_id: str, *, requester_session: str | None = None, source_ms: float | None = None) -> dict:
         if not body.strip() or not request_id:
             raise LinearError("Follow-up body and stable request identity are required", retryable=False)
@@ -1953,7 +2026,11 @@ class Bridge:
                     state = (issue.get("state") or {}).get("type")
                     if ((not self._report_delegate_allowed(issue, payload) and not released) or state == "canceled" or
                             (row["kind"] == "status" and state in CLOSED)): raise ProjectUpdateDeferred
-            if (payload.get("content_action") or row and row.get("kind") == "description") and not payload.get("unlinked_content"):
+            if row and row["kind"] == "delegate":
+                if payload.get("write_started") is not False:
+                    raise ProjectUpdateDeferred
+                self._delegate_preflight(payload)
+            elif (payload.get("content_action") or row and row.get("kind") == "description") and not payload.get("unlinked_content"):
                 work = self.store.get(payload.get("issue_id", ""))
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or
                         work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
@@ -1978,6 +2055,9 @@ class Bridge:
         if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
             guard.rejected = lambda: self.store.project_not_applied(
                 row_id, known_rejection=True, started_before=prior_started.get("value"))
+        elif (self.store.outbox_row(row_id) or {}).get("kind") == "delegate":
+            guard.rejected = lambda: self.store.delegate_not_applied(
+                row_id, started_before=prior_started.get("value"))
         with self.api.guarded_mutation(guard):
             action()
     def _send(self, row: dict[str, Any]) -> bool:
@@ -1986,6 +2066,8 @@ class Bridge:
         payload, kind = row["payload"], row["kind"]
         if payload.get("claim") or payload.get("admission_id"):
             raise LinearError("Retained execution admission needs reconciliation; it cannot replay", retryable=False)
+        if kind == "delegate":
+            return self._send_delegate(row)
         if kind == "description" and (payload.get("write_started") or
                 (row["attempts"] and "write_started" not in payload)):
             current = self._effect_issue(payload["issue_id"])

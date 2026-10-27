@@ -20,6 +20,7 @@ API is required. The plugin is disabled by default.
 | `status` with `issue` | Read the issue, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. |
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
+| `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
 | `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
@@ -36,6 +37,23 @@ cancellation and routing. Questions, short commands and bounded investigations w
 Linear. To continue active linked work, resolve its task and send a native operator comment;
 opening another conversation does not replace its executor. Passive progress uses native
 notification subscriptions with `notify`, never `wake` as an execution workaround.
+
+For an explicit chat takeover, first inspect the current owner and native work, coordinate
+its Stop and verify cleanup, then link the existing task or a deliberately created remainder
+on the receiving agent. Read `status` and pass its exact binding revision, delegate ID
+(including null) and issue timestamp to `delegate_self`. Confirm Linear delivery before
+using current native controls to resume the remainder. Assignment echoes see the existing
+binding and cannot start a second task. Delegated children return routing requests to their
+parent. Agent routing metadata neither proves the old worker stopped nor grants execution.
+The plugin uses its own app identity and writes only `delegateId`; it never borrows another
+agent's credentials or changes the human assignee. The timestamp check is optimistic,
+because Linear offers no remote compare-and-swap for this update.
+
+Routing requests use the existing outbox and retain their UUID and preimage across restart.
+Reuse the exact request after a lost response: fresh desired-state readback can settle it
+without another mutation. A different remote delegate after an uncertain attempt holds the
+request for the existing `hermes linear status` / `resolve` workflow. It never resends blindly
+or clears an earlier uncertain effect. A newer request cannot bypass that hold.
 
 Tracking preserves the native profile, board and task. The task must belong to the verified
 executor profile. Native board validation and worker pins apply across the private RPC;
