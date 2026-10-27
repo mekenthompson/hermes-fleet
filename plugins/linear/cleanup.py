@@ -232,6 +232,24 @@ def _runtime_scope(native, session_id, execution_id):
     return sessions, [workers[key] for key in sorted(workers)], [children[key] for key in sorted(children)]
 
 
+def _require_owned_workers(native, workers, epoch):
+    from hermes_state_runtime import _session
+    # worker_executions' native CHECK/NOT NULL contract and the actual writers:
+    # register binds an integer epoch/generation; begin_runtime_epoch starts at
+    # one, session generations start at zero and only advance, and receipt
+    # sequences start at zero. Historical terminal rows need not be current.
+    for row in workers:
+        _require(row["kind"] in ("cron", "child", "compute", "kanban")
+                 and row["status"] in ("registered", "running", "unknown", "terminal"),
+                 "native_worker_state_unreadable")
+        session = _session(native, row["session_id"])
+        _require(type(row["owner_epoch"]) is int and 0 < row["owner_epoch"] <= epoch
+                 and type(session["runtime_generation"]) is int and session["runtime_generation"] >= 0
+                 and type(row["generation"]) is int and 0 <= row["generation"] <= session["runtime_generation"]
+                 and type(row["last_sequence"]) is int and row["last_sequence"] >= 0,
+                 "native_worker_state_unreadable")
+
+
 def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
     from hermes_cli import kanban_db as kb
     from hermes_state import SessionDB
@@ -350,18 +368,16 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
             with db._read_ctx() as native:
                 lineage, native_workers, children = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
+                epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
+                _require(epoch is not None and type(epoch[0]) is int and epoch[0] > 0, "native_owner_unknown")
+                runtime_identity(epoch[1])
+                _require_owned_workers(native, native_workers, epoch[0])
                 _require(all(child["status"] == "terminal" for child in children), "native_child_spawner_unsettled")
-                # Validate every retained owned row's canonical CHECK state;
-                # a corrupted/future status is not evidence of settlement.
-                _require(all(row["status"] in ("registered", "running", "unknown", "terminal")
-                             for row in native_workers), "native_worker_state_unreadable")
                 _require(all(row["status"] == "terminal" for row in native_workers), "native_worker_or_spawner_unsettled")
                 executor = native.execute("SELECT status,owner_epoch,generation FROM worker_executions WHERE execution_id=?",
                                           ("admission-worker:" + admission["admission_id"],)).fetchone()
                 _require(executor and tuple(executor) == ("terminal", admission["owner_epoch"], admission["generation"]),
                          "native_executor_settlement_missing")
-                epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
-                _require(epoch is not None, "native_owner_unknown")
             retained = [row for target in sorted(lineage)
                         for row in list_session_admissions(db, session_id=target, pending_only=False)]
             _require(all(row["status"] == "terminal" and row.get("outcome") in _SETTLED_ADMISSION_OUTCOMES

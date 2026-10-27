@@ -209,6 +209,118 @@ class CleanupLineage(base.OriginScenarios):
                     cancel_session_input(self.authority.db, epoch=self.authority.epoch,
                                          admission_id=row["admission_id"])
                 self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_native_worker_writer_contracts_keep_valid_history(self):
+        from hermes_state_runtime import (RuntimeStoreError, begin_runtime_epoch, claim_session_input,
+            register_worker_execution, adopt_worker_execution, mutate_worker_execution, settle_session_input)
+        await self.stopped_issue()
+        for kind in ("cron", "child", "compute", "kanban"):
+            row = self.admit(self.sid, "native-worker-kind-" + kind)
+            claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+            self.assertEqual(row["admission_id"], claimed["admission_id"])
+            owned = dict(epoch=self.authority.epoch, execution_id="native-kind-" + kind,
+                         session_id=self.sid, generation=claimed["generation"])
+            register_worker_execution(self.authority.db, **owned, kind=kind, adoption_secret="finite-native-kind")
+            adopt_worker_execution(self.authority.db, **owned, adoption_secret="finite-native-kind")
+            for bad in (None, 0, -1, True, "1", 1.5):
+                with self.subTest(kind=kind, bad_sequence=bad):
+                    with self.assertRaises(RuntimeStoreError):
+                        mutate_worker_execution(self.authority.db, **owned, sequence=bad,
+                                                operation="execution.finish", payload={})
+            for bad in (None, "future-kind", b"compute", ""):
+                with self.subTest(bad_kind=bad), self.assertRaises(RuntimeStoreError):
+                    register_worker_execution(self.authority.db, **owned, kind=bad, adoption_secret="finite-native-kind")
+            for key in ("epoch", "generation"):
+                for bad in (None, True, "1", 1.5):
+                    with self.subTest(key=key, bad=bad), self.assertRaises(RuntimeStoreError):
+                        register_worker_execution(self.authority.db, **{**owned, key: bad},
+                                                  kind=kind, adoption_secret="finite-native-kind")
+            # The actual settlement writer can retire a registered/adopted
+            # execution without any worker receipt: terminal sequence zero is valid.
+            settle_session_input(self.authority.db, epoch=self.authority.epoch,
+                admission_id=row["admission_id"], generation=claimed["generation"], outcome="interrupted")
+            stored = self.authority.db._read_all("SELECT status,last_sequence FROM worker_executions WHERE execution_id=?",
+                                                (owned["execution_id"],))[0]
+            self.assertEqual((stored["status"], stored["last_sequence"]), ("terminal", 0))
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # Epoch advancement is a real native storage writer, not a claim of
+        # gateway restart. Older terminal owner epochs and generations remain valid.
+        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id=self.authority.instance_id)
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_owned_worker_schema_faults_are_held_without_repair(self):
+        await self.stopped_issue()
+        name = "owned-worker-schema-fault"
+        self.retired_extra_root(self.sid, name, child=False)
+        original = self.authority.db._read_all("SELECT * FROM worker_executions WHERE execution_id=?", (name,))[0]
+        # Explicit retained-schema corruption fixture: CHECK bypass does not
+        # bypass NOT NULL. Relax only this fixture table's NOT NULL declarations
+        # so actual NULL rows reach the read-only inspector; no production repair.
+        def allow_null_faults(conn):
+            schema = conn.execute("SELECT sql FROM sqlite_schema WHERE name='worker_executions'").fetchone()[0]
+            conn.execute("PRAGMA writable_schema=ON")
+            try:
+                conn.execute("UPDATE sqlite_schema SET sql=? WHERE name='worker_executions'",
+                             (schema.replace(" NOT NULL", ""),))
+                version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                conn.execute("PRAGMA schema_version=" + str(version + 1))
+            finally:
+                conn.execute("PRAGMA writable_schema=OFF")
+        self.authority.db._execute_write(allow_null_faults)
+        def update(column, value, target=name):
+            def write(conn):
+                conn.execute("PRAGMA ignore_check_constraints=ON")
+                try:
+                    conn.execute(f"UPDATE worker_executions SET {column}=? WHERE execution_id=?", (value, target))
+                finally:
+                    conn.execute("PRAGMA ignore_check_constraints=OFF")
+            self.authority.db._execute_write(write)
+        cases = {"kind": ("future-kind", b"compute", None),
+                 "status": ("future-status", b"terminal", None),
+                 "owner_epoch": (0, -1, self.authority.epoch + 1, 1.5, b"1", None),
+                 "generation": (-1, self.row["generation"] + 1, 1.5, b"1", None),
+                 "last_sequence": (-1, 1.5, b"1", None)}
+        for column, values in cases.items():
+            for value in values:
+                with self.subTest(column=column, value=value):
+                    update(column, value)
+                    try:
+                        before = self.authority.db._read_all("SELECT * FROM worker_executions WHERE execution_id=?", (name,))
+                        result = await self.cleanup_inspected()
+                        self.assertFalse(result["quiescence_proven"])
+                        self.assertEqual(result["reason"], "native_worker_state_unreadable")
+                        self.assertEqual(before, self.authority.db._read_all("SELECT * FROM worker_executions WHERE execution_id=?", (name,)))
+                    finally:
+                        update(column, original[column])
+        def arriving(_method, _params):
+            self.before_rpc = None
+            update("kind", "future-kind")
+        self.before_rpc = arriving
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_worker_state_unreadable")
+        update("kind", original["kind"])
+        self.authority.db.create_session("foreign-worker-schema-session", source="local")
+        foreign = "foreign-worker-schema-fault"
+        self.retired_extra_root("foreign-worker-schema-session", foreign, child=False)
+        for column, value in (("kind", b"future-kind"), ("status", "future-status"),
+                              ("owner_epoch", -1), ("generation", None), ("last_sequence", None)):
+            update(column, value, foreign)
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_owned_worker_missing_native_session_is_unknown(self):
+        await self.stopped_issue()
+        child = self.retired_extra_root(self.sid, "retained-native-fk-root")
+        # A retained descendant still belongs to the root by its native
+        # execution range even when its session foreign key is corrupted.
+        self.authority.db._conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE worker_executions SET session_id='missing-native-session' WHERE execution_id=?",
+                (child["execution_id"],)))
+        finally:
+            self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(CleanupLineage(name) for name in loader.getTestCaseNames(CleanupLineage)
                               if name.startswith("test_lineage_"))

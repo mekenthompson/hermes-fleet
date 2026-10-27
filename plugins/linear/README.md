@@ -397,9 +397,10 @@ their descendant session lineages. The read repeats that discovery until no new 
 execution remains; terminal extra compute roots participate too. A settled parent does not
 discharge queued or unknown child work. Those session identities, admissions and every
 retained worker identity/state participate in the repeated evidence digest, including
-settled arrivals during the owner read. Every retained worker status in the native
-runtime lineage is validated before active-only filters; malformed retained states remain
-unknown. Foreign lineage is outside this check. Runtime ownership selectors must retain
+settled arrivals during the owner read. Every consumed owned worker field must satisfy
+its native schema and writer contract, including kind, counters and referenced session.
+Historical terminal epochs/generations and terminal sequence zero remain valid; malformed
+retained records remain unknown. Foreign lineage is outside this check. Runtime ownership selectors must retain
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report
 `native_runtime_ownership_key_unreadable` for native-owner reconciliation. Execution/session
 IDs in the runtime worker ledger and admission targets use the native runtime identity
