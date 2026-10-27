@@ -13,6 +13,17 @@ from . import origin
 from .transport import Unavailable
 
 
+# task_runs' documented schema plus ended-run values written by native
+# kanban_db (_end_run/_synthesize_ended_run), kanban_db_controls and
+# kanban_db_dispatch (_DeadWorker/_record_task_failure). This is evidence
+# validation only: unfamiliar future native states require native reconciliation.
+_SETTLED_RUN_STATUSES = frozenset({
+    "done", "blocked", "crashed", "timed_out", "failed", "released",
+    "reclaimed", "stale", "rate_limited", "spawn_failed", "gave_up",
+    "review", "ready", "todo", "scheduled", "completed", "review_requested",
+})
+
+
 class Unknown(RuntimeError):
     pass
 
@@ -76,7 +87,7 @@ def _discover(home, issue, profile, native_profile, metadata, bound=None):
     return bound, reader.for_board(bound["board"])
 
 
-def _pid_gone(pid, fingerprint):
+def _pid_gone(pid, fingerprint, owner=None):
     """Compose native epoch and birth validation; never infer identity from junk."""
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_db import _pid_alive
@@ -109,8 +120,9 @@ def _pid_gone(pid, fingerprint):
         process = psutil.Process(pid)
         epoch_birth = round(process_birth(process) * 100)
         readings = [epoch_birth]
+        monotonic_birth = worker_birth(process)
         if psutil.LINUX:
-            readings.append(worker_birth(process) * os.sysconf("SC_CLK_TCK"))
+            readings.append(monotonic_birth * os.sysconf("SC_CLK_TCK"))
     except psutil.Error as exc:
         raise Unknown("worker_identity_unreadable") from exc
     _require(all(_start_times_agree(value, value) for value in readings), "worker_identity_unreadable")
@@ -118,11 +130,25 @@ def _pid_gone(pid, fingerprint):
              "worker_identity_unreadable")
     _require(not any(start_time_fingerprints_match(float(recorded), value) for value in readings),
              "old_worker_alive")
+    # Legacy fingerprint numbers do not identify their historical source.
+    # A clock step can move an epoch fallback while its Linux boot birth stays
+    # unchanged. Only this exact attempt's fully matched native admission
+    # receipt supplies the original native worker_birth, never a PID-only join.
+    _require(isinstance(owner, dict) and type(owner.get("pid")) is int and owner["pid"] == pid
+             and type(owner.get("birth")) in (int, float), "worker_identity_unproven")
+    original_birth = owner["birth"]
+    _require(_start_times_agree(original_birth, original_birth), "worker_identity_unproven")
+    _require(not _start_times_agree(monotonic_birth, original_birth), "old_worker_alive")
     # Recheck the native identity after the independent reads; a changing
     # incarnation or source that neither reading explains stays uncertain.
     repeated = birth(_process_fingerprint(pid), "worker_identity_unreadable")
     _require(any(start_time_fingerprints_match(float(repeated), value) for value in readings),
              "worker_identity_unreadable")
+    try:
+        repeated_birth = worker_birth(process)
+    except psutil.Error as exc:
+        raise Unknown("worker_identity_unreadable") from exc
+    _require(_start_times_agree(monotonic_birth, repeated_birth), "worker_identity_unreadable")
     return "recycled"
 
 
@@ -137,7 +163,13 @@ def _checkpoint(home, owners):
     # follow a checkpoint link or treat inaccessible metadata as an empty file.
     _require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024,
              "checkpoint_unreadable")
-    entries = json.loads(path.read_text(encoding="utf-8-sig"))
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            _require(key not in value, "checkpoint_duplicate_key")
+            value[key] = item
+        return value
+    entries = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=unique_object)
     _require(isinstance(entries, list), "checkpoint_unreadable")
     for entry in entries:
         _require(isinstance(entry, dict), "checkpoint_ownership_ambiguous")
@@ -208,14 +240,10 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         # and worker event before requiring admission evidence; absence is never safety.
         for run in runs:
             native_run = kb.Run.from_row(native_text_row(run, "id", "task_id", "status", "profile", "ended_at"))
-            _require(native_run.status not in {"running", "unknown"}
+            _require(native_run.status in _SETTLED_RUN_STATUSES
                      and native_run.ended_at is not None and native_run.profile == native_profile, "run_not_settled")
-            if run["worker_pid"] is not None or run["worker_started_at"] is not None:
-                _pid_gone(run["worker_pid"], run["worker_started_at"])
         for worker in workers:
             _require(worker["id"] < stop_id, "late_worker_binding_after_stop")
-            data = json.loads(worker["payload"])
-            _pid_gone(data.get("pid"), data.get("started_at"))
         for run in runs:
             admitted = [e for e in bindings if e["run_id"] == run["id"]]
             _require(len(admitted) == 1, "attempt_native_admission_missing_or_ambiguous")
@@ -238,6 +266,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             _require(admission and admission["status"] == "terminal" and admission["outcome"] in {"completed", "interrupted", "failed", "rejected"}
                      and admission["payload"].get("kanban_card_v1") == {"board": bound["board"], "task_id": task["id"], "run_id": run_id},
                      "native_admission_not_settled")
+            if run["worker_pid"] is not None or run["worker_started_at"] is not None:
+                _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
             _require(all(r["status"] == "terminal" and r.get("outcome") not in {"steering"}
                          for r in list_session_admissions(db, session_id=sid, pending_only=False)), "native_session_has_unsettled_work")
             with db._read_ctx() as native:
@@ -265,7 +295,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 _require(worker["id"] < stop_id, "late_worker_binding_after_stop")
                 if worker["kind"] == "worker_bound":
                     _require(data.get("claim_lock") == frozen.get("claim_lock"), "worker_claim_mismatch")
-                observed.append({"kind": worker["kind"], "fate": _pid_gone(data.get("pid"), data.get("started_at"))})
+                observed.append({"kind": worker["kind"], "fate": _pid_gone(data.get("pid"), data.get("started_at"), marker)})
             worker_evidence.append({"run_id": run_id, "workers": observed,
                 "scope": {key: frozen.get(key) for key in ("profile", "workspace", "branch", "tenant", "skills")}})
             owners.append(({saved["route"], *lineage}, {*lineage, *(child["session_id"] for child in children)}))

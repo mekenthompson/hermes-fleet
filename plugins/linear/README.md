@@ -388,13 +388,18 @@ key or conflicting event/run ownership can be treated as positive foreign eviden
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions and worker/child ledger, confirmed clear native Stop checkpoints, and recorded interpreter and
 submitter identities proven gone or recycled. Worker births use the actual current native
-instantiation epoch and native birth validation/comparison. Linux inspection compares both
-native boot-tick and epoch fallback representations, including a repeated native identity
-read; a source change or unreadable independent birth cannot establish PID reuse.
-Missing, malformed, unreadable
+instantiation epoch and native birth validation/comparison. Positive reuse of a live PID
+also requires this exact attempt's fully matched original native `owner_admitted` PID and
+`worker_birth` receipt. A legacy fingerprint cannot distinguish historical Linux boot ticks
+from a clock-adjusted epoch fallback. Without a trustworthy original monotonic witness,
+a living legacy PID stays unknown even if its current fingerprint differs; a genuinely
+gone PID remains positive evidence. Current native births and identity are read repeatedly;
+unreadable or changing evidence cannot prove reuse. Unknown run states remain unsettled
+even when an end timestamp exists. Missing, malformed, unreadable
 or unproved older-epoch witnesses stay unknown for native-owner reconciliation. Scoped process checkpoints must also contain
 no live or unconfirmed scope. A retained checkpoint symlink, including a dangling link,
-or unreadable metadata stays unknown; only genuine absence is empty.
+or unreadable metadata stays unknown; only genuine absence is empty. Duplicate JSON
+keys are rejected before checkpoint ownership classification.
 Only positively foreign records are excluded;
 missing, partial or conflicting route/owner attribution remains unknown. An attempt that
 spawned before native admission, orphan worker events, or any unverified older attempt also
