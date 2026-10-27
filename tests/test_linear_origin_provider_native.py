@@ -23,6 +23,7 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.OriginScenarios.asyncSetUp
     claim = fixtures.OriginScenarios.claim
     bind = fixtures.OriginScenarios.bind
+    during_origin_readback = fixtures.OriginScenarios.during_origin_readback
 
     async def linear(self, *, assignment=False):
         from gateway.config import Platform
@@ -57,6 +58,18 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def inspected(self, ref, *, api=True):
         return await asyncio.to_thread(origin.inspect, ref, self.settings, api=self.api if api else None)
+
+    async def test_provider_is_freshly_reverified_after_owner_readback(self):
+        await self.linear()
+        ref = (await self.current())["reference"]
+        self.provider.requests.clear()
+        evidence = await self.inspected(ref)
+        self.assertEqual(evidence["provider_verification"]["state"], "verified")
+        self.assertGreaterEqual(sum("AgentActivityAuthorization" in query for query in self.provider.requests), 2)
+        self.during_origin_readback(lambda: self.provider.activities[ACTIVITY].update(user={"id": VIEWER}))
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(ref)
+        self.assertEqual(self.provider.mutations, [])
 
     async def test_activity_roundtrip_verifies_exact_provider_actor_and_keeps_reference_opaque(self):
         await self.linear()

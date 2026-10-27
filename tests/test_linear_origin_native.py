@@ -190,6 +190,118 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def inspected(self, ref):
         return await asyncio.to_thread(origin.inspect, ref, self.settings)
 
+    def during_origin_readback(self, change):
+        """Run a finite fixture writer during the second actual owner receipt."""
+        count = 0
+        def arriving(_method, _params):
+            nonlocal count
+            count += 1
+            if count == 2:
+                change()
+        self.before_rpc = arriving
+
+    def retained_origin_payload(self, change):
+        """Explicit retained-row fault, not a supported mutation of immutable input."""
+        payload = json.loads(self.authority.db._read_one(
+            "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0])
+        change(payload)
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
+
+    async def test_origin_readback_rechecks_native_messaging_workspace(self):
+        for platform in ("telegram", "slack"):
+            with self.subTest(platform=platform):
+                await self.messaging(platform)
+                before, after = str(self.home / "before"), str(self.home / "after")
+                self.authority.db.update_session_cwd(self.sid, before)
+                ref = (await self.current())["reference"]
+                self.during_origin_readback(lambda: self.authority.db.update_session_cwd(self.sid, after))
+                with self.assertRaises(transport.Unavailable):
+                    await self.inspected(ref)
+                self.assertEqual(self.authority.db.get_session(self.sid)["cwd"], after)
+                self.before_rpc = None
+                evidence = await self.inspected(ref)
+                self.assertEqual(evidence["policy"]["cwd"], after)
+                self.assertFalse(evidence["permission_granted"])
+
+    async def test_origin_readback_rechecks_retained_text_and_requester(self):
+        for field in ("text", "requester"):
+            with self.subTest(field=field):
+                await self.api(session_id="api-" + field, request_id="request-" + field)
+                ref = (await self.current())["reference"]
+                def change(payload):
+                    if field == "text":
+                        payload["text"] = "Different exact original instruction"
+                    else:
+                        payload["api_turn_v1"]["transfer_auth"]["principal"] = "principal:fixture:" + "b" * 32
+                self.during_origin_readback(lambda: self.retained_origin_payload(change))
+                with self.assertRaises(transport.Unavailable):
+                    await self.inspected(ref)
+                self.before_rpc = None
+                evidence = await self.inspected(ref)
+                self.assertEqual(evidence["original_message"] if field == "text" else evidence["requester"]["principal"],
+                    "Different exact original instruction" if field == "text" else "principal:fixture:" + "b" * 32)
+                self.assertFalse(evidence["permission_granted"])
+
+    async def test_origin_readback_rechecks_consumed_local_policy(self):
+        from hermes_state_local import POLICY_PREFIX, local_receipt
+        from gateway.session_policy import restore_policy
+        await self.local()
+        ref = (await self.current())["reference"]
+        def change():
+            # Explicit fault in the otherwise immutable native creation receipt;
+            # the actual native decoder must project its new workspace/tool policy.
+            receipt = local_receipt(self.authority.db, self.sid)
+            receipt["policy"]["cwd"] = str(self.home / "different workspace")
+            for field, key in (("terminal_json", "TERMINAL_CWD"), ("request_json", "cwd")):
+                value = json.loads(receipt["policy"][field])
+                value[key] = receipt["policy"]["cwd"]
+                receipt["policy"][field] = json.dumps(value)
+            self.assertEqual(restore_policy(receipt["policy"]).cwd, receipt["policy"]["cwd"])
+            self.authority.db.set_meta(POLICY_PREFIX + self.sid, json.dumps(receipt))
+        self.during_origin_readback(change)
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(ref)
+        self.before_rpc = None
+        evidence = await self.inspected(ref)
+        self.assertEqual(evidence["policy"]["cwd"], str(self.home / "different workspace"))
+        self.assertFalse(evidence["permission_granted"])
+
+    async def test_origin_readback_rechecks_current_stop_checkpoint(self):
+        from gateway import session_ancillary
+        await self.messaging("telegram")
+        ref = (await self.current())["reference"]
+        supported = callable(getattr(session_ancillary, "process_stop_pending", None))
+        key = "fixture.pending.stop." + self.sid
+        # Pinned fae lacks the optional getter. Its adapter reads real native meta;
+        # compatibility Core exercises the actual native checkpoint writer/getter.
+        adapter = patch.object(session_ancillary, "process_stop_pending",
+            lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
+        if not supported:
+            adapter.start()
+            self.addCleanup(adapter.stop)
+        def stop():
+            if supported:
+                session_ancillary.record_process_stop(self.authority, self.ref, self.row["generation"])
+            else:
+                self.authority.db.set_meta(key, "pending")
+        self.during_origin_readback(stop)
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(ref)
+        self.assertIsNotNone(session_ancillary.process_stop_pending(self.authority.db, self.sid))
+
+    async def test_origin_readback_preserves_native_text_and_decoded_policy(self):
+        await self.messaging("telegram")
+        cwd = " workspace with spaces/\u00e9:unchanged "
+        self.authority.db.update_session_cwd(self.sid, cwd)
+        ref = (await self.current())["reference"]
+        # A native writer running with the exact same value is not a changed
+        # projection; do not add path grammar or normalize native TEXT.
+        self.during_origin_readback(lambda: self.authority.db.update_session_cwd(self.sid, cwd))
+        evidence = await self.inspected(ref)
+        self.assertEqual(evidence["policy"]["cwd"], cwd)
+        self.assertFalse(evidence["permission_granted"])
+
     async def kanban(self, *, existing=False):
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import _sqlite_connect

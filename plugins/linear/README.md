@@ -306,7 +306,9 @@ principal, filtered requester limits and relevant profile/workspace policy. It a
 other profile home, database path or transcript selector. It never attaches a viewer, loads
 runtime tool inventory, initializes credentials, starts a gateway, or runs a model.
 API credential principals remain API credential principals; they are not attributed to a
-named human. Recheck current native state before any subsequent control operation.
+named human. Inspection repeats the exact requester, text, workspace/policy, scope,
+Stop evidence and applicable provider verification after owner readback; a changed
+projection is refused. Recheck current native state before any subsequent control operation.
 
 Ordinary native Linear input uses a separate, bounded evidence branch. It checks
 the committed human actor, organization, issue, Agent Session and original
