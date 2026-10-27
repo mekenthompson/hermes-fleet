@@ -425,7 +425,11 @@ confirmed clear native Stop checkpoints, and recorded interpreter and
 submitter identities proven gone or recycled. Admission and Stop checks cover the native
 compression lineage of every attempt, every retained execution in that scope and all of
 their descendant session lineages. The read repeats that discovery until no new session or
-execution remains; terminal extra compute roots participate too. A settled parent does not
+execution remains; terminal extra compute roots participate too. Before native lineage resolution, only
+the relevant local receipt (or its chat-linked receipt) and explicit reset-child mapping
+metadata are decoded in the same pinned snapshot. Native helpers retain topology and
+semantic validation. Those consumed inputs join the repeated digest; unrelated model
+configuration and foreign receipts remain outside this check. A settled parent does not
 discharge queued or unknown child work. Those session identities, admissions and every
 retained worker identity/state participate in the repeated evidence digest, including
 settled arrivals during the owner read. Every consumed owned worker field must satisfy
