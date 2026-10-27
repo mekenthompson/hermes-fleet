@@ -86,9 +86,6 @@ def _checkpoint(home, owners):
     _require(path.is_file() and path.stat().st_size <= 1024 * 1024, "checkpoint_unreadable")
     entries = json.loads(path.read_text(encoding="utf-8-sig"))
     _require(isinstance(entries, list), "checkpoint_unreadable")
-    from gateway.status import get_process_start_time
-    from hermes_cli.kanban_db import _pid_alive
-    matched, recycled = 0, 0
     for entry in entries:
         _require(isinstance(entry, dict), "checkpoint_ownership_ambiguous")
         route = entry.get("session_key")
@@ -101,17 +98,11 @@ def _checkpoint(home, owners):
             continue  # Only positively foreign records can be excluded.
         _require(complete and any(route in keys and all(owner in ids for owner in attributed)
                                   for keys, ids in owners), "checkpoint_ownership_ambiguous")
-        matched += 1
-        _require(entry.get("pid_scope", "host") == "host" and not entry.get("wsl_chain")
-                 and not entry.get("systemd_unit") and not entry.get("_scope_stop_pending"), "scoped_process_cleanup_unknown")
-        pid, birth = entry.get("pid"), entry.get("host_start_time")
-        _require(type(pid) is int and pid > 0 and type(birth) is int and birth > 0, "checkpoint_identity_missing")
-        if _pid_alive(pid):
-            actual = get_process_start_time(pid)
-            _require(actual is not None, "checkpoint_identity_unreadable")
-            _require(actual != birth, "scoped_process_alive")
-            recycled += 1
-    return {"scoped_records": matched, "recycled_records": recycled}
+        # Native Stop retains both legacy and managed checkpoints until its
+        # scope, reader and durable ownership/output obligations are reconciled.
+        # Neither leader fate nor an exit file lets this reader discharge them.
+        raise Unknown("scoped_process_cleanup_unknown")
+    return {"scoped_records": 0, "recycled_records": 0}
 
 
 def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata):
