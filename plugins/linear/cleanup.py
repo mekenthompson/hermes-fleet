@@ -295,6 +295,13 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                          for r in list_session_admissions(db, session_id=sid, pending_only=False)), "native_session_has_unsettled_work")
             with db._read_ctx() as native:
                 lineage = runtime_lineage(native, sid)
+                # Validate every retained owned row before the native active-only
+                # filter. These are worker_executions' canonical CHECK states;
+                # a corrupted/future status is not evidence of settlement.
+                _require(all(row["status"] in ("registered", "running", "unknown", "terminal")
+                             for row in native.execute("SELECT status FROM worker_executions "
+                                 "WHERE session_id IN (SELECT value FROM json_each(?))",
+                                 (json.dumps(sorted(lineage)),))), "native_worker_state_unreadable")
                 _require(not worker_states(native, sid), "native_worker_or_spawner_unsettled")
                 executor = native.execute("SELECT status,owner_epoch,generation FROM worker_executions WHERE execution_id=?",
                                           ("admission-worker:" + admission["admission_id"],)).fetchone()

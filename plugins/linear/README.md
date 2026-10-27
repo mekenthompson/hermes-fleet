@@ -391,7 +391,9 @@ No filtered-out opaque key or conflicting event/run ownership is positive foreig
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions with recognized settled outcomes and worker/child ledger,
 confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. A terminal label with a missing, unknown or
+submitter identities proven gone or recycled. Every retained worker status in the native
+runtime lineage is validated before active-only filters; malformed retained states remain
+unknown. Foreign lineage is outside this check. A terminal label with a missing, unknown or
 unrecognized outcome remains held; native cancelled and settled steering histories do not
 clear any other run, worker, scope or Stop obligation. Worker births use the actual current native
 instantiation epoch and native birth validation/comparison. Positive reuse of a live PID
