@@ -374,13 +374,27 @@ class Kanban:
         return self.get(task_id)
     def get(self, task_id: str):
         with self.read_conn() as conn:
-            return self.task_from_row(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                # Missing is not authoritative if unreadable identity could
+                # have been excluded by the native equality predicate.
+                for key in conn.execute("SELECT id FROM tasks"):
+                    native_text_row(key, "id")
+            return self.task_from_row(row)
     def task_from_row(self, row):
         native_text_row(row, "id", "title", "body", "assignee", "status", "created_by", "result",
                         "idempotency_key", "completion_contract", "current_run_id", "claim_lock")
         return self.kb.Task.from_row(row) if row is not None else None
     def tasks(self, conn):
-        return [self.task_from_row(row) for row in conn.execute("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")]
+        # Admission/recovery inspect every row and refuse ambiguity; neither
+        # priority nor creation time chooses an executor from this collection.
+        return [self.task_from_row(row) for row in conn.execute("SELECT * FROM tasks")]
+    def task_keys(self, conn, table: str):
+        # Callers supply fixed native table names. Inspect only the predicate
+        # key before WHERE can hide it, not unrelated historical payloads.
+        # Leave BLOB/numeric/null comparison and affinity to native SQLite.
+        for row in conn.execute(f"SELECT task_id FROM {table}"):
+            native_text_row(row, "task_id")
     def subscribe(self, task_id: str, issue_id: str, *, issue: dict | None = None) -> None:
         with self.conn() as conn:
             if issue is not None:
@@ -396,6 +410,9 @@ class Kanban:
 
     def history(self, task_id: str, after_id: int) -> list:
         with self.read_conn() as conn:
+            self.task_keys(conn, "task_events")
+            for key in conn.execute("SELECT id FROM task_events WHERE task_id=?", (task_id,)):
+                native_text_row(key, "id")
             events = []
             for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
                                     (task_id, after_id)):
@@ -415,8 +432,9 @@ class Kanban:
                 self.comments(conn, task_id)  # Validate before any event in the batch is captured.
             return events
     def comments(self, conn, task_id: str):
+        self.task_keys(conn, "task_comments")
         return [self.kb.Comment.from_row(native_text_row(row, "id", "task_id", "author", "body", "created_at"))
-                for row in conn.execute("SELECT * FROM task_comments WHERE task_id=? ORDER BY created_at ASC", (task_id,))]
+                for row in conn.execute("SELECT * FROM task_comments WHERE task_id=?", (task_id,))]
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.read_conn() as conn:
             comments = self.comments(conn, task_id)
@@ -436,6 +454,11 @@ class Kanban:
         body = metadata.get("issue_comment") if isinstance(metadata, dict) else None
         return body if isinstance(body, str) else ""
     def latest_run(self, conn, task_id: str):
+        self.task_keys(conn, "task_runs")
+        for key in conn.execute("SELECT id,started_at FROM task_runs WHERE task_id=?", (task_id,)):
+            native_text_row(key, "id", "started_at")
+            if isinstance(key["started_at"], float):
+                int(key["started_at"])  # Native epoch conversion refuses nonfinite numeric stamps.
         row = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC, id DESC LIMIT 1",
                            (task_id,)).fetchone()
         if row is None:

@@ -72,6 +72,9 @@ for that board while authorized issue content and other valid bindings remain us
 Consumed native identity, evidence, event and comment text must decode as UTF-8 before
 native constructors run; unreadable bytes cannot become a missing issue link or a
 replacement-glyph outcome. Valid UTF-8 BLOB text and native legacy defaults remain usable.
+Native predicate keys and all candidate run ordering stamps are checked before filtering
+or selecting the latest run. An unreadable earlier attempt cannot win ordering and
+publish stale evidence; unused earlier summaries and metadata remain native history.
 Invalid events are retained
 for inspection, without being consumed or repaired. Original held project lines can report separately as their scope
 becomes valid; later same-session updates do not republish completed lines.
