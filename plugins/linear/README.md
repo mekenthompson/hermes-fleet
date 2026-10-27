@@ -372,8 +372,10 @@ The current task/run/claim coordinates come only from the owner's frozen Kanban 
 Native Kanban workers see only `linear_work_reference({"action":"work_reference"})` in the
 Linear tool inventory. The ordinary `linear` action remains compatible for existing callers.
 Inventory follows the native launch policy at tool selection; environment hints grant nothing.
-Workers execute and report through native Kanban, putting the Linear report in `kanban_complete`
-`metadata.issue_comment`; the existing gateway outbox publishes it. A coordinator with a
+Workers execute and report through native `kanban_complete` summary and evidence. Specialist
+agent-session assessments additionally require `metadata.issue_comment` matching their assessment
+contract; ordinary completion reporting does not publish an arbitrary value from that field.
+The existing gateway outbox publishes the native completion report. A coordinator with a
 native chat session checks remote issue and project publication. Queued reporting does
 not establish publication or prevent the worker from completing verified local work.
 Ordinary chat coordinators retain the full Linear tool inventory and native session checks.

@@ -68,8 +68,9 @@ WORK_SCHEMA = {
     "name": "linear_work_reference",
     "description": (
         "Identify this native Kanban worker's current work with work_reference (action only). "
-        "Execute and report through native Kanban; include the Linear report in "
-        "kanban_complete metadata.issue_comment for the existing gateway reporting outbox. "
+        "Execute and report through native Kanban using kanban_complete summary and evidence; "
+        "include metadata.issue_comment when the specialist assessment contract requires it. "
+        "The existing gateway reporting outbox publishes the native completion report. "
         "A coordinator with a native chat session verifies remote issue and project publication. "
         "Queued reporting is not confirmed publication and does not block completed local work. "
         "This reference grants no permission; the original requester remains unknown."),
