@@ -410,27 +410,36 @@ class Kanban:
 
     def history(self, task_id: str, after_id: int) -> list:
         with self.read_conn() as conn:
-            self.task_keys(conn, "task_events")
-            for key in conn.execute("SELECT id FROM task_events WHERE task_id=?", (task_id,)):
-                native_text_row(key, "id")
-            events = []
-            for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
-                                    (task_id, after_id)):
-                native_text_row(row, "id", "task_id", "kind", "created_at", "run_id")
-                # Native Event decoding treats malformed JSON as None. Validate
-                # persisted metadata first, in this same tracked read snapshot,
-                # so corrupt records cannot masquerade as legacy absence.
-                try:
-                    payload = transport.native_json_object(row["payload"], allow_null=True)
-                except (ValueError, TypeError, RecursionError) as exc:
-                    raise LinearError("Native event metadata cannot be decoded; inspect retained history before reporting", retryable=False) from exc
-                event = self.kb.Event.from_row(row)
-                event.payload = payload
-                native_event_payload(event)
-                events.append(event)
-            if any(event.kind == "commented" for event in events):
-                self.comments(conn, task_id)  # Validate before any event in the batch is captured.
-            return events
+            return self.history_rows(conn, task_id, after_id)
+    def history_rows(self, conn, task_id: str, after_id: int | None = None) -> list:
+        """Decode native history within the caller's existing read snapshot.
+
+        Ordinary reporting retains its original cursor predicate. Owner evidence
+        uses None to consume the complete history without inventing a cursor floor.
+        """
+        self.task_keys(conn, "task_events")
+        for key in conn.execute("SELECT id FROM task_events WHERE task_id=?", (task_id,)):
+            native_text_row(key, "id")
+        events = []
+        query, params = "SELECT * FROM task_events WHERE task_id=?", (task_id,)
+        if after_id is not None:
+            query, params = query + " AND id>?", (*params, after_id)
+        for row in conn.execute(query + " ORDER BY id", params):
+            native_text_row(row, "id", "task_id", "kind", "created_at", "run_id")
+            # Native Event decoding treats malformed JSON as None. Validate
+            # persisted metadata first, in this same tracked read snapshot,
+            # so corrupt records cannot masquerade as legacy absence.
+            try:
+                payload = transport.native_json_object(row["payload"], allow_null=True)
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise LinearError("Native event metadata cannot be decoded; inspect retained history before reporting", retryable=False) from exc
+            event = self.kb.Event.from_row(row)
+            event.payload = payload
+            native_event_payload(event)
+            events.append(event)
+        if any(event.kind == "commented" for event in events):
+            self.comments(conn, task_id)  # Validate before any event in the batch is captured.
+        return events
     def comments(self, conn, task_id: str):
         self.task_keys(conn, "task_comments")
         return [self.kb.Comment.from_row(native_text_row(row, "id", "task_id", "author", "body", "created_at"))

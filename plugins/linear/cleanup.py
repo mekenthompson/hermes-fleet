@@ -11,7 +11,7 @@ from . import origin
 from .transport import Unavailable
 
 
-class Unknown(ValueError):
+class Unknown(RuntimeError):
     pass
 
 
@@ -47,7 +47,7 @@ def _binding(state, issue, profile):
         return bound
 
 
-def _discover(home, issue, profile, native_profile, metadata):
+def _discover(home, issue, profile, native_profile, metadata, bound=None):
     from .bridge import Kanban
     from hermes_cli import kanban_db as kb
     class ReadOnlyDiscovery(Kanban):
@@ -56,12 +56,22 @@ def _discover(home, issue, profile, native_profile, metadata):
             # algorithm and inherited strict tracked read-only history reader remain unchanged.
             self.kb, self.board = kb, kb.get_current_board()
             self.executor_profile, self.profile_home = native_profile, home
-    found = ReadOnlyDiscovery().discover(metadata or {"id": issue})
-    _require(len(found) == 1, "native_history_match_missing_or_ambiguous")
-    adapter, task = found[0]
-    _require(task.assignee == native_profile and not getattr(adapter, "history_only", False),
-             "native_history_match_foreign_or_archived")
-    return {"issue_id": issue, "task_id": task.id, "board": adapter.board, "profile": profile}
+    reader = ReadOnlyDiscovery()
+    found = reader.discover(metadata or {"id": issue})
+    if bound is not None:
+        # A reporting link can include marker-free manual work, but cannot
+        # hide any other retained executor discovered through native history.
+        _require(len(found) <= 1 and all(adapter.board == bound["board"] and task.id == bound["task_id"]
+                                        for adapter, task in found), "native_history_match_missing_or_ambiguous")
+    else:
+        _require(len(found) == 1, "native_history_match_missing_or_ambiguous")
+    if found:
+        adapter, task = found[0]
+        _require(task.assignee == native_profile and not getattr(adapter, "history_only", False),
+                 "native_history_match_foreign_or_archived")
+    if bound is None:
+        bound = {"issue_id": issue, "task_id": task.id, "board": adapter.board, "profile": profile}
+    return bound, reader.for_board(bound["board"])
 
 
 def _pid_gone(pid, fingerprint):
@@ -120,16 +130,29 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     # (isolated fleet homes use default). It must never select a home or reject its valid link.
     bound = _binding(state, issue, native_profile)
     source = "saved_native_binding" if bound else "native_history_discovery"
-    if bound is None:
-        bound = _discover(home, issue, native_profile, native_profile, metadata)
+    bound, reader = _discover(home, issue, native_profile, native_profile, metadata, bound)
     path = kb.kanban_db_path(board=bound["board"]).resolve(strict=True)
     receipts, owners, worker_evidence = [], [], []
-    with _read(path) as board, SessionDB(home / "state.db", read_only=True) as db:
+    with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
+        from .bridge import task_issue_match, native_text_row
+        discovered = reader.tasks(board)
+        _require(all(task.id == bound["task_id"] for task in discovered
+                     if task_issue_match(task, metadata or {"id": issue})), "native_history_match_missing_or_ambiguous")
+        selected = [task for task in discovered if task.id == bound["task_id"]]
+        _require(len(selected) == 1, "native_task_missing_or_ambiguous")
+        reader.task_keys(board, "task_events")
+        reader.task_keys(board, "task_runs")
         task = board.execute("SELECT * FROM tasks WHERE id=?", (bound["task_id"],)).fetchone()
         _require(task and task["status"] == "blocked" and task["block_kind"] == "needs_input"
                  and task["current_run_id"] is None and task["claim_lock"] is None
                  and task["assignee"] == native_profile, "task_not_currently_stopped")
-        events = board.execute("SELECT id,run_id,kind,payload FROM task_events WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
+        for key in board.execute("SELECT run_id FROM task_events"):
+            native_text_row(key, "run_id")
+        _require(board.execute("SELECT 1 FROM task_events e JOIN task_runs r ON e.run_id=r.id "
+                               "WHERE r.task_id=? AND e.task_id IS NOT ? LIMIT 1",
+                               (task["id"], task["id"])).fetchone() is None, "attempt_event_task_mismatch")
+        events = [{"id": event.id, "run_id": event.run_id, "kind": event.kind,
+                   "payload": json.dumps(event.payload)} for event in reader.history_rows(board, task["id"])]
         stops = [e for e in events if e["kind"] == "blocked" and (json.loads(e["payload"] or "{}" ).get("kind") == "needs_input")]
         _require(stops and stops[-1]["id"] == stop_id, "stop_event_changed")
         runs = board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
@@ -141,8 +164,9 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         # A submitter can spawn before native admission. Inspect every retained run
         # and worker event before requiring admission evidence; absence is never safety.
         for run in runs:
-            _require(run["status"] not in {"running", "unknown"}
-                     and run["ended_at"] is not None and run["profile"] == native_profile, "run_not_settled")
+            native_run = kb.Run.from_row(native_text_row(run, "id", "task_id", "status", "profile", "ended_at"))
+            _require(native_run.status not in {"running", "unknown"}
+                     and native_run.ended_at is not None and native_run.profile == native_profile, "run_not_settled")
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"])
         for worker in workers:

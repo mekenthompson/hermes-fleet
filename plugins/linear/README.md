@@ -378,7 +378,11 @@ or retained legacy data, it inspects existing native history using the same issu
 rules as ordinary discovery, without creating or adopting a reporting link. Optional
 `--issue-json '{"id":"...","identifier":"...","url":"..."}'` supplies independently read
 issue metadata for explicit marker matching; it is discovery data and grants no authority.
-Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown.
+Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown. Existing
+saved links never skip native discovery across retained boards. Another matching executor,
+including archived work, holds proof. The selected board's strict SDK history, predicate-key
+preflight and native event decoding share one tracked read transaction; no filtered-out opaque
+key or conflicting event/run ownership can be treated as positive foreign evidence.
 
 `quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,

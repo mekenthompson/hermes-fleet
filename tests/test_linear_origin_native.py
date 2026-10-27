@@ -1145,3 +1145,113 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         raced = await self.cleanup_inspected()
         self.assertFalse(raced["quiescence_proven"])
         self.assertEqual(raced["reason"], "scoped_process_cleanup_unknown")
+
+    async def test_cleanup_saved_manual_binding_cannot_hide_another_matching_live_task(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _set_worker_pid
+        await self.stopped_issue()
+        other = kb.create_task(self.board, title="Retained work on the same issue", assignee="default",
+                               idempotency_key="linear:issue-one")
+        claimed = kb.claim_task(self.board, other, claimer="fixture-other-claim")
+        _set_worker_pid(self.board, other, os.getpid(), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        self.assertTrue(kb.block_task(self.board, other, kind="needs_input", reason="Stop before admission"))
+        evidence = await self.cleanup_inspected()
+        self.assertFalse(evidence["quiescence_proven"])
+        self.assertEqual(evidence["reason"], "native_history_match_missing_or_ambiguous")
+        self.assertFalse(evidence["permission_granted"])
+
+    async def test_cleanup_single_saved_target_and_unrelated_live_work_remain_readable(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _set_worker_pid
+        await self.stopped_issue()
+        self.board.execute("UPDATE tasks SET idempotency_key='linear:issue-one' WHERE id=?", (self.task_id,))
+        other = kb.create_task(self.board, title="Work on a different issue", assignee="default",
+                               idempotency_key="linear:another-issue")
+        claimed = kb.claim_task(self.board, other, claimer="fixture-unrelated-claim")
+        _set_worker_pid(self.board, other, os.getpid(), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertEqual(evidence["task_id"], self.task_id)
+        self.assertEqual(evidence["discovery_source"], "saved_native_binding")
+
+    async def test_cleanup_same_snapshot_rechecks_tasks_created_after_discovery(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin.bridge import Kanban
+        await self.stopped_issue()
+        original = Kanban.discover
+        inserted = []
+        def racing(reader, issue):
+            found = original(reader, issue)
+            if not inserted:
+                from hermes_cli.kanban_db_connect import _sqlite_connect
+                from contextlib import closing
+                with closing(_sqlite_connect(self.board_path)) as writer:
+                    writer.row_factory = __import__("sqlite3").Row
+                    inserted.append(kb.create_task(writer, title="New matching executor", assignee="default",
+                                                   idempotency_key="linear:issue-one"))
+            return found
+        with patch.object(Kanban, "discover", racing):
+            evidence = await self.cleanup_inspected()
+        self.assertTrue(inserted, evidence)
+        self.assertFalse(evidence["quiescence_proven"])
+        self.assertEqual(evidence["reason"], "native_history_match_missing_or_ambiguous")
+
+    async def test_cleanup_matching_task_arriving_during_receipt_readback_invalidates(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        def arriving(method, params):
+            self.before_rpc = None
+            kb.create_task(self.board, title="New matching task", assignee="default", idempotency_key="linear:issue-one")
+        self.before_rpc = arriving
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_strict_predicate_keys_and_native_event_normalization_precede_selection(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        cases = [(b"\xff", self.work_context["run_id"], "spawned", False),
+                 (self.task_id.encode(), self.work_context["run_id"], "spawned", False),
+                 (self.task_id, b"\xff", "spawned", False),
+                 (self.task_id, self.work_context["run_id"], b"spawned", False),
+                 (self.task_id, self.work_context["run_id"], "spawned", True)]
+        for task_key, run_key, kind, negative in cases:
+            with self.subTest(task_key=task_key, run_key=run_key, kind=kind, negative=negative):
+                with kb.write_txn(self.board):
+                    kb._append_event(self.board, task_key, kind, {"pid": os.getpid(),
+                        "started_at": _process_fingerprint(os.getpid())}, run_id=run_key)
+                    event_id = self.board.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+                    if negative:
+                        self.board.execute("UPDATE task_events SET id=-1 WHERE id=?", (event_id,))
+                        event_id = -1
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                self.board.execute("DELETE FROM task_events WHERE id=?", (event_id,))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_corrupt_retained_run_predicate_key_is_not_foreign_absence(self):
+        await self.stopped_issue()
+        original = dict(self.board.execute("SELECT * FROM task_runs WHERE id=?", (self.work_context["run_id"],)).fetchone())
+        for field, value in (("task_id", b"\xff"), ("status", b"running"), ("ended_at", "not-a-native-epoch")):
+            with self.subTest(field=field):
+                self.board.execute("UPDATE task_runs SET " + field + "=? WHERE id=?", (value, original["id"]))
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                self.board.execute("UPDATE task_runs SET " + field + "=? WHERE id=?", (original[field], original["id"]))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_saved_binding_checks_other_boards_and_archived_matching_work(self):
+        from contextlib import closing
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import _sqlite_connect
+        from hermes_cli.kanban_db_dispatch import _set_worker_pid
+        await self.stopped_issue()
+        slug = "retained-project"
+        kb.create_board(slug)
+        with closing(_sqlite_connect(kb.kanban_db_path(board=slug))) as other_board:
+            other_board.row_factory = __import__("sqlite3").Row
+            other = kb.create_task(other_board, title="Retained executor in another board", assignee="default",
+                                   idempotency_key="linear:issue-one", board=slug)
+            claimed = kb.claim_task(other_board, other, claimer="fixture-other-board")
+            _set_worker_pid(other_board, other, os.getpid(), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+            self.assertTrue(kb.block_task(other_board, other, kind="needs_input", reason="Stop before admission"))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        kb.remove_board(slug, archive=True)
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
