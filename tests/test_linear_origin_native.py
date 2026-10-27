@@ -958,7 +958,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             with self.subTest(intent=intent), self.assertRaises(RuntimeStoreError):
                 admit_session_input(self.authority.db, **params, intent=intent)
         for payload in ([], None, {"value": float("nan")}):
-            with self.subTest(payload=payload), self.assertRaises(RuntimeStoreError):
+            # Core93 checks native Stop membership before _json; None fails there.
+            errors = (RuntimeStoreError, TypeError) if payload is None else RuntimeStoreError
+            with self.subTest(payload=payload), self.assertRaises(errors):
                 admit_session_input(self.authority.db, **{**params, "payload": payload})
         # A valid maximum-length native ID is not trimmed or given a new grammar.
         admit_session_input(self.authority.db, **{**params, "request_id": " " * 1024})
