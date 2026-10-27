@@ -785,6 +785,54 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             db.execute("INSERT INTO specialist_scope_fence(issue_id,reason,fenced_at) VALUES('issue-one','fixture',1)")
         self.assertEqual((await self.cleanup_inspected())["reason"], "issue_scope_fenced")
 
+    async def test_cleanup_primary_payload_native_mapping_validation_precedes_access(self):
+        from hermes_state_runtime import find_session_admission, _json, RuntimeStoreError
+        await self.stopped_issue()
+        original = json.loads(self.authority.db._read_one(
+            "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0])
+        def retained(payload):
+            encoded = json.dumps(payload)
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (encoded, self.admission)))
+            return encoded
+        for payload in ([], None, "scalar", True, 1, 0.5):
+            with self.subTest(payload=payload):
+                with self.assertRaises(RuntimeStoreError):
+                    _json(payload)
+                encoded = retained(payload)  # Explicit fault in an actual settled native row.
+                decoded = find_session_admission(self.authority.db, principal_id=self.row["principal_id"],
+                    session_id=self.sid, request_id=self.row["request_id"])
+                self.assertEqual(decoded["payload"], payload)
+                evidence = await self.cleanup_inspected()
+                self.assertEqual(evidence["state"], "unknown")
+                self.assertEqual(evidence["reason"], "native_admission_state_unreadable")
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertFalse(evidence["permission_granted"])
+                self.assertEqual(self.authority.db._read_one(
+                    "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0], encoded)
+        # Valid mappings retain the native payload contract; a mapping alone
+        # does not replace the independently required Kanban attempt binding.
+        retained({})
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_admission_not_settled")
+        for payload in (original, {**original, "opaque": {"nested": [None, {}, [], " text ", 3]}}):
+            self.assertIsInstance(json.loads(_json(payload)), dict)
+            retained(payload)
+            evidence = await self.cleanup_inspected()
+            self.assertTrue(evidence["quiescence_proven"], evidence)
+            self.assertFalse(evidence["permission_granted"])
+
+    async def test_cleanup_primary_payload_fault_during_owner_readback_returns_unknown(self):
+        await self.stopped_issue()
+        def arriving(_method, _params):
+            self.before_rpc = None
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET payload_json='[]' WHERE admission_id=?", (self.admission,)))
+        self.before_rpc = arriving
+        evidence = await self.cleanup_inspected()
+        self.assertFalse(evidence["quiescence_proven"])
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertFalse(evidence["permission_granted"])
+
     async def test_work_current_preserves_unknown_requester_and_selective_privacy(self):
         from hermes_cli import kanban_db as kb
         await self.kanban()
