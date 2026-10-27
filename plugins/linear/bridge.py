@@ -148,6 +148,18 @@ def native_event_payload(event) -> dict:
         raise LinearError("Native event metadata is not an object; inspect retained history before reporting", retryable=False)
     return payload
 
+def native_text_row(row, *columns):
+    """Refuse unreadable consumed text before native constructors replace bytes.
+
+    Keep values and native legacy/default coercions intact; unused fields are
+    not new requirements on historical tasks.
+    """
+    if row is not None:
+        for column in columns:
+            if column in row.keys() and isinstance(row[column], bytes):
+                row[column].decode("utf-8")
+    return row
+
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
     activity, session = event.get("agentActivity") or {}, event.get("agentSession") or {}
@@ -358,10 +370,17 @@ class Kanban:
         if self.executor_profile is not None:
             fields["assignee"] = self.executor_profile
         with self.conn() as conn:
-            return self.kb.get_task(conn, self.kb.create_task(conn, board=self.board, **fields))
+            task_id = self.kb.create_task(conn, board=self.board, **fields)
+        return self.get(task_id)
     def get(self, task_id: str):
         with self.read_conn() as conn:
-            return self.kb.get_task(conn, task_id)
+            return self.task_from_row(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+    def task_from_row(self, row):
+        native_text_row(row, "id", "title", "body", "assignee", "status", "created_by", "result",
+                        "idempotency_key", "completion_contract", "current_run_id", "claim_lock")
+        return self.kb.Task.from_row(row) if row is not None else None
+    def tasks(self, conn):
+        return [self.task_from_row(row) for row in conn.execute("SELECT * FROM tasks ORDER BY priority DESC, created_at ASC")]
     def subscribe(self, task_id: str, issue_id: str, *, issue: dict | None = None) -> None:
         with self.conn() as conn:
             if issue is not None:
@@ -380,6 +399,7 @@ class Kanban:
             events = []
             for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
                                     (task_id, after_id)):
+                native_text_row(row, "id", "task_id", "kind", "created_at", "run_id")
                 # Native Event decoding treats malformed JSON as None. Validate
                 # persisted metadata first, in this same tracked read snapshot,
                 # so corrupt records cannot masquerade as legacy absence.
@@ -391,10 +411,15 @@ class Kanban:
                 event.payload = payload
                 native_event_payload(event)
                 events.append(event)
+            if any(event.kind == "commented" for event in events):
+                self.comments(conn, task_id)  # Validate before any event in the batch is captured.
             return events
+    def comments(self, conn, task_id: str):
+        return [self.kb.Comment.from_row(native_text_row(row, "id", "task_id", "author", "body", "created_at"))
+                for row in conn.execute("SELECT * FROM task_comments WHERE task_id=? ORDER BY created_at ASC", (task_id,))]
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.read_conn() as conn:
-            comments = self.kb.list_comments(conn, task_id)
+            comments = self.comments(conn, task_id)
         return resolve_comment_body(comments, author, length, event_at=event_at)
     def evidence_text(self, task) -> str:
         with self.read_conn() as conn:
@@ -415,6 +440,7 @@ class Kanban:
                            (task_id,)).fetchone()
         if row is None:
             return None
+        native_text_row(row, "id", "task_id", "summary")
         metadata = transport.native_json_object(row["metadata"], allow_null=True)
         run = self.kb.Run.from_row(row)
         run.metadata = metadata
@@ -481,12 +507,11 @@ class Kanban:
     def find_comment(self, task_id: str, body: str, marker: str) -> list:
         author = "linear:" + hashlib.sha256(marker.encode()).hexdigest()
         with self.read_conn() as conn:
-            return [item for item in self.kb.list_comments(conn, task_id)
+            return [item for item in self.comments(conn, task_id)
                     if item.author == author and item.body == body.strip()]
     def find_created(self, key: str) -> list:
         with self.read_conn() as conn:
-            ids = [row[0] for row in conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (key,))]
-            return [self.kb.get_task(conn, ident) for ident in ids]
+            return [task for task in self.tasks(conn) if task.idempotency_key == key]
     def discover(self, issue: dict) -> list:
         """Inspect existing boards in this native home; never enter another profile.
 
@@ -517,7 +542,7 @@ class Kanban:
                 raise LinearError(f"Existing native board {slug!r} has no readable database; inspect it before replacement work", retryable=False)
             adapter = self.for_board(slug)
             with adapter.history_conn(path, snapshot=True) as conn:
-                for task in self.kb.list_tasks(conn, include_archived=True):
+                for task in adapter.tasks(conn):
                     if task_issue_match(task, issue):
                         found.append((adapter, task))
         # Native remove_board preserves board.json in its documented own-home
@@ -549,7 +574,7 @@ class Kanban:
                     adapter.board, adapter.history_only, adapter.history_db = slug, True, path
                     adapter.board_selection_error = None
                     with adapter.conn() as conn:
-                        for task in self.kb.list_tasks(conn, include_archived=True):
+                        for task in adapter.tasks(conn):
                             if task_issue_match(task, issue):
                                 found.append((adapter, task))
                     inspected.add(slug)

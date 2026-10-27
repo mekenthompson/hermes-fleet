@@ -47,6 +47,7 @@ class ExecutorProfileTests(unittest.TestCase):
         adapter.executor_profile = 'default'
         adapter.board = 'sample-board'
         adapter.kb = Mock()
+        adapter.get = Mock()
         adapter.conn = lambda: nullcontext('connection')
         adapter.create(title='sample', assignee='sample')
         adapter.kb.create_task.assert_called_once_with('connection', board='sample-board', title='sample', assignee='default')
