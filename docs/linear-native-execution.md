@@ -121,6 +121,13 @@ converting them into human authority. A2A text remains untrusted input; controll
 native checkpoint/Stop/quiescence are separate requirements. See the plugin README for the
 guarded, manifest-pinned origin proof entrypoint.
 
+An active provider event loop is not an unavailable owner. Registered synchronous evidence
+tools reuse Core's bounded coroutine bridge when called from such a loop; the owner CLI
+keeps its normal synchronous path. Guarded cases exercise the actual registered `tool_call`
+dispatch while the separate native owner answers receipt checks, including context propagation,
+settled admissions, selector refusal and pending Stop. Those source cases do not establish
+authenticated client or deployed handoff acceptance.
+
 For recovery into an already authorized native Kanban task, the separate selector-free
 `work_reference` / owner `inspect-work` projection verifies the exact current dispatcher run
 from its frozen owner policy and tracked read-only Task/Run/Claim records. It reports the

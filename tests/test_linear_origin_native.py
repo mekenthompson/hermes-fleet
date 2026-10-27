@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, replace
 import inspect
 import json
@@ -74,6 +75,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             "capabilities": ["session:create", "session:read", "session:submit", "session:control"]}, operator=True)
         self.addAsyncCleanup(self.conn.close)
         self.loop = asyncio.get_running_loop()
+        self.origin_context = ContextVar("linear_origin_test_context", default=None)
+        self.origin_context.set("native-turn-context")
         self.calls = []
         self.before_rpc = None
 
@@ -94,6 +97,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         @asynccontextmanager
         async def client(home):
             self.assertEqual(home, self.home)
+            self.assertEqual(self.origin_context.get(), "native-turn-context")
             yield SimpleNamespace(rpc=rpc), SimpleNamespace(instance_id=self.authority.instance_id,
                                                             authority_epoch=self.authority.epoch)
         patcher = patch.object(origin, "_client", client)
@@ -189,6 +193,94 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def inspected(self, ref):
         return await asyncio.to_thread(origin.inspect, ref, self.settings)
+
+    async def async_registered_tool(self, action, **selectors):
+        """The native tool_call bridge on a provider loop, off the owner RPC loop."""
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from tools.registry import registry
+        from model_tools import handle_function_call
+        if not hasattr(self, "tool_manager"):
+            configured = {**self.config, "plugins": {"entries": {"linear": {
+                "settings": {"enabled": True, **self.settings}}}}}
+            (self.home / "config.yaml").write_text(json.dumps(configured))
+            self.tool_manager = PluginManager(scope_key=str(self.home))
+            context = PluginContext(PluginManifest(name="linear", source="user",
+                path=str(Path(plugin.__file__).parent)), self.tool_manager)
+            plugin.register(context)
+            self.addCleanup(registry.deregister, "linear", scope=str(self.home))
+            self.assertIsNotNone(registry.get_entry("linear", scope=str(self.home)))
+
+        async def provider_callback():
+            self.assertIsNot(asyncio.get_running_loop(), self.loop)
+            result = handle_function_call("tool_call", {"calls": [{"name": "linear", "arguments": {
+                "action": action, **selectors}}]}, enabled_tools=["linear"], enabled_toolsets=["linear"],
+                session_id=self.sid)
+            return json.loads(result)
+
+        # Native conversation execution is off the owner loop; provider SDK callbacks
+        # can run a separate asyncio loop there. The real owner dispatch below must
+        # still answer the inspection's prompt.receipt requests during this call.
+        return await asyncio.wait_for(asyncio.to_thread(lambda: asyncio.run(provider_callback())), 15)
+
+    async def test_registered_origin_tool_on_async_provider_loop_keeps_owner_responsive(self):
+        await self.local()
+        result = await self.async_registered_tool("origin_reference")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["permission_granted"])
+        ref = result["reference"]
+        self.assertEqual(ref["admission_id"], self.admission)
+        self.assertEqual(ref["profile"], "default")
+        self.assertEqual(ref["scope_digest"], origin._digest(origin.scope(self.settings)))
+        self.assertGreaterEqual(len(self.calls), 2)
+        inspected = await self.inspected(ref)
+        self.assertEqual(inspected["policy"]["source"], "gui")
+        self.assertEqual(inspected["scope"], origin.scope(self.settings))
+
+    async def test_registered_work_tool_on_async_provider_loop_keeps_owner_responsive(self):
+        await self.kanban()
+        result = await self.async_registered_tool("work_reference")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["permission_granted"])
+        ref = result["reference"]
+        self.assertEqual(ref["admission_id"], self.admission)
+        self.assertEqual(ref["profile"], "default")
+        self.assertEqual(ref["scope_digest"], origin._digest(origin.scope(self.settings)))
+        self.assertGreaterEqual(len(self.calls), 2)
+        inspected = await self.work_inspected(ref)
+        self.assertFalse(inspected["permission_granted"])
+        self.assertEqual(inspected["requester"]["original_requester"], "unknown")
+
+    async def test_registered_evidence_tools_on_async_provider_loop_refuse_selectors(self):
+        await self.local()
+        for action in ("origin_reference", "work_reference"):
+            for selector in ("profile", "session_id", "home", "task_id", "issue"):
+                with self.subTest(action=action, selector=selector):
+                    result = await self.async_registered_tool(action, **{selector: "forged"})
+                    self.assertFalse(result["ok"])
+        self.assertEqual(self.calls, [])
+
+    async def test_registered_origin_tool_on_async_provider_loop_refuses_settled_admission(self):
+        from hermes_state_runtime import settle_session_input
+        await self.local()
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                             generation=self.row["generation"], outcome="completed")
+        result = await self.async_registered_tool("origin_reference")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("reference", result)
+
+    async def test_registered_evidence_tools_on_async_provider_loop_preserve_pending_stop(self):
+        from gateway import session_ancillary
+        for action in ("origin_reference", "work_reference"):
+            with self.subTest(action=action):
+                if action == "origin_reference":
+                    await self.local()
+                else:
+                    await self.kanban()
+                session_ancillary.record_process_stop(self.authority, self.ref, self.row["generation"])
+                result = await self.async_registered_tool(action)
+                self.assertFalse(result["ok"])
+                self.assertNotIn("reference", result)
+                self.assertIsNotNone(session_ancillary.process_stop_pending(self.authority.db, self.sid))
 
     def during_origin_readback(self, change):
         """Run a finite fixture writer during the second actual owner receipt."""

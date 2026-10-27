@@ -171,13 +171,13 @@ async def _inspect(home, profile, declared, ref=None, context=None):
 
 def _run(home, profile, declared, ref=None, context=None):
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass
-    else:
-        _refuse()
-    try:
-        return asyncio.run(_inspect(home, profile, declared, ref, context))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            run = asyncio.run
+        else:
+            from model_tools import _run_async as run
+        return run(_inspect(home, profile, declared, ref, context))
     except Unavailable:
         raise
     except (RuntimeError, OSError, ValueError, ImportError, KeyError, IndexError, TypeError, sqlite3.DatabaseError) as exc:

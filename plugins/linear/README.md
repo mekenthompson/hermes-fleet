@@ -312,6 +312,12 @@ the owner in a cross-agent reference.
 Delegated children, bots, automation, ambiguous steering, unknown execution and stale owners
 cannot supply this reference. Unsupported native hosts fail closed.
 
+Provider SDKs can invoke the registered synchronous tool from their own asyncio loop.
+Origin and work evidence use Core's existing bounded coroutine bridge on that path,
+preserving the native profile and turn context while the gateway owner answers receipt
+checks on its separate loop. The owner CLI keeps its ordinary synchronous entrypoint.
+This changes neither the reference contract nor authorization, Stop or current-owner checks.
+
 An already-authorized operator can independently inspect that reference **inside its owning
 profile**, using that profile's own mounted plugin and UID:
 
