@@ -1629,3 +1629,84 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 conn.execute("PRAGMA ignore_check_constraints=OFF")
         self.authority.db._execute_write(corrupt_foreign)
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+
+    async def test_cleanup_runtime_selector_types_hold_encoded_retained_keys_without_repair(self):
+        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution
+        from hermes_state_local import local_receipt
+        await self.stopped_issue()
+        owned = dict(epoch=self.authority.epoch, execution_id="selector-proof-worker", session_id=self.sid,
+                     generation=self.row["generation"])
+        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-selector")
+        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-selector")
+        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        control = self.cancelled_control()
+        foreign = self.sid + "-selector-foreign"
+        self.authority.db.create_session(foreign, source="local")
+        self.authority.db.set_meta("selector-proof-meta", "opaque unrelated payload")
+        def same_snapshot(db, *args, **kwargs):
+            with db._read_ctx() as conn:
+                self.assertTrue(conn.in_transaction)
+            return local_receipt(db, *args, **kwargs)
+        with patch("hermes_state_local.local_receipt", same_snapshot):
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        cases = (("worker_executions", "execution_id", "execution_id", owned["execution_id"]),
+                 ("worker_executions", "session_id", "execution_id", owned["execution_id"]),
+                 ("session_admissions", "target_session_id", "admission_id", control["admission_id"]),
+                 ("sessions", "id", "id", foreign),
+                 ("sessions", "parent_session_id", "id", foreign),
+                 ("sessions", "chat_id", "id", foreign),
+                 ("state_meta", "key", "key", "selector-proof-meta"))
+        for table, column, selector, value in cases:
+            with self.subTest(table=table, column=column):
+                row = self.authority.db._execute_write(lambda conn: conn.execute(
+                    f"SELECT rowid AS native_rowid,{column} FROM {table} WHERE {selector}=?", (value,)).fetchone())
+                original = row[column]
+                damaged = (original or self.sid).encode()
+                def update_key(raw):
+                    # Explicit corruption/restoration of this isolated fixture;
+                    # production inspection never disables constraints or repairs.
+                    self.authority.db._conn.execute("PRAGMA foreign_keys=OFF")
+                    try:
+                        self.authority.db._execute_write(lambda conn: conn.execute(
+                            f"UPDATE {table} SET {column}=? WHERE rowid=?", (raw, row["native_rowid"])))
+                    finally:
+                        self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
+                update_key(damaged)
+                try:
+                    result = await self.cleanup_inspected()
+                    self.assertFalse(result["quiescence_proven"])
+                    self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
+                    retained = self.authority.db._execute_write(lambda conn: conn.execute(
+                        f"SELECT {column} FROM {table} WHERE rowid=?", (row["native_rowid"],)).fetchone()[0])
+                    self.assertEqual(retained, damaged)
+                finally:
+                    update_key(original)
+                self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_runtime_key_snapshot_rechecks_rpc_race_and_ignores_foreign_payload(self):
+        from hermes_state_runtime import register_worker_execution
+        await self.stopped_issue()
+        foreign = self.sid + "-unrelated-scope"
+        self.authority.db.create_session(foreign, source="local")
+        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id="foreign-selector-proof",
+            session_id=foreign, generation=0, kind="compute", adoption_secret="fixture-foreign-selector")
+        def foreign_corruption(conn):
+            conn.execute("PRAGMA ignore_check_constraints=ON")
+            try:
+                conn.execute("UPDATE worker_executions SET status='unreadable' WHERE execution_id='foreign-selector-proof'")
+                conn.execute("UPDATE sessions SET model_config='not-json' WHERE id=?", (foreign,))
+            finally:
+                conn.execute("PRAGMA ignore_check_constraints=OFF")
+        self.authority.db._execute_write(foreign_corruption)
+        self.authority.db.set_meta("unrelated-payload", "not-json")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        def arriving(method, params):
+            self.before_rpc = None
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE state_meta SET key=? WHERE key='unrelated-payload'",
+                (("fixture.pending.stop." + self.sid).encode(),)))
+        self.before_rpc = arriving
+        result = await self.cleanup_inspected()
+        self.assertFalse(result["quiescence_proven"])
+        self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
