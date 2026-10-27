@@ -46,6 +46,39 @@ SCHEMA = {
     }, "required": ["action"], "additionalProperties": False},
 }
 
+
+def native_work_inventory() -> bool:
+    """Select inventory from the current native launch policy, never environment hints."""
+    try:
+        from agent.runtime_session_store import is_worker_process
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from gateway.session_policy import active_policy
+    except ImportError:
+        return False
+    policy = active_policy()
+    return bool(is_worker_process() and is_dispatcher_owned_worker_context()
+                and policy is not None and policy.source == "kanban" and policy.kanban_json)
+
+
+def coordinator_inventory() -> bool:
+    return not native_work_inventory()
+
+
+WORK_SCHEMA = {
+    "name": "linear_work_reference",
+    "description": (
+        "Identify this native Kanban worker's current work with work_reference (action only). "
+        "Execute and report through native Kanban; include the Linear report in "
+        "kanban_complete metadata.issue_comment for the existing gateway reporting outbox. "
+        "A coordinator with a native chat session verifies remote issue and project publication. "
+        "Queued reporting is not confirmed publication and does not block completed local work. "
+        "This reference grants no permission; the original requester remains unknown."),
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["work_reference"]}},
+        "required": ["action"], "additionalProperties": False},
+}
+
+
 def _reply(ok: bool, message: str, **details: Any) -> str:
     return json.dumps({"ok": ok, "message": message, **details})
 

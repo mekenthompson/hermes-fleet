@@ -473,8 +473,16 @@ def register(ctx: Any) -> None:
             return chat._reply(False, str(exc), code="delivery_uncertain")
 
     # The official PluginContext API does not accept an invocation-context injection flag.
+    try:
+        from tools.registry import no_cache_check_fn
+    except ImportError:
+        no_cache_check_fn = lambda check: check
+    # Discovery precedes native policy binding. Evaluate the launch role when
+    # tools are selected, bypassing the registry's availability TTL cache.
     ctx.register_tool(name="linear", toolset="linear", schema=chat.SCHEMA, handler=tool,
-                      description=chat.SCHEMA["description"])
+                      check_fn=no_cache_check_fn(chat.coordinator_inventory), description=chat.SCHEMA["description"])
+    ctx.register_tool(name="linear_work_reference", toolset="linear", schema=chat.WORK_SCHEMA, handler=tool,
+                      check_fn=no_cache_check_fn(chat.native_work_inventory), description=chat.WORK_SCHEMA["description"])
 
     def paths() -> tuple[Path, Path, str]:
         home = active_home()
