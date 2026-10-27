@@ -1519,3 +1519,55 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         bad = [row for row in list_session_admissions(self.authority.db, session_id=self.sid, pending_only=False)
                if row["admission_id"] == control["admission_id"]]
         self.assertEqual((bad[0]["status"], bad[0]["outcome"]), ("unknown", "unknown"))
+
+
+    async def test_cleanup_encoded_owned_predicate_keys_cannot_hide_retained_rows(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        run = kb._synthesize_ended_run(self.board, self.task_id, outcome="completed", profile="default")
+        self.board.execute("UPDATE task_runs SET task_id=?,status='running',ended_at=NULL,worker_pid=? WHERE id=?",
+                           (self.task_id.encode(), os.getpid(), run))
+        row = self.board.execute("SELECT * FROM task_runs WHERE id=?", (run,)).fetchone()
+        self.assertEqual(kb.Run.from_row(row).task_id, self.task_id)
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("DELETE FROM task_runs WHERE id=?", (run,))
+        payload = {"pid": os.getpid(), "started_at": _process_fingerprint(os.getpid())}
+        for task_key, run_key in ((self.task_id.encode(), None),
+                                  ("foreign", str(self.work_context["run_id"]).encode()),
+                                  ("foreign", self.work_context["run_id"] + 0.5)):
+            with self.subTest(task_key=task_key, run_key=run_key):
+                kb._append_event(self.board, task_key, "spawned", payload, run_id=run_key)
+                event = self.board.execute("SELECT * FROM task_events ORDER BY id DESC LIMIT 1").fetchone()
+                if run_key is not None:
+                    self.assertEqual(kb.Event.from_row(event).run_id, self.work_context["run_id"])
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+                self.board.execute("DELETE FROM task_events WHERE id=?", (event["id"],))
+        comment = kb.add_comment(self.board, self.task_id, "fixture", "Native retained comment")
+        self.board.execute("UPDATE task_comments SET task_id=? WHERE id=?", (self.task_id.encode(), comment))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.board.execute("UPDATE task_comments SET task_id=? WHERE id=?", (self.task_id, comment))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_readable_encoded_foreign_keys_preserve_unrelated_live_work(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint, _set_worker_pid
+        await self.stopped_issue()
+        other = kb.create_task(self.board, title="Unrelated retained work", assignee="default",
+                               idempotency_key="linear:another-issue")
+        claimed = kb.claim_task(self.board, other, claimer="fixture-foreign-claim")
+        _set_worker_pid(self.board, other, os.getpid(), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        self.board.execute("UPDATE task_runs SET task_id=? WHERE id=?", (other.encode(), claimed.current_run_id))
+        kb._append_event(self.board, other.encode(), "spawned",
+            {"pid": os.getpid(), "started_at": _process_fingerprint(os.getpid())},
+            run_id=str(claimed.current_run_id).encode())
+        comment = kb.add_comment(self.board, other, "fixture", "Unrelated native comment")
+        self.board.execute("UPDATE task_comments SET task_id=? WHERE id=?", (other.encode(), comment))
+        result = await self.cleanup_inspected()
+        self.assertTrue(result["quiescence_proven"], result)
+        self.assertEqual(result["task_id"], self.task_id)
+        # SQLite's raw BLOB/TEXT distinction remains intact; no read repair occurred.
+        row = self.board.execute("SELECT * FROM task_runs WHERE id=?", (claimed.current_run_id,)).fetchone()
+        self.assertIsInstance(row["task_id"], bytes)
+        self.assertEqual(kb.Run.from_row(row).task_id, other)
+        self.assertIsNone(self.board.execute("SELECT id FROM task_runs WHERE task_id=?", (other,)).fetchone())

@@ -223,17 +223,32 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      if task_issue_match(task, metadata or {"id": issue})), "native_history_match_missing_or_ambiguous")
         selected = [task for task in discovered if task.id == bound["task_id"]]
         _require(len(selected) == 1, "native_task_missing_or_ambiguous")
-        reader.task_keys(board, "task_events")
-        reader.task_keys(board, "task_runs")
+        # A readable key may still be excluded by SQLite's BLOB/TEXT equality
+        # while native row construction identifies it as this task. Validate
+        # that boundary before any selected-task predicate can hide a record.
+        for table, column in (("tasks", "id"), ("task_runs", "task_id"),
+                              ("task_events", "task_id"), ("task_comments", "task_id")):
+            if column == "task_id":
+                reader.task_keys(board, table)
+            for key in board.execute(f"SELECT {column} AS native_key,{column}=? AS selected FROM {table}",
+                                     (bound["task_id"],)):
+                native_text_row(key, "native_key")
+                _require(kb._lossy_text(key["native_key"]) != bound["task_id"] or key["selected"] == 1,
+                         "native_task_predicate_ambiguous")
         task = board.execute("SELECT * FROM tasks WHERE id=?", (bound["task_id"],)).fetchone()
         _require(task and task["status"] == "blocked" and task["block_kind"] == "needs_input"
                  and task["current_run_id"] is None and task["claim_lock"] is None
                  and task["assignee"] == native_profile, "task_not_currently_stopped")
-        for key in board.execute("SELECT run_id FROM task_events"):
+        owned_runs = {int(row["id"]) for row in board.execute("SELECT id FROM task_runs WHERE task_id=?", (task["id"],))}
+        for key in board.execute("SELECT run_id,task_id=? AS selected_task,"
+                                 "run_id IN (SELECT id FROM task_runs WHERE task_id=?) AS selected_run "
+                                 "FROM task_events", (task["id"], task["id"])):
             native_text_row(key, "run_id")
-        _require(board.execute("SELECT 1 FROM task_events e JOIN task_runs r ON e.run_id=r.id "
-                               "WHERE r.task_id=? AND e.task_id IS NOT ? LIMIT 1",
-                               (task["id"], task["id"])).fetchone() is None, "attempt_event_task_mismatch")
+            # Event.from_row uses this exact native conversion. A normalized
+            # owned run must agree with both actual SQLite ownership predicates.
+            _require(kb._opt_int(key["run_id"]) not in owned_runs
+                     or (key["selected_task"] == 1 and key["selected_run"] == 1),
+                     "attempt_event_task_mismatch")
         events = [{"id": event.id, "run_id": event.run_id, "kind": event.kind,
                    "payload": json.dumps(event.payload)} for event in reader.history_rows(board, task["id"])]
         stops = [e for e in events if e["kind"] == "blocked" and (json.loads(e["payload"] or "{}" ).get("kind") == "needs_input")]
