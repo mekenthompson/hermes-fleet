@@ -944,6 +944,53 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 0)
         self.assertFalse(json.loads(printed.call_args.args[0])["permission_granted"])
 
+    async def test_work_owner_cli_missing_native_columns_is_unavailable_without_repair(self):
+        import argparse
+        from hermes_fleet_linear_plugin import ops
+
+        await self.kanban()
+        ref = (await self.work_current())["reference"]
+        parser = argparse.ArgumentParser()
+        ops.setup(parser)
+        args = parser.parse_args(["inspect-work", "--reference-json", json.dumps(ref)])
+
+        async def inspected():
+            with patch("builtins.print") as printed:
+                code = await asyncio.to_thread(ops.run, args, self.home / "unused", self.home / "unused",
+                                               "default", origin_settings=self.settings)
+            return code, json.loads(printed.call_args.args[0])
+
+        self.assertEqual((await inspected())[0], 0)
+        columns = {
+            "tasks": ("status", "current_run_id", "claim_lock", "claim_expires", "assignee",
+                      "workspace_path", "branch_name", "tenant", "title", "body", "goal_mode",
+                      "goal_max_turns", "max_runtime_seconds", "skills", "workspace_kind", "project_id",
+                      "completion_contract", "model_override", "provider_override", "reasoning_effort"),
+            "task_runs": ("status", "claim_lock", "claim_expires", "profile"),
+        }
+        for table, names in columns.items():
+            original = [tuple(row) for row in self.board.execute(f"SELECT * FROM {table}")]
+            for column in names:
+                with self.subTest(table=table, column=column):
+                    missing = "missing_" + column
+                    self.board.execute(f"ALTER TABLE {table} RENAME COLUMN {column} TO {missing}")
+                    try:
+                        code, result = await inspected()
+                        self.assertEqual(code, 1)
+                        self.assertFalse(result["ok"])
+                        self.assertFalse(result["permission_granted"])
+                        self.assertIn("unavailable", result["message"].lower())
+                        present = {row[1] for row in self.board.execute(f"PRAGMA table_info({table})")}
+                        self.assertIn(missing, present)
+                        self.assertNotIn(column, present)
+                        self.assertEqual([tuple(row) for row in self.board.execute(f"SELECT * FROM {table}")], original)
+                    finally:
+                        self.board.execute(f"ALTER TABLE {table} RENAME COLUMN {missing} TO {column}")
+                    code, result = await inspected()
+                    self.assertEqual(code, 0)
+                    self.assertFalse(result["permission_granted"])
+                    self.assertEqual(result["reference"], ref)
+
     async def test_work_stale_run_claim_lease_and_scope_are_refused(self):
         await self.kanban()
         ref = (await self.work_current())["reference"]
