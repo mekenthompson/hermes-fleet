@@ -75,6 +75,7 @@ replacement-glyph outcome. Valid UTF-8 BLOB text and native legacy defaults rema
 Native predicate keys and all candidate run ordering stamps are checked before filtering
 or selecting the latest run. An unreadable earlier attempt cannot win ordering and
 publish stale evidence; unused earlier summaries and metadata remain native history.
+
 Invalid events are retained
 for inspection, without being consumed or repaired. Original held project lines can report separately as their scope
 becomes valid; later same-session updates do not republish completed lines.
@@ -222,3 +223,47 @@ socket → consumer boundaries via the manifest-verified `HERMES_AGENT_SRC`; the
 the exact official snapshot above.
 These are source/backend tests. Desktop, Telegram and Slack client round-trips and deployed
 fleet behavior require separate live acceptance; source tests do not claim that evidence.
+
+### Native Agent Session conversations
+
+The optional `linear` gateway platform sends verified Agent Session assignments and
+prompts through ordinary native authorization, conversation admission, model tools
+and replies. It uses the existing profile inbox and scoped outbox. Current requests
+can inspect stopped, scheduled or completed work and decide the authorized next
+action; a status request creates no task. The model uses native Kanban controls and
+the work-tracking skill for durable work and handoff.
+
+Enable it through native platform configuration and the real permitted Linear user
+IDs, with an explicit per-profile toolset:
+
+```yaml
+platforms:
+  linear:
+    enabled: true
+    allowed_users: ["<authorized-linear-user-id>"]
+platform_toolsets:
+  linear: [linear, kanban]
+```
+
+This route requires Core support for durable provider input and typed structured
+Stop. Capability checks leave it unavailable on older Core; ordinary plugin reads
+and native reporting remain separate. No injection flag, shared credentials or
+trusted-inbound authorization bypass is used. Creator-null automatic assignments
+retain their native dispatcher provenance; the recipient app is never invented as
+a human sender. Their coordination task carries an unknown requester and uses the
+existing native assignment, contract and permission guards. A later authenticated
+Activity may authorize its own conversation without changing the original creator.
+Specialist reporting and queued content retain that exact Session/Activity pair;
+each effect verifies the current provider actor, app, issue and organization again.
+
+Provider retries preserve original actor, Activity, Agent Session, text and source
+time. Inbox acknowledgment follows committed native acceptance, including exact
+retry reconciliation. Structured Stop reaches native conversation control and the
+linked task; an accepted control receipt does not prove physical cleanup. Replies
+remain queued until the existing scoped sender confirms publication. Prior uncertain
+effects stay held while unrelated authorized discussion continues.
+
+Source and component checks do not establish deployment or client acceptance. The
+JTBD outcome cases still require actual Linear, Desktop, Slack and Telegram evidence.
+The guarded finite-model task test does not establish a gateway-spawned actorless
+worker or live client acceptance; that case remains a release acceptance check.

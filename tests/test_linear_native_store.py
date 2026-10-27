@@ -24,6 +24,36 @@ class NativeStoreTests(unittest.TestCase):
     def bind(self, issue="issue-1", task="task-1"):
         return self.store.bind_native(issue, task, "alpha", "default", at=100)
 
+    def test_project_merge_retains_original_activity_and_legacy_evidence_per_member(self):
+        self.bind("issue-1", "task-1")
+        self.bind("issue-2", "task-2")
+        first = {"issue_id": "update:batch:project", "session_id": "batch", "project_id": "project",
+            "resolve": "issue-1", "task_id": "task-1",
+            "lines": {"OPS-1": "Original outcome"}, "line_issues": {"OPS-1": "issue-1"},
+            "requester_sessions": {"issue-1": "session-1"},
+            "requester_activities": {"issue-1": "activity-original"}}
+        self.assertTrue(self.store.queue_project_update(first, due=0, quiet=False))
+        second = {**first, "lines": {"OPS-1": "Updated outcome", "OPS-2": "Independent outcome"},
+            "line_issues": {"OPS-1": "issue-1", "OPS-2": "issue-2"},
+            "requester_sessions": {"issue-1": "session-1", "issue-2": "session-2"},
+            "requester_activities": {"issue-1": "later-activity", "issue-2": "activity-2"}}
+        self.assertTrue(self.store.queue_project_update(second, due=0, quiet=False))
+        row = self.store.project_update("batch", "project")
+        self.assertEqual(row["payload"]["requester_activities"],
+            {"issue-1": "activity-original", "issue-2": "activity-2"})
+        self.assertTrue(self.store.split_project_update(row["id"], row["payload"], 0, {"OPS-1"}))
+        parts = [entry for entry in self.store.pending() if entry["kind"] == "project_update"]
+        self.assertEqual(len(parts), 2)
+        for part in parts:
+            self.assertEqual(part["payload"]["requester_activities"], row["payload"]["requester_activities"])
+        # A legacy member cannot gain a later Activity as replacement authority.
+        legacy = {**first, "session_id": "legacy-batch"}
+        legacy.pop("requester_activities")
+        self.assertTrue(self.store.queue_project_update(legacy, due=0, quiet=False))
+        self.assertTrue(self.store.queue_project_update({**second, "session_id": "legacy-batch"}, due=0, quiet=False))
+        payload = self.store.project_update("legacy-batch", "project")["payload"]
+        self.assertEqual(payload["requester_activities"], {"issue-2": "activity-2"})
+
     def test_concurrent_unbound_stops_preserve_maximum_source_and_its_actor(self):
         barrier = threading.Barrier(4)
         def record(stamp):
@@ -187,6 +217,29 @@ class NativeStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get("issue-1"), before)
         self.assertEqual(self.store.binding_revision("issue-1"), revision)
         self.assertIsNone(self.store.outbox_row("current-report")["hold_reason"])
+
+    def test_explicit_activity_replacement_preserves_native_control_history_and_old_effect_coordinates(self):
+        self.assertTrue(self.store.bind_native("issue-1", "task-1", "alpha", "default",
+            owner_ref="provider-session", requester_activity="original-activity", at=100))
+        self.store.update("issue-1", last_event_id=9)
+        with self.store._tx() as db:
+            db.execute("UPDATE work SET stop_requested_at=110,resume_fence_at=109 WHERE issue_id='issue-1'")
+        self.outbox("old-activity-report", "comment", {"issue_id": "issue-1", "task_id": "task-1",
+            "body": "Frozen original outcome", "requester_sessions": {"issue-1": "provider-session"},
+            "requester_activities": {"issue-1": "original-activity"}})
+        before = self.store.get("issue-1")
+        prior_payload = self.store.outbox_row("old-activity-report")["payload"]
+        result = self.store.replace_native_binding("issue-1", "task-1", "alpha", "default",
+            owner_ref="provider-session", requester_activity="later-activity", project_id=None,
+            expected_revision=self.store.binding_revision("issue-1"), request_id=str(uuid.uuid4()), at=200)
+        self.assertTrue(result)
+        after = self.store.get("issue-1")
+        for field in ("task_id", "last_event_id", "stop_requested_at", "resume_fence_at"):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(self.store.native_binding("issue-1")["requester_activity_id"], "later-activity")
+        retained = self.store.outbox_row("old-activity-report")
+        self.assertEqual(retained["payload"], prior_payload)
+        self.assertTrue(retained["hold_reason"])
 
     def test_superseded_holds_preserve_existing_reasons_and_leave_unrelated_dependencies_alone(self):
         self.assertTrue(self.bind())

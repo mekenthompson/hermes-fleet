@@ -1914,5 +1914,81 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [])
 
 
+class ActivityRequesterContextTests(unittest.TestCase):
+    def setUp(self):
+        self.authority = Authority()
+        self.authority.sessions[SESSION]['creator'] = None
+        self.authority.issues[ISSUE]['creator'] = {'id': 'unrelated-original-creator'}
+        self.api = self.authority.api(scope={**SCOPE, 'requester_basis': 'agent_session'})
+
+    def test_exact_activity_supports_reads_effects_and_fresh_revocation_without_rewriting_creator(self):
+        with self.assertRaises(LinearError):
+            self.api.agent_session(SESSION)
+        with self.api.requester_session(SESSION, activity_id=ACTIVITY):
+            self.assertIsNone(self.api.agent_session(SESSION)['creator'])
+            self.assertEqual(self.api.issue(ISSUE)['id'], ISSUE)
+            self.api.update_issue(ISSUE, {'stateId': 'state-progress'})
+            self.authority.activities[ACTIVITY]['user'] = {'id': 'revoked'}
+            self.authority.mutations.clear()
+            with self.assertRaises(LinearError):
+                self.api.update_issue(ISSUE, {'stateId': 'state-done'})
+            self.assertEqual(self.authority.mutations, [])
+        with self.assertRaises(LinearError):
+            self.api.agent_session(SESSION)
+        self.assertIsNone(self.authority.sessions[SESSION]['creator'])
+
+    def test_issue_maps_pair_only_the_authoritative_session_issue_and_restore_outer_context(self):
+        with self.api.requester_session({ISSUE: SESSION}, activity_id={ISSUE: ACTIVITY}):
+            self.assertEqual(self.api.issue(ISSUE)['id'], ISSUE)
+            with self.api.requester_session(SESSION):
+                with self.assertRaises(LinearError):
+                    self.api.agent_session(SESSION)
+            self.assertEqual(self.api.issue(ISSUE)['id'], ISSUE)
+        for sessions, activities in [({ISSUE: SESSION}, {'other': ACTIVITY}),
+                                     (SESSION, ACTIVITY), ({ISSUE: SESSION}, {ISSUE: SESSION})]:
+            if isinstance(sessions, str):
+                with self.api.requester_session(sessions, activity_id=activities):
+                    self.assertEqual(self.api.agent_session(SESSION)['id'], SESSION)
+            else:
+                with self.assertRaises(ValueError):
+                    self.api.requester_session(sessions, activity_id=activities)
+        with self.api.requester_session({'other': SESSION}, activity_id={'other': ACTIVITY}):
+            with self.assertRaises(LinearError):
+                self.api.agent_session(SESSION)
+
+    def test_reporting_fallback_reuses_exact_activity_and_never_replaces_explicit_context(self):
+        calls = []
+        self.api.requester_session_for_issue = lambda issue: calls.append(("session", issue)) or SESSION
+        self.api.requester_activity_for_issue = lambda issue: calls.append(("activity", issue)) or ACTIVITY
+        self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
+        self.assertEqual(calls, [("session", ISSUE), ("activity", ISSUE)])
+        calls.clear()
+        for bound in ({}, {"other": SESSION}, SESSION, None):
+            with self.subTest(bound=bound), self.api.requester_session(bound):
+                with self.assertRaises(LinearError):
+                    self.api.issue(ISSUE)
+                self.assertEqual(calls, [])
+        self.authority.activities[ACTIVITY]["user"] = {"id": "revoked"}
+        with self.assertRaises(LinearError):
+            self.api.update_issue(ISSUE, {"stateId": "state-done"})
+        self.assertEqual(self.authority.mutations, [])
+        self.assertIsNone(self.authority.sessions[SESSION]["creator"])
+
+    def test_foreign_activity_session_bot_app_org_issue_and_scope_fail_without_mutations(self):
+        changes = [lambda: self.authority.activities[ACTIVITY].update(user={'id': VIEWER}),
+                   lambda: self.authority.activities[ACTIVITY].update(agentSession={'id': 'foreign'}),
+                   lambda: self.authority.sessions[SESSION].update(appUser={'id': 'foreign'}),
+                   lambda: setattr(self.authority, 'organization', 'foreign'),
+                   lambda: self.authority.sessions[SESSION].update(issue={'id': 'foreign'}),
+                   lambda: self.authority.issues[ISSUE].update(team={'id': 'foreign'})]
+        for change in changes:
+            self.setUp()
+            change()
+            with self.subTest(change=change), self.api.requester_session(SESSION, activity_id=ACTIVITY):
+                with self.assertRaises(LinearError):
+                    self.api.update_issue(ISSUE, {'stateId': 'state-done'})
+                self.assertEqual(self.authority.mutations, [])
+
+
 if __name__ == "__main__":
     unittest.main()

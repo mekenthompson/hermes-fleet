@@ -196,6 +196,21 @@ class NativeFrontdoorTests(unittest.TestCase):
         self.assertEqual(self.bridge.flush(), 1)
         self.assertEqual(len(self.remote.comments), 1)
 
+    def test_optional_conversation_capability_preserves_ordinary_native_reads_and_tracking(self):
+        from hermes_fleet_linear_plugin.native_input import native_supported
+        available = native_supported()
+        self.assertIs(type(available), bool)
+        self.bind_api()
+        status = self.call({"action": "status", "issue": "ABC-1"})
+        self.assertTrue(status["ok"], status)
+        task = self.board.create(title="Existing native work", body="Linear issue issue-1: " + self.issue["url"],
+            created_by=self.board.executor_profile, initial_status="blocked")
+        result = self.call({"action": "track", "issue": "ABC-1", "task_id": task.id})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.board.get(task.id).status, "blocked")
+        self.assertEqual(self.bridge.store.native_binding("issue-1")["task_id"], task.id)
+        print("native conversation capability:", available)
+
     def test_api_process_crosses_real_socket_with_complete_host_context(self):
         parent, child = multiprocessing.Pipe(duplex=False)
         process = multiprocessing.get_context("spawn").Process(target=api_process_invoke, args=(str(self.home), child))
