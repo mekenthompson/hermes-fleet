@@ -20,7 +20,7 @@ def verify(requester, declared_scope, api):
     actor, session_id, message = requester["user_id"], requester["thread_id"], requester["message_id"]
     if actor == api.identity["viewer_id"]:
         raise Unavailable("The Linear recipient app is not the original human requester.")
-    with api.requester_session(session_id):
+    with api.requester_session(session_id, activity_id=message if message != session_id else None):
         api.viewer_id()  # existing credential/app/workspace authorization, never a new client
         session = api.agent_session(session_id)
         issue = api.issue(requester["chat_id"])

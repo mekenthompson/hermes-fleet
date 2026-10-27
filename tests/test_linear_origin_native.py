@@ -971,3 +971,20 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(evidence["reference"]["execution_generation"], old_generation)
         self.assertEqual(evidence["original_message"], "Take over the remaining work on ABC-1")
 
+
+    async def test_cleanup_partial_conflicting_and_opaque_checkpoint_ownership_is_unknown(self):
+        await self.stopped_issue()
+        route = self.authority.sessions[self.sid].route
+        entries = [{}, {"session_key": route}, {"parent_session_id": self.sid},
+                   {"session_key": "foreign", "parent_session_id": self.sid},
+                   {"session_key": route, "parent_session_id": "foreign"},
+                   {"session_key": "foreign", "parent_session_id": "foreign", "owner_task_id": self.sid}]
+        for entry in entries:
+            entry.update(pid=os.getpid(), systemd_unit="unresolved-private-scope")
+            with self.subTest(entry=entry):
+                (self.home / "processes.json").write_text(json.dumps([entry]))
+                evidence = await self.cleanup_inspected()
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertEqual(evidence["reason"], "checkpoint_ownership_ambiguous")
+                self.assertFalse(evidence["permission_granted"])
+                self.assertNotIn("unresolved-private-scope", json.dumps(evidence))
