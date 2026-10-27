@@ -1,5 +1,6 @@
 """Retained native physical sessions remain part of the stopped work's evidence."""
 from functools import partial
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -8,6 +9,92 @@ import test_linear_origin_native as base
 
 
 class CleanupLineage(base.OriginScenarios):
+    def reset(self, parent, suffix):
+        from hermes_state_local import local_receipt
+        from hermes_state_local_lineage import reset_local_target
+        receipt = local_receipt(self.authority.db, self.sid)
+        child = parent + suffix
+        reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=parent,
+            entry={**receipt["entry"], "session_id": child})
+        return child
+
+    async def test_lineage_native_reset_mapping_validation_precedes_sdk_access(self):
+        await self.stopped_issue()
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        first = self.reset(self.sid, "-reset")
+        tip = self.reset(first, "-again")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # Both a retained intermediate reset and the current target are
+        # consumed by the actual native lineage validator.
+        for child, parent in ((first, self.sid), (tip, first)):
+            original = json.dumps({"_reset_from": parent})
+            for value in ([], [1], None, "scalar", "", True, False, 1, 0):
+                with self.subTest(child=child, value=value):
+                    raw = json.dumps(value)
+                    self.authority.db.update_session_meta(child, raw)
+                    evidence = await self.cleanup_inspected()
+                    self.assertEqual(evidence["state"], "unknown")
+                    self.assertFalse(evidence["quiescence_proven"])
+                    self.assertFalse(evidence["permission_granted"])
+                    self.assertEqual(self.authority.db.get_session(child)["model_config"], raw)
+            # Native NULL/empty fallback still cannot invent _reset_from.
+            for raw in (None, ""):
+                self.authority.db.update_session_meta(child, raw)
+                self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+            self.authority.db.update_session_meta(child, original)
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_reset_preflight_preserves_native_scope_and_legacy_absence(self):
+        from hermes_fleet_linear_plugin import cleanup
+        from hermes_state_runtime_workers import runtime_lineage
+        from hermes_state_local import POLICY_PREFIX
+        await self.stopped_issue()
+        # Original native receipts have no explicit lineage and ordinary
+        # model_config may be NULL. Neither becomes a new global requirement.
+        self.assertIsNone(self.authority.db.get_session(self.sid)["model_config"])
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        tip = self.reset(self.sid, "-reset")
+        self.authority.db.create_session("foreign-reset-metadata", source="local")
+        self.authority.db.update_session_meta("foreign-reset-metadata", "[]")
+        self.authority.db.set_meta(POLICY_PREFIX + "foreign-reset-metadata", "[]")
+        # A non-reset model field is not consumed as reset ownership metadata.
+        self.authority.db.update_session_meta(self.sid, "[]")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        with self.authority.db._read_ctx() as conn:
+            # A physical target reaches the same logical receipt through
+            # chat_id, exactly as the native helper's second lookup does.
+            native = runtime_lineage(conn, tip)
+            observed, _, _, _ = cleanup._runtime_scope(conn, tip, "admission-worker:" + self.admission)
+            self.assertTrue(native <= observed)
+            self.assertIn(self.sid, observed)
+        self.authority.db.update_session_meta(tip, json.dumps({"_reset_from": "wrong-parent"}))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+        self.authority.db.update_session_meta(tip, json.dumps({"_reset_from": self.sid, "opaque": [None, {}, []]}))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_lineage_reset_metadata_arrivals_are_rechecked_without_foreign_repairs(self):
+        await self.stopped_issue()
+        tip = self.reset(self.sid, "-reset")
+        original = {"_reset_from": self.sid}
+        for value in ([], {**original, "opaque": [None, {}, []]}):
+            self.authority.db.update_session_meta(tip, json.dumps(original))
+            def arriving(_method, _params):
+                self.before_rpc = None
+                self.authority.db.update_session_meta(tip, json.dumps(value))
+            self.before_rpc = arriving
+            evidence = await self.cleanup_inspected()
+            self.assertFalse(evidence["quiescence_proven"])
+            self.assertEqual(evidence["state"], "unknown")
+            if isinstance(value, dict):
+                self.assertEqual(evidence["reason"], "cleanup_evidence_changed")
+        self.authority.db.create_session("foreign-lineage-arrival", source="local")
+        def foreign(_method, _params):
+            self.before_rpc = None
+            self.authority.db.update_session_meta("foreign-lineage-arrival", "[]")
+        self.before_rpc = foreign
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        self.assertEqual(self.authority.db.get_session("foreign-lineage-arrival")["model_config"], "[]")
+
     def compressed(self, parent, suffix):
         tip = parent + suffix
         self.authority.db.publish_compression_child(parent_session_id=parent, child_session_id=tip,

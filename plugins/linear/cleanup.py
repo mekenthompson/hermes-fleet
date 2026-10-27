@@ -198,15 +198,41 @@ def _checkpoint(home, owners):
     return {"scoped_records": 0, "recycled_records": 0}
 
 
+def _lineage_inputs(native, session_id):
+    """Prevalidate only mapping fields consumed by native runtime_lineage."""
+    from hermes_state_local import POLICY_PREFIX
+    observed = {"receipts": {}, "reset_models": {}}
+    row = native.execute("SELECT chat_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    for logical in dict.fromkeys([session_id, *([row[0]] if row and row[0] else [])]):
+        saved = native.execute("SELECT value FROM state_meta WHERE key=?", (POLICY_PREFIX + logical,)).fetchone()
+        if saved is None:
+            continue
+        receipt = native_json_object(saved[0])
+        observed["receipts"][logical] = receipt
+        if logical != session_id and session_id not in receipt.get("lineage", [logical]):
+            continue
+        lineage = receipt.get("lineage", [])
+        if not isinstance(lineage, list):
+            continue  # The native helper retains all lineage/topology validation.
+        for parent, child in zip(lineage, lineage[1:]):
+            reset = native.execute("SELECT child.id,child.model_config FROM sessions AS parent "
+                "JOIN sessions AS child ON child.parent_session_id=parent.id "
+                "WHERE parent.id=? AND child.id=? AND parent.end_reason='session_reset'", (parent, child)).fetchone()
+            if reset is not None:
+                observed["reset_models"][reset[0]] = native_json_object(reset[1] or "{}")
+    return observed
+
+
 def _runtime_scope(native, session_id, execution_id):
     """Close over retained native sessions and executions inside one read snapshot."""
     from hermes_state_runtime_workers import runtime_lineage, descendant_range
-    sessions, workers, children, inspected = set(), {}, {}, set()
+    sessions, workers, children, inspected, lineage_inputs = set(), {}, {}, set(), {}
     pending_sessions, pending_roots = {session_id}, {execution_id}
     columns = "execution_id,session_id,status,kind,owner_epoch,generation,last_sequence"
     while pending_sessions or pending_roots:
         discovered = set()
         for target in sorted(pending_sessions):
+            lineage_inputs[target] = _lineage_inputs(native, target)
             discovered.update(runtime_lineage(native, target))
         discovered.difference_update(sessions)
         sessions.update(discovered)
@@ -229,7 +255,7 @@ def _runtime_scope(native, session_id, execution_id):
         pending_roots.difference_update(inspected)
     # Each session component and retained execution root is inspected once;
     # the fixed snapshot, not an invented depth cap, bounds this traversal.
-    return sessions, [workers[key] for key in sorted(workers)], [children[key] for key in sorted(children)]
+    return sessions, [workers[key] for key in sorted(workers)], [children[key] for key in sorted(children)], lineage_inputs
 
 
 def _require_owned_workers(native, workers, epoch):
@@ -403,7 +429,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker)
             with db._read_ctx() as native:
-                lineage, native_workers, children = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
+                lineage, native_workers, children, lineage_inputs = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
                 epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
                 _require(epoch is not None and type(epoch[0]) is int and epoch[0] > 0, "native_owner_unknown")
                 runtime_identity(epoch[1])
@@ -422,7 +448,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 _require_owned_admissions(native, retained, epoch[0])
             _require(all(getter(db, target) is None for target in lineage), "native_stop_checkpoint_pending")
             native_lineages.append({"sessions": sorted(lineage), "admissions": retained,
-                                    "workers": native_workers, "children": children})
+                                    "workers": native_workers, "children": children, "lineage_inputs": lineage_inputs})
             relevant = [e for e in events if e["run_id"] == run_id and e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
             _require(any(e["kind"] == "worker_bound" for e in relevant)
                      and any(e["kind"] in {"spawned", "worker_registered"} for e in relevant), "worker_binding_evidence_missing")
