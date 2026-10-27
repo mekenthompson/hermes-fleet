@@ -215,7 +215,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             result = handle_function_call("tool_call", {"calls": [{"name": "linear", "arguments": {
                 "action": action, **selectors}}]}, enabled_tools=["linear"], enabled_toolsets=["linear"],
                 session_id=self.sid)
-            return json.loads(result)
+            result = json.loads(result)
+            self.assertIn("ok", result, result)  # The registered plugin must actually run.
+            return result
 
         # Native conversation execution is off the owner loop; provider SDK callbacks
         # can run a separate asyncio loop there. The real owner dispatch below must
