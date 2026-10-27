@@ -295,7 +295,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     path = kb.kanban_db_path(board=bound["board"]).resolve(strict=True)
     receipts, owners, worker_evidence, native_lineages = [], [], [], []
     with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
-        from .bridge import task_issue_match, native_text_row
+        from .bridge import task_issue_match, require_task_issue_scope, native_text_row
+        from .api import LinearError
         with db._read_ctx() as native:
             # Pin this existing mode=ro connection for the preflight and all
             # subsequent native helper reads. No owner RPC runs in this scope.
@@ -324,6 +325,10 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      if task_issue_match(task, metadata or {"id": issue})), "native_history_match_missing_or_ambiguous")
         selected = [task for task in discovered if task.id == bound["task_id"]]
         _require(len(selected) == 1, "native_task_missing_or_ambiguous")
+        try:
+            require_task_issue_scope(selected[0], metadata or {"id": issue})
+        except LinearError as exc:
+            raise Unknown("native_task_issue_scope_conflict") from exc
         # A readable key may still be excluded by SQLite's BLOB/TEXT equality
         # while native row construction identifies it as this task. Validate
         # that boundary before any selected-task predicate can hide a record.
