@@ -105,11 +105,14 @@ def _pid_gone(pid, fingerprint):
     # rather than interpreting a source change as PID reuse.
     import psutil
     from hermes_cli.process_identity import process_birth, worker_birth
-    process = psutil.Process(pid)
-    epoch_birth = round(process_birth(process) * 100)
-    readings = [epoch_birth]
-    if psutil.LINUX:
-        readings.append(worker_birth(process) * os.sysconf("SC_CLK_TCK"))
+    try:
+        process = psutil.Process(pid)
+        epoch_birth = round(process_birth(process) * 100)
+        readings = [epoch_birth]
+        if psutil.LINUX:
+            readings.append(worker_birth(process) * os.sysconf("SC_CLK_TCK"))
+    except psutil.Error as exc:
+        raise Unknown("worker_identity_unreadable") from exc
     _require(all(_start_times_agree(value, value) for value in readings), "worker_identity_unreadable")
     _require(any(start_time_fingerprints_match(float(current), value) for value in readings),
              "worker_identity_unreadable")

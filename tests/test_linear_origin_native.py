@@ -1351,3 +1351,34 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Changing the native identity during the independent observation is unknown.
         with patch("hermes_cli.kanban_db_dispatch._process_fingerprint", side_effect=[direct, self.process_witness(1)]):
             self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+
+    async def test_cleanup_psutil_identity_errors_are_structured_unknown(self):
+        import psutil
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        await self.stopped_issue()
+        pid = os.getpid()
+        self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+            (json.dumps({"pid": pid, "started_at": _process_fingerprint(pid),
+                         "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        actual_process = psutil.Process
+        for target in ("psutil.Process", "hermes_cli.process_identity.process_birth", "hermes_cli.process_identity.worker_birth"):
+            for error in (psutil.AccessDenied(pid), psutil.NoSuchProcess(pid)):
+                with self.subTest(target=target, error=type(error).__name__):
+                    def fault(*args, **kwargs):
+                        # Race only at the independent birth lookup; keep native
+                        # liveness probing real so NoSuchProcess is not an earlier
+                        # authoritative gone-PID observation.
+                        caller = inspect.currentframe().f_back
+                        while caller and caller.f_globals.get("__name__") == "unittest.mock":
+                            caller = caller.f_back
+                        if target == "psutil.Process" and caller.f_code is not cleanup._pid_gone.__code__:
+                            return actual_process(*args, **kwargs)
+                        raise error
+                    with patch(target, side_effect=fault):
+                        evidence = await self.cleanup_inspected()
+                    self.assertFalse(evidence["quiescence_proven"])
+                    self.assertEqual(evidence["state"], "unknown")
+                    self.assertEqual(evidence["reason"], "worker_identity_unreadable")
+                    self.assertFalse(evidence["permission_granted"])
+        self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
