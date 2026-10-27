@@ -218,6 +218,23 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     receipts, owners, worker_evidence = [], [], []
     with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
         from .bridge import task_issue_match, native_text_row
+        with db._read_ctx() as native:
+            # Pin this existing mode=ro connection for the preflight and all
+            # subsequent native helper reads. No owner RPC runs in this scope.
+            native.execute("BEGIN")
+            # Runtime identities are TEXT, unlike Kanban's legacy decoding.
+            # A malformed selector has no proved foreign attribution: hold it
+            # before WHERE can hide it, never decode it into identity/authority.
+            for table, required, optional in (
+                ("worker_executions", ("execution_id", "session_id"), ()),
+                ("session_admissions", ("target_session_id",), ()),
+                ("sessions", ("id",), ("parent_session_id", "chat_id")),
+                ("state_meta", ("key",), ()),
+            ):
+                for row in native.execute(f"SELECT {','.join(required + optional)} FROM {table}"):
+                    _require(all(isinstance(row[key], str) for key in required)
+                             and all(row[key] is None or isinstance(row[key], str) for key in optional),
+                             "native_runtime_ownership_key_unreadable")
         discovered = reader.tasks(board)
         _require(all(task.id == bound["task_id"] for task in discovered
                      if task_issue_match(task, metadata or {"id": issue})), "native_history_match_missing_or_ambiguous")
