@@ -26,11 +26,10 @@ def verify(requester, declared_scope, api):
         issue = api.issue(requester["chat_id"])
         if (session.get("id") != session_id or (session.get("issue") or {}).get("id") != issue.get("id")
                 or issue.get("id") != requester["chat_id"]
-                or (session.get("appUser") or {}).get("id") != api.identity["viewer_id"]
-                or not (session.get("creator") or {}).get("id")):
+                or (session.get("appUser") or {}).get("id") != api.identity["viewer_id"]):
             raise Unavailable("The original Linear Agent Session no longer verifies its human input.")
         if message == session_id:
-            if session["creator"]["id"] != actor:
+            if (session.get("creator") or {}).get("id") != actor:
                 raise Unavailable("The Linear assignment actor does not match the native admission.")
         else:
             activity = api.agent_activity(message, session_id)

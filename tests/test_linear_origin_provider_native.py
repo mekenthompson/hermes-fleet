@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import json
-import os
 from types import SimpleNamespace
 import unittest
 
@@ -82,6 +81,19 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.provider.sessions[SESSION]["creator"] = {"id": VIEWER}
         with self.assertRaises(transport.Unavailable):
             await self.inspected(result["reference"])
+        self.provider.sessions[SESSION]["creator"] = None
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(result["reference"])
+
+    async def test_later_real_activity_actor_is_verified_when_assignment_creator_was_unknown(self):
+        await self.linear()
+        self.provider.sessions[SESSION]["creator"] = None
+        result = await self.current()
+        inspected = await self.inspected(result["reference"])
+        self.assertEqual(inspected["provider_verification"]["state"], "verified")
+        self.assertEqual(inspected["requester"]["user_id"], USER)
+        self.assertEqual(inspected["requester"]["message_id"], ACTIVITY)
+        self.assertFalse(inspected["permission_granted"])
 
     async def test_later_cli_without_existing_api_honestly_needs_provider_verification(self):
         await self.linear()
@@ -101,8 +113,7 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
                  lambda: self.provider.activities[ACTIVITY].update(agentSession={"id": "foreign"}),
                  lambda: self.provider.sessions[SESSION].update(appUser={"id": "foreign"}),
                  lambda: setattr(self.provider, "organization", "foreign"),
-                 lambda: self.provider.sessions[SESSION].update(issue={"id": "foreign"}),
-                 lambda: self.provider.sessions[SESSION].update(creator=None)]
+                 lambda: self.provider.sessions[SESSION].update(issue={"id": "foreign"})]
         for change in cases:
             self.provider.activities[ACTIVITY] = json.loads(json.dumps(original))
             self.provider.sessions[SESSION] = {"id": SESSION, "creator": {"id": USER},
@@ -127,6 +138,25 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
         with self.assertRaises(transport.Unavailable):
             await self.current()
+        self.assertEqual(self.provider.requests, [])
+
+    async def test_bot_automation_missing_actor_and_command_flags_cannot_supply_human_origin(self):
+        await self.linear()
+        row = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+                                         (self.admission,))
+        original = json.loads(row[0])
+        self.provider.requests.clear()
+        cases = [lambda payload: payload["native_text_v1"]["source"].update(is_bot=True),
+                 lambda payload: payload["native_text_v1"].update(automation={"heartbeat": True}),
+                 lambda payload: payload["native_text_v1"]["source"].update(user_id=None),
+                 lambda payload: payload["native_text_v1"]["event"].update(allow_gateway_control=True)]
+        for change in cases:
+            payload = json.loads(json.dumps(original))
+            change(payload)
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
+            with self.subTest(change=change), self.assertRaises(transport.Unavailable):
+                await self.current()
         self.assertEqual(self.provider.requests, [])
 
     async def test_missing_original_provider_id_needs_verification_without_inventing_one(self):
