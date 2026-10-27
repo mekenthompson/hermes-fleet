@@ -1151,7 +1151,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.authority.mutations, [])
         self.assertEqual(self.kanban.creates, [])
 
-    def test_chat_actions_refuse_persisted_specialist_fence_without_changing_history(self):
+    def test_persisted_fence_holds_effects_but_authorized_status_preserves_history(self):
         from hermes_fleet_linear_plugin import chat
         context = self.context()
         for action in ("status", "track", "followup", "add_comment", "update_description"):
@@ -1166,7 +1166,12 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                     "action": action, "issue": issue_id, "task_id": "existing-task",
                     "id": str(uuid.uuid4()), "body": "Verified finding", "description": "Updated evidence",
                     "expected_description": "Synthetic issue body"}, context))
-                self.assertFalse(reply["ok"])
+                if action == "status":
+                    self.assertTrue(reply["ok"], reply)
+                    self.assertTrue(reply["native"]["effects_held"])
+                else:
+                    self.assertFalse(reply["ok"])
+                self.assertTrue(self.store.scope_fenced(issue_id))
                 self.assertEqual(self.store.get(issue_id), before)
                 self.assertEqual(self.store.pending(), pending)
                 self.assertEqual(self.authority.mutations, [])

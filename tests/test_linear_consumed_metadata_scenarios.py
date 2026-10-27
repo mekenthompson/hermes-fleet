@@ -129,7 +129,7 @@ class ConsumedMetadataScenarios(unittest.TestCase):
                     self.assertTrue(status["ok"], status)
                     self.assertEqual(status["issue"]["id"], "affected")
                     self.assertFalse(status["native"]["linked"])
-                    with patch.object(reporter, "authorize_specialist_effect", return_value=False):
+                    with patch.object(reporter.api, "issue", side_effect=native.LinearError("Current issue authorization refused", retryable=False)):
                         refused = json.loads(chat.handle(reporter, {"action": "status", "issue": "affected"}, context))
                     self.assertFalse(refused["ok"])
                     self.assertNotIn("issue", refused)

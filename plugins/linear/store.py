@@ -111,6 +111,9 @@ class Store:
         content = payload.get("content") or {}
         return (kind == "activity" and type(payload.get("native_reply_version")) is int
                 and payload["native_reply_version"] == 1 and isinstance(content, dict)
+                and payload.get("content_action") is True and payload.get("unlinked_content") is True
+                and not any(payload.get(key) for key in ("work_owner", "session_key", "admission_id", "claim",
+                    "release", "task_id", "stop_intent_id", "requires_status_id", "terminal"))
                 and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
                 and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
@@ -246,7 +249,7 @@ class Store:
                 return False
             payload = json.loads(row["payload"])
             targets = self._targets(payload)
-            if not self._admitted(db, *targets):
+            if not self.conversation_reply(row["kind"], payload) and not self._admitted(db, *targets):
                 return False
             # A normal authorized issue edit/comment is independent of retained chat ownership.
             # An uncertain prior remote mutation still requires external reconciliation.
@@ -293,9 +296,11 @@ class Store:
                                     else None) if ident}
     def _row_admitted(self, db: sqlite3.Connection, row_id: str, state: str | None = None) -> bool:
         self._hold_legacy_outbox(db)
-        row = db.execute("SELECT state, payload, hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
-        return bool(row and row["hold_reason"] is None and (state is None or row["state"] == state) and
-                    self._admitted(db, *self._targets(json.loads(row["payload"]))))
+        row = db.execute("SELECT kind, state, payload, hold_reason FROM outbox WHERE id=?", (row_id,)).fetchone()
+        if not row or row["hold_reason"] is not None or state is not None and row["state"] != state:
+            return False
+        payload = json.loads(row["payload"])
+        return self.conversation_reply(row["kind"], payload) or self._admitted(db, *self._targets(payload))
     @contextmanager
     def guard_outbox(self, row_id: str, state: str = "pending") -> Iterator[bool]:
         with self._tx() as db:
@@ -703,7 +708,7 @@ class Store:
                 raise ValueError("outbox id reused with conflicting content")
             targets = self._targets(payload)
             if payload.get("content_action"):
-                if not self._admitted(db, *targets) or (not self.independent_message(kind, payload) and
+                if (not self.conversation_reply(kind, payload) and not self._admitted(db, *targets)) or (not self.independent_message(kind, payload) and
                         any(self._unresolved_terminal(db, target) for target in targets)): return ""
             elif self.reporting_notice(kind, payload):
                 if not self._admitted(db, *targets): return ""
@@ -752,7 +757,7 @@ class Store:
             self._hold_legacy_outbox(db)
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
-                " AND (" + ADVISORY + " OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
+                " AND (" + ADVISORY + " OR (o.kind='activity' AND json_extract(o.payload, '$.native_reply_version')=1) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
                 " AND NOT " + ADVISORY + " AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
                 ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
@@ -1079,7 +1084,9 @@ class Store:
             db.execute("UPDATE outbox SET payload = json_set(payload, '$.reported', 1) WHERE id = ?", (row_id,))
     def rewrite(self, row_id: str, payload: dict[str, Any], next_at: float) -> None:
         with self._tx() as db:
-            if not self._row_admitted(db, row_id) or not self._admitted(db, *self._targets(payload)): return
+            if not self._row_admitted(db, row_id): return
+            row = db.execute("SELECT kind FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not self.conversation_reply(row["kind"], payload) and not self._admitted(db, *self._targets(payload)): return
             db.execute("UPDATE outbox SET payload = ?, next_at = ? WHERE id = ?", (json.dumps(payload), next_at, row_id))
     def delay_session_updates(self, session_id: str, next_at: float, *, turn_id: str = "") -> None:
         """Quiet period: each identified turn retains its first captured deadline across replay."""

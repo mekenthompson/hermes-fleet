@@ -1075,7 +1075,7 @@ connection.close()
             self.assertEqual(result["issue"]["id"], native.ISSUE)
             self.assertFalse(result["native"]["linked"])
             self.assertEqual(result["native"]["status"], "reconciliation")
-            with patch.object(self.bridge, "authorize_specialist_effect", return_value=False):
+            with patch.object(self.bridge.api, "issue", side_effect=native.LinearError("Current issue authorization refused", retryable=False)):
                 refused = json.loads(chat.handle(self.bridge, {"action": "status", "issue": native.ISSUE}, context))
             self.assertFalse(refused["ok"])
             self.assertNotIn("issue", refused)

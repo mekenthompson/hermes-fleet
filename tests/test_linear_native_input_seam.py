@@ -256,6 +256,206 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.bridge.track(self.ISSUE, task.id)
         return task.id
 
+    def specialist_bridge(self, *, session_requester=False, creator_null=False):
+        from hermes_fleet_linear_plugin.bridge import Bridge
+        from test_linear_specialist_authorization import SCOPE
+        if creator_null:
+            self.provider.sessions[self.SESSION]["creator"] = None
+        scope = {**SCOPE, **({"requester_basis": "agent_session"} if session_requester else {})}
+        self.bridge = Bridge(self.bridge.store, self.provider.api(scope=scope), self.board,
+            profile="default", clock=lambda: 1900000000.0)
+        self.bridge.profile_home = self.home
+        self.running["bridge"] = self.bridge
+        self.bridge.native_ingress = lambda delivery: self.native_input.route_delivery(self.running, delivery)
+
+    async def test_creator_null_current_activity_stop_controls_linked_ready_task_before_ack(self):
+        task_id = self.fixture_task()
+        self.specialist_bridge(session_requester=True, creator_null=True)
+        event = self.event("creator-null-stop", "stop", signal="stop")
+        event["agentSession"].pop("creatorId")
+        await self.deliver_raw("creator-null-stop", event)
+        await self.until(lambda: self.inbox_row("creator-null-stop")[2] == "imported")
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        intent = self.bridge.store.native_intent(f"stop:{self.ISSUE}:creator-null-stop")
+        self.assertEqual(intent["state"], "applied")
+        self.assertIn("expected_event_id", intent["payload"])
+        self.assertIsNone(self.provider.sessions[self.SESSION]["creator"])
+
+    async def test_fresh_authorized_discussion_reads_and_replies_without_thawing_old_effect_fence(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from hermes_fleet_linear_plugin import chat, transport
+        from hermes_fleet_linear_plugin.api import LinearError
+        task_id = self.fixture_task()
+        self.specialist_bridge()
+        old = self.bridge.comment(self.ISSUE, "Original held native finding")
+        old_row = self.bridge.store.outbox_row(old)
+        denied = self.event("earlier-denied-actor", "Denied older instruction")
+        self.provider.activities["earlier-denied-actor"]["user"] = {"id": "not-allowed"}
+        denied["agentActivity"]["user"] = {"id": "not-allowed"}
+        with self.assertRaises(LinearError):
+            self.native_input.project_input(self.bridge, denied)
+        self.assertTrue(self.bridge.store.scope_fenced(self.ISSUE))
+        native_events = self.board.history(task_id, 0)
+        async def decision(event):
+            context = transport.capture_context()
+            status = json.loads(chat.handle(self.bridge, {"action": "status", "issue": self.ISSUE}, context))
+            self.assertTrue(status["ok"], status)
+            self.assertEqual(status["issue"]["description"], self.provider.issues[self.ISSUE]["description"])
+            self.assertTrue(status["native"]["effects_held"])
+            effect = json.loads(chat.handle(self.bridge, {"action": "followup", "issue": self.ISSUE,
+                "id": "00000000-0000-4000-8000-000000000001", "body": "Must stay held"}, context))
+            self.assertFalse(effect["ok"], effect)
+            execution_result.get()["result"] = {"completed": True,
+                "final_response": "Current issue read; prior effects remain held."}
+            return "Current issue read; prior effects remain held."
+        self.model = decision
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        await self.deliver("current-allowed-discussion", "Read the current issue and discuss its status.")
+        await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
+        await self.until(lambda: bool(self.provider.mutations))
+        replies = [row for row in self.bridge.store.pending() if self.bridge.store.conversation_reply(row["kind"], row["payload"])]
+        self.assertEqual(replies, [])
+        self.assertTrue(self.bridge.store.scope_fenced(self.ISSUE))
+        self.assertEqual(self.bridge.store.outbox_row(old), old_row)
+        self.assertEqual(self.board.history(task_id, 0), native_events)
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        self.assertEqual(self.inbox_row("current-allowed-discussion")[2], "imported")
+        self.assertEqual(len(self.provider.mutations), 1)
+
+    async def test_fenced_discussion_reply_rechecks_original_actor_and_does_not_starve_new_allowed_reply(self):
+        self.specialist_bridge(session_requester=True, creator_null=True)
+        self.bridge.store.fence_scope(self.ISSUE, "retained earlier authorization denial", at=1)
+        self.event("original-reply-actor", "Original authorized discussion")
+        transport = self.bridge.api.transport
+        unavailable = [True]
+        def endpoint(url, body, headers):
+            if unavailable[0] and json.loads(body)["query"].lstrip().startswith("mutation"):
+                return 503, {}, json.dumps({"errors": [{"message": "finite reply outage"}]}).encode()
+            return transport(url, body, headers)
+        self.bridge.api.transport = endpoint
+        first = await self.adapter.send(self.ISSUE, "Frozen original discussion response",
+            reply_to="original-reply-actor", metadata={"thread_id": self.SESSION})
+        self.assertFalse(first.success)
+        original = self.bridge.store.outbox_row(first.message_id)["payload"]
+        self.provider.activities["original-reply-actor"]["user"] = {"id": "revoked"}
+        unavailable[0] = False
+        self.bridge.clock = lambda: 1900001000.0
+        self.assertEqual(await asyncio.to_thread(self.bridge.flush), 0)
+        self.assertEqual(self.provider.mutations, [])
+        self.event("new-allowed-reply", "Independent current authorized discussion")
+        second = await self.adapter.send(self.ISSUE, "New independently authorized response",
+            reply_to="new-allowed-reply", metadata={"thread_id": self.SESSION})
+        self.assertTrue(second.success, second)
+        held = self.bridge.store.outbox_row(first.message_id)
+        self.assertNotEqual(held["state"], "sent")
+        self.assertEqual(held["payload"]["content"], original["content"])
+        self.assertEqual(held["payload"]["requester_activities"], original["requester_activities"])
+        self.assertTrue(self.bridge.store.scope_fenced(self.ISSUE))
+        self.assertEqual(len(self.provider.mutations), 1)
+        self.assertEqual(self.rows(), [])
+
+    async def test_rejected_task_stop_remains_pending_and_old_retry_cannot_stop_new_run(self):
+        from hermes_cli import kanban_db as kb
+        task_id = self.fixture_task()
+        with self.board.conn() as conn:
+            conn.execute("CREATE TRIGGER fixture_refuse_stop BEFORE UPDATE OF status ON tasks "
+                "WHEN NEW.status='blocked' BEGIN SELECT RAISE(ABORT, 'finite native Stop refusal'); END")
+        event = self.event("rejected-task-stop", "stop", signal="stop")
+        await self.deliver_raw("rejected-task-stop", event)
+        key = f"stop:{self.ISSUE}:rejected-task-stop"
+        await self.until(lambda: (self.bridge.store.native_intent(key) or {}).get("state") == "reconcile")
+        await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        original = self.bridge.store.native_intent(key)
+        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "pending")
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        with self.board.conn() as conn:
+            conn.execute("DROP TRIGGER fixture_refuse_stop")
+            newer = kb.claim_task(conn, task_id)
+        self.assertIsNotNone(newer)
+        event_id = self.board.history(task_id, 0)[-1].id
+        await self.deliver_raw("rejected-stop-redelivery", event)
+        for _ in range(3):
+            await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+            await asyncio.sleep(0.02)
+        await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        self.assertEqual(self.board.get(task_id).status, "running")
+        self.assertEqual(self.board.get(task_id).current_run_id, newer.current_run_id)
+        self.assertEqual(self.board.history(task_id, 0)[-1].id, event_id)
+        self.assertEqual(self.bridge.store.native_intent(key)["payload"], original["payload"])
+        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "pending")
+        self.assertEqual(self.inbox_row("rejected-stop-redelivery")[2], "pending")
+
+    async def test_lost_task_stop_response_reconciles_original_receipt_without_stopping_resumed_run(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin.api import LinearError
+        task_id = self.fixture_task()
+        stop = self.board.stop
+        def lose_response(*args, **kwargs):
+            self.assertTrue(stop(*args, **kwargs))
+            raise LinearError("finite response loss after native commit")
+        event = self.event("lost-task-stop", "stop", signal="stop")
+        with patch.object(self.board, "stop", side_effect=lose_response):
+            await self.deliver_raw("lost-task-stop", event)
+            key = f"stop:{self.ISSUE}:lost-task-stop"
+            await self.until(lambda: (self.bridge.store.native_intent(key) or {}).get("state") == "reconcile")
+            await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        original = self.bridge.store.native_intent(key)["payload"]
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.inbox_row("lost-task-stop")[2], "pending")
+        with self.board.conn() as conn:
+            self.assertTrue(kb.unblock_task(conn, task_id, expected_event_id=self.board.history(task_id, 0)[-1].id))
+            newer = kb.claim_task(conn, task_id)
+        event_id = self.board.history(task_id, 0)[-1].id
+        await self.deliver_raw("lost-stop-redelivery", event)
+        for _ in range(3):
+            await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+            await asyncio.sleep(0.02)
+        await self.until(lambda: self.inbox_row("lost-stop-redelivery")[2] == "imported")
+        self.assertEqual(self.board.get(task_id).status, "running")
+        self.assertEqual(self.board.get(task_id).current_run_id, newer.current_run_id)
+        self.assertEqual(self.board.history(task_id, 0)[-1].id, event_id)
+        self.assertEqual(self.bridge.store.native_intent(key)["payload"], original)
+        self.assertEqual(self.bridge.store.native_intent(key)["state"], "applied")
+
+    async def test_unavailable_first_task_stop_retains_old_binding_and_cannot_control_replacement(self):
+        from hermes_cli import kanban_db as kb
+        import uuid
+        old_task = self.fixture_task()
+        database = Path(kb.kanban_db_path(board=self.board.board))
+        unavailable = database.with_name("finite-unavailable.db")
+        event = self.event("unavailable-task-stop", "stop", signal="stop")
+        database.rename(unavailable)
+        try:
+            await self.deliver_raw("unavailable-task-stop", event)
+            key = f"stop:{self.ISSUE}:unavailable-task-stop"
+            await self.until(lambda: (self.bridge.store.native_intent(key) or {}).get("state") == "reconcile")
+            await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+            original = self.bridge.store.native_intent(key)["payload"]
+            self.assertEqual(original["task_id"], old_task)
+            self.assertIsNone(original["expected_event_id"])
+            self.assertEqual(self.inbox_row("unavailable-task-stop")[2], "pending")
+        finally:
+            unavailable.rename(database)
+        issue = self.provider.issues[self.ISSUE]
+        replacement = self.board.create(title="Explicitly inspected replacement",
+            body=f"Linear issue {self.ISSUE}: {issue['url']}", created_by=self.board.executor_profile)
+        self.bridge.track(self.ISSUE, replacement.id, replace=True,
+            expected_revision=self.bridge.store.binding_revision(self.ISSUE), request_id=str(uuid.uuid4()))
+        with self.board.conn() as conn:
+            newer = kb.claim_task(conn, replacement.id)
+        event_id = self.board.history(replacement.id, 0)[-1].id
+        await self.deliver_raw("unavailable-stop-redelivery", event)
+        for _ in range(3):
+            await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
+            await asyncio.sleep(0.02)
+        await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        self.assertEqual(self.board.get(replacement.id).status, "running")
+        self.assertEqual(self.board.get(replacement.id).current_run_id, newer.current_run_id)
+        self.assertEqual(self.board.history(replacement.id, 0)[-1].id, event_id)
+        self.assertEqual(self.bridge.store.native_intent(key)["payload"], original)
+        self.assertEqual(self.inbox_row("unavailable-stop-redelivery")[2], "pending")
+
     async def test_running_worker_consumes_one_followup_without_another_model_or_native_run(self):
         task_id = self.fixture_task()
         self.enable_owned_worker(task_id)

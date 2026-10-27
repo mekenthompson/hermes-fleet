@@ -155,10 +155,14 @@ class InputProjectionTests(unittest.TestCase):
     def test_reply_has_no_work_or_execution_authority(self):
         row_id = queue_reply(self.bridge, ISSUE, SESSION, ACTIVITY, "Status without a task")
         payload = self.bridge.store.outbox_row(row_id)["payload"]
+        self.bridge.store.fence_scope(ISSUE, "Retained native effects are held", at=1)
         for key in ("task_id", "session_key", "admission_id", "work_owner", "claim", "terminal"):
             with self.subTest(key=key):
                 forged = {**payload, key: "unverified"}
                 self.assertFalse(self.bridge.store.unlinked_content("activity", forged))
+                self.assertFalse(self.bridge.store.conversation_reply("activity", forged))
+                self.assertEqual(self.bridge.store.enqueue("activity", {**forged, "id": str(uuid.uuid4())}), "")
+        self.assertEqual(self.authority.mutations, [])
 
     def linear_context(self, **changes):
         values = dict(home=str(self.bridge.profile_home), profile=self.bridge.profile,
