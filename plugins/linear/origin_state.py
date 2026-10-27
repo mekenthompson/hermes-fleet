@@ -57,7 +57,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
               context: NativeContext | None) -> dict:
     """Read exactly one native admission, using the owner's native read-only state API."""
     from hermes_state import SessionDB
-    from hermes_state_runtime import get_session_admission
+    from hermes_state_runtime import get_session_admission, _json
     from gateway.session_operator import is_viewer_input
     from agent.turn_author import parse_turn_author
     with SessionDB(home / "state.db", read_only=True) as db:
@@ -69,6 +69,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
                 or row["generation"] != ref["execution_generation"]):
             _refuse()
         payload = row["payload"]
+        _json(payload)
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16384 or text != current.get("text"):
             _refuse("The exact original native text cannot be inspected within this bounded request.")
@@ -76,13 +77,19 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
             if key in payload:
                 _refuse("Automation cannot supply a human origin reference.")
         for key in ("cli_turn_v1", "api_turn_v1"):
-            author = parse_turn_author((payload.get(key) or {}).get("turn_author"))
+            data = payload.get(key)
+            if data is not None:
+                _json(data)
+            author = parse_turn_author(data.get("turn_author") if data is not None else None)
             if author and author.get("is_bot"):
                 _refuse("Bot-authored input cannot supply a human origin reference.")
         requester = {"principal_id": row["principal_id"]}
-        native = payload.get("native_text_v1")
-        if isinstance(native, dict):
+        if "native_text_v1" in payload:
+            native = payload["native_text_v1"]
+            _json(native)
             source, event = native["source"], native["event"]
+            _json(source)
+            _json(event)
             platform = source.get("platform")
             identity = [source.get(k) for k in ("profile", "platform", "chat_id", "thread_id", "user_id")]
             linear = platform == "linear"
@@ -110,10 +117,15 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
         elif "api_turn_v1" in payload:
             from gateway.session_api_turn import _valid_transfer_auth
             data = payload["api_turn_v1"]
+            _json(data)
             auth = data.get("transfer_auth")
+            settings = data.get("settings")
+            if settings is not None:
+                _json(settings)
+            settings = settings if settings is not None else {}
             if (row["principal_id"] != "api" or not _valid_transfer_auth(auth)
-                    or (data.get("settings") or {}).get("room_dispatch") is not None
-                    or (data.get("settings") or {}).get("room_execution_policy") is not None):
+                    or settings.get("room_dispatch") is not None
+                    or settings.get("room_execution_policy") is not None):
                 _refuse("The API admission has no independently attributable ordinary credential principal.")
             platform = "api_server"
             requester.update(kind="api_credential", **auth)
@@ -147,7 +159,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
 def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
     """Only this session's lineage and admission state; no transcript, config or tool inventory."""
     from hermes_state import SessionDB
-    from hermes_state_runtime import list_session_admissions
+    from hermes_state_runtime import list_session_admissions, _json
     with SessionDB(home / "state.db", read_only=True) as db:
         lineage = db.get_compression_lineage(session_id)
         canonical = lineage[0] if lineage else session_id
@@ -162,6 +174,7 @@ def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
         if type(generation) is not int or generation < 1 or len(started) != 1:
             _refuse("The originating turn is not current, or has ambiguous steering.")
         row = started[0]
+        _json(row["payload"])
         # Authenticate this owner/generation only. Historical uncertainty remains the native
         # owner's responsibility; it is not a blanket refusal of a newly admitted request.
         same_claim = [r for r in rows if r.get("generation") == generation and r.get("owner_epoch") == row["owner_epoch"]]
