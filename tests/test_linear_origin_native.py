@@ -100,7 +100,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def local(self, text="Take over ABC-1", *, source="gui", extra=None, work_context=None):
+    async def local(self, text="Take over ABC-1", *, source="gui", extra=None, work_context=None, intent="queue"):
         from gateway.config import Platform
         from gateway.session import SessionEntry, SessionSource
         from gateway.session_contract import SessionRef
@@ -137,7 +137,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             payload["kanban_card_v1"] = {k: work_context[k] for k in ("board", "task_id", "run_id")}
         row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid,
-            request_id=request_id if work_context else "request-1", payload=payload)
+            request_id=request_id if work_context else "request-1", payload=payload, intent=intent)
         self.admission = row["admission_id"]
         self.claim()
         self.bind("local", self.sid)
@@ -302,7 +302,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["policy"]["cwd"], cwd)
         self.assertFalse(evidence["permission_granted"])
 
-    async def kanban(self, *, existing=False, idempotency_key=None):
+    async def kanban(self, *, existing=False, idempotency_key=None, intent="queue"):
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import _sqlite_connect
         if not existing:
@@ -327,7 +327,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             "workspaces_root": str(self.home), "skills": [], "goal_mode": task.goal_mode,
             "goal_max_turns": task.goal_max_turns, "goal_text": task.title + "\n\n" + task.body,
             "context": "UNRELATED_FROZEN_CONTEXT", "max_runtime_seconds": task.max_runtime_seconds, "accept_hooks": True}
-        await self.local("work kanban task " + task.id, source="kanban", work_context=self.work_context)
+        await self.local("work kanban task " + task.id, source="kanban", work_context=self.work_context, intent=intent)
         # Actual managed Kanban workers bind the AIAgent/compression session ID but no chat
         # platform/source/key. Exercise precisely that supported binder, with no env identity.
         from gateway.session_context import reset_session_vars, set_current_session_id
@@ -943,6 +943,136 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                            origin_settings=self.settings)
         self.assertEqual(code, 0)
         self.assertFalse(json.loads(printed.call_args.args[0])["permission_granted"])
+
+    async def test_selected_admission_native_constructor_and_known_header_controls(self):
+        from hermes_state_runtime import admit_session_input, cancel_session_input, RuntimeStoreError
+
+        await self.local()
+        params = {"epoch": self.authority.epoch, "principal_id": self.conn.actor.subject,
+                  "session_id": self.sid, "request_id": "invalid-header", "payload": {"text": "fixture"}}
+        for key in ("principal_id", "session_id", "request_id"):
+            for value in (None, "", "x" * 1025, True):
+                with self.subTest(key=key, value=value), self.assertRaises(RuntimeStoreError):
+                    admit_session_input(self.authority.db, **{**params, key: value})
+        for intent in (None, "", "future-native-intent", 1):
+            with self.subTest(intent=intent), self.assertRaises(RuntimeStoreError):
+                admit_session_input(self.authority.db, **params, intent=intent)
+        for payload in ([], None, {"value": float("nan")}):
+            with self.subTest(payload=payload), self.assertRaises(RuntimeStoreError):
+                admit_session_input(self.authority.db, **{**params, "payload": payload})
+        # A valid maximum-length native ID is not trimmed or given a new grammar.
+        admit_session_input(self.authority.db, **{**params, "request_id": " " * 1024})
+        for native_work in (False, True):
+            for intent in ("queue", "steer", "redirect"):
+                with self.subTest(native_work=native_work, intent=intent):
+                    await (self.kanban(intent=intent) if native_work else self.local(intent=intent))
+                    current = self.work_current if native_work else self.current
+                    inspected = self.work_inspected if native_work else self.inspected
+                    ref = (await current())["reference"]
+                    self.assertFalse((await inspected(ref))["permission_granted"])
+                    # Historical and foreign malformed headers are outside this selected claim.
+                    history = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                        principal_id=self.conn.actor.subject, session_id=self.sid,
+                        request_id="historical", payload={"text": "unused"})
+                    cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+                                         admission_id=history["admission_id"])
+                    self.authority.db.create_session("foreign-header", source="gui")
+                    foreign = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                        principal_id="foreign", session_id="foreign-header",
+                        request_id="foreign-" + self.admission, payload={"text": "unused"})
+                    def damage(conn):
+                        conn.execute("PRAGMA ignore_check_constraints=ON")
+                        try:
+                            for row in (history, foreign):
+                                conn.execute("UPDATE session_admissions SET intent=? WHERE admission_id=?",
+                                             ("future-native-intent", row["admission_id"]))
+                        finally:
+                            conn.execute("PRAGMA ignore_check_constraints=OFF")
+                    self.authority.db._execute_write(damage)
+                    self.assertFalse((await inspected(ref))["permission_granted"])
+                    for row in (history, foreign):
+                        self.assertEqual(self.authority.db._read_one(
+                            "SELECT intent FROM session_admissions WHERE admission_id=?", (row["admission_id"],))[0],
+                            "future-native-intent")
+
+    async def test_selected_admission_header_faults_return_structured_owner_cli_unavailable(self):
+        import argparse
+        from hermes_fleet_linear_plugin import ops
+
+        for native_work in (False, True):
+            await (self.kanban() if native_work else self.local())
+            current = self.work_current if native_work else self.current
+            inspected = self.work_inspected if native_work else self.inspected
+            ref = (await current())["reference"]
+            parser = argparse.ArgumentParser()
+            ops.setup(parser)
+            args = parser.parse_args(["inspect-work" if native_work else "inspect-origin",
+                                      "--reference-json", json.dumps(ref)])
+            long_target = "x" * 1025
+            if self.authority.db.get_session(long_target) is None:
+                self.authority.db.create_session(long_target, source="gui")
+            faults = {"admission_id": ("", "x" * 1025), "request_id": ("", "x" * 1025),
+                      "principal_id": ("", "x" * 1025), "target_session_id": (long_target,),
+                      "intent": ("future-native-intent", ""), "seq": (0, -1),
+                      "owner_epoch": (0, -1, 1.5), "generation": (0, -1, 1.5),
+                      "status": ("queued", "unknown", "unsupported"), "outcome": ("completed",),
+                      "payload_json": ("[]", '{"value":NaN}')}
+            for column, values in faults.items():
+                selector, identity = (("admission_id", self.admission) if column == "target_session_id"
+                                      else ("target_session_id", self.sid))
+                original = self.authority.db._read_one(
+                    f"SELECT {column} FROM session_admissions WHERE {selector}=?", (identity,))[0]
+                for value in values:
+                    def update(value):
+                        def write(conn):
+                            conn.execute("PRAGMA ignore_check_constraints=ON")
+                            try:
+                                conn.execute(f"UPDATE session_admissions SET {column}=? WHERE {selector}=?",
+                                             (value, identity))
+                            finally:
+                                conn.execute("PRAGMA ignore_check_constraints=OFF")
+                        self.authority.db._execute_write(write)
+                    with self.subTest(native_work=native_work, column=column, value=value):
+                        update(value)
+                        try:
+                            with self.assertRaises(transport.Unavailable):
+                                await current()
+                            with self.assertRaises(transport.Unavailable):
+                                await inspected(ref)
+                            with patch("builtins.print") as printed:
+                                code = await asyncio.to_thread(ops.run, args, self.home / "unused", self.home / "unused",
+                                                               "default", origin_settings=self.settings)
+                            result = json.loads(printed.call_args.args[0])
+                            self.assertEqual(code, 1)
+                            self.assertFalse(result["ok"])
+                            self.assertFalse(result["permission_granted"])
+                            self.assertEqual(self.authority.db._read_one(
+                                f"SELECT {column} FROM session_admissions WHERE {selector}=?", (identity,))[0], value)
+                        finally:
+                            update(original)
+                        self.assertFalse((await inspected(ref))["permission_granted"])
+
+    async def test_selected_admission_header_changes_during_owner_readback_are_refused(self):
+        for native_work in (False, True):
+            await (self.kanban() if native_work else self.local())
+            current = self.work_current if native_work else self.current
+            inspected = self.work_inspected if native_work else self.inspected
+            for column, value in (("intent", "steer"), ("seq", self.row["seq"] + 1000),
+                                  ("principal_id", "different-valid-native-principal")):
+                original = self.row[column]
+                def update(value):
+                    self.authority.db._execute_write(lambda conn: conn.execute(
+                        f"UPDATE session_admissions SET {column}=? WHERE admission_id=?", (value, self.admission)))
+                with self.subTest(native_work=native_work, column=column):
+                    ref = (await current())["reference"]
+                    self.during_origin_readback(lambda: update(value))
+                    try:
+                        with self.assertRaises(transport.Unavailable):
+                            await inspected(ref)
+                    finally:
+                        self.before_rpc = None
+                        update(original)
+                    self.assertFalse((await inspected(ref))["permission_granted"])
 
     async def test_work_owner_cli_missing_native_columns_is_unavailable_without_repair(self):
         import argparse

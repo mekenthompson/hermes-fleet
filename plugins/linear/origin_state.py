@@ -25,20 +25,33 @@ def _refuse(message="The originating native request is not current and independe
     raise Unavailable(message)
 
 
+def current_admission(row: dict | None) -> dict:
+    """Validate only the selected active row against its native writer/claim contract."""
+    from hermes_state_runtime import _text, _json
+    if row is None:
+        _refuse()
+    for key in ("admission_id", "request_id", "principal_id", "target_session_id"):
+        _text(row[key])
+    _json(row["payload"])
+    if (row["intent"] not in ("queue", "steer", "redirect")
+            or any(type(row[key]) is not int or row[key] < 1 for key in ("seq", "owner_epoch", "generation"))
+            or row["status"] != "started" or row["outcome"] is not None):
+        _refuse("The current native admission contract is unavailable.")
+    return {key: row[key] for key in ("admission_id", "request_id", "principal_id", "target_session_id",
+                                     "seq", "intent", "owner_epoch", "generation", "status", "outcome")}
+
+
 def resolve_reference(home: Path, ref: dict) -> str:
     """Resolve private logical coordinates only from this owner's exact native admission."""
     from hermes_state import SessionDB
     from hermes_state_runtime import get_session_admission
     with SessionDB(home / "state.db", read_only=True) as db:
         row = get_session_admission(db, admission_id=ref["admission_id"])
-        if (row is None or row["status"] != "started" or row["outcome"] is not None
-                or row["owner_epoch"] != ref["authority_epoch"]
+        current_admission(row)
+        if (row["owner_epoch"] != ref["authority_epoch"]
                 or row["generation"] != ref["execution_generation"]):
             _refuse()
-        sid = row["target_session_id"]
-        if not isinstance(sid, str) or not sid or len(sid) > 4096:
-            _refuse()
-        return sid
+        return row["target_session_id"]
 
 
 def _policy(db, session_id: str, platform: str) -> dict:
@@ -63,13 +76,13 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
     with SessionDB(home / "state.db", read_only=True) as db:
         sid = current["session_id"]
         row = get_session_admission(db, admission_id=ref["admission_id"])
-        if (row is None or row["target_session_id"] != sid
-                or row["request_id"] != current["input_id"] or row["status"] != "started"
-                or row["outcome"] is not None or row["owner_epoch"] != ref["authority_epoch"]
+        if current_admission(row) != current["admission_header"]:
+            _refuse()
+        if (row["target_session_id"] != sid
+                or row["request_id"] != current["input_id"] or row["owner_epoch"] != ref["authority_epoch"]
                 or row["generation"] != ref["execution_generation"]):
             _refuse()
         payload = row["payload"]
-        _json(payload)
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16384 or text != current.get("text"):
             _refuse("The exact original native text cannot be inspected within this bounded request.")
@@ -159,7 +172,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
 def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
     """Only this session's lineage and admission state; no transcript, config or tool inventory."""
     from hermes_state import SessionDB
-    from hermes_state_runtime import list_session_admissions, _json
+    from hermes_state_runtime import list_session_admissions
     with SessionDB(home / "state.db", read_only=True) as db:
         lineage = db.get_compression_lineage(session_id)
         canonical = lineage[0] if lineage else session_id
@@ -174,7 +187,7 @@ def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
         if type(generation) is not int or generation < 1 or len(started) != 1:
             _refuse("The originating turn is not current, or has ambiguous steering.")
         row = started[0]
-        _json(row["payload"])
+        header = current_admission(row)
         # Authenticate this owner/generation only. Historical uncertainty remains the native
         # owner's responsibility; it is not a blanket refusal of a newly admitted request.
         same_claim = [r for r in rows if r.get("generation") == generation and r.get("owner_epoch") == row["owner_epoch"]]
@@ -184,5 +197,5 @@ def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
         snapshot = {"session_id": canonical, "authority_epoch": row["owner_epoch"], "execution_generation": generation}
         current = {"admission_id": row["admission_id"], "input_id": row["request_id"],
                    "authority_epoch": row["owner_epoch"], "execution_generation": row["generation"],
-                   "text": row["payload"].get("text")}
+                   "text": row["payload"].get("text"), "admission_header": header}
         return snapshot, current
