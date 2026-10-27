@@ -534,7 +534,12 @@ class Kanban:
                     if item.author == author and item.body == body.strip()]
     def find_created(self, key: str) -> list:
         with self.read_conn() as conn:
-            return [task for task in self.tasks(conn) if task.idempotency_key == key]
+            # Inspect unreadable keys before selection, but preserve native
+            # SQLite equality/affinity for recovery of an uncertain creation.
+            for row in conn.execute("SELECT idempotency_key FROM tasks"):
+                native_text_row(row, "idempotency_key")
+            return [self.task_from_row(row) for row in conn.execute(
+                "SELECT * FROM tasks WHERE idempotency_key=?", (key,))]
     def discover(self, issue: dict) -> list:
         """Inspect existing boards in this native home; never enter another profile.
 
@@ -676,6 +681,7 @@ class Bridge:
         return iso_ms(issue.get(field)) or iso_ms(issue.get("updatedAt")) or math.inf
     def me(self) -> str | None:
         try: return self.api.viewer_id()
+        except RateLimited: raise
         except LinearError: return None
     def _alert_reauthorization(self) -> None:
         log.error("linear: profile %s needs reauthorization; durable reporting is queued", self.profile)
@@ -801,6 +807,8 @@ class Bridge:
             return False
         try:
             self._effect_issue(issue_id)
+        except RateLimited:
+            raise
         except LinearError:
             return False
         return not self.store.scope_fenced(issue_id)
@@ -1301,6 +1309,8 @@ class Bridge:
     def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
         try:
             self._native_effect_task(issue_id)
+        except RateLimited:
+            raise
         except LinearError as exc:
             log.warning("linear: native event capture held for %s: %s", issue_id, exc)
             return False
@@ -1334,6 +1344,8 @@ class Bridge:
         try:
             if task_issue_scope(task, {"id": issue_id})[1]:
                 require_task_issue_scope(task, self._effect_issue(issue_id))
+        except RateLimited:
+            raise
         except LinearError as exc:
             reconciliation = {"reconciliation_required": True, "message": str(exc)}
         return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status, **reconciliation,
@@ -1460,6 +1472,8 @@ class Bridge:
                 return
             try:
                 require_task_issue_scope(task, self._effect_issue(issue_id))
+            except RateLimited:
+                raise
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
                 self._decline(issue_id, session_id, str(exc))
@@ -1483,6 +1497,8 @@ class Bridge:
             try:
                 stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
                                        run_id=task.current_run_id, issue=self._effect_issue(issue_id))
+            except RateLimited:
+                raise
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
                 self._decline(issue_id, session_id, str(exc))
@@ -1846,6 +1862,8 @@ class Bridge:
             if row:
                 try:
                     self._require_outbox_native_scope(row, issue_ids)
+                except RateLimited:
+                    raise
                 except LinearError:
                     if row["kind"] == "project_update":
                         # The existing unstarted-create path can reproject and
