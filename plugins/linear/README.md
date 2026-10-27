@@ -391,7 +391,11 @@ No filtered-out opaque key or conflicting event/run ownership is positive foreig
 claim, matching frozen owner/run/admission/executor records for every retained task attempt,
 terminal native admissions with recognized settled outcomes and worker/child ledger,
 confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. Every retained worker status in the native
+submitter identities proven gone or recycled. Admission and Stop checks cover the native
+compression lineage of every attempt and its retained descendant execution sessions; a
+settled parent does not discharge queued or unknown child work. Those session identities,
+admissions and descendant bindings participate in the repeated evidence digest, including
+settled arrivals during the owner read. Every retained worker status in the native
 runtime lineage is validated before active-only filters; malformed retained states remain
 unknown. Foreign lineage is outside this check. Runtime ownership selectors must retain
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report
