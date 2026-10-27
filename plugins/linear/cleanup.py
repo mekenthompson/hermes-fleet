@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 
 from . import origin
-from .transport import Unavailable
+from .transport import Unavailable, native_json_object
 
 
 # task_runs' documented schema plus ended-run values written by native
@@ -61,7 +61,7 @@ def _binding(state, issue, profile):
         _require(not fenced, "issue_scope_fenced")
         if not row or not work or work["origin"] != "native":
             return None
-        bound = json.loads(row[0])
+        bound = native_json_object(row[0])
         if not (bound.get("issue_id") == issue and bound.get("profile") == profile
                 and bound.get("task_id") == work["task_id"] and isinstance(bound.get("board"), str)):
             return None  # A stale reporting link does not replace inspection of actual local work.
@@ -382,7 +382,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             _require(Path(marker["db"]).resolve() == home / "state.db", "foreign_native_owner")
             saved = local_receipt(db, sid)
             policy = restore_policy(saved["policy"])
-            frozen = json.loads(policy.kanban_json or "{}")
+            frozen = native_json_object(policy.kanban_json or "{}")
             request = "kanban:" + json.dumps([bound["board"], task["id"], run_id], separators=(",", ":"))
             _require(saved["profile_id"] == str(home) and policy.source == "kanban"
                      and frozen.get("board") == bound["board"] and frozen.get("task_id") == task["id"]
