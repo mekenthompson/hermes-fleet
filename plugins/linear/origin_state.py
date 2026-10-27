@@ -172,10 +172,14 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
 def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
     """Only this session's lineage and admission state; no transcript, config or tool inventory."""
     from hermes_state import SessionDB
+    from hermes_state_local import local_lineage_owner
     from hermes_state_runtime import list_session_admissions
     with SessionDB(home / "state.db", read_only=True) as db:
         lineage = db.get_compression_lineage(session_id)
         canonical = lineage[0] if lineage else session_id
+        # Match the native admission owner: compression root, then local reset owner.
+        with db._read_ctx() as conn:
+            canonical = local_lineage_owner(conn, canonical)
         session = db.get_session(canonical)
         if session is None:
             _refuse()

@@ -1574,6 +1574,134 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(compressed, original)
                 self.assertEqual((await self.inspected(compressed))["reference"]["admission_id"], self.admission)
 
+    async def reset_current_origin(self, *, compress_before=False, compress_after=False):
+        from gateway.session_context import set_current_session_id
+        from hermes_state_local import local_receipt
+        from hermes_state_local_lineage import reset_local_target, local_physical_target
+        from hermes_state_runtime import settle_session_input, admit_session_input
+        await self.local()
+        old = (await self.current())["reference"]
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                             generation=self.row["generation"], outcome="completed")
+        self.authority.executing.pop(self.sid, None)
+        parent = self.sid
+        if compress_before:
+            parent = self.sid + "-compressed"
+            self.authority.db.publish_compression_child(parent_session_id=self.sid, child_session_id=parent,
+                source="gui", messages=[{"role": "user", "content": "Native checkpoint before reset"}],
+                require_compression_lease=False)
+        saved = local_receipt(self.authority.db, self.sid)
+        tip = parent + "-reset"
+        reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=parent,
+                           entry={**saved["entry"], "session_id": tip})
+        if compress_after:
+            compressed = tip + "-compressed"
+            self.authority.db.publish_compression_child(parent_session_id=tip, child_session_id=compressed,
+                source="gui", messages=[{"role": "user", "content": "Native checkpoint after reset"}],
+                require_compression_lease=False)
+            tip = compressed
+        row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            principal_id=self.conn.actor.subject, session_id=self.sid, request_id="request-after-reset",
+            payload={"text": "Take over remaining work after reset"})
+        self.admission = row["admission_id"]
+        self.claim()
+        set_current_session_id(tip)
+        with self.authority.db._read_ctx() as conn:
+            self.assertEqual(local_physical_target(conn, self.sid), tip)
+        return old, tip
+
+    async def test_origin_native_reset_and_compression_resolve_the_current_logical_admission(self):
+        import argparse
+        from gateway.session_authorities import admission_owner
+        from hermes_fleet_linear_plugin import ops
+        for before, after in ((False, False), (True, False), (False, True)):
+            with self.subTest(compress_before=before, compress_after=after):
+                old, tip = await self.reset_current_origin(compress_before=before, compress_after=after)
+                self.assertEqual(admission_owner(self.authority, tip), self.sid)
+                self.assertNotEqual(self.authority.db.get_compression_lineage(tip)[0], self.sid)
+                retained = self.authority.db._read_all("SELECT * FROM session_admissions")
+                result = await self.current()
+                ref = result["reference"]
+                self.assertEqual(ref["admission_id"], self.admission)
+                self.assertNotEqual(ref, old)
+                evidence = await self.inspected(ref)
+                self.assertEqual(evidence["original_message"], "Take over remaining work after reset")
+                self.assertFalse(evidence["permission_granted"])
+                with self.assertRaises(transport.Unavailable):
+                    await self.inspected(old)
+                parser = argparse.ArgumentParser()
+                ops.setup(parser)
+                args = parser.parse_args(["inspect-origin", "--reference-json", json.dumps(ref)])
+                with patch("builtins.print") as printed:
+                    code = await asyncio.to_thread(ops.run, args, self.home / "unused", self.home / "unused",
+                                                   "default", origin_settings=self.settings)
+                self.assertEqual(code, 0)
+                self.assertFalse(json.loads(printed.call_args.args[0])["permission_granted"])
+                self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), retained)
+
+    async def test_origin_native_reset_preserves_readback_stop_and_active_mutation_guards(self):
+        from gateway import session_ancillary
+        from hermes_state_local import local_receipt
+        from hermes_state_local_lineage import reset_local_target
+        from hermes_state_runtime import RuntimeStoreError, settle_session_input
+        _, tip = await self.reset_current_origin(compress_after=True)
+        ref = (await self.current())["reference"]
+        saved = local_receipt(self.authority.db, self.sid)
+        with self.assertRaises(RuntimeStoreError):
+            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=tip,
+                               entry={**saved["entry"], "session_id": tip + "-forbidden"})
+        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        self.assertFalse((await self.inspected(ref))["permission_granted"])
+        original = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+                                             (self.admission,))[0]
+        self.during_origin_readback(lambda: self.retained_origin_payload(
+            lambda payload: payload.update(text="Changed during post-reset owner receipt")))
+        try:
+            with self.assertRaises(transport.Unavailable):
+                await self.inspected(ref)
+        finally:
+            self.before_rpc = None
+            self.authority.db._execute_write(lambda conn: conn.execute(
+                "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (original, self.admission)))
+        self.assertFalse((await self.inspected(ref))["permission_granted"])
+        self.authority.adopt_agent(self.sid, self.row["generation"], SimpleNamespace(interrupt=lambda *args: None))
+        await self.authority.interrupt(self.conn.actor, self.ref, self.row["generation"])
+        if callable(getattr(session_ancillary, "process_stop_pending", None)):
+            with self.assertRaises(transport.Unavailable):
+                await self.inspected(ref)
+        else:
+            self.assertEqual((await self.inspected(ref))["stop_evidence"]["state"], "unknown")
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                             generation=self.row["generation"], outcome="interrupted")
+        with self.assertRaises(transport.Unavailable):
+            await self.inspected(ref)
+
+    async def test_work_native_compression_keeps_its_admission_and_reset_remains_guarded(self):
+        from gateway.session_context import set_current_session_id
+        from hermes_state_local import local_receipt
+        from hermes_state_local_lineage import reset_local_target
+        from hermes_state_runtime import RuntimeStoreError
+        await self.kanban()
+        ref = (await self.work_current())["reference"]
+        saved = local_receipt(self.authority.db, self.sid)
+        with self.assertRaises(RuntimeStoreError):
+            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=self.sid,
+                               entry={**saved["entry"], "session_id": self.sid + "-forbidden"})
+        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        tip = self.sid + "-compressed"
+        self.authority.db.publish_compression_child(parent_session_id=self.sid, child_session_id=tip,
+            source="kanban", messages=[{"role": "user", "content": "Native worker compression checkpoint"}],
+            require_compression_lease=False)
+        set_current_session_id(tip)
+        self.assertEqual((await self.work_current())["reference"], ref)
+        self.assertFalse((await self.work_inspected(ref))["permission_granted"])
+        saved = local_receipt(self.authority.db, self.sid)
+        with self.assertRaises(RuntimeStoreError):
+            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=tip,
+                               entry={**saved["entry"], "session_id": tip + "-forbidden"})
+        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        self.assertFalse((await self.work_inspected(ref))["permission_granted"])
+
     async def test_owner_restart_invalidates_a_previously_valid_reference(self):
         from hermes_state_runtime import begin_runtime_epoch
         await self.local()
