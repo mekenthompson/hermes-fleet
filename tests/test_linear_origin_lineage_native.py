@@ -21,6 +21,28 @@ class CleanupLineage(base.OriginScenarios):
             principal_id=self.conn.actor.subject, session_id=target, request_id=request,
             payload={"text": "Finite retained native instruction"})
 
+    def retired_extra_root(self, target, name, *, child=True):
+        import psutil
+        from hermes_cli.process_identity import worker_birth
+        from gateway.session_worker_child import reserve_child_execution
+        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+            apply_worker_receipt, mutate_worker_execution)
+        generation = self.authority.db._read_all("SELECT runtime_generation FROM sessions WHERE id=?", (target,))[0]["runtime_generation"]
+        owned = dict(epoch=self.authority.epoch, execution_id=name, session_id=target, generation=generation)
+        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="finite-extra-root")
+        adopt_worker_execution(self.authority.db, **owned, adoption_secret="finite-extra-root")
+        reserved = None
+        if child:
+            identity = {"profile_id": str(self.home), "pid": os.getpid(), "birth": worker_birth(psutil.Process())}
+            reserve = partial(reserve_child_execution, epoch=self.authority.epoch, execution_id=name,
+                identity=identity, principal=self.conn.actor.subject, limits=(1, 1), refused=None)
+            reserved = apply_worker_receipt(self.authority.db, **owned, sequence=1,
+                operation="child.reserve", payload={"secret": "finite-extra-child-secret"},
+                handlers={"child.reserve": reserve})["child"]
+        mutate_worker_execution(self.authority.db, **owned, sequence=2 if child else 1,
+                                operation="execution.finish", payload={})
+        return reserved
+
     async def test_lineage_admissions_remain_owned_through_native_settlement(self):
         from gateway.session_settlement_recovery import _mark_unknown
         from hermes_state_runtime import claim_session_input, resolve_unknown_session_input
@@ -133,7 +155,60 @@ class CleanupLineage(base.OriginScenarios):
         cancel_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=row["admission_id"])
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
+    async def test_lineage_all_retained_roots_and_descendant_compressions_are_closed(self):
+        from hermes_state_runtime import cancel_session_input
+        await self.stopped_issue()
+        target = self.sid
+        for index in range(3):
+            # Independent compute roots deliberately do not share the primary
+            # admission-worker prefix. The session binding establishes scope.
+            target = self.compressed(target, "-continued")
+            child = self.retired_extra_root(target, "independent-retained-root-" + str(index))
+            target = child["session_id"]
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        target = self.compressed(target, "-last")
+        row = self.admit(target, "deep-retained-native-work")
+        before = self.authority.db._read_all("SELECT * FROM worker_executions")
+        held = await self.cleanup_inspected()
+        self.assertFalse(held["quiescence_proven"])
+        self.assertEqual(held["reason"], "native_session_has_unsettled_work")
+        self.assertEqual(before, self.authority.db._read_all("SELECT * FROM worker_executions"))
+        cancel_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=row["admission_id"])
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        self.authority.db.set_meta("fixture.pending.stop." + target, "pending")
+        self.assertEqual((await self.cleanup_inspected())["reason"], "native_stop_checkpoint_pending")
+        self.authority.db._execute_write(lambda conn: conn.execute(
+            "DELETE FROM state_meta WHERE key=?", ("fixture.pending.stop." + target,)))
+        self.authority.db.create_session("foreign-extra-root-session", source="local")
+        foreign = self.retired_extra_root("foreign-extra-root-session", "independent-retained-root-foreign")
+        self.admit(foreign["session_id"], "foreign-descendant-queued-work")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
+    async def test_lineage_extra_retained_roots_arriving_during_owner_read_change_digest(self):
+        from hermes_state_runtime import cancel_session_input
+        await self.stopped_issue()
+        tip = self.compressed(self.sid, "-continued")
+        for kind in ("terminal-root", "terminal-child", "settled-child", "queued-child"):
+            with self.subTest(kind=kind):
+                admitted = []
+                def arriving(_method, _params):
+                    self.before_rpc = None
+                    child = self.retired_extra_root(tip, "arrived-extra-" + kind, child=kind != "terminal-root")
+                    if kind in ("settled-child", "queued-child"):
+                        row = self.admit(child["session_id"], "arrived-extra-work-" + kind)
+                        admitted.append(row)
+                        if kind == "settled-child":
+                            cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+                                                 admission_id=row["admission_id"])
+                self.before_rpc = arriving
+                evidence = await self.cleanup_inspected()
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertEqual(evidence["reason"], "native_session_has_unsettled_work" if kind == "queued-child"
+                                 else "cleanup_evidence_changed")
+                for row in admitted:
+                    cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+                                         admission_id=row["admission_id"])
+                self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(CleanupLineage(name) for name in loader.getTestCaseNames(CleanupLineage)
                               if name.startswith("test_lineage_"))

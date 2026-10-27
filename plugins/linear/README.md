@@ -392,9 +392,11 @@ claim, matching frozen owner/run/admission/executor records for every retained t
 terminal native admissions with recognized settled outcomes and worker/child ledger,
 confirmed clear native Stop checkpoints, and recorded interpreter and
 submitter identities proven gone or recycled. Admission and Stop checks cover the native
-compression lineage of every attempt and its retained descendant execution sessions; a
-settled parent does not discharge queued or unknown child work. Those session identities,
-admissions and descendant bindings participate in the repeated evidence digest, including
+compression lineage of every attempt, every retained execution in that scope and all of
+their descendant session lineages. The read repeats that discovery until no new session or
+execution remains; terminal extra compute roots participate too. A settled parent does not
+discharge queued or unknown child work. Those session identities, admissions and every
+retained worker identity/state participate in the repeated evidence digest, including
 settled arrivals during the owner read. Every retained worker status in the native
 runtime lineage is validated before active-only filters; malformed retained states remain
 unknown. Foreign lineage is outside this check. Runtime ownership selectors must retain
