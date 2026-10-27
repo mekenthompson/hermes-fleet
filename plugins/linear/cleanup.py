@@ -203,7 +203,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
     from hermes_state_keys import local_identity
-    from hermes_state_runtime import find_session_admission, list_session_admissions
+    from hermes_state_runtime import (RuntimeStoreError, _text as runtime_identity,
+                                      find_session_admission, list_session_admissions)
     from hermes_state_runtime_workers import runtime_lineage, worker_states, descendant_range
     from gateway.session_policy import restore_policy
     from gateway import session_ancillary
@@ -232,6 +233,12 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 ("state_meta", ("key",), ()),
             ):
                 for row in native.execute(f"SELECT {','.join(required + optional)} FROM {table}"):
+                    if table in ("worker_executions", "session_admissions"):
+                        try:
+                            for key in required:
+                                runtime_identity(row[key])
+                        except RuntimeStoreError as exc:
+                            raise Unknown("native_runtime_ownership_key_unreadable") from exc
                     _require(all(isinstance(row[key], str) for key in required)
                              and all(row[key] is None or isinstance(row[key], str) for key in optional),
                              "native_runtime_ownership_key_unreadable")

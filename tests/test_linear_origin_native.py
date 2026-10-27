@@ -1710,3 +1710,79 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         result = await self.cleanup_inspected()
         self.assertFalse(result["quiescence_proven"])
         self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
+
+
+    async def test_cleanup_runtime_bounded_identity_contract_rejects_empty_and_oversize_selectors(self):
+        from hermes_state_runtime import (RuntimeStoreError, register_worker_execution,
+            adopt_worker_execution, mutate_worker_execution, admit_session_input)
+        await self.stopped_issue()
+        owned = dict(epoch=self.authority.epoch, execution_id="bounded-selector-worker", session_id=self.sid,
+                     generation=self.row["generation"])
+        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-bounds")
+        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-bounds")
+        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        control = self.cancelled_control()
+        cases = (("worker_executions", "execution_id", "execution_id", owned["execution_id"]),
+                 ("worker_executions", "session_id", "execution_id", owned["execution_id"]),
+                 ("session_admissions", "target_session_id", "admission_id", control["admission_id"]))
+        for table, column, selector, value in cases:
+            original = self.authority.db._execute_write(lambda conn: conn.execute(
+                f"SELECT rowid AS native_rowid,{column} FROM {table} WHERE {selector}=?", (value,)).fetchone())
+            for bad in ("", "x" * 1025):
+                with self.subTest(table=table, column=column, length=len(bad)):
+                    # These are refusals by the actual native writers, not a
+                    # second implementation of their identity grammar.
+                    with self.assertRaisesRegex(RuntimeStoreError, "invalid_params"):
+                        if column == "target_session_id":
+                            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                                principal_id=self.conn.actor.subject, session_id=bad, request_id="bad-target",
+                                payload={"text": "Finite native identity refusal"})
+                        else:
+                            register_worker_execution(self.authority.db,
+                                **{**owned, column: bad}, kind="compute", adoption_secret="fixture-bounds")
+                    def update_key(raw):
+                        # Corrupt/restore only this isolated retained-state fixture.
+                        self.authority.db._conn.execute("PRAGMA foreign_keys=OFF")
+                        try:
+                            self.authority.db._execute_write(lambda conn: conn.execute(
+                                f"UPDATE {table} SET {column}=? WHERE rowid=?", (raw, original["native_rowid"])))
+                        finally:
+                            self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
+                    update_key(bad)
+                    try:
+                        result = await self.cleanup_inspected()
+                        self.assertFalse(result["quiescence_proven"])
+                        self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
+                        retained = self.authority.db._execute_write(lambda conn: conn.execute(
+                            f"SELECT {column} FROM {table} WHERE rowid=?", (original["native_rowid"],)).fetchone()[0])
+                        self.assertEqual(retained, bad)
+                    finally:
+                        update_key(original[column])
+                    self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_preserves_actual_native_identity_and_broader_text_contracts(self):
+        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution, admit_session_input
+        await self.stopped_issue()
+        for execution_id in (" ", "e" * 1024):
+            args = dict(epoch=self.authority.epoch, execution_id=execution_id,
+                        session_id=self.sid, generation=self.row["generation"])
+            register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-valid-bound")
+            adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-valid-bound")
+            mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
+        for index, foreign in enumerate((" ", "s" * 1024)):
+            self.authority.db.create_session(foreign, source="local", chat_id="")
+            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                principal_id=self.conn.actor.subject, session_id=foreign, request_id="valid-bound-" + str(index),
+                payload={"text": "Unrelated valid native work"})
+            register_worker_execution(self.authority.db, epoch=self.authority.epoch,
+                execution_id="foreign-bound-" + str(index), session_id=foreign, generation=0,
+                kind="compute", adoption_secret="fixture-foreign-bound")
+        # SessionDB's constructor and metadata writer have broader TEXT
+        # contracts. Do not import RuntimeStore's identifier bound into them.
+        for session in ("", "w" * 2048):
+            self.authority.db.create_session(session, source="local", chat_id="")
+        self.authority.db.create_session("foreign-wide-parent", source="local", parent_session_id="w" * 2048,
+                                         chat_id="c" * 2048)
+        self.authority.db.set_meta("", "opaque metadata")
+        self.authority.db.set_meta("native-prefix:" + "m" * 2048, "opaque metadata")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])

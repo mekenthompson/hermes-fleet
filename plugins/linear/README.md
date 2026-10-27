@@ -395,8 +395,11 @@ submitter identities proven gone or recycled. Every retained worker status in th
 runtime lineage is validated before active-only filters; malformed retained states remain
 unknown. Foreign lineage is outside this check. Runtime ownership selectors must retain
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report
-`native_runtime_ownership_key_unreadable` for native-owner reconciliation. They are never
-decoded into identity or authority. Only fixed selector columns are checked; valid foreign
+`native_runtime_ownership_key_unreadable` for native-owner reconciliation. Execution/session
+IDs in the runtime worker ledger and admission targets use the native runtime identity
+validator, including its empty-value and length rules. Broader SessionDB/metadata text fields
+and optional empty/NULL values retain their own writer contracts. Values are never stripped,
+normalized or decoded into identity or authority. Only fixed selector columns are checked; valid foreign
 TEXT scope and unrelated payloads remain outside the check. The native read snapshot is
 closed before owner RPC and read again afterward. A terminal label with a missing, unknown or
 unrecognized outcome remains held; native cancelled and settled steering histories do not
