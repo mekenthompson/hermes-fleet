@@ -281,7 +281,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
     from hermes_state_keys import local_identity
-    from hermes_state_runtime import (RuntimeStoreError, _text as runtime_identity,
+    from hermes_state_runtime import (RuntimeStoreError, _text as runtime_identity, _json as runtime_payload,
                                       find_session_admission, list_session_admissions)
     from gateway.session_policy import restore_policy
     from gateway import session_ancillary
@@ -392,6 +392,11 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      and saved["request_id"] == request and marker["request_id"] == request
                      and sid == local_identity(str(home), saved["principal_id"], request), "native_attempt_binding_mismatch")
             admission = find_session_admission(db, principal_id=saved["principal_id"], session_id=sid, request_id=request)
+            try:
+                if admission is not None:
+                    runtime_payload(admission["payload"])
+            except RuntimeStoreError as exc:
+                raise Unknown("native_admission_state_unreadable") from exc
             _require(admission and admission["status"] == "terminal" and admission["outcome"] in {"completed", "interrupted", "failed", "rejected"}
                      and admission["payload"].get("kanban_card_v1") == {"board": bound["board"], "task_id": task["id"], "run_id": run_id},
                      "native_admission_not_settled")

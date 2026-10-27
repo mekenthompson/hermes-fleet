@@ -406,8 +406,8 @@ settled arrivals during the owner read. Every consumed owned worker field must s
 its native schema and writer contract, including kind, counters and referenced session.
 Historical terminal epochs/generations and terminal sequence zero remain valid; malformed
 retained records remain unknown. Selected admission records use the native identity and
-JSON validators, recognized intents and native counter contracts, preserving resultless
-controls and nullable legacy terminal metadata. The native worker/admission physical-lineage
+JSON validators before primary payload field access, recognized intents and native counter
+contracts, preserving resultless controls and nullable legacy terminal metadata. The native worker/admission physical-lineage
 join also checks for started or unknown claims whose logical target differs. Unrelated
 foreign payloads remain outside these checks. Runtime ownership selectors must retain
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report
