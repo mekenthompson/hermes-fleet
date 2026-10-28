@@ -2696,16 +2696,21 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         await self.stopped_issue()
         pid = os.getpid()
         direct = _process_fingerprint(pid)
-        original = Path.read_text
-        def unreadable_stat(path, *args, **kwargs):
-            if path == Path("/proc/" + str(pid) + "/stat"):
-                raise PermissionError("finite direct-stat read failure")
-            return original(path, *args, **kwargs)
+        stat_path = Path("/proc/" + str(pid) + "/stat")
+        original_text, original_bytes = Path.read_text, Path.read_bytes
+        def failing(original):
+            def read(path, *args, **kwargs):
+                if path == stat_path:
+                    raise PermissionError("finite direct-stat read failure")
+                return original(path, *args, **kwargs)
+            return read
         def bound(witness):
             self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
                 (json.dumps({"pid": pid, "started_at": witness, "claim_lock": self.work_context["claim_lock"]}), self.task_id))
         bound(direct)
-        with patch.object(Path, "read_text", unreadable_stat):
+        # Core reads /proc/<pid>/stat as text on older releases and as bytes on newer ones; fail both.
+        with patch.object(Path, "read_text", failing(original_text)), \
+                patch.object(Path, "read_bytes", failing(original_bytes)):
             fallback = _process_fingerprint(pid)
             self.assertNotEqual(direct, fallback)
             self.assertEqual((await self.cleanup_inspected())["reason"], "old_worker_alive")
