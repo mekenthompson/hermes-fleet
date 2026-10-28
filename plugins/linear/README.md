@@ -77,6 +77,11 @@ reporting still requires destination readback. This does not authorize closing a
 An exact request known not to have applied is not retimed or treated as delivered. After
 inspecting current state, a fresh deliberate reporting request can repair that known result;
 pending, uncertain and applied effects retain their original request and are not duplicated.
+Required specialist assessment delivery is repaired separately from issue status. A known
+unapplied recommendation needs a fresh authorized comment request; an applied status alone
+does not satisfy that delivery. Reusing its exact historical acknowledgement grants no new
+recipient authority. Held uncertain comments require exact readback rather than a duplicate
+publication, and earlier request coordinates and receipts remain intact.
 
 For an explicit chat takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder
