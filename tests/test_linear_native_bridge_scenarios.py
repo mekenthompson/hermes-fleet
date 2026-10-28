@@ -521,6 +521,29 @@ class NativeBridgeScenarios(unittest.TestCase):
                           self.board, profile="default", clock=clock)
         reporter.recover()
         reporter.flush()
+        self.assertNotEqual(remote.state(ISSUE), "Done")
+        self.assertEqual(remote.state("unaffected"), "Done")
+        self.assertFalse(any(row["payload"].get("issue_id") == ISSUE and row["payload"].get("state") == "done"
+                             for row in reporter.store.pending()))
+        cursor = reporter.store.get(ISSUE)["last_event_id"]
+        self.assertGreater(cursor, before)
+        native = self.board.get(task_id)
+        self.assertEqual(native.status, "done")
+        history = copy.deepcopy(self.board.history(task_id, 0))
+        with self.board.conn() as conn:
+            tasks = kb.list_tasks(conn, include_archived=True)
+        request = dict(replace=True, completion_scope="outcome", reconcile_complete=True,
+                       expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+        result = reporter.track(ISSUE, task_id, **request)
+        self.assertTrue(result["reporting_only"])
+        self.assertTrue(result["completion_reporting_reconciled"])
+        self.assertEqual(reporter.store.get(ISSUE)["last_event_id"], cursor)
+        self.assertEqual(self.board.get(task_id), native)
+        self.assertEqual(self.board.history(task_id, 0), history)
+        reporter.track(ISSUE, task_id, **request)  # A lost reply reuses the same UUID and inspected CAS preimage.
+        with self.board.conn() as conn:
+            self.assertEqual(kb.list_tasks(conn, include_archived=True), tasks)
+        reporter.flush()
         self.assertEqual(remote.state(ISSUE), "Done")
         self.assertEqual(remote.state("unaffected"), "Done")
         self.assertTrue(any("precise bounded outcome" in body for body in remote.bodies(ISSUE)))

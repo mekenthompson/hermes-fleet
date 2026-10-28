@@ -32,6 +32,28 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertEqual(len(self.fixture.tasks()), 1)
         self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
 
+    def test_assignment_activation_preserves_outcome_snapshot_through_native_completion(self):
+        import copy
+        task_id = self.assign()
+        before = self.board.get(task_id)
+        self.assertEqual(before.status, "ready")
+        binding = copy.deepcopy(self.store.native_binding(scenarios.ISSUE))
+        self.assertEqual(binding["completion_scope"]["mode"], "outcome")
+        self.assertFalse(any(event.kind == "specified" for event in self.board.history(task_id, 0)))
+        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.complete_task(conn, task_id,
+                result="Verified the assigned outcome and retained the final deliverable."))
+        after = self.board.get(task_id)
+        self.assertEqual((after.title, after.body, after.completion_contract),
+                         (before.title, before.body, before.completion_contract))
+        self.bridge.pump_kanban()
+        self.assertEqual(self.store.native_binding(scenarios.ISSUE), binding)
+        self.assertTrue(any(row["kind"] == "status" and row["payload"].get("state") == "done"
+                            for row in self.store.pending()))
+        self.assertTrue(any(row["kind"] == "project_update" for row in self.store.pending()))
+        self.assertEqual(len(self.fixture.tasks()), 1)
+
     def test_stop_during_creation_invalidates_initial_admission(self):
         create = self.board.create
         def stopped(**fields):

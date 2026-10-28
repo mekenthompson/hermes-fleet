@@ -1123,13 +1123,14 @@ class Bridge:
                     return False
                 if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                         adapter.board or "default", owner_ref=session_id,
-                        project_id=(current.get("project") or {}).get("id"), at=stamp):
+                        project_id=(current.get("project") or {}).get("id"),
+                        completion_scope=self._completion_scope(adapter, task, "progress"), at=stamp):
                     return False
                 adapter.subscribe(task.id, issue_id, issue=current)
                 self._pending_assignment_stop(self.store.get(issue_id))
                 task = adapter.require_task(task.id)
                 self.activity(issue_id, session_id, "thought",
-                    f"Existing native task linked on its original board; current state is {task.status}. No replacement worker was created or work resumed. Follow-ups use this task; native controls and effect reconciliation remain authoritative.")
+                    f"Existing native task linked for progress on its original board; current state is {task.status}. Discovery does not verify completion of the issue outcome. Inspect acceptance before reconciling an outcome link. No replacement worker was created or work resumed; native controls remain authoritative.")
                 return True
         context = "\n\n".join(x for x in (fresh.get("description") or "", self._thread(issue_id, until_ms=stamp), prompt) if x)
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
@@ -1178,7 +1179,8 @@ class Bridge:
             raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
         require_task_issue_scope(task, fresh)
         if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
-                                     owner_ref=session_id, project_id=project, at=stamp):
+                                     owner_ref=session_id, project_id=project,
+                                     completion_scope=self._completion_scope(self.kanban, task), at=stamp):
             self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
             return False
         self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
@@ -1295,15 +1297,18 @@ class Bridge:
         return False
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
               requester_session: str | None = None, requester_activity: str | None = None, replace: bool = False,
-              expected_revision: str | None = None, request_id: str | None = None) -> dict:
+              expected_revision: str | None = None, request_id: str | None = None,
+              completion_scope: str = "outcome", reconcile_complete: bool = False) -> dict:
         with self.lock(issue_id):
             return self._track(issue_id, task_id, board=board, requester_session=requester_session,
                                requester_activity=requester_activity,
-                               replace=replace, expected_revision=expected_revision, request_id=request_id)
+                               replace=replace, expected_revision=expected_revision, request_id=request_id,
+                               completion_scope=completion_scope, reconcile_complete=reconcile_complete)
 
     def _track(self, issue_id: str, task_id: str, *, board: str | None,
                requester_session: str | None, requester_activity: str | None, replace: bool,
-               expected_revision: str | None, request_id: str | None) -> dict:
+               expected_revision: str | None, request_id: str | None, completion_scope: str,
+               reconcile_complete: bool) -> dict:
         # A reporting link is not an execution grant or a conflicting remote
         # mutation. Retained uncertain effects remain held independently.
         if not (self.authorize_specialist_effect(issue_id) if replace else self._require_effect(issue_id)):
@@ -1312,21 +1317,88 @@ class Bridge:
         adapter = self.kanban if board is None else self.kanban.for_board(board)
         task = adapter.require_task(task_id)
         require_task_issue_scope(task, issue)
+        if type(reconcile_complete) is not bool or reconcile_complete and (not replace or completion_scope != "outcome" or task.status != "done"):
+            raise LinearError("Completion reconciliation requires an explicit outcome replacement and an already completed native task", retryable=False)
+        completed = [event for event in adapter.history(task.id, 0) if event.kind == "completed"] if reconcile_complete else []
+        if reconcile_complete and not completed:
+            raise LinearError("Native Done has no completed event to reconcile", retryable=False)
+        accepted_scope = self._completion_scope(adapter, task, completion_scope)
         if replace:
             binding = self.store.replace_native_binding(issue_id, task_id, adapter.executor_profile,
                 adapter.board or "default", expected_revision=expected_revision, request_id=request_id,
                 owner_ref=requester_session or "", requester_activity=requester_activity,
                 project_id=(issue.get("project") or {}).get("id"),
-                at=self.clock() * 1000)
+                completion_scope=accepted_scope, reconcile_complete=reconcile_complete, at=self.clock() * 1000)
             if not binding:
                 raise LinearError("Reporting link changed or its scope was refused; inspect current issue and native work before retrying", retryable=False)
-            return {"issue_id": issue_id, "task_id": task.id, "status": task.status,
-                    "reporting_only": True, "history_preserved": True}
+            result = {"issue_id": issue_id, "task_id": task.id, "status": task.status,
+                      "reporting_only": True, "history_preserved": True}
+            if reconcile_complete:
+                result["completion_reporting_reconciled"] = bool(self._finished(
+                    self.store.get(issue_id), event_id=max(event.id for event in completed),
+                    reconcile_request_id=request_id))
+                result["publication_requires_readback"] = True
+            return result
         if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                 adapter.board or "default", owner_ref=requester_session or "", requester_activity=requester_activity,
-                project_id=(issue.get("project") or {}).get("id"), at=self.clock() * 1000):
+                project_id=(issue.get("project") or {}).get("id"), completion_scope=accepted_scope,
+                at=self.clock() * 1000):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
+
+    @staticmethod
+    def _completion_scope(adapter, task, mode: str = "outcome") -> dict:
+        if mode not in ("outcome", "progress"):
+            raise LinearError("Completion scope must be outcome or progress", retryable=False)
+        fields = {key: getattr(task, key, None) for key in ("title", "body", "completion_contract")}
+        if any(value is not None and not isinstance(value, str) for value in fields.values()):
+            raise LinearError("Native task specification is unreadable", retryable=False)
+        fields["title"] = fields["title"] or ""
+        fields["body"] = fields["body"] or ""
+        fields["completion_contract"] = fields["completion_contract"] or "local-only"
+        specified = []
+        for event in adapter.history(task.id, 0):
+            if event.kind == "edited":
+                # Core can combine a scope edit with result backfill while
+                # listing only result/summary in fields. Every edited event
+                # versions acceptance; restoring old text cannot undo it.
+                native_event_payload(event)
+                specified.append(event.id)
+                continue
+            if event.kind != "specified":
+                continue
+            changed = native_event_payload(event).get("changed_fields") or []
+            if not isinstance(changed, list) or any(not isinstance(field, str) for field in changed):
+                raise LinearError("Native specification event is unreadable", retryable=False)
+            if set(changed) & {"title", "body", "completion_contract"}:
+                specified.append(event.id)
+        return {"mode": mode, "task_spec_sha256": hashlib.sha256(json.dumps(
+            fields, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+            "specified_event_id": max(specified, default=0)}
+
+    def _completion_scope_matches(self, issue_id: str, task, adapter) -> bool:
+        scope = (self.store.native_binding(issue_id) or {}).get("completion_scope")
+        try:
+            return (self.store.validate_completion_scope(scope)["mode"] == "outcome"
+                    and scope == self._completion_scope(adapter, task))
+        except ValueError:
+            return False
+
+    def _require_completion_report(self, payload: dict) -> None:
+        """Recheck the stable native specification/event, independently of the cursor."""
+        issue_id = payload["issue_id"]
+        binding = self.store.native_binding(issue_id)
+        proof = payload.get("native_completion")
+        task = self._native_effect_task(issue_id)
+        adapter = self._binding_adapter(issue_id)
+        completed = [event for event in adapter.history(task.id, 0) if event.kind == "completed"]
+        latest = max(completed, key=lambda event: event.id) if completed else None
+        expected = ({"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
+                     "scope": binding.get("completion_scope"), "event_id": latest.id,
+                     "run_id": getattr(latest, "run_id", None)} if binding and latest else None)
+        if (task.status != "done" or not proof or proof != expected
+                or not self._completion_scope_matches(issue_id, task, adapter)):
+            raise LinearError("Native completion scope changed or is unverified; inspect the outcome and reconcile its reporting link", retryable=False)
     def _binding_adapter(self, issue_id: str):
         binding = self.store.native_binding(issue_id, self.kanban.executor_profile)
         if not binding:
@@ -1349,6 +1421,9 @@ class Bridge:
     def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
         try:
             self._native_effect_task(issue_id)
+            for kind, payload in writes:
+                if kind == "status" and payload.get("terminal") and payload.get("state") == "done":
+                    self._require_completion_report(payload)
         except RateLimited:
             raise
         except LinearError as exc:
@@ -1357,10 +1432,51 @@ class Bridge:
         return self.store.capture_event(issue_id, event_id, writes, at=at, forget=forget)
 
     def _require_outbox_native_scope(self, row, issue_ids=None):
-        if not row["payload"].get("task_id"):
-            return  # Authorized independent content and refusal notices have no task effect.
-        for issue_id in issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row):
-            self._native_effect_task(issue_id)
+        payload = row["payload"]
+        selected = issue_ids if issue_ids is not None else self._outbox_scope_issue_ids(row)
+        if payload.get("task_id"):
+            for issue_id in selected:
+                self._native_effect_task(issue_id)
+        if row["kind"] == "status":
+            if payload.get("terminal") and payload.get("state") == "done":
+                self._require_completion_report(payload)
+            return
+        if row["kind"] == "comment" and payload.get("assessment") and payload.get("completion_reconcile_request_id"):
+            self._require_assessment_repair(payload)
+        # Completion messages and batched project lines already name their
+        # exact terminal status dependency. Reuse it instead of another ledger
+        # or a batch-wide token that could hold an unrelated issue's progress.
+        ids = {payload.get("requires_status_id"), payload.get("reconciled_status_id"),
+               *(payload.get("terminal_lines") or {}).values()} - {None, ""}
+        for status_id in ids:
+            status = self.store.outbox_row(status_id)
+            source = status["payload"] if status else {}
+            if source.get("issue_id") in selected and source.get("terminal") and source.get("state") == "done":
+                self._require_completion_report(source)
+
+    def _require_assessment_repair(self, payload: dict) -> None:
+        """Old applied status is a delivery fact, never the new caller's authority."""
+        issue_id = payload["issue_id"]
+        saved = self.store.native_intent(f"track:{issue_id}:{payload['completion_reconcile_request_id']}") or {}
+        request = saved.get("payload", {}).get("request", {})
+        if (saved.get("state") != "applied" or request.get("reconcile_complete") is not True
+                or request.get("binding") != self.store.native_binding(issue_id)
+                or payload.get("source_ms") != saved.get("payload", {}).get("at")):
+            raise LinearError("Assessment repair no longer matches its current reporting request", retryable=False)
+        self._require_completion_report(payload)
+        if payload.get("reconciled_status_id"):
+            prior = self.store.outbox_row(payload["reconciled_status_id"])
+            if (not prior or prior["kind"] != "status" or prior["state"] != "sent"
+                    or prior["payload"].get("applied") != 1
+                    or prior["payload"].get("issue_id") != issue_id
+                    or prior["payload"].get("native_completion") != payload.get("native_completion")):
+                raise LinearError("Assessment repair has no matching applied completion acknowledgement", retryable=False)
+        issue = self._effect_issue(issue_id)
+        if iso_ms(issue.get("updatedAt")) > float(payload["source_ms"]):
+            receipt = self.store.native_status_receipt(issue_id, payload["task_id"])
+            if (not self._receipt_scope(payload, receipt)
+                    or receipt["issue"] != self._issue_version(issue)):
+                raise LinearError("Human changed issue after assessment repair; publication held", retryable=False)
 
     def native_status(self, issue_id: str) -> dict:
         # Observe the revision before subsequent state reads. A concurrent change
@@ -1388,10 +1504,22 @@ class Bridge:
             raise
         except LinearError as exc:
             reconciliation = {"reconciliation_required": True, "message": str(exc)}
+        scope = binding.get("completion_scope")
+        if isinstance(scope, dict) and scope.get("mode") == "progress":
+            reconciliation.update(outcome_completed=False,
+                                  completion_message="This task reports an internal stage; native Done does not complete the Linear outcome.")
+        else:
+            try:
+                matches = self._completion_scope_matches(issue_id, task, self._binding_adapter(issue_id))
+            except LinearError:
+                matches = False
+            if not matches:
+                reconciliation.update(completion_reconciliation_required=True,
+                                      completion_message="Accepted completion scope is missing or changed. Inspect the agreed outcome and reconcile its reporting link; execution is unaffected.")
         return {"issue_id": issue_id, "linked": True, "task_id": task.id, "status": task.status, **reconciliation,
                 "run_id": task.current_run_id, "profile": task.assignee,
                 "board": binding["board"], "local": local,
-                "binding_revision": revision}
+                "binding_revision": revision, "completion_scope": binding.get("completion_scope")}
     def queue_delegate_self(self, issue_id: str, request_id: str, *, expected_delegate_id: str | None,
                             expected_updated_at: str, expected_binding_revision: str,
                             caller_context: dict, requester: dict) -> str:
@@ -1752,31 +1880,64 @@ class Bridge:
         return [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                              "body": _visible_activity(payload.get("content") or {})})
                 if kind == "activity" else (kind, payload) for kind, payload in writes]
-    def _finish_work(self, issue_id: str, writes: list, *, at: float, event_id: int | None = None) -> bool:
+    def _finish_work(self, issue_id: str, writes: list, *, at: float, event_id: int | None = None,
+                     reconcile_request_id: str | None = None) -> bool:
         row = self.store.get(issue_id)
         if not row or row.get("origin") != "native" or event_id is None:
             return False
         source = next((getattr(event, "created_at", None) for event in self._binding_adapter(issue_id).history(row["task_id"], 0) if event.id == event_id), None)
-        writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source * 1000} if kind == "status" and source is not None else {})})
+        if reconcile_request_id is not None:
+            # This deliberate reporting request is current; the native result
+            # can be older than a corrected issue. Retries retain its original
+            # timestamp, so a later human change still fences the write.
+            intent = self.store.native_intent(f"track:{issue_id}:{reconcile_request_id}") or {}
+            source_ms = intent.get("payload", {}).get("at")
+        else:
+            source_ms = source * 1000 if source is not None else None
+        writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source_ms} if source_ms is not None and
+                    (kind == "status" or reconcile_request_id is not None and payload.get("assessment")) else {})})
                   for kind, payload in self._report_writes(row, writes)]
+        if reconcile_request_id is not None:
+            for kind, payload in writes:
+                if kind == "status" and payload.get("state") == "done":
+                    self._require_completion_report(payload)
+                    status_required = (self._effect_issue(issue_id).get("state") or {}).get("type") != "completed"
+                    return self.store.reconcile_completion(issue_id, reconcile_request_id, event_id, writes,
+                                                           at=at, status_required=status_required)
+            return False
         # Cursor and reporting intents commit together, including completion.
         return self._capture_native_event(issue_id, event_id, writes, at=at)
-    def _finished(self, row: dict[str, Any], *, event_id: int | None = None) -> None:
+    def _finished(self, row: dict[str, Any], *, event_id: int | None = None,
+                  reconcile_request_id: str | None = None) -> bool | None:
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
         adapter = self._binding_adapter(row["issue_id"])
         task = self._native_effect_task(row["issue_id"])
         latest = [event.id for event in adapter.history(task.id, 0) if event.kind == "completed"]
+        if task.status == "done" and not latest:
+            raise LinearError("Native Done has no completed event to verify", retryable=False)
         if task.status != "done" or (event_id is not None and latest and event_id != max(latest)):
             if event_id is not None:
                 self._capture_native_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
+        summary = _project_summary(adapter.completion_summary(task), 1500)
+        if not self._completion_scope_matches(row["issue_id"], task, adapter):
+            body = ("Native stage finished. The Linear outcome remains unfinished: this task reports progress, "
+                    "or its accepted completion scope is missing or changed. Inspect the agreed outcome and "
+                    "remaining work before reconciling the reporting link; no execution was started.")
+            if summary:
+                body += f"\n\nNative stage result: {summary}"
+            if event_id is not None:
+                self._capture_native_event(row["issue_id"], event_id, self._report_writes(row, [
+                    ("activity", {"issue_id": row["issue_id"], "session_id": row["owner_ref"],
+                                  **self._alert_route(row), "content": {"type": "thought", "body": body}})
+                ]), at=self.clock())
+            return
         evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
         issue_id = row["issue_id"]
         heads, failures = {}, []
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
-        summary = _project_summary(adapter.completion_summary(task), 1500)
         residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", summary, flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
             body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
@@ -1808,22 +1969,43 @@ class Bridge:
                                                            "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id)
                 return
         links = " ".join(dict.fromkeys(evidence))
+        binding = self.store.native_binding(issue_id)
+        completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
+                        key=lambda event: event.id)
+        completion = {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
+                      "scope": binding["completion_scope"], "event_id": completed.id,
+                      "run_id": getattr(completed, "run_id", None)}
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
-                              "evidence": evidence, "evidence_contract": contract, "pr_heads": heads}),
+                              "evidence": evidence, "evidence_contract": contract, "pr_heads": heads,
+                              "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": "Assessment posted on the issue." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
+                                "content": {"type": "response", "body": "Assessment completed." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: "Assessment posted on the issue." if assessment else f"Done: {links or _project_summary(summary)}"},
+                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
-        if assessment and not self.store.assessment_comment_id(issue_id, assessment):
-            writes.insert(2, ("comment", {
-                "id": stable_uuid4("assessment-comment", issue_id, hashlib.sha256(assessment.encode()).hexdigest()),
-                "issue_id": issue_id, "body": assessment, "assessment": True, "task_id": row["task_id"]}))
+        if assessment:
+            prior_id = self.store.assessment_comment_id(issue_id, assessment,
+                completion=completion if reconcile_request_id else None)
+            if prior_id and reconcile_request_id:
+                prior = self.store.outbox_row(prior_id)
+                if prior.get("hold_reason") and not (prior["state"] == "sent" and prior["payload"].get("applied") == 1):
+                    verify = getattr(self.api, "verify_comment", None)
+                    if not callable(verify) or not verify(prior_id, issue_id, assessment):
+                        raise LinearError("Prior assessment publication is held or uncertain; reconcile its exact comment before another publication", retryable=False)
+            if not prior_id:
+                comment_id = stable_uuid4("assessment-comment", issue_id,
+                    hashlib.sha256(assessment.encode()).hexdigest(),
+                    reconcile_request_id or f"{self._project_batch(binding)}:{completed.id}")
+                writes.insert(1, ("comment", {
+                    "id": comment_id, "issue_id": issue_id, "body": assessment, "assessment": True,
+                    "task_id": row["task_id"], "native_completion": completion,
+                    **({"completion_reconcile_request_id": reconcile_request_id} if reconcile_request_id else {})}))
         if not self.authorize_specialist_effect(issue_id): return
-        self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
-                                     for kind, payload in writes], at=self.clock(), event_id=event_id)
+        return self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
+                                     for kind, payload in writes], at=self.clock(), event_id=event_id,
+                          reconcile_request_id=reconcile_request_id)
     def _report_delegate_allowed(self, issue: dict, payload: dict | None = None) -> bool:
         delegate = (issue.get("delegate") or {}).get("id")
         if delegate == self.api.viewer_id():
@@ -2249,6 +2431,12 @@ class Bridge:
                         waiting_lines.add(ident)
                     continue
                 release_status = self.store.outbox_row(terminal_id) if terminal_id else None
+                if release_status and release_status["payload"].get("state") == "done":
+                    try:
+                        self._require_completion_report(release_status["payload"])
+                    except LinearError:
+                        waiting_lines.add(ident)
+                        continue
                 if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): continue
                 if ((issue.get("delegate") or {}).get("id") != self.api.viewer_id() and
                         self.store.pending_claim(issue["id"])):
