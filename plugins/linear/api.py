@@ -344,13 +344,14 @@ class LinearAPI:
         return data["issue"]
     def issue_with_thread(self, issue_id: str, limit: int = 50) -> tuple[dict[str, Any], list[dict[str, str]]]:
         """The issue and its latest comments, oldest first, in one read."""
-        data = self.graphql("query IssueThread($id: String!) { issue(id: $id) { %s comments(last: %d) "
-                            "{ nodes { body createdAt user { id name } botActor { name } } } } }" % (ISSUE_FIELDS, limit),
+        data = self.graphql("query IssueThread($id: String!) { issue(id: $id) { %s comments(first: %d, orderBy: createdAt) "
+                            "{ nodes { id url body createdAt user { id name } botActor { name } } } } }" % (ISSUE_FIELDS, limit),
                             {"id": issue_id})
         if not data.get("issue"):
             raise LinearError(f"Linear issue {issue_id} not found", retryable=False)
         nodes = (data["issue"].get("comments") or {}).get("nodes") or []
-        return data["issue"], sorted(({"at": str(n.get("createdAt") or ""), "body": str(n.get("body") or ""),
+        return data["issue"], sorted(({"id": str(n.get("id") or ""), "url": str(n.get("url") or ""),
+                                       "at": str(n.get("createdAt") or ""), "body": str(n.get("body") or ""),
                                        "user_id": (n.get("user") or {}).get("id"),
                                        "who": str((n.get("user") or n.get("botActor") or {}).get("name") or "unknown")}
                                       for n in nodes if isinstance(n, dict)), key=lambda comment: comment["at"])

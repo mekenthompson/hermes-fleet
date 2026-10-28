@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import threading
 import uuid
@@ -177,10 +178,18 @@ class FakeLinear:
                 (i for i in self.issues.values() if i["identifier"] == variables["id"]), None)
             issue = json.loads(json.dumps(issue)) if issue else None
             if issue and "comments(" in query:
-                issue["comments"] = {"nodes": [
-                    {"body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()),
+                comments = [
+                    {"id": c.get("id"), "url": c.get("url"),
+                     "body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()),
                      "user": {"id": c.get("author_id", SELF), "name": c.get("author", "Pat Example")}}
-                    for c in self.comments if c.get("issueId") == issue["id"]]}
+                    for c in self.comments if c.get("issueId") == issue["id"]]
+                # Linear connections are newest first; last selects the old end.
+                comments.sort(key=lambda c: c["createdAt"], reverse=True)
+                page = re.search(r"comments\((first|last): (\d+)", query)
+                if page:
+                    count = int(page[2])
+                    comments = comments[:count] if page[1] == "first" else comments[-count:]
+                issue["comments"] = {"nodes": comments}
             return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}
 
