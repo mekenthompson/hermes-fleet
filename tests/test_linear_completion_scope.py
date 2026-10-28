@@ -326,5 +326,107 @@ class CompletionScopeTests(unittest.TestCase):
         self.assertEqual(len(self.kanban.creates), 1)
 
 
+    def test_known_unapplied_automatic_done_allows_fresh_finish_only_repair(self):
+        self.track()
+        self.complete()
+        original = next(row for row in self.store.pending() if row['kind'] == 'status')
+        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
+            1800000100, datetime.timezone.utc).isoformat()
+        self.bridge.clock = lambda: 1800000300
+        self.bridge.flush()
+        obsolete = self.store.outbox_row(original['id'])
+        self.assertEqual((obsolete['state'], obsolete['payload'].get('applied')), ('sent', 0))
+        self.assertNotEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
+        native_history = copy.deepcopy(self.kanban.histories[self.task.id])
+        cursor = self.store.get(ISSUE)['last_event_id']
+        request = dict(replace=True, completion_scope='outcome', reconcile_complete=True,
+                       expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+        result = self.track(**request)
+        self.assertTrue(result['completion_reporting_reconciled'])
+        repair = self.store.outbox_row(request['request_id'])
+        self.assertIsNotNone(repair, 'A known unapplied obsolete report cannot satisfy a fresh repair')
+        self.assertEqual(repair['payload']['source_ms'], 1800000300000)
+        self.track(**request)
+        self.assertEqual(self.store.outbox_row(request['request_id']), repair)
+        self.bridge.flush()
+        self.assertEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
+        self.assertEqual(self.store.outbox_row(original['id']), obsolete)
+        self.assertEqual(self.store.get(ISSUE)['last_event_id'], cursor)
+        self.assertEqual(self.kanban.histories[self.task.id], native_history)
+        self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_same_proof_pending_unknown_and_applied_reports_prevent_duplicate_repair(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        for disposition in ('pending', 'unknown', 'applied'):
+            with self.subTest(disposition=disposition):
+                self.setUp()
+                self.track()
+                self.complete()
+                original = next(row for row in self.store.pending() if row['kind'] == 'status')
+                if disposition == 'unknown':
+                    self.assertTrue(self.store.admit_mutation(original['id'], terminal=True))
+                    self.assertTrue(self.store.outbox_row(original['id'])['payload']['write_started'])
+                elif disposition == 'applied':
+                    self.bridge.flush(only_id=original['id'])
+                    applied = self.store.outbox_row(original['id'])
+                    self.assertEqual((applied['state'], applied['payload']['applied']), ('sent', 1))
+                request_id = str(uuid.uuid4())
+                before = self.store.outbox_row(original['id'])
+                try:
+                    self.track(replace=True, completion_scope='outcome', reconcile_complete=True,
+                               expected_revision=self.store.binding_revision(ISSUE), request_id=request_id)
+                except LinearError:
+                    if disposition != 'unknown':
+                        raise
+                self.assertIsNone(self.store.outbox_row(request_id))
+                self.assertEqual(self.store.outbox_row(original['id']), before)
+                self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_newer_human_edit_still_fences_fresh_repair_of_known_unapplied_done(self):
+        self.track()
+        self.complete()
+        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
+            1800000100, datetime.timezone.utc).isoformat()
+        self.bridge.clock = lambda: 1800000300
+        self.bridge.flush()
+        request = dict(replace=True, completion_scope='outcome', reconcile_complete=True,
+                       expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+        self.track(**request)
+        self.assertIsNotNone(self.store.outbox_row(request['request_id']))
+        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
+            1800000400, datetime.timezone.utc).isoformat()
+        self.bridge.clock = lambda: 1800000500
+        self.track(**request)
+        self.authority.mutations.clear()
+        self.bridge.flush()
+        self.assertNotEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
+        self.assertFalse(any('issueUpdate' in query for query in self.authority.mutations))
+        self.assertEqual(self.store.outbox_row(request['request_id'])['payload']['source_ms'], 1800000300000)
+
+    def test_same_known_unapplied_repair_uuid_never_claims_or_retimes_success(self):
+        self.track(completion_scope='progress')
+        self.complete()
+        self.bridge.clock = lambda: 1800000300
+        request = dict(replace=True, completion_scope='outcome', reconcile_complete=True,
+                       expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+        self.assertTrue(self.track(**request)['completion_reporting_reconciled'])
+        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
+            1800000400, datetime.timezone.utc).isoformat()
+        self.bridge.clock = lambda: 1800000500
+        self.bridge.flush()
+        obsolete = self.store.outbox_row(request['request_id'])
+        self.assertEqual((obsolete['state'], obsolete['payload'].get('applied')), ('sent', 0))
+        cursor = self.store.get(ISSUE)['last_event_id']
+        self.authority.mutations.clear()
+        result = self.track(**request)
+        self.assertFalse(result['completion_reporting_reconciled'])
+        self.assertEqual(self.store.outbox_row(request['request_id']), obsolete)
+        self.assertEqual(self.store.get(ISSUE)['last_event_id'], cursor)
+        self.bridge.flush()
+        self.assertEqual(self.authority.mutations, [])
+        self.assertNotEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
+        self.assertEqual(len(self.kanban.creates), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
