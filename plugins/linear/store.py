@@ -536,11 +536,12 @@ class Store:
                         or prior["payload"].get("native_completion") != proof
                         or prior["payload"].get("completion_reconcile_request_id") != request_id):
                     raise ValueError("Completion reconciliation UUID conflicts with an existing report")
-                return True
+                return not (prior["state"] == "sent" and prior["payload"].get("applied", 1) == 0)
             # Another exact request may already have captured this same result.
             # Reuse its pending, uncertain or applied effect instead of another send.
             existing = db.execute("SELECT payload FROM outbox WHERE kind='status' AND hold_reason IS NULL "
-                                  "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.state')='done'",
+                                  "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.state')='done' "
+                                  "AND NOT (state='sent' AND COALESCE(json_extract(payload,'$.applied'),1)=0)",
                                   (issue_id,)).fetchall()
             if not any(json.loads(row[0]).get("native_completion") == proof for row in existing):
                 writes = [(kind, {**payload, "completion_reconcile_request_id": request_id} if kind == "status" else payload)

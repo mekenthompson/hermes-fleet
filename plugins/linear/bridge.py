@@ -1124,13 +1124,13 @@ class Bridge:
                 if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                         adapter.board or "default", owner_ref=session_id,
                         project_id=(current.get("project") or {}).get("id"),
-                        completion_scope=self._completion_scope(adapter, task), at=stamp):
+                        completion_scope=self._completion_scope(adapter, task, "progress"), at=stamp):
                     return False
                 adapter.subscribe(task.id, issue_id, issue=current)
                 self._pending_assignment_stop(self.store.get(issue_id))
                 task = adapter.require_task(task.id)
                 self.activity(issue_id, session_id, "thought",
-                    f"Existing native task linked on its original board; current state is {task.status}. No replacement worker was created or work resumed. Follow-ups use this task; native controls and effect reconciliation remain authoritative.")
+                    f"Existing native task linked for progress on its original board; current state is {task.status}. Discovery does not verify completion of the issue outcome. Inspect acceptance before reconciling an outcome link. No replacement worker was created or work resumed; native controls remain authoritative.")
                 return True
         context = "\n\n".join(x for x in (fresh.get("description") or "", self._thread(issue_id, until_ms=stamp), prompt) if x)
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
@@ -1358,6 +1358,13 @@ class Bridge:
         fields["completion_contract"] = fields["completion_contract"] or "local-only"
         specified = []
         for event in adapter.history(task.id, 0):
+            if event.kind == "edited":
+                # Core can combine a scope edit with result backfill while
+                # listing only result/summary in fields. Every edited event
+                # versions acceptance; restoring old text cannot undo it.
+                native_event_payload(event)
+                specified.append(event.id)
+                continue
             if event.kind != "specified":
                 continue
             changed = native_event_payload(event).get("changed_fields") or []
