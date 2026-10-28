@@ -59,6 +59,8 @@ Linear assignment creates and admits a fully populated outcome task automaticall
 
 The existing binding records the accepted native title, body and completion-contract digest
 and specification-event version. Normal comments and follow-ups do not change that boundary.
+A native edit also versions acceptance, including result backfill: restoring the previous
+text cannot silently restore completion eligibility.
 A missing boundary or a later specification change holds automatic issue completion while
 native work and ordinary reporting continue. A finished stage reports its bounded summary;
 it does not imply the human outcome is Done. After inspecting the issue acceptance and actual
@@ -72,6 +74,9 @@ to that guarded outcome replacement after inspecting acceptance and evidence. Th
 durably queues only its verified completion through the existing outbox, without another
 executor or replaying earlier progress. Retry the exact request after a lost response; queued
 reporting still requires destination readback. This does not authorize closing a partial stage.
+An exact request known not to have applied is not retimed or treated as delivered. After
+inspecting current state, a fresh deliberate reporting request can repair that known result;
+pending, uncertain and applied effects retain their original request and are not duplicated.
 
 For an explicit chat takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder
@@ -101,7 +106,9 @@ Before creating work, a validated assignment inspects existing native boards in 
 A task's `linear:<issue id>` retry key or explicit `Linear issue <id or identifier>: <issue URL>`
 body line identifies existing work to inspect. A unique task with that explicit issue link,
 assigned to the verified local executor, is linked on its original board; subsequent follow-ups
-steer that task. A retry key alone cannot authorize adoption of manual work. Linking
+steer that task. Discovered work reports progress until its actual acceptance is inspected and
+the agent deliberately reconciles an outcome link; a matching issue marker cannot promote a
+completed preparation stage into the full human outcome. A retry key alone cannot authorize adoption of manual work. Linking
 does not resume stopped work or restart completed work. Several matching tasks, a different
 executor, or an unavailable existing board require scoped inspection, never a replacement
 worker or access to another profile's private state. A conflicting configured project
