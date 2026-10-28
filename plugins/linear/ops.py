@@ -152,7 +152,8 @@ def setup(parser: Any) -> None:
     inspect_work.add_argument("--reference-json", required=True, help="Complete work_reference result's reference object")
     cleanup = sub.add_parser("inspect-cleanup", help="Read cleanup evidence for one currently bound stopped issue; grants no permissions")
     cleanup.add_argument("issue_id")
-    cleanup.add_argument("--expected-stop-event-id", required=True, type=int)
+    cleanup.add_argument("--expected-stop-event-id", required=True, type=int,
+                         help="Latest native blocked or block_loop_detected pause event, not a later worker-result event")
     cleanup.add_argument("--issue-json", help="Optional independently inspected issue id/identifier/url for native marker discovery; grants no permission")
 
 def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None, origin_api=None) -> int:

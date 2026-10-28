@@ -130,6 +130,19 @@ def _namespace_disposition(ingress, home, deployment_profile, native_profile, ep
     return {"epoch": epoch, "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def _loop_pause_payload(payload):
+    """Recognize the native needs-input recurrence guard, never arbitrary TRIAGE."""
+    from hermes_cli.kanban_db import BLOCK_RECURRENCE_LIMIT
+    return (set(payload) == {"kind", "source_status", "reason", "recurrences", "limit"}
+            and payload.get("kind") == "needs_input"
+            and payload.get("source_status") in {"ready", "review"}
+            and isinstance(payload.get("reason"), str) and bool(payload["reason"])
+            and type(payload.get("recurrences")) is int
+            and type(payload.get("limit")) is int
+            and payload["limit"] == BLOCK_RECURRENCE_LIMIT
+            and payload["recurrences"] >= payload["limit"])
+
+
 def _control_only_run(run, events, native_profile, stop_id):
     """Recognize only the native block writer's never-claimed zero-duration row.
 
@@ -148,9 +161,11 @@ def _control_only_run(run, events, native_profile, stop_id):
                 "worker_started_at", "max_runtime_seconds", "last_heartbeat_at", "metadata", "error"))):
         return False
     linked = [event for event in events if event["run_id"] == run["id"]]
-    if len(linked) != 1 or linked[0]["kind"] != "blocked" or linked[0]["id"] > stop_id:
+    if len(linked) != 1 or linked[0]["kind"] not in {"blocked", "block_loop_detected"} or linked[0]["id"] > stop_id:
         return False
     payload = json.loads(linked[0]["payload"])
+    if linked[0]["kind"] == "block_loop_detected":
+        return _loop_pause_payload(payload) and payload["reason"] == run["summary"]
     return (set(payload) == {"kind", "source_status", "reason", "recurrences"}
             and payload.get("kind") == "needs_input" and payload.get("source_status") in {"ready", "review"}
             and type(payload.get("recurrences")) is int and 0 < payload["recurrences"] < BLOCK_RECURRENCE_LIMIT
@@ -494,7 +509,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 _require(kb._lossy_text(key["native_key"]) != bound["task_id"] or key["selected"] == 1,
                          "native_task_predicate_ambiguous")
         task = board.execute("SELECT * FROM tasks WHERE id=?", (bound["task_id"],)).fetchone()
-        _require(task and task["status"] == "blocked" and task["block_kind"] == "needs_input"
+        _require(task and task["status"] in {"blocked", "triage"} and task["block_kind"] == "needs_input"
                  and task["current_run_id"] is None and task["claim_lock"] is None
                  and task["assignee"] == native_profile, "task_not_currently_stopped")
         owned_runs = {int(row["id"]) for row in board.execute("SELECT id FROM task_runs WHERE task_id=?", (task["id"],))}
@@ -509,11 +524,22 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      "attempt_event_task_mismatch")
         events = [{"id": event.id, "run_id": event.run_id, "kind": event.kind,
                    "payload": json.dumps(native_event_payload(event))} for event in reader.history_rows(board, task["id"])]
-        stops = [e for e in events if e["kind"] == "blocked"]
+        stops = [e for e in events if e["kind"] in {"blocked", "block_loop_detected"}]
         _require(stops and stops[-1]["id"] == stop_id
                  and json.loads(stops[-1]["payload"]).get("kind") == "needs_input", "stop_event_changed")
         runs = board.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task["id"],)).fetchall()
         by_run = {run["id"]: run for run in runs}
+        stop = stops[-1]
+        if task["status"] == "triage":
+            payload = json.loads(stop["payload"])
+            paused = by_run.get(stop["run_id"])
+            _require(stop["kind"] == "block_loop_detected" and _loop_pause_payload(payload)
+                     and type(task["block_recurrences"]) is int
+                     and task["block_recurrences"] == payload["recurrences"]
+                     and paused is not None and paused["status"] == paused["outcome"] == "blocked"
+                     and paused["summary"] == payload["reason"], "native_loop_pause_unproven")
+        else:
+            _require(stop["kind"] == "blocked", "stop_event_changed")
         bindings = [e for e in events if e["kind"] == "owner_admitted"]
         workers = [e for e in events if e["kind"] in {"spawned", "worker_registered", "worker_bound"}]
         _require(bindings and all(e["id"] < stop_id for e in bindings), "admission_after_stop_or_missing")

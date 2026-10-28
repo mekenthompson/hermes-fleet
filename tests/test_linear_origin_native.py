@@ -517,6 +517,165 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             return await asyncio.to_thread(cleanup.inspect, self.linear_state, "issue-one", "default",
                                            self.stop_id if stop_id is None else stop_id, self.settings, metadata, ingress=ingress)
 
+    async def triage_cleanup_issue(self, *, control_only=False, settle_admission=True):
+        """Reach the recurrence fence with real native writers in the guarded fixture."""
+        from hermes_cli import kanban_db as kb
+        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+            mutate_worker_execution, settle_session_input)
+        await self.stopped_issue()
+        self.first_stop_id = self.stop_id
+        self.assertTrue(kb.unblock_task(self.board, self.task_id, expected_event_id=self.stop_id))
+        if not control_only:
+            await self.kanban(existing=True)
+            args = dict(epoch=self.authority.epoch, execution_id="admission-worker:" + self.admission,
+                        session_id=self.sid, generation=self.row["generation"])
+            register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-loop-adoption")
+            adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-loop-adoption")
+            mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
+            if settle_admission:
+                settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                                     generation=self.row["generation"], outcome="interrupted")
+            with kb.write_txn(self.board):
+                # Preserve the first attempt's claim and every retained worker.
+                self.board.execute("UPDATE task_events SET payload=? WHERE kind='worker_bound' AND run_id=?",
+                    (json.dumps({"pid": 99999998, "started_at": self.process_witness(1),
+                                 "claim_lock": self.work_context["claim_lock"]}), self.work_context["run_id"]))
+                kb._append_event(self.board, self.task_id, "spawned",
+                                 {"pid": 99999999, "started_at": self.process_witness(2)},
+                                 run_id=self.work_context["run_id"])
+                self.board.execute("UPDATE task_runs SET worker_pid=99999999,worker_started_at=? WHERE id=?",
+                                   (self.process_witness(2), self.work_context["run_id"]))
+        latest = kb.list_events(self.board, self.task_id)[-1].id
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="fixture recurring pause",
+                                     expected_event_id=latest,
+                                     expected_run_id=None if control_only else self.work_context["run_id"]))
+        event = kb.list_events(self.board, self.task_id)[-1]
+        self.stop_id = event.id
+        self.assertEqual(event.kind, "block_loop_detected")
+        task = kb.get_task(self.board, self.task_id)
+        self.assertEqual((task.status, task.block_kind, task.block_recurrences),
+                         ("triage", "needs_input", kb.BLOCK_RECURRENCE_LIMIT))
+        return event
+
+    async def test_cleanup_triage_admitted_native_loop_uses_pause_anchor_without_writes(self):
+        from hermes_cli import kanban_db as kb
+        loop = await self.triage_cleanup_issue()
+        with kb.write_txn(self.board):
+            kb._append_event(self.board, self.task_id, "worker_result",
+                {"pid": 99999998, "claim_lock": self.work_context["claim_lock"], "exit_code": 130,
+                 "last_output": "Finite interrupted fixture"}, run_id=loop.run_id)
+        result_id = kb.list_events(self.board, self.task_id)[-1].id
+        before = {table: [tuple(row) for row in self.board.execute("SELECT * FROM " + table)]
+                  for table in ("tasks", "task_runs", "task_events")}
+        admissions = self.authority.db._read_all("SELECT * FROM session_admissions")
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertFalse(evidence["permission_granted"])
+        self.assertEqual((evidence["stop_event_id"], evidence["latest_event_id"]), (loop.id, result_id))
+        self.assertEqual(len(evidence["attempts"]), 2)
+        self.assertEqual(evidence["control_only_runs"], [])
+        for selector in (self.first_stop_id, result_id):
+            rejected = await self.cleanup_inspected(stop_id=selector)
+            self.assertFalse(rejected["quiescence_proven"])
+            self.assertFalse(rejected["permission_granted"])
+        for table, rows in before.items():
+            self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], rows)
+        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), admissions)
+
+    async def test_cleanup_triage_queued_loop_recognizes_only_strict_control_cohort(self):
+        loop = await self.triage_cleanup_issue(control_only=True)
+        control = self.board.execute("SELECT * FROM task_runs WHERE id=?", (loop.run_id,)).fetchone()
+        self.assertEqual((control["status"], control["outcome"], control["claim_lock"]), ("blocked", "blocked", None))
+        self.assertEqual(control["started_at"], control["ended_at"])
+        self.assertEqual(self.board.execute("SELECT COUNT(*) FROM task_events WHERE run_id=?",
+                                           (loop.run_id,)).fetchone()[0], 1)
+        evidence = await self.cleanup_inspected()
+        self.assertTrue(evidence["quiescence_proven"], evidence)
+        self.assertFalse(evidence["permission_granted"])
+        self.assertEqual(evidence["control_only_runs"], [loop.run_id])
+        self.assertEqual(len(evidence["attempts"]), 1)
+        for key, value in (("claim_lock", "unproved-claim"), ("worker_pid", 99999999),
+                           ("profile", "foreign"), ("ended_at", control["ended_at"] + 1)):
+            with self.subTest(field=key):
+                self.board.execute(f"UPDATE task_runs SET {key}=? WHERE id=?", (value, loop.run_id))
+                try:
+                    held = await self.cleanup_inspected()
+                    self.assertFalse(held["quiescence_proven"])
+                    self.assertFalse(held["permission_granted"])
+                finally:
+                    self.board.execute(f"UPDATE task_runs SET {key}=? WHERE id=?", (control[key], loop.run_id))
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_triage_loop_rejects_malformed_payload_and_counter_lookalikes(self):
+        from hermes_cli import kanban_db as kb
+        loop = await self.triage_cleanup_issue()
+        original = json.dumps(loop.payload)
+        payload = loop.payload
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        changes = ({key: value for key, value in payload.items() if key != "limit"},
+                   {**payload, "unexpected": True}, {**payload, "kind": "dependency"},
+                   {**payload, "source_status": "running"}, {**payload, "reason": ""},
+                   {**payload, "recurrences": True}, {**payload, "recurrences": kb.BLOCK_RECURRENCE_LIMIT - 1},
+                   {**payload, "recurrences": kb.BLOCK_RECURRENCE_LIMIT + 1},
+                   {**payload, "limit": True}, {**payload, "limit": kb.BLOCK_RECURRENCE_LIMIT + 1})
+        for changed in changes:
+            with self.subTest(payload=changed):
+                self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(changed), loop.id))
+                try:
+                    held = await self.cleanup_inspected()
+                    self.assertFalse(held["quiescence_proven"])
+                    self.assertFalse(held["permission_granted"])
+                finally:
+                    self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (original, loop.id))
+        self.board.execute("UPDATE tasks SET block_recurrences=? WHERE id=?",
+                           (kb.BLOCK_RECURRENCE_LIMIT + 1, self.task_id))
+        self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_triage_manual_status_without_native_loop_anchor_is_unknown(self):
+        await self.stopped_issue()
+        self.board.execute("UPDATE tasks SET status='triage' WHERE id=?", (self.task_id,))
+        held = await self.cleanup_inspected()
+        self.assertFalse(held["quiescence_proven"])
+        self.assertFalse(held["permission_granted"])
+
+    async def test_cleanup_triage_loop_still_requires_canonical_admission_settlement(self):
+        from hermes_state_runtime import settle_session_input
+        await self.triage_cleanup_issue(settle_admission=False)
+        held = await self.cleanup_inspected()
+        self.assertFalse(held["quiescence_proven"])
+        self.assertFalse(held["permission_granted"])
+        self.assertEqual(held["reason"], "native_admission_not_settled")
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                             generation=self.row["generation"], outcome="interrupted")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
+    async def test_cleanup_triage_loop_late_worker_binding_is_unknown(self):
+        from hermes_cli import kanban_db as kb
+        loop = await self.triage_cleanup_issue()
+        with kb.write_txn(self.board):
+            kb._append_event(self.board, self.task_id, "worker_registered",
+                             {"pid": 99999997, "started_at": self.process_witness(3)}, run_id=loop.run_id)
+        held = await self.cleanup_inspected()
+        self.assertFalse(held["quiescence_proven"])
+        self.assertFalse(held["permission_granted"])
+        self.assertEqual(held["reason"], "late_worker_binding_after_stop")
+
+    async def test_cleanup_triage_loop_rechecks_native_history_during_owner_receipt(self):
+        from hermes_cli import kanban_db as kb
+        loop = await self.triage_cleanup_issue()
+        def arriving(_method, _params):
+            self.before_rpc = None
+            with kb.write_txn(self.board):
+                kb._append_event(self.board, self.task_id, "worker_result",
+                                 {"pid": 99999998, "claim_lock": self.work_context["claim_lock"], "exit_code": 130},
+                                 run_id=loop.run_id)
+        self.before_rpc = arriving
+        held = await self.cleanup_inspected()
+        self.assertFalse(held["quiescence_proven"])
+        self.assertFalse(held["permission_granted"])
+        self.assertEqual(held["reason"], "cleanup_evidence_changed")
+        self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+
     def reap_fixture_terminal_workers(self):
         from hermes_cli import kanban_db_dispatch as dispatcher
         import time

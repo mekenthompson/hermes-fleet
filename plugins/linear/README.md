@@ -435,6 +435,13 @@ the owner-only command inside the old work's fixed approved deployment:
 hermes --profile default linear inspect-cleanup <issue-id> --expected-stop-event-id <stop-event-id>
 ```
 
+Use the latest native `blocked` or `block_loop_detected` pause event as the anchor;
+a later `worker_result` is settlement evidence, not the pause. A needs-input
+recurrence guard can leave the task in TRIAGE. Inspection recognizes only that
+verified native loop pause, with matching counters and a settled blocked run,
+and retains every admission, process and scope check. Leave the TRIAGE fence in
+place while inspecting; cleanup evidence grants no execution permission.
+
 It derives the board/task from the current saved native reporting link. If the link is absent
 or retained legacy data, it inspects existing native history using the same issue-matching
 rules as ordinary discovery, without creating or adopting a reporting link. Optional
