@@ -16,6 +16,7 @@ API is required. The plugin is disabled by default.
 | Action | Result |
 | --- | --- |
 | `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
+| `track` with `completion_scope: progress` | Report an internal stage without completing the issue. The default `outcome` means the task covers the agreed human outcome. |
 | `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
 | `status` with `issue` | Read the issue, bounded recent comment evidence, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. Starts no work. |
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
@@ -49,6 +50,28 @@ cancellation and routing. Questions, short commands and bounded investigations w
 Linear. To continue active linked work, resolve its task and send a native operator comment;
 opening another conversation does not replace its executor. Passive progress uses native
 notification subscriptions with `notify`, never `wake` as an execution workaround.
+
+The agent finalizes the full native task scope before tracking and admitting chat-origin
+work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
+(the default); use `progress` for preparation, a hold, or another internal stage. The agent
+manages this distinction without asking the user to maintain task IDs or activate reporting.
+Linear assignment creates and admits a fully populated outcome task automatically.
+
+The existing binding records the accepted native title, body and completion-contract digest
+and specification-event version. Normal comments and follow-ups do not change that boundary.
+A missing boundary or a later specification change holds automatic issue completion while
+native work and ordinary reporting continue. A finished stage reports its bounded summary;
+it does not imply the human outcome is Done. After inspecting the issue acceptance and actual
+work, the agent can reconcile the link through the existing `track` replacement and its fresh
+binding revision. Queued completion writes recheck that same accepted scope before delivery.
+Previously captured progress remains history: reconciling a link does not restart a worker,
+rewind its reporting cursor, or republish an earlier completion. Preserve a completed partial
+task and deliberately continue only the remaining outcome through native controls and tracking.
+If the entire outcome really is already complete, the agent can add `reconcile_complete: true`
+to that guarded outcome replacement after inspecting acceptance and evidence. The same UUID
+durably queues only its verified completion through the existing outbox, without another
+executor or replaying earlier progress. Retry the exact request after a lost response; queued
+reporting still requires destination readback. This does not authorize closing a partial stage.
 
 For an explicit chat takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder

@@ -55,7 +55,7 @@ Optional, **disabled by default**. They exist so isolation does not mean a dumb 
 
 ### Linear
 
-`plugins/linear/` links meaningful outcomes to native Hermes tasks and reports their progress through a durable outbox. Native Hermes owns execution, permissions, worker claims, recovery and Stop. Ordinary chat and authorized issue operations need no Linear claim or task link. Cross-channel follow-ups reach the existing native task without transfer phrases or another executor. The mounted plugin can also expose and independently inspect one exact current native request without granting control permission. It preserves legacy records and uncertain effects for reconciliation. It remains disabled by default; identities, scopes and reporting routes are overlay configuration. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
+`plugins/linear/` links meaningful outcomes to native Hermes tasks and reports their progress through a durable outbox. A completed internal stage does not close the human issue; outcome completion remains bound to the accepted native specification. Native Hermes owns execution, permissions, worker claims, recovery and Stop. Ordinary chat and authorized issue operations need no Linear claim or task link. Cross-channel follow-ups reach the existing native task without transfer phrases or another executor. The mounted plugin can also expose and independently inspect one exact current native request without granting control permission. It preserves legacy records and uncertain effects for reconciliation. It remains disabled by default; identities, scopes and reporting routes are overlay configuration. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
 
 ### Browser handoff
 

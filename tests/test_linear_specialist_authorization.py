@@ -170,6 +170,13 @@ class FakeKanban:
     def history(self, task_id, after_id):
         return [event for event in self.histories.get(task_id, []) if event.id > after_id]
 
+    def record_completion(self, task, event_id):
+        """Seed an explicit synthetic native completion, independently of status."""
+        task.current_run_id = task.current_run_id or 1
+        self.histories.setdefault(task.id, []).append(SimpleNamespace(
+            id=event_id, kind="completed", created_at=int(time.time()),
+            run_id=task.current_run_id, payload={"summary": task.result}))
+
     def completion_summary(self, task):
         return task.result or ""
 
@@ -1193,8 +1200,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             with self.subTest(evidence_accepted=accepted):
                 issue_id = f"{ISSUE}-{accepted}"
                 self.authority.issues[issue_id] = issue_record(id=issue_id)
-                self.kanban.tasks["task"] = SimpleNamespace(id="task", status="done", completion_contract="https://docs.example/findings/1", result="Done", title="OPS-1: task", current_run_id=1, assignee="synthetic")
-                self.store.bind_native(issue_id, "task", "synthetic", "default", owner_ref=SESSION, project_id=PROJECT, at=0)
+                task = SimpleNamespace(id="task", status="ready", completion_contract="https://docs.example/findings/1", result="Done", title="OPS-1: task", current_run_id=1, assignee="synthetic")
+                self.kanban.tasks[task.id] = task
+                self.bridge.track(issue_id, task.id, requester_session=SESSION)
+                task.status = "done"
+                self.kanban.record_completion(task, 1)
                 before = self.store.get(issue_id)
                 def evidence_checked(_links, _contract, **_ignored):
                     self.authority.issues[issue_id] = issue_record(id=issue_id, project={"id": "project-foreign"})
@@ -1541,6 +1551,7 @@ class SessionRequesterTests(unittest.TestCase):
         task = self.kanban.tasks["task-1"]
         task.status, task.result = "done", "Synthetic result"
         self.kanban.evidence_text = lambda task: "https://example.test/findings"
+        self.kanban.record_completion(task, 99)
         self.bridge._finished(self.store.get(ISSUE), event_id=99)
         self.assertIsNotNone(self.store.get(ISSUE))
         self.authority.mutations.clear()
@@ -1631,6 +1642,7 @@ class SessionRequesterTests(unittest.TestCase):
         task = self.kanban.tasks["task-1"]
         task.status = "done"
         self.kanban.evidence_text = lambda task: "https://example.test/findings"
+        self.kanban.record_completion(task, 99)
         self.bridge._finished(self.store.get(ISSUE), event_id=99)
         self.authority.mutations.clear()
         other = "successor-session"
@@ -1719,7 +1731,8 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge.handle_webhook(self.session_event())
         task = self.kanban.tasks["task-1"]
         task.status, task.result = "done", "Verified synthetic result"
-        self.bridge._finished(self.store.get(ISSUE), event_id=1)
+        self.kanban.record_completion(task, 2)
+        self.bridge._finished(self.store.get(ISSUE), event_id=2)
         before = self.store.get(ISSUE)
         self.authority.mutations.clear()
         changed = []
@@ -1772,6 +1785,7 @@ class SessionRequesterTests(unittest.TestCase):
                     task = self.kanban.tasks["task-1"]
                     task.status = "done"
                     self.kanban.evidence_text = lambda task: "https://example.test/findings"
+                    self.kanban.record_completion(task, 99)
                     self.bridge._finished(self.store.get(ISSUE), event_id=99)
                     self.authority.mutations.clear()
                     changed, attempts = [], []
@@ -1817,6 +1831,7 @@ class SessionRequesterTests(unittest.TestCase):
                     task = self.kanban.tasks["task-1"]
                     task.status = "done"
                     self.kanban.evidence_text = lambda task: "https://example.test/findings"
+                    self.kanban.record_completion(task, 99)
                     self.bridge._finished(self.store.get(ISSUE), event_id=99)
                     self.bridge.project_update("task-1", PROJECT, "OPS-2", "Progress", quiet=False, issue_id=other)
                     changed, accepted, attempts = [], [], []

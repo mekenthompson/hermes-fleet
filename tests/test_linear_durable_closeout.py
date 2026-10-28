@@ -450,7 +450,7 @@ class DurableCloseoutTests(unittest.TestCase):
             store = Store(Path(directory) / 'state.db')
             kanban = FakeKanban()
             task = kanban.create(title='OPS-1: review')
-            task.status, task.result, task.completion_contract = 'done', None, 'local-only'
+            task.result, task.completion_contract = None, 'local-only'
             adapter = object.__new__(Kanban)
             database = sqlite3.connect(':memory:')
             self.addCleanup(database.close)
@@ -466,8 +466,10 @@ class DurableCloseoutTests(unittest.TestCase):
                 summary=row['summary'], metadata=None)))
             kanban.evidence_text = adapter.evidence_text
             kanban.completion_summary = adapter.completion_summary
-            store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
             bridge = Bridge(store, api, kanban, profile='synthetic')
+            bridge.track(ISSUE, task.id, requester_session=SESSION)
+            task.status = 'done'
+            kanban.record_completion(task, 1)
             bridge._finished(store.get(ISSUE), event_id=1)
             responses = [row['payload']['content'] for row in store.pending(ISSUE)
                          if row['kind'] == 'activity']
@@ -508,10 +510,12 @@ class DurableCloseoutTests(unittest.TestCase):
                 store = Store(Path(directory) / 'state.db')
                 kanban = FakeKanban()
                 task = kanban.create(title='OPS-1: review')
-                task.status, task.result, task.completion_contract = 'done', result, contract
+                task.result, task.completion_contract = result, contract
                 kanban.evidence_text = lambda task: evidence_text or task.result
-                store.bind_native(ISSUE, task.id, 'synthetic', 'default', owner_ref=SESSION, at=0)
                 bridge = Bridge(store, authority.api(), kanban, profile='synthetic')
+                bridge.track(ISSUE, task.id, requester_session=SESSION)
+                task.status = 'done'
+                kanban.record_completion(task, 1)
                 with patch.object(bridge, 'accepted_evidence', return_value=contract == 'local-only'):
                     bridge._finished(store.get(ISSUE), event_id=1)
                 pending = store.pending(ISSUE)
