@@ -512,8 +512,9 @@ class Store:
                 "revision": self._binding_revision(issue_id, self._binding_snapshot(db, issue_id))})
             return dict(binding)
     def reconcile_completion(self, issue_id: str, request_id: str, event_id: int,
-                             writes: list[tuple[str, dict]], *, at: float) -> bool:
-        """Publish only an explicitly reconciled result; never rewind native history."""
+                             writes: list[tuple[str, dict]], *, at: float,
+                             status_required: bool = True) -> bool:
+        """Repair missing delivery components without repeating native work or applied effects."""
         key = f"track:{issue_id}:{request_id}"
         with self._tx() as db:
             saved = self.native_intent(key)
@@ -536,14 +537,54 @@ class Store:
                         or prior["payload"].get("native_completion") != proof
                         or prior["payload"].get("completion_reconcile_request_id") != request_id):
                     raise ValueError("Completion reconciliation UUID conflicts with an existing report")
-                return not (prior["state"] == "sent" and prior["payload"].get("applied", 1) == 0)
-            # Another exact request may already have captured this same result.
-            # Reuse its pending, uncertain or applied effect instead of another send.
-            existing = db.execute("SELECT payload FROM outbox WHERE kind='status' AND hold_reason IS NULL "
+                if prior["state"] == "sent" and prior["payload"].get("applied", 1) == 0:
+                    return False  # Exact requests never acquire a newer reporting timestamp.
+            existing = db.execute("SELECT * FROM outbox WHERE kind='status' "
                                   "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.state')='done' "
-                                  "AND NOT (state='sent' AND COALESCE(json_extract(payload,'$.applied'),1)=0)",
+                                  "AND NOT (state='sent' AND COALESCE(json_extract(payload,'$.applied'),1)=0) "
+                                  "ORDER BY CASE WHEN state='sent' AND json_extract(payload,'$.applied')=1 "
+                                  "THEN 0 WHEN hold_reason IS NULL THEN 1 ELSE 2 END, rowid DESC",
                                   (issue_id,)).fetchall()
-            if not any(json.loads(row[0]).get("native_completion") == proof for row in existing):
+            reusable = prior
+            if reusable is None:
+                for raw in existing:
+                    candidate = {**dict(raw), "payload": json.loads(raw["payload"])}
+                    if candidate["payload"].get("native_completion") != proof:
+                        continue
+                    applied = candidate["state"] == "sent" and candidate["payload"].get("applied") == 1
+                    if status_required and applied:
+                        continue  # A reopened issue needs a current authorized status intent.
+                    reusable = candidate
+                    break
+            if reusable is not None:
+                applied = reusable["state"] == "sent" and reusable["payload"].get("applied") == 1
+                if reusable.get("hold_reason") and not applied:
+                    return False  # A held or uncertain status is never a delivery receipt.
+                for kind, payload in writes:
+                    if kind != "comment" or not payload.get("assessment"):
+                        continue
+                    if self.assessment_comment_id(issue_id, payload["body"], completion=proof):
+                        continue
+                    current = self.outbox_row(payload["id"])
+                    if current:
+                        if (current["kind"] != "comment" or current["payload"].get("issue_id") != issue_id
+                                or current["payload"].get("body") != payload["body"]
+                                or current["payload"].get("completion_reconcile_request_id") != request_id):
+                            raise ValueError("Completion reconciliation UUID conflicts with an existing report")
+                        if current["state"] == "sent" and current["payload"].get("applied", 1) == 0:
+                            return False
+                        continue
+                    sibling = {**payload, "native_completion": proof,
+                               "completion_reconcile_request_id": request_id,
+                               "source_ms": saved["payload"]["at"]}
+                    dependency = "reconciled_status_id" if reusable.get("hold_reason") else "requires_status_id"
+                    sibling[dependency] = reusable["id"]
+                    if not self.enqueue("comment", sibling, at=at):
+                        return False
+            else:
+                writes = [(kind, payload) for kind, payload in writes
+                          if not (kind == "comment" and payload.get("assessment")
+                                  and self.assessment_comment_id(issue_id, payload["body"], completion=proof))]
                 writes = [(kind, {**payload, "completion_reconcile_request_id": request_id} if kind == "status" else payload)
                           for kind, payload in writes]
                 if not self.finish(issue_id, writes, at=at, status_id=request_id):
@@ -662,6 +703,9 @@ class Store:
                 if kind != "status":
                     payload = {**payload, "requires_status_id": status_id}
                 if kind == "project_update":
+                    # Project batches have their own queue: an older coalesced batch
+                    # may depend on a newer status without blocking that status.
+                    payload["issue_id"] = f"update:{payload['session_id']}:{payload['project_id'] or issue_id}"
                     payload["terminal_lines"] = {ident: status_id for ident in payload["lines"]}
                     existing = db.execute("SELECT * FROM outbox WHERE kind = 'project_update' AND hold_reason IS NULL AND "
                                           "json_extract(payload, '$.session_id') = ? AND "
@@ -740,15 +784,35 @@ class Store:
                                    "(? IS NULL OR json_extract(payload, '$.issue_id')=?) AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
                                    "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id, issue_id, issue_id)).fetchone())
-    def assessment_comment_id(self, issue_id: str, body: str) -> str | None:
+    def assessment_comment_id(self, issue_id: str, body: str, *, completion: dict | None = None) -> str | None:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
-            row = db.execute("SELECT id FROM outbox WHERE hold_reason IS NULL AND kind='comment' AND "
-                             "json_extract(payload, '$.issue_id')=? AND "
-                             "json_extract(payload, '$.assessment')=1 AND "
-                             "json_extract(payload, '$.body')=? AND state IN ('sent', 'pending') LIMIT 1",
-                             (issue_id, body)).fetchone()
-        return str(row["id"]) if row else None
+            rows = db.execute("SELECT * FROM outbox WHERE kind='comment' AND "
+                              "json_extract(payload, '$.issue_id')=? AND "
+                              "json_extract(payload, '$.assessment')=1 AND "
+                              "json_extract(payload, '$.body')=? AND state IN ('sent', 'pending', 'failed') "
+                              "ORDER BY CASE WHEN state='sent' AND json_extract(payload,'$.applied')=1 "
+                              "THEN 0 ELSE 1 END, rowid DESC", (issue_id, body)).fetchall()
+            for raw in rows:
+                row = {**dict(raw), "payload": json.loads(raw["payload"])}
+                payload = row["payload"]
+                if row["state"] == "sent" and payload.get("applied", 1) == 0:
+                    continue
+                if row["state"] == "failed" and not self.uncertain(row, payload):
+                    continue
+                dependency = self.outbox_row(payload.get("requires_status_id") or payload.get("reconciled_status_id") or "")
+                if (dependency and dependency["state"] == "sent"
+                        and dependency["payload"].get("applied", 1) == 0
+                        and not self.uncertain(row, payload)):
+                    continue  # An unattempted sibling cannot publish behind a known-unapplied status.
+                if row.get("hold_reason"):
+                    source = dependency
+                    if (not completion or not source or source["kind"] != "status"
+                            or source["payload"].get("issue_id") != issue_id
+                            or source["payload"].get("native_completion") != completion):
+                        continue
+                return str(row["id"])
+        return None
     def superseded(self, row: dict[str, Any]) -> bool:
         payload, owner = row["payload"], row["payload"].get("work_owner")
         with self._tx() as db:

@@ -518,7 +518,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 kanban.record_completion(task, 1)
                 with patch.object(bridge, 'accepted_evidence', return_value=contract == 'local-only'):
                     bridge._finished(store.get(ISSUE), event_id=1)
-                pending = store.pending(ISSUE)
+                pending = store.pending()  # Project batches use their own queue; inspect all captured components.
                 status = next(row['payload']['state'] for row in pending if row['kind'] == 'status')
                 self.assertEqual(status, 'done' if done else 'blocked')
                 self.assertEqual(any(row['kind'] == 'project_update' for row in pending), done)

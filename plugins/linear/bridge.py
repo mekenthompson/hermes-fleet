@@ -1441,15 +1441,42 @@ class Bridge:
             if payload.get("terminal") and payload.get("state") == "done":
                 self._require_completion_report(payload)
             return
+        if row["kind"] == "comment" and payload.get("assessment") and payload.get("completion_reconcile_request_id"):
+            self._require_assessment_repair(payload)
         # Completion messages and batched project lines already name their
         # exact terminal status dependency. Reuse it instead of another ledger
         # or a batch-wide token that could hold an unrelated issue's progress.
-        ids = {payload.get("requires_status_id"), *(payload.get("terminal_lines") or {}).values()} - {None, ""}
+        ids = {payload.get("requires_status_id"), payload.get("reconciled_status_id"),
+               *(payload.get("terminal_lines") or {}).values()} - {None, ""}
         for status_id in ids:
             status = self.store.outbox_row(status_id)
             source = status["payload"] if status else {}
             if source.get("issue_id") in selected and source.get("terminal") and source.get("state") == "done":
                 self._require_completion_report(source)
+
+    def _require_assessment_repair(self, payload: dict) -> None:
+        """Old applied status is a delivery fact, never the new caller's authority."""
+        issue_id = payload["issue_id"]
+        saved = self.store.native_intent(f"track:{issue_id}:{payload['completion_reconcile_request_id']}") or {}
+        request = saved.get("payload", {}).get("request", {})
+        if (saved.get("state") != "applied" or request.get("reconcile_complete") is not True
+                or request.get("binding") != self.store.native_binding(issue_id)
+                or payload.get("source_ms") != saved.get("payload", {}).get("at")):
+            raise LinearError("Assessment repair no longer matches its current reporting request", retryable=False)
+        self._require_completion_report(payload)
+        if payload.get("reconciled_status_id"):
+            prior = self.store.outbox_row(payload["reconciled_status_id"])
+            if (not prior or prior["kind"] != "status" or prior["state"] != "sent"
+                    or prior["payload"].get("applied") != 1
+                    or prior["payload"].get("issue_id") != issue_id
+                    or prior["payload"].get("native_completion") != payload.get("native_completion")):
+                raise LinearError("Assessment repair has no matching applied completion acknowledgement", retryable=False)
+        issue = self._effect_issue(issue_id)
+        if iso_ms(issue.get("updatedAt")) > float(payload["source_ms"]):
+            receipt = self.store.native_status_receipt(issue_id, payload["task_id"])
+            if (not self._receipt_scope(payload, receipt)
+                    or receipt["issue"] != self._issue_version(issue)):
+                raise LinearError("Human changed issue after assessment repair; publication held", retryable=False)
 
     def native_status(self, issue_id: str) -> dict:
         # Observe the revision before subsequent state reads. A concurrent change
@@ -1867,13 +1894,16 @@ class Bridge:
             source_ms = intent.get("payload", {}).get("at")
         else:
             source_ms = source * 1000 if source is not None else None
-        writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source_ms} if kind == "status" and source_ms is not None else {})})
+        writes = [(kind, {**payload, **self._alert_route(row), **({"source_ms": source_ms} if source_ms is not None and
+                    (kind == "status" or reconcile_request_id is not None and payload.get("assessment")) else {})})
                   for kind, payload in self._report_writes(row, writes)]
         if reconcile_request_id is not None:
             for kind, payload in writes:
                 if kind == "status" and payload.get("state") == "done":
                     self._require_completion_report(payload)
-                    return self.store.reconcile_completion(issue_id, reconcile_request_id, event_id, writes, at=at)
+                    status_required = (self._effect_issue(issue_id).get("state") or {}).get("type") != "completed"
+                    return self.store.reconcile_completion(issue_id, reconcile_request_id, event_id, writes,
+                                                           at=at, status_required=status_required)
             return False
         # Cursor and reporting intents commit together, including completion.
         return self._capture_native_event(issue_id, event_id, writes, at=at)
@@ -1949,16 +1979,29 @@ class Bridge:
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads,
                               "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": "Assessment posted on the issue." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
+                                "content": {"type": "response", "body": "Assessment completed." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: "Assessment posted on the issue." if assessment else f"Done: {links or _project_summary(summary)}"},
+                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else f"Done: {links or _project_summary(summary)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
-        if assessment and not self.store.assessment_comment_id(issue_id, assessment):
-            writes.insert(2, ("comment", {
-                "id": stable_uuid4("assessment-comment", issue_id, hashlib.sha256(assessment.encode()).hexdigest()),
-                "issue_id": issue_id, "body": assessment, "assessment": True, "task_id": row["task_id"]}))
+        if assessment:
+            prior_id = self.store.assessment_comment_id(issue_id, assessment,
+                completion=completion if reconcile_request_id else None)
+            if prior_id and reconcile_request_id:
+                prior = self.store.outbox_row(prior_id)
+                if prior.get("hold_reason") and not (prior["state"] == "sent" and prior["payload"].get("applied") == 1):
+                    verify = getattr(self.api, "verify_comment", None)
+                    if not callable(verify) or not verify(prior_id, issue_id, assessment):
+                        raise LinearError("Prior assessment publication is held or uncertain; reconcile its exact comment before another publication", retryable=False)
+            if not prior_id:
+                comment_id = stable_uuid4("assessment-comment", issue_id,
+                    hashlib.sha256(assessment.encode()).hexdigest(),
+                    reconcile_request_id or f"{self._project_batch(binding)}:{completed.id}")
+                writes.insert(1, ("comment", {
+                    "id": comment_id, "issue_id": issue_id, "body": assessment, "assessment": True,
+                    "task_id": row["task_id"], "native_completion": completion,
+                    **({"completion_reconcile_request_id": reconcile_request_id} if reconcile_request_id else {})}))
         if not self.authorize_specialist_effect(issue_id): return
         return self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock(), event_id=event_id,
