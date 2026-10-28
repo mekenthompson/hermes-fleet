@@ -48,6 +48,11 @@ def main():
         # Packaged Hermes carries build provenance; a source checkout would probe git while
         # importing provider declarations. Use the already verified immutable fixture identity.
         sys.path.insert(0, str(source))
+        # Newer Core bootstraps start a detached scratch-prune child process once per process. The
+        # proof's homes are fresh and their scratch empty, so mark this process already pruned; a
+        # Core without the flag ignores the attribute.
+        import hermes_constants
+        hermes_constants._scratch_pruned_once = True
         from hermes_cli import version_info
         version_info._cached_version_info = version_info.VersionInfo("fixture", "fixture", 0, actual, None, "ci")
         suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_origin*_native.py")
