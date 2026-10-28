@@ -12,6 +12,9 @@ SCHEMA = {
     "description": (
         "Read Linear status, link an existing native task for reporting, or edit issues and projects. "
         "track requires issue and task_id and never starts, claims, resumes or transfers work. "
+        "Use completion_scope=progress for an internal stage; outcome (default) means this task covers the agreed issue outcome. "
+        "Specification changes hold automatic issue completion until the agent inspects and reconciles the reporting link. "
+        "For an already completed entire outcome, guarded replace with reconcile_complete=true queues its verified completion only; no worker or prior progress is replayed. "
         "After inspecting and coordinating native work, replace=true can replace only the reporting link; "
         "requires id and the exact binding_revision from status, and preserves prior history. "
         "status reads the issue, bounded recent comment evidence and native reporting state without starting work. "
@@ -34,6 +37,8 @@ SCHEMA = {
         "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
+        "completion_scope": {"type": "string", "enum": ["outcome", "progress"], "description": "track: outcome (default) can complete the agreed issue; progress reports an internal stage without closing it. Choose after inspecting acceptance; no execution grant."},
+        "reconcile_complete": {"type": "boolean", "description": "track with replace and outcome only: deliberately reconcile an already completed entire outcome after inspecting acceptance/evidence. Reuses this UUID; no native execution or historical progress replay. Queued reporting is not confirmed delivery."},
         "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},
         "replace": {"type": "boolean", "description": "track: explicitly replace a prior reporting link after inspecting actual work. Does not transfer execution or prove the old worker stopped."},
         "expected_binding_revision": {"type": "string", "description": "track with replace or delegate_self: exact native.binding_revision from a fresh status read."},
@@ -283,6 +288,8 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
                               requester_activity=(context.message_id if context.platform == "linear" and
                                   context.message_id != context.thread_id else None),
                               expected_revision=args.get("expected_binding_revision"),
+                              completion_scope=args.get("completion_scope", "outcome"),
+                              reconcile_complete=args.get("reconcile_complete", False),
                               request_id=_uuid(args.get("id")) if replace else None))
         if action == "followup":
             if context.delegated_child:

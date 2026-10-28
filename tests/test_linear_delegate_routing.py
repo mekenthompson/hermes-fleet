@@ -29,6 +29,10 @@ class InspectedBoard:
             raise LinearError("Unknown native task", retryable=False)
         return self.task
 
+    def history(self, task_id, after_id):
+        self.require_task(task_id)
+        return []  # This inspected, unmodified task has no specification events.
+
 
 class DelegateRoutingTests(unittest.TestCase):
     def setUp(self):

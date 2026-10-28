@@ -361,12 +361,14 @@ class Store:
         return binding
     def bind_native(self, issue_id: str, task_id: str, profile: str, board: str | None,
                     owner_ref: str = "", project_id: str | None = None, *,
-                    requester_activity: str | None = None, at: float) -> bool:
+                    requester_activity: str | None = None, completion_scope: dict | None = None, at: float) -> bool:
         """Link an inspected task without claiming, resuming or adopting legacy work."""
         if any(not isinstance(value, str) or not value.strip() for value in (issue_id, task_id, profile)):
             raise ValueError("native binding needs an issue, task and profile")
         binding = {"issue_id": issue_id, "task_id": task_id, "profile": profile,
                    "board": board or "default"}
+        if completion_scope is not None:
+            binding["completion_scope"] = self.validate_completion_scope(completion_scope)
         if requester_activity is not None:
             if not owner_ref or not isinstance(requester_activity, str) or not requester_activity or requester_activity == owner_ref:
                 raise ValueError("native reporting needs distinct session and Activity coordinates")
@@ -385,6 +387,17 @@ class Store:
             db.execute("INSERT INTO metadata (key,value) VALUES (?,?)",
                        (f"native-binding:{issue_id}", json.dumps(binding)))
             return True
+    @staticmethod
+    def validate_completion_scope(value: dict) -> dict:
+        """A reporting boundary, never permission to execute or a second task state."""
+        if (not isinstance(value, dict) or set(value) != {"mode", "task_spec_sha256", "specified_event_id"}
+                or not isinstance(value.get("mode"), str) or value["mode"] not in ("outcome", "progress")
+                or not isinstance(value.get("task_spec_sha256"), str)
+                or len(value["task_spec_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in value["task_spec_sha256"])
+                or type(value.get("specified_event_id")) is not int or value["specified_event_id"] < 0):
+            raise ValueError("Invalid native completion reporting scope")
+        return dict(value)
     @staticmethod
     def _binding_snapshot(db: sqlite3.Connection, issue_id: str) -> dict[str, Any]:
         work = db.execute("SELECT * FROM work WHERE issue_id=?", (issue_id,)).fetchone()
@@ -425,6 +438,7 @@ class Store:
     def replace_native_binding(self, issue_id: str, task_id: str, profile: str, board: str | None, *,
                                expected_revision: str, request_id: str, owner_ref: str = "",
                                project_id: str | None = None, requester_activity: str | None = None,
+                               completion_scope: dict | None = None, reconcile_complete: bool = False,
                                at: float) -> dict[str, Any] | None:
         """Explicitly replace reporting after caller inspection, never native execution.
 
@@ -447,12 +461,16 @@ class Store:
                 any(char not in "0123456789abcdef" for char in expected_revision)):
             raise ValueError("reporting replacement needs an inspected binding revision")
         binding = {"issue_id": issue_id, "task_id": task_id, "profile": profile, "board": board or "default"}
+        if completion_scope is not None:
+            binding["completion_scope"] = self.validate_completion_scope(completion_scope)
         if requester_activity is not None:
             if not owner_ref or not isinstance(requester_activity, str) or not requester_activity or requester_activity == owner_ref:
                 raise ValueError("native reporting needs distinct session and Activity coordinates")
             binding.update(requester_session_id=owner_ref, requester_activity_id=requester_activity)
         request = {"binding": binding, "expected_revision": expected_revision,
                    "owner_ref": owner_ref, "project_id": project_id}
+        if reconcile_complete:
+            request["reconcile_complete"] = True
         key = f"track:{issue_id}:{request_id}"
         with self._tx() as db:
             if not self._admitted(db, issue_id):
@@ -493,6 +511,44 @@ class Store:
             self.native_intent_settle(key, {"state": "applied", "binding": binding,
                 "revision": self._binding_revision(issue_id, self._binding_snapshot(db, issue_id))})
             return dict(binding)
+    def reconcile_completion(self, issue_id: str, request_id: str, event_id: int,
+                             writes: list[tuple[str, dict]], *, at: float) -> bool:
+        """Publish only an explicitly reconciled result; never rewind native history."""
+        key = f"track:{issue_id}:{request_id}"
+        with self._tx() as db:
+            saved = self.native_intent(key)
+            request = (saved or {}).get("payload", {}).get("request", {})
+            binding = request.get("binding")
+            if (not saved or saved.get("state") != "applied" or request.get("reconcile_complete") is not True
+                    or not binding or self.native_binding(issue_id) != binding
+                    or binding.get("completion_scope", {}).get("mode") != "outcome"):
+                return False
+            status = next((payload for kind, payload in writes if kind == "status"
+                           and payload.get("terminal") and payload.get("state") == "done"), None)
+            proof = (status or {}).get("native_completion") or {}
+            if (not status or type(event_id) is not int or event_id <= 0 or proof.get("event_id") != event_id
+                    or status.get("issue_id") != issue_id or proof.get("scope") != binding["completion_scope"]
+                    or any(proof.get(field) != binding[field] for field in ("task_id", "profile", "board"))):
+                return False
+            prior = self.outbox_row(request_id)
+            if prior:
+                if (prior["kind"] != "status" or prior["payload"].get("issue_id") != issue_id
+                        or prior["payload"].get("native_completion") != proof
+                        or prior["payload"].get("completion_reconcile_request_id") != request_id):
+                    raise ValueError("Completion reconciliation UUID conflicts with an existing report")
+                return True
+            # Another exact request may already have captured this same result.
+            # Reuse its pending, uncertain or applied effect instead of another send.
+            existing = db.execute("SELECT payload FROM outbox WHERE kind='status' AND hold_reason IS NULL "
+                                  "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.state')='done'",
+                                  (issue_id,)).fetchall()
+            if not any(json.loads(row[0]).get("native_completion") == proof for row in existing):
+                writes = [(kind, {**payload, "completion_reconcile_request_id": request_id} if kind == "status" else payload)
+                          for kind, payload in writes]
+                if not self.finish(issue_id, writes, at=at, status_id=request_id):
+                    return False
+            db.execute("UPDATE work SET last_event_id=MAX(last_event_id,?) WHERE issue_id=?", (event_id, issue_id))
+            return True
     def native_intent(self, key: str) -> dict[str, Any] | None:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-intent:{key}",)).fetchone()
@@ -580,7 +636,7 @@ class Store:
             db.execute("INSERT OR IGNORE INTO specialist_scope_fence (issue_id, reason, fenced_at) "
                        "VALUES (?, ?, ?)", (issue_id, reason[:500], at))
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float,
-               release: bool = False) -> bool:
+               release: bool = False, status_id: str | None = None) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
@@ -597,7 +653,7 @@ class Store:
                                        (payload["session_id"], payload["project_id"])).fetchone()
                     if prior and prior["state"] in ("pending", "failed") and not json.loads(prior["payload"]).get("frozen") \
                             and not self._admitted(db, *self._targets(json.loads(prior["payload"]))): return False
-            status_id = str(uuid.uuid4())
+            status_id = status_id or str(uuid.uuid4())
             for kind, payload in writes:
                 payload = {**payload, "work_owner": work["ownership_id"]}
                 row_id = status_id if kind == "status" else (
