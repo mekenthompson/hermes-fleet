@@ -16,6 +16,7 @@ API is required. The plugin is disabled by default.
 | Action | Result |
 | --- | --- |
 | `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
+| `track` with `completion_scope: progress` | Report an internal stage without completing the issue. The default `outcome` means the task covers the agreed human outcome. |
 | `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
 | `status` with `issue` | Read the issue, bounded recent comment evidence, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. Starts no work. |
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
@@ -50,6 +51,38 @@ Linear. To continue active linked work, resolve its task and send a native opera
 opening another conversation does not replace its executor. Passive progress uses native
 notification subscriptions with `notify`, never `wake` as an execution workaround.
 
+The agent finalizes the full native task scope before tracking and admitting chat-origin
+work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
+(the default); use `progress` for preparation, a hold, or another internal stage. The agent
+manages this distinction without asking the user to maintain task IDs or activate reporting.
+Linear assignment creates and admits a fully populated outcome task automatically.
+
+The existing binding records the accepted native title, body and completion-contract digest
+and specification-event version. Normal comments and follow-ups do not change that boundary.
+A native edit also versions acceptance, including result backfill: restoring the previous
+text cannot silently restore completion eligibility.
+A missing boundary or a later specification change holds automatic issue completion while
+native work and ordinary reporting continue. A finished stage reports its bounded summary;
+it does not imply the human outcome is Done. After inspecting the issue acceptance and actual
+work, the agent can reconcile the link through the existing `track` replacement and its fresh
+binding revision. Queued completion writes recheck that same accepted scope before delivery.
+Previously captured progress remains history: reconciling a link does not restart a worker,
+rewind its reporting cursor, or republish an earlier completion. Preserve a completed partial
+task and deliberately continue only the remaining outcome through native controls and tracking.
+If the entire outcome really is already complete, the agent can add `reconcile_complete: true`
+to that guarded outcome replacement after inspecting acceptance and evidence. The same UUID
+durably queues only its verified completion through the existing outbox, without another
+executor or replaying earlier progress. Retry the exact request after a lost response; queued
+reporting still requires destination readback. This does not authorize closing a partial stage.
+An exact request known not to have applied is not retimed or treated as delivered. After
+inspecting current state, a fresh deliberate reporting request can repair that known result;
+pending, uncertain and applied effects retain their original request and are not duplicated.
+Required specialist assessment delivery is repaired separately from issue status. A known
+unapplied recommendation needs a fresh authorized comment request; an applied status alone
+does not satisfy that delivery. Reusing its exact historical acknowledgement grants no new
+recipient authority. Held uncertain comments require exact readback rather than a duplicate
+publication, and earlier request coordinates and receipts remain intact.
+
 For an explicit chat takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder
 on the receiving agent. Read `status` and pass its exact binding revision, delegate ID
@@ -78,7 +111,9 @@ Before creating work, a validated assignment inspects existing native boards in 
 A task's `linear:<issue id>` retry key or explicit `Linear issue <id or identifier>: <issue URL>`
 body line identifies existing work to inspect. A unique task with that explicit issue link,
 assigned to the verified local executor, is linked on its original board; subsequent follow-ups
-steer that task. A retry key alone cannot authorize adoption of manual work. Linking
+steer that task. Discovered work reports progress until its actual acceptance is inspected and
+the agent deliberately reconciles an outcome link; a matching issue marker cannot promote a
+completed preparation stage into the full human outcome. A retry key alone cannot authorize adoption of manual work. Linking
 does not resume stopped work or restart completed work. Several matching tasks, a different
 executor, or an unavailable existing board require scoped inspection, never a replacement
 worker or access to another profile's private state. A conflicting configured project
