@@ -191,15 +191,18 @@ class FakeLinear:
                 comments = [
                     {"id": c.get("id"), "url": c.get("url"),
                      "body": c["body"], "createdAt": c.get("createdAt", self.clock.iso()),
+                     "updatedAt": c.get("updatedAt", c.get("createdAt", self.clock.iso())),
                      "user": {"id": c.get("author_id", SELF), "name": c.get("author", "Pat Example")}}
                     for c in self.comments if c.get("issueId") == issue["id"]]
                 # Linear connections are newest first; last selects the old end.
-                comments.sort(key=lambda c: c["createdAt"], reverse=True)
+                order = "updatedAt" if "orderBy: updatedAt" in query else "createdAt"
+                comments.sort(key=lambda c: c[order], reverse=True)
+                total = len(comments)
                 page = re.search(r"comments\((first|last): (\d+)", query)
                 if page:
                     count = int(page[2])
                     comments = comments[:count] if page[1] == "first" else comments[-count:]
-                issue["comments"] = {"nodes": comments}
+                issue["comments"] = {"nodes": comments, "pageInfo": {"hasNextPage": bool(page and total > count)}}
             return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}
 

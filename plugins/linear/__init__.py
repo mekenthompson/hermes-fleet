@@ -191,6 +191,15 @@ class BoundLinearAPI(LinearAPI):
         requesters and this app are passed on, so a refused requester's words never reach the worker."""
         with self._permit_specialist_operation():
             issue, comments = super().issue_with_thread(issue_id, limit)
+        return self._scoped_comments(issue, issue_id, comments)
+    def issue_progress(self, issue_id, limit=20):
+        """Recent updates for status only, with the same issue/author authorization as threads."""
+        with self._permit_specialist_operation():
+            issue, comments = super().issue_with_thread(issue_id, limit, progress=True)
+        comments = self._scoped_comments(issue, issue_id, comments)
+        page = (issue.get("comments") or {}).get("pageInfo") or {}
+        return {"comments": comments, "history_complete": page.get("hasNextPage") is False}
+    def _scoped_comments(self, issue, issue_id, comments):
         self._scoped(issue, issue_id)
         if self.specialist_scope is not None:
             allowed = set(self.specialist_scope["allowed_requester_ids"]) | {self.viewer_id()}

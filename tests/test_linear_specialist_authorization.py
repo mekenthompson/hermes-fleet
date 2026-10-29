@@ -100,7 +100,7 @@ class Authority:
             data = {"agentActivity": self.activities.get(variables["id"])}
         elif "query CommentReadback(" in query:
             data = {"comment": self.comment_records.get(variables["id"])}
-        elif "query IssueThread(" in query:
+        elif "query IssueThread(" in query or "query IssueProgress(" in query:
             issue = self.issues.get(variables["id"])
             data = {"issue": {**issue, "comments": {"nodes": self.comments.get(variables["id"], [])}} if issue else None}
         elif "query Issue(" in query:
