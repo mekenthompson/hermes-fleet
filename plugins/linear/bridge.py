@@ -24,8 +24,11 @@ log = logging.getLogger("linear")
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
 class NativeProgressSuperseded(Exception):
-    """Native work finished before its unsent transient progress reached Linear."""
+    """Native work entered a wait, halt or terminal state before transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
+# Core's ready/running phases can still use current progress. Known waits,
+# halts and terminal phases supersede earlier Started/Working projections.
+NATIVE_PROGRESS_SUPERSEDED = frozenset({"todo", "scheduled", "blocked", "triage", "review", "done", "archived"})
 URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
@@ -1855,9 +1858,9 @@ class Bridge:
             if task_status in allowed:
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
                 writes = ([status(state)] if state else []) + [message("thought", f"{label}: {detail or fallback}.")]
-        elif event.kind == "spawned" and task_status != "done":
+        elif event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
-        elif event.kind == "heartbeat" and task_status != "done":
+        elif event.kind == "heartbeat" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             note = _progress_text(payload.get("note"))
             if note:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
@@ -2262,7 +2265,7 @@ class Bridge:
         binding = self.store.get(payload["issue_id"])
         if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
             return False
-        return self._native_effect_task(payload["issue_id"]).status == "done"
+        return self._native_effect_task(payload["issue_id"]).status in NATIVE_PROGRESS_SUPERSEDED
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred

@@ -450,6 +450,179 @@ class NativeBridgeScenarios(unittest.TestCase):
             self.assertTrue(heartbeat_worker(conn, task_id, note="Checkpoint B remains absent",
                                            expected_run_id=claimed.current_run_id))
 
+    def halt_reported_task(self, clock, task_id, state):
+        for index in range(kb.BLOCK_RECURRENCE_LIMIT if state == "triage" else 1):
+            clock.now += 1
+            task = self.board.get(task_id)
+            with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                self.assertTrue(kb.block_task(conn, task_id, reason="Runtime reconciliation pending",
+                                             kind="transient", expected_run_id=task.current_run_id))
+                if state == "triage" and index < kb.BLOCK_RECURRENCE_LIMIT - 1:
+                    self.assertTrue(kb.unblock_task(conn, task_id))
+        self.assertEqual(self.board.get(task_id).status, state)
+
+    def test_halted_reporting_gap_coalesces_native_progress_before_capture_or_send(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        for state in ("blocked", "triage"):
+            for captured in (False, True):
+                with self.subTest(state=state, captured=captured):
+                    clock, remote, reporter, task_id = self.reporting_fixture("halted-gap-" + state + str(captured))
+                    remote.comment_updates_issue = True
+                    reporter.flush()
+                    self.native_progress(clock, task_id)
+                    if captured:
+                        reporter.pump_kanban()
+                    self.halt_reported_task(clock, task_id, state)
+                    native, history = self.board.get(task_id), self.board.history(task_id, 0)
+                    clock.now += 10
+                    reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                                      self.board, profile="default", clock=clock)
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.state(ISSUE), "Blocked")
+                    bodies = remote.bodies(ISSUE)
+                    self.assertTrue(any("Runtime reconciliation pending" in body for body in bodies))
+                    self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in bodies))
+                    self.assertEqual(self.board.get(task_id), native)
+                    self.assertEqual(self.board.history(task_id, 0), history)
+                    self.assertFalse(reporter.store.pending())
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.bodies(ISSUE), bodies)
+
+    def test_native_halt_at_progress_http_boundary_skips_obsolete_send(self):
+        for state in ("blocked", "triage"):
+            with self.subTest(state=state):
+                clock, remote, reporter, task_id = self.reporting_fixture("halt-http-" + state)
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                create = reporter.api.create_comment
+                def halt_before_http(*args, **kwargs):
+                    self.halt_reported_task(clock, task_id, state)
+                    return create(*args, **kwargs)
+                with patch.object(reporter.api, "create_comment", side_effect=halt_before_http) as attempted:
+                    reporter.flush()
+                self.assertEqual(attempted.call_count, 1)
+                self.assertEqual(remote.bodies(ISSUE), [])
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.state(ISSUE), "Blocked")
+
+    def test_halted_progress_keeps_later_human_edit_and_takeover_authoritative(self):
+        for change in ("same_state", "assignee", "delegate", "close"):
+            with self.subTest(change=change):
+                clock, remote, reporter, task_id = self.reporting_fixture("halted-human-" + change)
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                self.halt_reported_task(clock, task_id, "blocked")
+                clock.now += 10
+                if change == "same_state":
+                    remote.set_state(ISSUE, "In Progress")
+                elif change == "assignee":
+                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
+                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                elif change == "delegate":
+                    remote.set_delegate(ISSUE, {"id": "different-agent"})
+                else:
+                    remote.set_state(ISSUE, "Canceled")
+                human = copy.deepcopy(remote.issues[ISSUE])
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.issues[ISSUE], human)
+                self.assertEqual(self.board.get(task_id).status, "blocked")
+                self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body
+                                     for body in remote.bodies(ISSUE)))
+
+    def test_other_native_waits_keep_current_milestones_instead_of_old_progress(self):
+        for state, milestone in (("todo", "Waiting for a dependency"), ("scheduled", "Scheduled"),
+                                 ("review", "Review requested"), ("archived", "unfinished")):
+            with self.subTest(state=state):
+                clock, remote, reporter, task_id = self.reporting_fixture("stationary-" + state)
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                clock.now += 1
+                task = self.board.get(task_id)
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    if state == "todo":
+                        parent = kb.create_task(conn, title="Independent dependency", assignee="default", initial_status="blocked")
+                        kb.link_tasks(conn, parent, task_id, expected_child_run_id=task.current_run_id)
+                        self.assertTrue(kb.block_task(conn, task_id, reason="Dependency remains unfinished", kind="dependency",
+                                                     expected_run_id=task.current_run_id))
+                    elif state == "scheduled":
+                        self.assertTrue(kb.schedule_task(conn, task_id, reason="Waiting for the scheduled time",
+                                                        expected_run_id=task.current_run_id))
+                    elif state == "review":
+                        self.assertTrue(kb.request_review(conn, task_id, summary="Implementation ready for review", reviewer="default",
+                                                         expected_run_id=task.current_run_id))
+                    else:
+                        self.assertTrue(kb.archive_task(conn, task_id))
+                self.assertEqual(self.board.get(task_id).status, state)
+                native, history = self.board.get(task_id), self.board.history(task_id, 0)
+                clock.now += 10
+                reporter.recover()
+                reporter.flush()
+                bodies = remote.bodies(ISSUE)
+                self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in bodies))
+                self.assertTrue(any(milestone in body for body in bodies), bodies)
+                self.assertEqual(self.board.get(task_id), native)
+                self.assertEqual(self.board.history(task_id, 0), history)
+
+    def test_halted_task_preserves_attempted_progress_uuid_and_exact_readback(self):
+        for state in ("blocked", "triage"):
+            with self.subTest(state=state):
+                clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication("halted-attempt-" + state)
+                self.halt_reported_task(clock, task_id, state)
+                clock.now += 10
+                reporter.recover()
+                reporter.flush()
+                settled = reporter.store.outbox_row(progress_id)
+                self.assertEqual(settled["payload"].get("applied"), 1)
+                self.assertIs(settled["payload"].get("write_started"), True)
+                self.assertEqual(sum(comment["id"] == progress_id for comment in remote.comments), 1)
+                self.assertIn("query CommentReadback", remote.requests)
+                self.assertEqual(remote.state(ISSUE), "Blocked")
+
+    def test_running_ready_and_unknown_phases_do_not_silently_drop_progress(self):
+        for state in ("running", "ready", "future-native-phase"):
+            with self.subTest(state=state):
+                clock, remote, reporter, task_id = self.reporting_fixture("active-phase-" + state)
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                native = copy.copy(self.board.get(task_id))
+                native.status = state
+                # The unrecognized readback is deliberately not written to native storage.
+                with patch.object(self.board, "require_task", return_value=native):
+                    reporter.pump_kanban()
+                    reporter.flush()
+                self.assertTrue(any("Reading the ticket" in body for body in remote.bodies(ISSUE)))
+                self.assertTrue(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
+
+    def test_native_operator_stop_survives_reporting_catchup_without_reactivation(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("stopped-progress")
+        remote.comment_updates_issue = True
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.block_task(conn, task_id, reason="native operator Stop", kind="needs_input",
+                                         expected_run_id=self.board.get(task_id).current_run_id))
+        native, history = self.board.get(task_id), self.board.history(task_id, 0)
+        clock.now += 10
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertEqual(self.board.get(task_id), native)
+        self.assertEqual(self.board.history(task_id, 0), history)
+        self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body
+                             for body in remote.bodies(ISSUE)))
+
     def test_completed_reporting_gap_coalesces_native_progress_before_capture_or_send(self):
         from hermes_fleet_linear_plugin.api import LinearAPI
         for captured in (False, True):
