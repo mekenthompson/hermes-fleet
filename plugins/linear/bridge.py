@@ -753,6 +753,7 @@ class Bridge:
                    "content": {"type": "action", "action": action, "parameter": parameter}, **route}
         if row.get("origin") == "native" and row.get("task_id"):
             payload["native_progress"] = True
+            payload["write_started"] = False
         if ephemeral:
             payload["ephemeral"] = True
         return ("activity", payload)
@@ -2256,7 +2257,7 @@ class Bridge:
         # User comments, finished-stage summaries and uncertain sends retain history.
         if (row["kind"] not in ("activity", "comment") or payload.get("native_progress") is not True or
                 not payload.get("task_id") or payload.get("terminal") or
-                payload.get("write_started") or row["attempts"]):
+                payload.get("write_started") is not False or row["attempts"]):
             return False
         binding = self.store.get(payload["issue_id"])
         if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
@@ -2266,6 +2267,8 @@ class Bridge:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
+        attempted_progress = (payload.get("native_progress") is True and
+                              (payload.get("write_started") is not False or row["attempts"]))
         if payload.get("claim") or payload.get("admission_id"):
             raise LinearError("Retained execution admission needs reconciliation; it cannot replay", retryable=False)
         if kind == "delegate":
@@ -2336,6 +2339,8 @@ class Bridge:
                                 and payload.get("requester_sessions"))
             if ((not self._report_delegate_allowed(issue, payload) and not (session_progress and not delegate))
                     or (issue.get("state") or {}).get("type") in CLOSED):
+                if attempted_progress:
+                    raise LinearError("Prior native progress delivery requires reconciliation after ownership or state changed", retryable=False)
                 return False
         if kind == "status":
             issue = self._effect_issue(payload["issue_id"])  # exact target on every re-read
@@ -2392,7 +2397,7 @@ class Bridge:
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
             verify = getattr(self.api, "verify_comment", None)
-            if payload.get("content_action") and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
+            if (payload.get("content_action") or attempted_progress) and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
                 raise LinearError("Comment target/body readback did not match; reconcile before retrying")
             return True
         elif kind == "description":

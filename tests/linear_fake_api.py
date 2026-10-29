@@ -144,6 +144,10 @@ class FakeLinear:
     def _apply(self, query: str, variables: dict) -> tuple[int, dict]:
         if "viewer" in query:
             return 200, {"data": {"viewer": {"id": SELF}}}
+        if "comment(" in query:
+            comment = next((item for item in self.comments if item["id"] == variables["id"]), None)
+            return 200, {"data": {"comment": ({"id": comment["id"], "body": comment["body"],
+                                              "issue": {"id": comment["issueId"]}} if comment else None)}}
         if "issueUpdate" in query:
             issue = self.issues[variables["id"]]
             fields = variables["input"]

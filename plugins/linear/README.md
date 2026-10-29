@@ -73,6 +73,9 @@ When reporting catches up after native completion, obsolete Started and heartbea
 are omitted. Queued messages explicitly identified as native progress recheck completion
 immediately before publication. Native comments, partial-stage summaries and uncertain sends
 remain intact; completion still preserves later human edits and ownership changes.
+Only progress durably recorded as unstarted is omitted. Publication admission records an
+attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
+on retry; a missing historical attempt marker never proves that a message was unsent.
 If the entire outcome really is already complete, the agent can add `reconcile_complete: true`
 to that guarded outcome replacement after inspecting acceptance and evidence. The same UUID
 durably queues only its verified completion through the existing outbox, without another

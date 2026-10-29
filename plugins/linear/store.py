@@ -265,7 +265,9 @@ class Store:
                     return False
                 if payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                     return False
-            if terminal or row["kind"] in ("status", "description", "delegate", "project_update"):
+            native_progress = (row["kind"] in ("comment", "activity") and
+                               payload.get("native_progress") is True and payload.get("task_id"))
+            if terminal or native_progress or row["kind"] in ("status", "description", "delegate", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
