@@ -438,6 +438,139 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.flush()
         self.assertEqual(sum("precise bounded outcome" in body for body in remote.bodies(ISSUE)), 1)
 
+    def native_progress(self, clock, task_id):
+        from hermes_cli.kanban_db_dispatch import heartbeat_worker
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            claimed = kb.claim_task(conn, task_id, claimer="reporting-scenario")
+            self.assertIsNotNone(claimed)
+            # Native dispatcher records spawn before its worker produces heartbeats.
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "spawned", {"pid": 123456}, run_id=claimed.current_run_id)
+            self.assertTrue(heartbeat_worker(conn, task_id, note="Checkpoint B remains absent",
+                                           expected_run_id=claimed.current_run_id))
+
+    def test_completed_reporting_gap_coalesces_native_progress_before_capture_or_send(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        for captured in (False, True):
+            with self.subTest(captured=captured):
+                clock, remote, reporter, task_id = self.reporting_fixture("gap-progress-" + str(captured))
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                if captured:
+                    reporter.pump_kanban()
+                    self.assertTrue(any(row["kind"] == "comment" for row in reporter.store.pending()))
+                self.complete_reported_task(clock, task_id)
+                native = self.board.get(task_id)
+                history = self.board.history(task_id, 0)
+                clock.now += 10
+                reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                                  self.board, profile="default", clock=clock)
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.state(ISSUE), "Done")
+                bodies = remote.bodies(ISSUE)
+                self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in bodies))
+                self.assertEqual(sum("precise bounded outcome" in body for body in bodies), 1)
+                self.assertFalse(reporter.store.pending())
+                self.assertEqual(self.board.get(task_id), native)
+                self.assertEqual(self.board.history(task_id, 0), history)
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.bodies(ISSUE), bodies)
+
+    def test_native_completion_at_progress_http_boundary_skips_obsolete_send(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("progress-http-boundary")
+        remote.comment_updates_issue = True
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        create = reporter.api.create_comment
+        def complete_before_http(*args, **kwargs):
+            self.complete_reported_task(clock, task_id)
+            return create(*args, **kwargs)
+        with patch.object(reporter.api, "create_comment", side_effect=complete_before_http) as attempted:
+            reporter.flush()
+        self.assertEqual(attempted.call_count, 1)
+        self.assertEqual(remote.bodies(ISSUE), [])
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Done")
+        self.assertEqual(sum("precise bounded outcome" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_coalesced_progress_keeps_later_human_changes_authoritative(self):
+        for change in ("same_state", "assignee", "delegate", "close"):
+            with self.subTest(change=change):
+                clock, remote, reporter, task_id = self.reporting_fixture("coalesced-human-" + change)
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                self.complete_reported_task(clock, task_id)
+                clock.now += 10
+                if change == "same_state":
+                    remote.set_state(ISSUE, "In Progress")
+                elif change == "assignee":
+                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
+                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                elif change == "delegate":
+                    remote.set_delegate(ISSUE, {"id": "different-agent"})
+                else:
+                    remote.set_state(ISSUE, "Canceled")
+                human = copy.deepcopy(remote.issues[ISSUE])
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.issues[ISSUE], human)
+                self.assertEqual(remote.bodies(ISSUE), [])
+                self.assertEqual(self.board.get(task_id).status, "done")
+
+    def test_coalescing_keeps_native_comments_and_partial_stage_summary(self):
+        import uuid
+        clock, remote, reporter, task_id = self.reporting_fixture("progress-partial-stage")
+        reporter.flush()
+        reporter.track(ISSUE, task_id, replace=True, completion_scope="progress",
+                       expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+        self.native_progress(clock, task_id)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.add_comment(conn, task_id, "worker", "Checkpoint evidence retained")
+        reporter.pump_kanban()
+        reporter.comment(ISSUE, "Started: Reading the ticket — explicitly requested comment")
+        self.complete_reported_task(clock, task_id)
+        clock.now += 10
+        reporter.recover()
+        reporter.flush()
+        self.assertNotEqual(remote.state(ISSUE), "Done")
+        bodies = remote.bodies(ISSUE)
+        self.assertTrue(any("Checkpoint evidence retained" in body for body in bodies))
+        self.assertTrue(any("explicitly requested comment" in body for body in bodies))
+        self.assertTrue(any("precise bounded outcome" in body for body in bodies))
+        self.assertFalse(any("Checkpoint B remains absent" in body for body in bodies))
+
+    def test_lost_progress_response_retains_its_uuid_after_native_completion(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("uncertain-native-progress")
+        remote.comment_updates_issue = True
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        remote.lose_next_response = True
+        self.assertEqual(reporter.flush(), 0)
+        self.assertEqual(len(remote.bodies(ISSUE)), 1)
+        self.assertIn("Reading the ticket", remote.bodies(ISSUE)[0])
+        unknown = next(row for row in reporter.store.pending() if row["attempts"])
+        self.complete_reported_task(clock, task_id)
+        reporter.recover()
+        self.assertEqual(reporter.store.outbox_row(unknown["id"]), unknown)
+        self.assertEqual(len(remote.bodies(ISSUE)), 1)
+        clock.now += 61
+        reporter.flush()
+        settled = reporter.store.outbox_row(unknown["id"])
+        self.assertEqual(settled["state"], "sent")
+        self.assertEqual(settled["payload"].get("applied"), 1)
+        self.assertEqual(sum("Reading the ticket" in body for body in remote.bodies(ISSUE)), 1)
+        self.assertFalse(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
+        self.assertEqual(remote.state(ISSUE), "Done")
+
     def test_atomic_progress_receipt_survives_restart_before_completion_projection(self):
         from hermes_fleet_linear_plugin.api import LinearAPI
         clock, remote, reporter, task_id = self.reporting_fixture("receipt-restart")

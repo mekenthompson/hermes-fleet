@@ -23,6 +23,8 @@ from . import transport
 log = logging.getLogger("linear")
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
+class NativeProgressSuperseded(Exception):
+    """Native work finished before its unsent transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
 URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
@@ -749,6 +751,8 @@ class Bridge:
                            *, ephemeral: bool = False) -> tuple[str, dict[str, Any]]:
         payload = {"issue_id": row["issue_id"], "session_id": row["owner_ref"],
                    "content": {"type": "action", "action": action, "parameter": parameter}, **route}
+        if row.get("origin") == "native" and row.get("task_id"):
+            payload["native_progress"] = True
         if ephemeral:
             payload["ephemeral"] = True
         return ("activity", payload)
@@ -1850,9 +1854,9 @@ class Bridge:
             if task_status in allowed:
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
                 writes = ([status(state)] if state else []) + [message("thought", f"{label}: {detail or fallback}.")]
-        elif event.kind == "spawned":
+        elif event.kind == "spawned" and task_status != "done":
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
-        elif event.kind == "heartbeat":
+        elif event.kind == "heartbeat" and task_status != "done":
             note = _progress_text(payload.get("note"))
             if note:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
@@ -2130,6 +2134,8 @@ class Bridge:
                         continue
                     try:
                         applied = self._send(row)
+                    except NativeProgressSuperseded:
+                        applied = False
                     except ProjectUpdateDeferred:
                         if self.store.outbox_row(row["id"]) is None: progress = True
                         continue
@@ -2187,6 +2193,8 @@ class Bridge:
                         # split held lines; an uncertain send remains frozen.
                         raise ProjectUpdateDeferred from None
                     raise
+            if row and self._obsolete_native_progress(row):
+                raise NativeProgressSuperseded
             if payload.get("initial_ack"):
                 issue = self._effect_issue(payload["issue_id"])
                 if ((self._specialist_scope_active() and
@@ -2242,6 +2250,18 @@ class Bridge:
                 row_id, started_before=prior_started.get("value"))
         with self.api.guarded_mutation(guard):
             action()
+    def _obsolete_native_progress(self, row: dict[str, Any]) -> bool:
+        payload = row["payload"]
+        # Only our explicitly identified transient native projection is coalesced.
+        # User comments, finished-stage summaries and uncertain sends retain history.
+        if (row["kind"] not in ("activity", "comment") or payload.get("native_progress") is not True or
+                not payload.get("task_id") or payload.get("terminal") or
+                payload.get("write_started") or row["attempts"]):
+            return False
+        binding = self.store.get(payload["issue_id"])
+        if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
+            return False
+        return self._native_effect_task(payload["issue_id"]).status == "done"
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
@@ -2264,6 +2284,8 @@ class Bridge:
             return True  # The atomic mutation response already proves this effect; never send it again.
         if kind != "project_update":
             self._require_outbox_native_scope(row)
+        if self._obsolete_native_progress(row):
+            return False
         if kind == "status":
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])

@@ -73,6 +73,7 @@ class FakeLinear:
         self.requests: list[str] = []
         self.down = False
         self.lose_next_response = False
+        self.comment_updates_issue = False
         self.rate_limited_until = 0.0
         self.lock = threading.Lock()
         fake = self
@@ -172,6 +173,8 @@ class FakeLinear:
                 if "agentSessionId" in fields:
                     fields["issueId"] = self.sessions.get(fields["agentSessionId"])
                 store.append(fields)
+                if mutation == "commentCreate" and self.comment_updates_issue:
+                    self.issues[fields["issueId"]]["updatedAt"] = self.clock.iso()
                 return 200, {"data": {mutation: {"success": True}}}
         if "issue(" in query:
             issue = self.issues.get(variables["id"]) or next(
