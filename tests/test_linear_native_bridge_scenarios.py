@@ -571,6 +571,85 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertFalse(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
         self.assertEqual(remote.state(ISSUE), "Done")
 
+    def crash_after_progress_publication(self, name):
+        clock, remote, reporter, task_id = self.reporting_fixture(name)
+        remote.comment_updates_issue = True
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        progress = next(row for row in reporter.store.pending() if row["payload"].get("native_progress")
+                        and not row["payload"].get("ephemeral"))
+        mark_sent = reporter.store.mark_sent
+        class ProcessCrash(BaseException):
+            pass
+        def crash_before_settlement(row_id, applied):
+            if row_id == progress["id"]:
+                raise ProcessCrash
+            return mark_sent(row_id, applied)
+        with patch.object(reporter.store, "mark_sent", side_effect=crash_before_settlement):
+            with self.assertRaises(ProcessCrash):
+                reporter.flush()
+        self.assertEqual(len(remote.comments), 1)
+        self.assertEqual(reporter.store.outbox_row(progress["id"])["attempts"], 0)
+        return clock, remote, reporter, task_id, progress["id"]
+
+    def test_crash_after_progress_http_reconciles_same_uuid_instead_of_coalescing(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication("crash-progress")
+        self.complete_reported_task(clock, task_id)
+        clock.now += 10
+        reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        reporter.recover()
+        reporter.flush()
+        settled = reporter.store.outbox_row(progress_id)
+        self.assertEqual(settled["state"], "sent")
+        self.assertEqual(settled["payload"].get("applied"), 1)
+        self.assertIs(settled["payload"].get("write_started"), True)
+        self.assertEqual(sum(comment["id"] == progress_id for comment in remote.comments), 1)
+        self.assertIn("query CommentReadback", remote.requests)
+        self.assertEqual(remote.state(ISSUE), "Done")
+
+    def test_attempted_progress_does_not_claim_unapplied_after_takeover_or_changed_readback(self):
+        for change in ("body", "issue", "delegate", "closed"):
+            with self.subTest(change=change):
+                clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication("changed-progress-" + change)
+                self.complete_reported_task(clock, task_id)
+                clock.now += 10
+                if change == "body":
+                    remote.comments[0]["body"] = "Human corrected the progress comment"
+                elif change == "issue":
+                    remote.comments[0]["issueId"] = "different-issue"
+                elif change == "delegate":
+                    remote.set_delegate(ISSUE, {"id": "different-agent"})
+                else:
+                    remote.set_state(ISSUE, "Canceled")
+                remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                before = copy.deepcopy(remote.comments)
+                reporter.recover()
+                reporter.flush()
+                held = reporter.store.outbox_row(progress_id)
+                self.assertIn(held["state"], ("pending", "failed"))
+                self.assertNotIn("applied", held["payload"])
+                self.assertIs(held["payload"].get("write_started"), True)
+                self.assertEqual(remote.comments, before)
+                self.assertNotEqual(remote.state(ISSUE), "Done")
+
+    def test_legacy_progress_without_explicit_unstarted_marker_is_not_coalesced(self):
+        clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication("legacy-progress")
+        row = reporter.store.outbox_row(progress_id)
+        payload = dict(row["payload"])
+        payload.pop("write_started")
+        reporter.store.rewrite(progress_id, payload, row["next_at"])
+        self.complete_reported_task(clock, task_id)
+        clock.now += 10
+        reporter.recover()
+        reporter.flush()
+        settled = reporter.store.outbox_row(progress_id)
+        self.assertEqual(settled["payload"].get("applied"), 1)
+        self.assertEqual(sum(comment["id"] == progress_id for comment in remote.comments), 1)
+        self.assertIn("query CommentReadback", remote.requests)
+
     def test_atomic_progress_receipt_survives_restart_before_completion_projection(self):
         from hermes_fleet_linear_plugin.api import LinearAPI
         clock, remote, reporter, task_id = self.reporting_fixture("receipt-restart")
