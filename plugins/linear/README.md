@@ -77,6 +77,13 @@ uncertain sends remain intact; status reporting still preserves later human edit
 Only progress durably recorded as unstarted is omitted. Publication admission records an
 attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
 on retry; a missing historical attempt marker never proves that a message was unsent.
+Current native status is projected before ordinary history that is durably unattempted,
+using the existing status dependencies. A refused status still permits ordinary history
+while the issue remains open. History after our own Done requires that exact current
+native scope's applied completion acknowledgement; a human close grants no such permission.
+Attempted or legacy history keeps its original delivery boundary and UUID. These history
+writes never justify a later issue-version overwrite. Agent Session activities retain their
+existing advisory contract; unknown activity delivery requires inspection, not replay.
 If the entire outcome really is already complete, the agent can add `reconcile_complete: true`
 to that guarded outcome replacement after inspecting acceptance and evidence. The same UUID
 durably queues only its verified completion through the existing outbox, without another

@@ -461,6 +461,351 @@ class NativeBridgeScenarios(unittest.TestCase):
                     self.assertTrue(kb.unblock_task(conn, task_id))
         self.assertEqual(self.board.get(task_id).status, state)
 
+    def land_reported_task(self, clock, task_id, state):
+        if state in ("blocked", "triage"):
+            return self.halt_reported_task(clock, task_id, state)
+        if state == "done":
+            return self.complete_reported_task(clock, task_id)
+        clock.now += 1
+        task = self.board.get(task_id)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            if state == "todo":
+                parent = kb.create_task(conn, title="Synthetic unfinished prerequisite", assignee="default", initial_status="blocked")
+                kb.link_tasks(conn, parent, task_id, expected_child_run_id=task.current_run_id)
+                self.assertTrue(kb.block_task(conn, task_id, reason="Dependency remains unfinished", kind="dependency", expected_run_id=task.current_run_id))
+            elif state == "scheduled":
+                self.assertTrue(kb.schedule_task(conn, task_id, reason="Waiting for the scheduled time", expected_run_id=task.current_run_id))
+            elif state == "review":
+                self.assertTrue(kb.request_review(conn, task_id, summary="Implementation ready for review", reviewer="default", expected_run_id=task.current_run_id))
+            else:
+                self.assertTrue(kb.archive_task(conn, task_id))
+        self.assertEqual(self.board.get(task_id).status, state)
+
+    def test_mixed_native_history_projects_current_state_before_preserved_comments(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        for state in ("blocked", "triage", "todo", "scheduled", "done", "archived"):
+            for captured in (False, True):
+                with self.subTest(state=state, captured=captured):
+                    clock, remote, reporter, task_id = self.reporting_fixture("mixed-history-" + state + str(captured))
+                    remote.comment_updates_issue = True
+                    reporter.flush()
+                    self.native_progress(clock, task_id)
+                    clock.now += 1
+                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                        kb.add_comment(conn, task_id, "worker", "Preserve this ordinary native checkpoint")
+                        kb.add_comment(conn, task_id, "worker-secondary", "Preserve the second ordinary checkpoint too")
+                    if captured:
+                        reporter.pump_kanban()
+                    self.land_reported_task(clock, task_id, state)
+                    native, history = self.board.get(task_id), self.board.history(task_id, 0)
+                    clock.now += 10
+                    reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock), self.board, profile="default", clock=clock)
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.state(ISSUE), "Done" if state == "done" else "Blocked")
+                    bodies = remote.bodies(ISSUE)
+                    self.assertEqual(sum("Preserve this ordinary native checkpoint" in body for body in bodies), 1)
+                    self.assertEqual(sum("Preserve the second ordinary checkpoint too" in body for body in bodies), 1)
+                    self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in bodies))
+                    self.assertEqual(self.board.get(task_id), native)
+                    self.assertEqual(self.board.history(task_id, 0), history)
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.bodies(ISSUE), bodies)
+
+    def test_mixed_history_preserves_human_versions_and_history_when_status_is_denied(self):
+        for phase in ("blocked", "done"):
+            for change in ("same_state", "assignee", "delegate", "close", "human_done"):
+                with self.subTest(phase=phase, change=change):
+                    clock, remote, reporter, task_id = self.reporting_fixture("mixed-human-" + phase + change)
+                    remote.comment_updates_issue = True
+                    reporter.flush()
+                    self.native_progress(clock, task_id)
+                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                        kb.add_comment(conn, task_id, "worker", "Ordinary history must survive denied status")
+                    reporter.pump_kanban()
+                    self.land_reported_task(clock, task_id, phase)
+                    clock.now += 10
+                    if change == "assignee":
+                        remote.issues[ISSUE]["assignee"] = {"id": "different-human"}
+                        remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                    elif change == "delegate":
+                        remote.set_delegate(ISSUE, {"id": "different-agent"})
+                    else:
+                        remote.set_state(ISSUE, "Done" if change == "human_done" else "Canceled" if change == "close" else "In Progress")
+                    human = copy.deepcopy(remote.issues[ISSUE])
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.issues[ISSUE], human)
+                    ordinary = [body for body in remote.bodies(ISSUE) if "Ordinary history must survive" in body]
+                    self.assertEqual(len(ordinary), int(change in ("same_state", "assignee")))
+                    status = reporter.store.outbox_row(reporter.store.latest_status(ISSUE)["id"])
+                    self.assertEqual(status["payload"].get("applied"), 0)
+                    self.assertIs(status["payload"].get("write_started"), False)
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(reporter.store.outbox_row(status["id"]), status)
+
+    def test_attempted_ordinary_history_keeps_its_delivery_boundary_and_uuid(self):
+        for legacy_marker in (False, True):
+            with self.subTest(legacy_marker=legacy_marker):
+                clock, remote, reporter, task_id = self.reporting_fixture("ordinary-crash-" + str(legacy_marker))
+                remote.comment_updates_issue = True
+                reporter.flush()
+                clock.now += 1
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.claim_task(conn, task_id, claimer="ordinary-history-worker")
+                    kb.add_comment(conn, task_id, "worker", "Original ordinary delivery must not be moved or replayed")
+                reporter.pump_kanban()
+                ordinary = next(row for row in reporter.store.pending() if row["kind"] == "comment")
+                class ProcessCrash(BaseException):
+                    pass
+                with patch.object(reporter.store, "mark_sent", side_effect=ProcessCrash):
+                    with self.assertRaises(ProcessCrash):
+                        reporter.flush()
+                attempted = reporter.store.outbox_row(ordinary["id"])
+                self.assertIs(attempted["payload"].get("write_started"), True)
+                if legacy_marker:
+                    payload = dict(attempted["payload"])
+                    payload.pop("write_started")
+                    reporter.store.rewrite(attempted["id"], payload, attempted["next_at"])
+                    attempted = reporter.store.outbox_row(attempted["id"])
+                self.halt_reported_task(clock, task_id, "blocked")
+                reporter.recover()
+                self.assertEqual(reporter.store.outbox_row(attempted["id"]), attempted)
+                reporter.flush()
+                settled = reporter.store.outbox_row(attempted["id"])
+                self.assertEqual(settled["payload"].get("applied"), 1)
+                self.assertEqual(sum(item["id"] == attempted["id"] for item in remote.comments), 1)
+                self.assertIn("query CommentReadback", remote.requests)
+                self.assertEqual(remote.state(ISSUE), "Blocked")
+
+    def test_own_done_history_requires_current_scope_and_preserves_late_history(self):
+        import uuid
+        for replace_scope in (False, True):
+            with self.subTest(replace_scope=replace_scope):
+                clock, remote, reporter, task_id = self.reporting_fixture("done-late-history-" + str(replace_scope))
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.complete_reported_task(clock, task_id)
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.state(ISSUE), "Done")
+                if replace_scope:
+                    reporter.track(ISSUE, task_id, replace=True, completion_scope="progress",
+                                   expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+                clock.now += 1
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.add_comment(conn, task_id, "worker", "Late native history after own completion")
+                reporter.pump_kanban()
+                reporter.flush()
+                self.assertEqual(sum("Late native history after own completion" in body for body in remote.bodies(ISSUE)), int(not replace_scope))
+
+    def test_archived_history_does_not_revive_retired_release_or_human_clear(self):
+        import uuid
+        from linear_fake_api import SELF
+        for human_clear in (False, True):
+            with self.subTest(human_clear=human_clear):
+                clock, remote, reporter, task_id = self.reporting_fixture("release-history-" + str(human_clear))
+                reporter.flush()
+                remote.set_delegate(ISSUE, {"id": SELF})
+                reporter.track(ISSUE, task_id, replace=True, requester_session=SESSION, requester_activity=ACTIVITY,
+                               expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+                remote.sessions[SESSION] = ISSUE
+                clock.now += 1
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.add_comment(conn, task_id, "worker", "Archived history after verified release")
+                reporter.pump_kanban()
+                self.land_reported_task(clock, task_id, "archived")
+                self.assertTrue(reporter.store.finish(ISSUE, [("status", {"issue_id": ISSUE, "task_id": task_id,
+                    "state": "blocked", "release": True, "terminal": True, "owner_issue_id": ISSUE,
+                    "source_ms": clock() * 1000})], at=clock(), release=True))
+                if human_clear:
+                    clock.now += 1
+                    remote.set_delegate(ISSUE, None)
+                reporter.flush()
+                status = reporter.store.outbox_row(reporter.store.latest_status(ISSUE)["id"])
+                self.assertIn("Retained execution-derived delivery", status["hold_reason"])
+                self.assertNotIn("applied", status["payload"])
+                self.assertEqual(sum("Archived history after verified release" in body for body in remote.bodies(ISSUE)), 0)
+                self.assertEqual(remote.issues[ISSUE]["delegate"], None if human_clear else {"id": SELF})
+                self.assertEqual(self.board.get(task_id).status, "archived")
+
+    def session_reporting_fixture(self, name):
+        from linear_fake_api import Clock, FakeLinear, SELF
+        from hermes_fleet_linear_plugin.api import _http
+        from test_linear_specialist_authorization import ORG
+        clock = Clock()
+        remote = FakeLinear(clock)
+        self.addCleanup(remote.close)
+        remote.add_issue(ISSUE, "OPS-1", project=None)
+        remote.set_delegate(ISSUE, {"id": SELF})
+        remote.sessions[SESSION] = ISSUE
+        remote.comment_updates_issue = remote.activity_updates_issue = True
+        authority = Authority()
+        authority.viewer = SELF
+        authority.sessions[SESSION]["appUser"] = {"id": SELF}
+        def transport(url, body, headers):
+            if any(query in body.decode() for query in ("IdentityBinding", "AgentSessionAuthorization", "AgentActivityAuthorization")):
+                return authority.transport(url, body, headers)
+            return _http(remote.url, body, headers)
+        api = plugin.BoundLinearAPI(lambda: "synthetic", identity={"viewer_id": SELF, "organization_id": ORG},
+            specialist_scope={"all_teams": True, "all_projects": True, "allowed_requester_ids": [USER], "requester_basis": "agent_session"},
+            transport=transport, endpoint=remote.url, clock=clock)
+        reporter = Bridge(Store(self.home / (name + ".db")), api, self.board, profile="default", clock=clock)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            task_id = kb.create_task(conn, title="Existing session-native work", assignee="default", initial_status="blocked")
+        # The shared authoritative session/Activity fixture is read independently
+        # from provider coordinates; no production session or human grant is created.
+        with api.requester_session(SESSION, activity_id=ACTIVITY):
+            reporter.track(ISSUE, task_id, requester_session=SESSION, requester_activity=ACTIVITY)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.unblock_task(conn, task_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        return clock, remote, reporter, task_id
+
+    def test_authenticated_agent_session_history_uses_current_state_first(self):
+        for state in ("blocked", "done", "archived"):
+            for captured in (False, True):
+                with self.subTest(state=state, captured=captured):
+                    clock, remote, reporter, task_id = self.session_reporting_fixture("session-history-" + state + str(captured))
+                    self.native_progress(clock, task_id)
+                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                        kb.add_comment(conn, task_id, "worker", "Authenticated session ordinary history")
+                    if captured:
+                        reporter.pump_kanban()
+                    if state == "done":
+                        clock.now += 1
+                        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                            self.assertTrue(kb.complete_task(conn, task_id, result="Verified session-native bounded outcome",
+                                metadata={"issue_comment": "Recommendation: keep the verified bounded result with its supporting evidence."}))
+                    else:
+                        self.land_reported_task(clock, task_id, state)
+                    native, history = self.board.get(task_id), self.board.history(task_id, 0)
+                    clock.now += 10
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.state(ISSUE), "Done" if state == "done" else "Blocked")
+                    self.assertEqual(sum("Authenticated session ordinary history" in body for body in remote.bodies(ISSUE)), 1)
+                    self.assertTrue(any(item["content"].get("body") == "Authenticated session ordinary history" for item in remote.activities))
+                    self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
+                    self.assertEqual(self.board.get(task_id), native)
+                    self.assertEqual(self.board.history(task_id, 0), history)
+
+    def test_unknown_agent_session_history_activity_stays_unknown_without_replay(self):
+        clock, remote, reporter, task_id = self.session_reporting_fixture("session-unknown-history")
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.claim_task(conn, task_id, claimer="session-native-worker")
+            kb.add_comment(conn, task_id, "worker", "Session history whose HTTP response is lost")
+        reporter.pump_kanban()
+        row = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
+        remote.lose_next_response = True
+        reporter.flush()
+        unknown = reporter.store.outbox_row(row["id"])
+        self.assertIs(unknown["payload"].get("write_started"), True)
+        self.assertNotIn("applied", unknown["payload"])
+        self.halt_reported_task(clock, task_id, "blocked")
+        reporter.recover()
+        reporter.flush()
+        retained = reporter.store.outbox_row(row["id"])
+        self.assertNotIn("applied", retained["payload"])
+        self.assertEqual(sum(item["id"] == row["id"] for item in remote.activities), 1)
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+
+    def test_own_done_history_rechecks_human_takeover_at_http_boundary(self):
+        for change in ("delegate", "cancel"):
+            with self.subTest(change=change):
+                clock, remote, reporter, task_id = self.reporting_fixture("done-history-http-" + change)
+                reporter.flush()
+                self.complete_reported_task(clock, task_id)
+                reporter.recover()
+                reporter.flush()
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.add_comment(conn, task_id, "worker", "History held after human change at HTTP boundary")
+                reporter.pump_kanban()
+                create = reporter.api.create_comment
+                def human_change_before_http(*args, **kwargs):
+                    if change == "delegate":
+                        remote.set_delegate(ISSUE, {"id": "different-agent"})
+                    else:
+                        remote.set_state(ISSUE, "Canceled")
+                    return create(*args, **kwargs)
+                before = copy.deepcopy(remote.comments)
+                with patch.object(reporter.api, "create_comment", side_effect=human_change_before_http):
+                    reporter.flush()
+                self.assertEqual(remote.comments, before)
+
+    def test_ordinary_history_waits_for_a_native_halt_arriving_at_http_boundary(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("ordinary-halt-http")
+        remote.comment_updates_issue = True
+        reporter.flush()
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.claim_task(conn, task_id, claimer="ordinary-http-worker")
+            kb.add_comment(conn, task_id, "worker", "Ordinary checkpoint preserved after a boundary halt")
+        reporter.pump_kanban()
+        create = reporter.api.create_comment
+        def halt_before_http(*args, **kwargs):
+            self.halt_reported_task(clock, task_id, "blocked")
+            return create(*args, **kwargs)
+        with patch.object(reporter.api, "create_comment", side_effect=halt_before_http):
+            reporter.flush()
+        self.assertEqual(remote.comments, [])
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertEqual(sum("Ordinary checkpoint preserved" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_session_history_waits_for_a_native_halt_without_spending_its_advisory_attempt(self):
+        clock, remote, reporter, task_id = self.session_reporting_fixture("session-halt-http")
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.claim_task(conn, task_id, claimer="session-http-worker")
+            kb.add_comment(conn, task_id, "worker", "Session checkpoint preserved across deferred native halt")
+        reporter.pump_kanban()
+        ordinary = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
+        create = reporter.api.create_activity
+        def halt_before_http(*args, **kwargs):
+            self.halt_reported_task(clock, task_id, "blocked")
+            return create(*args, **kwargs)
+        with patch.object(reporter.api, "create_activity", side_effect=halt_before_http):
+            reporter.flush()
+        deferred = reporter.store.outbox_row(ordinary["id"])
+        self.assertEqual(deferred["state"], "pending")
+        self.assertIs(deferred["payload"].get("write_started"), False)
+        self.assertEqual(remote.activities, [])
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertEqual(sum("Session checkpoint preserved" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_history_dependency_is_rechecked_inside_mutation_admission(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("history-admit-race")
+        remote.comment_updates_issue = True
+        reporter.flush()
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.claim_task(conn, task_id, claimer="admission-race-worker")
+            kb.add_comment(conn, task_id, "worker", "Ordinary history protected by the final dependency check")
+        reporter.pump_kanban()
+        admit = reporter.store.admit_mutation
+        def concurrent_capture_before_admission(*args, **kwargs):
+            self.halt_reported_task(clock, task_id, "blocked")
+            work = reporter.store.get(ISSUE)
+            for event in self.board.history(task_id, work["last_event_id"]):
+                reporter._task_event(work, event, "blocked", {})
+                work = reporter.store.get(ISSUE)
+            return admit(*args, **kwargs)
+        with patch.object(reporter.store, "admit_mutation", side_effect=concurrent_capture_before_admission):
+            reporter.flush()
+        self.assertEqual(remote.comments, [])
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertEqual(sum("Ordinary history protected" in body for body in remote.bodies(ISSUE)), 1)
+
     def test_halted_reporting_gap_coalesces_native_progress_before_capture_or_send(self):
         from hermes_fleet_linear_plugin.api import LinearAPI
         for state in ("blocked", "triage"):
