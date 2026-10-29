@@ -248,6 +248,10 @@ class Store:
             if not self.delivery_allowed(row_id):
                 return False
             payload = json.loads(row["payload"])
+            if payload.get("native_history") is True and payload.get("requires_status_id"):
+                dependency = self.outbox_row(payload["requires_status_id"])
+                if not self.history_status_settled(dependency):
+                    return False
             targets = self._targets(payload)
             if not self.conversation_reply(row["kind"], payload) and not self._admitted(db, *targets):
                 return False
@@ -266,7 +270,8 @@ class Store:
                 if payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                     return False
             native_progress = (row["kind"] in ("comment", "activity") and
-                               payload.get("native_progress") is True and payload.get("task_id"))
+                               (payload.get("native_progress") is True or payload.get("native_history") is True)
+                               and payload.get("task_id"))
             if terminal or native_progress or row["kind"] in ("status", "description", "delegate", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
@@ -733,6 +738,7 @@ class Store:
                 body = json.dumps({**payload, "enqueued_at": payload.get("enqueued_at", at)})
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (row_id, kind, body, at + float(payload.get("quiet", 0))))
+            self._sequence_native_history(db, issue_id)
             if release:
                 db.execute("UPDATE work SET release_pending=1 WHERE issue_id=?", (issue_id,))
             else:
@@ -757,10 +763,27 @@ class Store:
                 for kind, payload in writes:
                     db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                                (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
+            self._sequence_native_history(db, issue_id)
             db.execute("UPDATE work SET last_event_id = ? WHERE issue_id = ?", (event_id, issue_id))
             if forget:
                 db.execute("DELETE FROM work WHERE issue_id = ? AND origin != 'native'", (issue_id,))
             return True
+    @staticmethod
+    def _sequence_native_history(db: sqlite3.Connection, issue_id: str) -> None:
+        """Current status precedes only native history durably known not to have started."""
+        work = db.execute("SELECT task_id FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone()
+        if not work:
+            return
+        status = db.execute("SELECT id FROM outbox WHERE kind='status' AND state='pending' AND hold_reason IS NULL "
+                            "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=? "
+                            "ORDER BY rowid DESC LIMIT 1", (issue_id, work["task_id"])).fetchone()
+        if status:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.requires_status_id',?) "
+                       "WHERE state='pending' AND hold_reason IS NULL AND kind IN ('comment','activity') AND attempts=0 "
+                       "AND json_extract(payload,'$.native_history')=1 AND json_type(payload,'$.write_started')='false' "
+                       "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=?",
+                       (status["id"], issue_id, work["task_id"]))
+
     def active(self, origin: str | None = None) -> list[dict[str, Any]]:
         with self._tx() as db:
             rows = db.execute("SELECT * FROM work WHERE ? IS NULL OR origin = ?", (origin, origin)).fetchall()
@@ -961,6 +984,17 @@ class Store:
         row = self.outbox_row(row_id)
         return bool(row and not row.get("hold_reason") and row["state"] == "sent" and row["kind"] == "status"
                     and row["payload"].get("release") and row["payload"].get("applied"))
+    @staticmethod
+    def history_status_settled(row: dict | None) -> bool:
+        if not row or row["kind"] != "status" or row.get("hold_reason"):
+            return False
+        payload = row["payload"]
+        if row["state"] == "sent" and payload.get("applied") == 1:
+            return True
+        return bool(payload.get("write_started") is False and (
+            (row["state"] == "sent" and payload.get("applied") == 0) or
+            (row["state"] == "failed" and row["attempts"] == 0)))
+
     def terminal_status_applied(self, row_id: str) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)

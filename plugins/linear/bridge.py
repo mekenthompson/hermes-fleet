@@ -858,7 +858,8 @@ class Bridge:
         """A thought or action is tried once: whatever held it, it never lands after a Stop, question or result."""
         try: yield
         finally:
-            if advisory(row): self.store.retire_advisory(row["id"], self.clock())
+            if advisory(row) and not row.get("_unattempted_history_deferred"):
+                self.store.retire_advisory(row["id"], self.clock())
     @contextmanager
     def _outbox_requester_scope(self, row):
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
@@ -1428,7 +1429,13 @@ class Bridge:
 
     def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
         try:
-            self._native_effect_task(issue_id)
+            task = self._native_effect_task(issue_id)
+            writes = [(kind, {**payload, "native_history": True, "write_started": False})
+                      if kind in ("comment", "activity") and not payload.get("terminal")
+                      and not payload.get("content_action") and not payload.get("assessment")
+                      and not payload.get("completion_reconcile_request_id") and payload.get("task_id") == task.id
+                      else (kind, {"write_started": False, **payload}) if kind == "status"
+                      else (kind, payload) for kind, payload in writes]
             for kind, payload in writes:
                 if kind == "status" and payload.get("terminal") and payload.get("state") == "done":
                     self._require_completion_report(payload)
@@ -1445,6 +1452,8 @@ class Bridge:
         if payload.get("task_id"):
             for issue_id in selected:
                 self._native_effect_task(issue_id)
+        if payload.get("native_history") is True:
+            return  # History does not imply completion; closed-issue delivery checks its own receipt.
         if row["kind"] == "status":
             if payload.get("terminal") and payload.get("state") == "done":
                 self._require_completion_report(payload)
@@ -2141,7 +2150,12 @@ class Bridge:
                     except NativeProgressSuperseded:
                         applied = False
                     except ProjectUpdateDeferred:
-                        if self.store.outbox_row(row["id"]) is None: progress = True
+                        current = self.store.outbox_row(row["id"])
+                        if current is None:
+                            progress = True
+                        elif (current["payload"].get("native_history") is True and
+                              current["payload"].get("write_started") is False):
+                            row["_unattempted_history_deferred"] = True
                         continue
                     except RateLimited as exc:
                         self.store.defer(row["id"], exc.until)
@@ -2199,6 +2213,16 @@ class Bridge:
                     raise
             if row and self._obsolete_native_progress(row):
                 raise NativeProgressSuperseded
+            if payload.get("native_history") is True:
+                if payload.get("write_started") is False and row["attempts"] == 0:
+                    work, task = self._native_task(payload["issue_id"])
+                    if task.status in NATIVE_PROGRESS_SUPERSEDED and self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"]):
+                        raise ProjectUpdateDeferred  # Capture the new native state before this ordinary write.
+                current = self._effect_issue(payload["issue_id"])
+                receipt = self._history_receipt_allows(payload, current)
+                if ((not self._report_delegate_allowed(current, payload) and not receipt)
+                        or ((current.get("state") or {}).get("type") in CLOSED and not receipt)):
+                    raise LinearError("Native history ownership or closed-state changed; reconcile delivery", retryable=False)
             if payload.get("initial_ack"):
                 issue = self._effect_issue(payload["issue_id"])
                 if ((self._specialist_scope_active() and
@@ -2254,6 +2278,24 @@ class Bridge:
                 row_id, started_before=prior_started.get("value"))
         with self.api.guarded_mutation(guard):
             action()
+    def _history_receipt_allows(self, payload: dict, issue: dict) -> bool:
+        if payload.get("native_history") is not True or (issue.get("state") or {}).get("type") == "canceled":
+            return False
+        status_id = payload.get("requires_status_id") or (self.store.latest_status(payload["issue_id"]) or {}).get("id")
+        status = self.store.outbox_row(status_id) if status_id else None
+        source = status["payload"] if status else {}
+        if (not status or not self.store.terminal_status_applied(status_id)
+                or source.get("issue_id") != payload["issue_id"] or source.get("task_id") != payload.get("task_id")):
+            return False
+        if not (source.get("terminal") and source.get("state") == "done"
+                and (issue.get("state") or {}).get("type") == "completed"):
+            return False
+        self._require_completion_report(source)
+        receipt = source.get("issue_write_receipt")
+        actual = self._issue_version(issue)
+        return bool(self._receipt_scope(source, receipt) and actual and all(
+            actual[key] == receipt["issue"].get(key) for key in ("state_id", "delegate_id", "assignee_id")))
+
     def _obsolete_native_progress(self, row: dict[str, Any]) -> bool:
         payload = row["payload"]
         # Only our explicitly identified transient native projection is coalesced.
@@ -2270,7 +2312,7 @@ class Bridge:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
-        attempted_progress = (payload.get("native_progress") is True and
+        attempted_progress = ((payload.get("native_progress") is True or payload.get("native_history") is True) and
                               (payload.get("write_started") is not False or row["attempts"]))
         if payload.get("claim") or payload.get("admission_id"):
             raise LinearError("Retained execution admission needs reconciliation; it cannot replay", retryable=False)
@@ -2317,14 +2359,18 @@ class Bridge:
         if kind != "project_update" and payload.get("requires_status_id") and \
                 not self.store.terminal_status_applied(payload["requires_status_id"]):
             status = self.store.outbox_row(payload["requires_status_id"])
-            if not status or not status["payload"].get("superseded") or kind not in ("activity", "comment"):
+            history_released = payload.get("native_history") is True and self.store.history_status_settled(status)
+            if payload.get("native_history") is True and not history_released:
+                raise ProjectUpdateDeferred  # Unknown/legacy status is not an unapplied prerequisite.
+            if not history_released and (not status or not status["payload"].get("superseded") or kind not in ("activity", "comment")):
                 return False
-            content = payload["content"] if kind == "activity" else payload
-            if not payload.get("superseded_receipt"):
-                content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
-                                   content["body"].replace("Done.", "Finished locally.", 1))
-            payload["superseded_receipt"] = True
-            self.store.rewrite(row["id"], payload, row["next_at"])
+            if not history_released:
+                content = payload["content"] if kind == "activity" else payload
+                if not payload.get("superseded_receipt"):
+                    content["body"] = ("Earlier work closeout superseded; Linear status was not changed.\n\n" +
+                                       content["body"].replace("Done.", "Finished locally.", 1))
+                payload["superseded_receipt"] = True
+                self.store.rewrite(row["id"], payload, row["next_at"])
         if kind != "project_update" and payload.get("terminal") and not payload.get("admission_id"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
@@ -2340,8 +2386,9 @@ class Bridge:
             session_progress = (kind == "activity" and payload.get("ephemeral")
                                 and (payload.get("content") or {}).get("type") == "action"
                                 and payload.get("requester_sessions"))
-            if ((not self._report_delegate_allowed(issue, payload) and not (session_progress and not delegate))
-                    or (issue.get("state") or {}).get("type") in CLOSED):
+            history_receipt = self._history_receipt_allows(payload, issue)
+            if ((not self._report_delegate_allowed(issue, payload) and not (session_progress and not delegate) and not history_receipt)
+                    or ((issue.get("state") or {}).get("type") in CLOSED and not history_receipt)):
                 if attempted_progress:
                     raise LinearError("Prior native progress delivery requires reconciliation after ownership or state changed", retryable=False)
                 return False
@@ -2413,6 +2460,8 @@ class Bridge:
                 payload["issue_id"], payload["expected_description"], payload["body"]))
             return True
         elif kind == "activity":
+            if payload.get("native_history") is True and attempted_progress:
+                raise LinearError("Attempted native history activity requires exact delivery reconciliation", retryable=False)
             self._mutate_outbox(row["id"], lambda: self.api.create_activity(
                 row["id"], payload["session_id"], payload["content"], issue_id=payload["issue_id"],
                 ephemeral=bool(payload.get("ephemeral"))))
