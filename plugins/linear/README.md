@@ -69,10 +69,11 @@ binding revision. Queued completion writes recheck that same accepted scope befo
 Previously captured progress remains history: reconciling a link does not restart a worker,
 rewind its reporting cursor, or republish an earlier completion. Preserve a completed partial
 task and deliberately continue only the remaining outcome through native controls and tracking.
-When reporting catches up after native completion, obsolete Started and heartbeat messages
-are omitted. Queued messages explicitly identified as native progress recheck completion
-immediately before publication. Native comments, partial-stage summaries and uncertain sends
-remain intact; completion still preserves later human edits and ownership changes.
+When reporting catches up after native work stops, waits for a dependency, time or review,
+finishes or is archived, obsolete Started and heartbeat messages are omitted. Queued messages
+explicitly identified as native progress recheck the current phase immediately before
+publication. Native comments, current wait/review milestones, partial-stage summaries and
+uncertain sends remain intact; status reporting still preserves later human edits and ownership changes.
 Only progress durably recorded as unstarted is omitted. Publication admission records an
 attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
 on retry; a missing historical attempt marker never proves that a message was unsent.
