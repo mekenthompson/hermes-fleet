@@ -580,7 +580,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 self.assertIn("query CommentReadback", remote.requests)
                 self.assertEqual(remote.state(ISSUE), "Blocked")
 
-    def test_own_done_history_requires_current_scope_and_preserves_late_history(self):
+    def test_own_done_receipt_does_not_authorize_new_post_done_native_history(self):
         import uuid
         for replace_scope in (False, True):
             with self.subTest(replace_scope=replace_scope):
@@ -599,7 +599,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     kb.add_comment(conn, task_id, "worker", "Late native history after own completion")
                 reporter.pump_kanban()
                 reporter.flush()
-                self.assertEqual(sum("Late native history after own completion" in body for body in remote.bodies(ISSUE)), int(not replace_scope))
+                self.assertEqual(sum("Late native history after own completion" in body for body in remote.bodies(ISSUE)), 0)
 
     def test_archived_history_does_not_revive_retired_release_or_human_clear(self):
         import uuid
@@ -720,12 +720,13 @@ class NativeBridgeScenarios(unittest.TestCase):
             with self.subTest(change=change):
                 clock, remote, reporter, task_id = self.reporting_fixture("done-history-http-" + change)
                 reporter.flush()
-                self.complete_reported_task(clock, task_id)
-                reporter.recover()
-                reporter.flush()
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
                     kb.add_comment(conn, task_id, "worker", "History held after human change at HTTP boundary")
                 reporter.pump_kanban()
+                self.complete_reported_task(clock, task_id)
+                reporter.recover()
+                done = next(row for row in reporter.store.pending() if row["kind"] == "status" and row["payload"].get("state") == "done")
+                reporter.flush(only_id=done["id"])
                 create = reporter.api.create_comment
                 def human_change_before_http(*args, **kwargs):
                     if change == "delegate":
@@ -805,6 +806,103 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.flush()
         self.assertEqual(remote.state(ISSUE), "Blocked")
         self.assertEqual(sum("Ordinary history protected" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_history_waits_for_native_resume_at_http_boundary_in_both_routes(self):
+        for session_route in (False, True):
+            with self.subTest(session_route=session_route):
+                factory = self.session_reporting_fixture if session_route else self.reporting_fixture
+                clock, remote, reporter, task_id = factory("resume-history-" + str(session_route))
+                remote.comment_updates_issue = True
+                reporter.flush()
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                reporter.flush()
+                self.halt_reported_task(clock, task_id, "blocked")
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(remote.state(ISSUE), "Blocked")
+                clock.now += 1
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.add_comment(conn, task_id, "worker", "Preserved ordinary history during native Stop")
+                reporter.pump_kanban()
+                method = "create_activity" if session_route else "create_comment"
+                create = getattr(reporter.api, method)
+                def resume_before_http(*args, **kwargs):
+                    clock.now += 1
+                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                        self.assertTrue(kb.unblock_task(conn, task_id))
+                        self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-resume-worker"))
+                    clock.now += 1
+                    return create(*args, **kwargs)
+                with patch.object(reporter.api, method, side_effect=resume_before_http):
+                    reporter.flush()
+                self.assertFalse(any("Preserved ordinary history during native Stop" in body for body in remote.bodies(ISSUE)))
+                reporter.recover()
+                reporter.flush()
+                self.assertEqual(self.board.get(task_id).status, "running")
+                self.assertEqual(remote.state(ISSUE), "In Progress")
+                self.assertEqual(sum("Preserved ordinary history during native Stop" in body for body in remote.bodies(ISSUE)), 1)
+
+    def test_uncaptured_halt_at_final_admission_never_reaches_transport(self):
+        for session_route in (False, True):
+            for progress in (False, True):
+                with self.subTest(session_route=session_route, progress=progress):
+                    factory = self.session_reporting_fixture if session_route else self.reporting_fixture
+                    clock, remote, reporter, task_id = factory("final-admit-" + str(session_route) + str(progress))
+                    remote.comment_updates_issue = True
+                    reporter.flush()
+                    if progress:
+                        self.native_progress(clock, task_id)
+                    else:
+                        clock.now += 1
+                        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                            kb.claim_task(conn, task_id, claimer="uncaptured-admission-worker")
+                            kb.add_comment(conn, task_id, "worker", "Ordinary history retained after uncaptured admission halt")
+                    reporter.pump_kanban()
+                    target = next(row for row in reporter.store.pending() if row["payload"].get("native_history") and not row["payload"].get("ephemeral"))
+                    admit = reporter.store.admit_mutation
+                    raced = False
+                    def halt_without_capture(row_id, **kwargs):
+                        nonlocal raced
+                        if row_id == target["id"] and not raced:
+                            raced = True
+                            self.halt_reported_task(clock, task_id, "blocked")
+                            clock.now += .25
+                        return admit(row_id, **kwargs)
+                    with patch.object(reporter.store, "admit_mutation", side_effect=halt_without_capture):
+                        reporter.flush()
+                    self.assertTrue(raced)
+                    self.assertEqual(remote.comments, [])
+                    self.assertEqual(remote.activities, [])
+                    boundary = reporter.store.outbox_row(target["id"])
+                    self.assertIs(boundary["payload"].get("write_started"), False)
+                    self.assertEqual(boundary["attempts"], 0)
+                    reporter.recover()
+                    reporter.flush()
+                    self.assertEqual(remote.state(ISSUE), "Blocked")
+                    self.assertEqual(sum("Ordinary history retained" in body for body in remote.bodies(ISSUE)), int(not progress))
+
+    def test_known_unstarted_legacy_progress_waits_for_resume_status_without_deadlock(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("legacy-progress-resume")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        progress = [row for row in reporter.store.pending() if row["payload"].get("native_progress")]
+        for row in progress:
+            payload = dict(row["payload"])
+            for key in ("native_history", "native_history_event_id", "requires_status_id"):
+                payload.pop(key, None)
+            reporter.store.rewrite(row["id"], payload, row["next_at"])
+        self.halt_reported_task(clock, task_id, "blocked")
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.unblock_task(conn, task_id)
+            kb.claim_task(conn, task_id, claimer="legacy-progress-resumed-worker")
+        reporter.recover()
+        reporter.flush()
+        self.assertFalse(reporter.store.pending())
+        self.assertEqual(remote.state(ISSUE), "In Progress")
+        self.assertTrue(all(reporter.store.outbox_row(row["id"])["payload"].get("applied") == 1 for row in progress))
 
     def test_halted_reporting_gap_coalesces_native_progress_before_capture_or_send(self):
         from hermes_fleet_linear_plugin.api import LinearAPI

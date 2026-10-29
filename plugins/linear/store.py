@@ -248,7 +248,7 @@ class Store:
             if not self.delivery_allowed(row_id):
                 return False
             payload = json.loads(row["payload"])
-            if payload.get("native_history") is True and payload.get("requires_status_id"):
+            if (payload.get("native_history") is True or payload.get("native_progress") is True) and payload.get("requires_status_id"):
                 dependency = self.outbox_row(payload["requires_status_id"])
                 if not self.history_status_settled(dependency):
                     return False
@@ -276,6 +276,22 @@ class Store:
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
+    def reject_native_message_before_transport(self, row_id: str, *, started_before: bool | None) -> bool:
+        """Only the pre-yield guard's proved non-send can restore an unstarted marker."""
+        if started_before is not False:
+            return False
+        with self._tx() as db:
+            row = db.execute("SELECT kind,state,attempts,payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not row or row["state"] != "pending" or row["attempts"] != 0 or row["kind"] not in ("comment", "activity"):
+                return False
+            payload = json.loads(row["payload"])
+            if (payload.get("write_started") is not True or not payload.get("task_id") or
+                    not (payload.get("native_history") is True or payload.get("native_progress") is True)):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) WHERE id=?", (row_id,))
+            self._sequence_native_history(db, payload["issue_id"])
+            return True
+
     def delegate_not_applied(self, row_id: str, *, started_before: bool | None) -> bool:
         """Only an affirmative HTTP rejection can undo this attempt's send marker."""
         if started_before is not False:
@@ -780,7 +796,8 @@ class Store:
         if status:
             db.execute("UPDATE outbox SET payload=json_set(payload,'$.requires_status_id',?) "
                        "WHERE state='pending' AND hold_reason IS NULL AND kind IN ('comment','activity') AND attempts=0 "
-                       "AND json_extract(payload,'$.native_history')=1 AND json_type(payload,'$.write_started')='false' "
+                       "AND (json_extract(payload,'$.native_history')=1 OR json_extract(payload,'$.native_progress')=1) "
+                       "AND json_type(payload,'$.write_started')='false' "
                        "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=?",
                        (status["id"], issue_id, work["task_id"]))
 

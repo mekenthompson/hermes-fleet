@@ -79,8 +79,10 @@ attempt before HTTP, and an attempted comment keeps its UUID and requires exact 
 on retry; a missing historical attempt marker never proves that a message was unsent.
 Current native status is projected before ordinary history that is durably unattempted,
 using the existing status dependencies. A refused status still permits ordinary history
-while the issue remains open. History after our own Done requires that exact current
-native scope's applied completion acknowledgement; a human close grants no such permission.
+while the issue remains open. Earlier history delivered after our own Done requires its
+native event to precede that exact current scope's applied completion event. A human close,
+old scope or new post-Done native comment grants no such permission; explicitly authorized
+chat comments retain their separate content path.
 Attempted or legacy history keeps its original delivery boundary and UUID. These history
 writes never justify a later issue-version overwrite. Agent Session activities retain their
 existing advisory contract; unknown activity delivery requires inspection, not replay.
