@@ -29,6 +29,8 @@ CLOSED = ("completed", "canceled")
 # Core's ready/running phases can still use current progress. Known waits,
 # halts and terminal phases supersede earlier Started/Working projections.
 NATIVE_PROGRESS_SUPERSEDED = frozenset({"todo", "scheduled", "blocked", "triage", "review", "done", "archived"})
+NATIVE_STATUS_EVENTS = frozenset({"blocked", "block_loop_detected", "gave_up", "unblocked", "changes_requested",
+                                  "promoted", "scheduled", "dependency_wait", "descendant_invalidated", "completed", "archived"})
 URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
@@ -1430,7 +1432,7 @@ class Bridge:
     def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
         try:
             task = self._native_effect_task(issue_id)
-            writes = [(kind, {**payload, "native_history": True, "write_started": False})
+            writes = [(kind, {**payload, "native_history": True, "native_history_event_id": event_id, "write_started": False})
                       if kind in ("comment", "activity") and not payload.get("terminal")
                       and not payload.get("content_action") and not payload.get("assessment")
                       and not payload.get("completion_reconcile_request_id") and payload.get("task_id") == task.id
@@ -2216,7 +2218,8 @@ class Bridge:
             if payload.get("native_history") is True:
                 if payload.get("write_started") is False and row["attempts"] == 0:
                     work, task = self._native_task(payload["issue_id"])
-                    if task.status in NATIVE_PROGRESS_SUPERSEDED and self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"]):
+                    pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
+                    if any(event.kind in NATIVE_STATUS_EVENTS for event in pending):
                         raise ProjectUpdateDeferred  # Capture the new native state before this ordinary write.
                 current = self._effect_issue(payload["issue_id"])
                 receipt = self._history_receipt_allows(payload, current)
@@ -2269,6 +2272,19 @@ class Bridge:
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
+            if (prior_started.get("value") is False and row["attempts"] == 0 and
+                    (payload.get("native_history") is True or payload.get("native_progress") is True)):
+                work, task = self._native_task(payload["issue_id"])
+                pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
+                latest = self.store.outbox_row((self.store.latest_status(payload["issue_id"]) or {}).get("id", ""))
+                changed = (any(event.kind in NATIVE_STATUS_EVENTS for event in pending) or
+                           (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED) or
+                           (latest and not latest.get("hold_reason") and latest["state"] == "pending"
+                            and latest["payload"].get("task_id") == payload.get("task_id")))
+                if changed:
+                    # Still before guard yield: this request has made no HTTP call.
+                    self.store.reject_native_message_before_transport(row_id, started_before=prior_started["value"])
+                    raise ProjectUpdateDeferred
             yield
         if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
             guard.rejected = lambda: self.store.project_not_applied(
@@ -2291,6 +2307,10 @@ class Bridge:
                 and (issue.get("state") or {}).get("type") == "completed"):
             return False
         self._require_completion_report(source)
+        completed_event = (source.get("native_completion") or {}).get("event_id")
+        history_event = payload.get("native_history_event_id")
+        if type(history_event) is not int or type(completed_event) is not int or history_event >= completed_event:
+            return False  # Own completion covers earlier history, never a new post-Done request.
         receipt = source.get("issue_write_receipt")
         actual = self._issue_version(issue)
         return bool(self._receipt_scope(source, receipt) and actual and all(
@@ -2359,8 +2379,8 @@ class Bridge:
         if kind != "project_update" and payload.get("requires_status_id") and \
                 not self.store.terminal_status_applied(payload["requires_status_id"]):
             status = self.store.outbox_row(payload["requires_status_id"])
-            history_released = payload.get("native_history") is True and self.store.history_status_settled(status)
-            if payload.get("native_history") is True and not history_released:
+            history_released = (payload.get("native_history") is True or payload.get("native_progress") is True) and self.store.history_status_settled(status)
+            if (payload.get("native_history") is True or payload.get("native_progress") is True) and not history_released:
                 raise ProjectUpdateDeferred  # Unknown/legacy status is not an unapplied prerequisite.
             if not history_released and (not status or not status["payload"].get("superseded") or kind not in ("activity", "comment")):
                 return False

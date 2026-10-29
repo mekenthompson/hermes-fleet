@@ -125,7 +125,8 @@ class FakeLinear:
 
     def bodies(self, issue_id: str) -> list[str]:
         return [c["body"] for c in self.comments if c["issueId"] == issue_id] + \
-               [a["content"]["body"] for a in self.activities if a.get("issueId") == issue_id]
+               [a["content"].get("body") or a["content"].get("parameter") or ""
+                for a in self.activities if a.get("issueId") == issue_id]
 
     def handle(self, query: str, variables: dict) -> tuple[int, dict, dict]:
         with self.lock:
