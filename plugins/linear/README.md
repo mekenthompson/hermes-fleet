@@ -69,6 +69,10 @@ binding revision. Queued completion writes recheck that same accepted scope befo
 Previously captured progress remains history: reconciling a link does not restart a worker,
 rewind its reporting cursor, or republish an earlier completion. Preserve a completed partial
 task and deliberately continue only the remaining outcome through native controls and tracking.
+When reporting catches up after native completion, obsolete Started and heartbeat messages
+are omitted. Queued messages explicitly identified as native progress recheck completion
+immediately before publication. Native comments, partial-stage summaries and uncertain sends
+remain intact; completion still preserves later human edits and ownership changes.
 If the entire outcome really is already complete, the agent can add `reconcile_complete: true`
 to that guarded outcome replacement after inspecting acceptance and evidence. The same UUID
 durably queues only its verified completion through the existing outbox, without another
