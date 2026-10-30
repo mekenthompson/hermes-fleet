@@ -25,6 +25,13 @@ class ContentRemote(FakeLinear):
             found = next((c for c in self.comments if c['id'] == variables['id']), None)
             return 200, {'data': {'comment': ({'id': found['id'], 'body': found['body'],
                 'issue': {'id': found['issueId']}} if found else None)}}
+        if 'projectCreate' in query:
+            self.created_project = dict(variables['input'])
+            return 200, {'data': {'projectCreate': {'success': True}}}
+        if 'CreatedProject' in query:
+            data = self.created_project
+            return 200, {'data': {'project': {'id': data['id'], 'name': data['name'],
+                'lead': None, 'teams': {'nodes': [{'id': team} for team in data['teamIds']]}}}}
         if 'issueCreate' in query:
             data = variables['input']
             issue = self.add_issue(data['id'], 'ABC-2', project=None)
@@ -391,6 +398,47 @@ class ContentActionTests(unittest.TestCase):
         created = self.remote.issues[args['id']]
         self.assertEqual(created['description'], long)
         self.assertIsNone(self.store.get(args['id']))
+
+    def test_project_long_paragraph_warns_without_rewriting(self):
+        body = 'Project prose. ' * 60
+        args = {'action': 'create_project', 'id': self.request_id, 'name': 'Outcome',
+                'team': 'team-1', 'description': body}
+        reply = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(reply['ok'], reply)
+        self.assertIn('Formatting tip', reply['message'])
+        self.assertEqual(self.remote.created_project['description'], body)
+        self.assertIsNone(self.remote.created_project['leadId'])
+
+    def test_handler_content_preserves_bytes_and_warning_boundary(self):
+        # Coverage of existing behavior, including create through the exposed handler.
+        bodies = (('  Setup verified.  ', False), ('x' * 500, False),
+                  ('x' * 501, True), ('  ' + BODY * 5 + '\n\n', False))
+        for action in ('create_issue', 'create_project', 'update_description', 'add_comment'):
+            for body, warns in bodies:
+                with self.subTest(action=action, body_length=len(body)):
+                    request_id = str(uuid.uuid4())
+                    args = {'action': action, 'id': request_id, 'issue': 'ABC-1',
+                            'team': 'team-1', 'title': 'Outcome', 'name': 'Outcome',
+                            'description': body, 'body': body,
+                            'expected_description': self.remote.issues['issue-1']['description']}
+                    reply = json.loads(chat.handle(self.bridge, args, self.context))
+                    self.assertTrue(reply['ok'], reply)
+                    self.assertEqual('Formatting tip' in reply['message'], warns)
+                    if action == 'create_issue':
+                        self.assertEqual(self.remote.issues[request_id]['description'], body)
+                        self.assertIsNone(self.store.get(request_id))
+                    elif action == 'create_project':
+                        self.assertEqual(self.remote.created_project['description'], body)
+                    else:
+                        row = self.store.outbox_row(request_id)
+                        self.assertEqual(row['payload']['body'], body)
+                        self.assertTrue(self.bridge._send(row))
+                        self.store.mark_sent(request_id, True)
+                        if action == 'update_description':
+                            self.assertEqual(self.remote.issues['issue-1']['description'], body)
+                        else:
+                            comment = next(c for c in self.remote.comments if c['id'] == request_id)
+                            self.assertEqual(comment['body'], body)
 
     def test_bound_specialist_allows_content_on_scope_and_refuses_foreign_scope(self):
         from hermes_fleet_linear_plugin import BoundLinearAPI
