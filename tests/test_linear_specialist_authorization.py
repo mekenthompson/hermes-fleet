@@ -456,6 +456,22 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.kanban.creates, [])
 
 
+    def test_compact_read_alias_keeps_specialist_requester_and_scope_denials(self):
+        from hermes_fleet_linear_plugin import chat
+        self.authority.issues["OPS-1"] = issue_record()
+        for changes in ({"creator": {"id": "foreign-requester"}},
+                        {"project": {"id": "foreign-project"}},
+                        {"team": {"id": "foreign-team", "key": "OPS"}},
+                        {"identifier": "OTHER-1"}):
+            with self.subTest(changes=changes):
+                self.authority.issues["OPS-1"] = issue_record(**changes)
+                result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": "OPS1"}, self.context()))
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(self.store.active(), [])
+                self.assertEqual(self.store.pending(), [])
+                self.assertEqual(self.kanban.creates, [])
+                self.assertEqual(self.authority.mutations, [])
+
     def test_scope_contract_is_complete_and_closed(self):
         for scope in (
             {},

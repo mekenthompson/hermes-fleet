@@ -1846,6 +1846,15 @@ class Bridge:
             return "activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "content": {"type": kind, "body": body}, **route}
         if event.kind in ("blocked", "block_loop_detected") and str(payload.get("reason") or "").startswith(OWN):
             writes = [status("blocked")]
+        elif (event.kind == "blocked" and payload.get("reason") == "initial_status"
+              and getattr(self._binding_adapter(issue_id), "guarded_controls", False)
+              and self._binding_adapter(issue_id).initial_activation_event(row["task_id"]) == event.id):
+            # Native creation atomically parks a new task before admission. Only
+            # that pristine create+block pair proves preparation; a later Stop,
+            # even with this same reason, remains a real block. Reporting cannot
+            # admit the task or promise that a parked task will be started.
+            writes = [status("blocked"), message("thought",
+                "Native task prepared; waiting for native admission. No user input is requested.")]
         elif event.kind in ("blocked", "block_loop_detected"):
             internal_block = payload.get("kind") in {"capability", "transient"}
             instruction = ("Resolve Kanban triage on the board." if task_status == "triage" else
