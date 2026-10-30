@@ -70,6 +70,47 @@ class StatusProgressTests(unittest.TestCase):
         self.assertEqual(self.kanban.subscriptions, [])
         self.assertFalse(any(q.startswith("mutation") for q in self.remote.requests))
 
+    def test_compact_status_reference_resolves_once_without_dispatch_or_mutation(self):
+        self.comment(1, "Verified delivery. Remaining: actual client checks.")
+        for ref in ("ABC1", "abc1", "ABC-1", "issue-1"):
+            with self.subTest(ref=ref):
+                before = self.snapshot()
+                expected = "ABC-1" if ref in ("ABC1", "abc1") else ref
+                with patch.object(self.api, "issue", wraps=self.api.issue) as lookup:
+                    result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": ref}, self.context))
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["issue"]["id"], "issue-1")
+                lookup.assert_called_once_with(expected)
+                self.assert_read_only(before)
+
+    def test_compact_status_does_not_weaken_exact_identity_or_scope(self):
+        for field, value in (("identifier", "OTHER-1"), ("project", {"id": "foreign-project"}),
+                             ("team", {"id": "foreign-team", "key": "OTHER"})):
+            with self.subTest(field=field):
+                original = copy.deepcopy(self.remote.issues["issue-1"])
+                self.remote.issues["issue-1"][field] = value
+                before = self.snapshot()
+                result = json.loads(chat.handle(self.bridge, {"action": "status", "issue": "ABC1"}, self.context))
+                self.assertFalse(result["ok"], result)
+                self.assertNotIn("progress", result)
+                self.assert_read_only(before)
+                self.remote.issues["issue-1"] = original
+
+    def test_compact_alias_is_not_a_mutation_target_or_fuzzy_issue_search(self):
+        before = self.snapshot()
+        requests = [
+            {"action": "add_comment", "issue": "ABC1", "body": "Not authorized by a read alias",
+             "id": "cb12d692-1fa5-4ed3-8bfe-a2539f24f426"},
+            *({"action": "status", "issue": ref} for ref in
+              ("A1B2", "ABC0001", "ABC1 or DEF2", "a" * 24 + "1" * 8)),
+        ]
+        for request in requests:
+            with self.subTest(request=request), patch.object(self.api, "issue", wraps=self.api.issue) as lookup:
+                result = json.loads(chat.handle(self.bridge, request, self.context))
+                self.assertFalse(result["ok"], result)
+                lookup.assert_called_once_with(request["issue"])
+                self.assert_read_only(before)
+
     def test_newest_page_exposes_current_milestones_without_rewriting_acceptance(self):
         for number in range(67):
             self.comment(number)

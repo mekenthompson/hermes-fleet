@@ -25,6 +25,80 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.bridge.handle_webhook(self.fixture.event())
         return self.store.get(scenarios.ISSUE)["task_id"]
 
+    def prepared_chat_task(self):
+        task = self.board.create(title="Fresh chat-origin outcome", initial_status="blocked")
+        self.bridge.track(scenarios.ISSUE, task.id, requester_session=scenarios.SESSION)
+        return task.id
+
+    def pending_contents(self):
+        return [row["payload"]["content"] for row in self.store.pending()
+                if row["kind"] == "activity"]
+
+    def test_pristine_chat_preparation_reports_no_human_input_or_activation(self):
+        task_id = self.prepared_chat_task()
+        self.bridge.pump_kanban()
+        contents = self.pending_contents()
+        self.assertFalse(any(content["type"] == "elicitation" for content in contents))
+        self.assertTrue(any(content["type"] == "thought" and "prepared" in content["body"]
+                            and "No user input" in content["body"] for content in contents))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        events = self.board.history(task_id, 0)
+        self.assertEqual([event.kind for event in events], ["created", "blocked"])
+        self.assertEqual(self.store.get(scenarios.ISSUE)["last_event_id"], events[-1].id)
+        # A repeated reporting pump advances no work and duplicates no notice.
+        before = self.store.pending()
+        self.bridge.pump_kanban()
+        self.assertEqual(self.store.pending(), before)
+
+    def test_preparation_reporting_does_not_mask_later_operator_stop(self):
+        task_id = self.prepared_chat_task()
+        self.bridge.pump_kanban()
+        token = self.board.history(task_id, 0)[-1].id
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="operator Stop",
+                                                    kind="needs_input", expected_event_id=token))
+        self.bridge.pump_kanban()
+        self.assertTrue(any(content["type"] == "elicitation" and "operator Stop" in content["body"]
+                            for content in self.pending_contents()))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_later_block_cannot_impersonate_creation_by_reusing_initial_reason(self):
+        task_id = self.prepared_chat_task()
+        self.bridge.pump_kanban()
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="initial_status", kind="needs_input"))
+        self.bridge.pump_kanban()
+        self.assertTrue(any(content["type"] == "elicitation" and "initial_status" in content["body"]
+                            for content in self.pending_contents()))
+
+    def test_nonblocked_creation_does_not_prove_initial_preparation(self):
+        task = self.board.create(title="Existing running outcome", initial_status="running")
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.block_task(conn, task.id, reason="initial_status", kind="needs_input"))
+        self.bridge.track(scenarios.ISSUE, task.id, requester_session=scenarios.SESSION)
+        self.bridge.pump_kanban()
+        self.assertTrue(any(content["type"] == "elicitation" for content in self.pending_contents()))
+        self.assertEqual(self.board.get(task.id).status, "blocked")
+
+    def test_legacy_native_host_keeps_parked_block_reporting(self):
+        from unittest.mock import PropertyMock
+        task_id = self.prepared_chat_task()
+        with patch.object(type(self.board), "guarded_controls", new_callable=PropertyMock, return_value=False):
+            self.bridge.pump_kanban()
+        self.assertTrue(any(content["type"] == "elicitation" for content in self.pending_contents()))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertFalse(any(event.kind == "unblocked" for event in self.board.history(task_id, 0)))
+
+    def test_delayed_preparation_event_does_not_replace_actual_running_progress(self):
+        task_id = self.prepared_chat_task()
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.unblock_task(conn, task_id))
+            self.assertIsNotNone(scenarios.kb.claim_task(conn, task_id, claimer="current-worker"))
+        self.bridge.pump_kanban()
+        self.assertFalse(any(content["type"] == "elicitation" or "prepared" in content.get("body", "")
+                             for content in self.pending_contents()))
+        self.assertEqual(self.board.get(task_id).status, "running")
+
     def test_assignment_reaches_native_ready_without_manual_activation(self):
         task_id = self.assign()
         self.assertEqual(self.board.get(task_id).status, "ready")
