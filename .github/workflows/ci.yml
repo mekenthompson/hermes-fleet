@@ -95,6 +95,59 @@ jobs:
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-notification-contract" \
             --expected-revision 1436af4a930a65faff42cf2d79a88b65b69a5fdc
+  candidate-hf578:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.7'
+      # Test-only companion source. The source-checks manifest lane remains the
+      # only release compatibility claim; this checkout proves the candidate pair.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: mekenthompson/hermes-agent
+          ref: 769d1be0a24dd28d44d27894094cc77e9359dbea
+          path: agent-candidate
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exact companion Core candidate scenarios
+        run: |
+          python -m venv "$RUNNER_TEMP/linear-scenarios"
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          candidate = dict(json.loads(Path('release/agent-image-manifest.json').read_text()))
+          candidate['revision'] = '769d1be0a24dd28d44d27894094cc77e9359dbea'
+          Path(os.environ['RUNNER_TEMP'], 'hf578-candidate-test-only.json').write_text(json.dumps(candidate))
+          PY
+          echo 'Candidate evidence only: temporary revision selector is not a release manifest.'
+          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-candidate" \
+            --manifest "$RUNNER_TEMP/hf578-candidate-test-only.json"
+          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-candidate" \
+            --manifest "$RUNNER_TEMP/hf578-candidate-test-only.json" \
+            --pattern candidate_hf578.py
+      - name: Exact companion Core checkpoint and origin tests
+        run: |
+          (cd agent-candidate && python -m pm.build_env --source . \
+            --out "$RUNNER_TEMP/hf578-core-test-env" --group dev --group test --extra all --ci)
+          (cd agent-candidate && HERMES_PYTHON="$RUNNER_TEMP/hf578-core-test-env/bin/python" \
+            scripts/run_tests.sh tests/hermes_cli/test_kanban_human_checkpoint.py \
+            tests/gateway/test_kanban_checkpoint_local.py \
+            tests/tui_gateway/test_kanban_checkpoint_passive.py \
+            tests/tools/test_kanban_trusted_profile_origin.py \
+            tests/agent/test_runtime_session_store_surface_parity.py \
+            tests/tui_gateway/test_protocol.py \
+            tests/gateway/test_wake_admitted_before_drain_authority.py -j 2 --file-retries 0)
 
   history-root:
     runs-on: ubuntu-latest

@@ -98,10 +98,13 @@ class EventDataScenarios(unittest.TestCase):
                 self.assertEqual(case.reporter.store.get(native.ISSUE)["last_event_id"], case.event_id)
                 self.check_independent_delivery(case)
 
-    def test_comment_numeric_metadata_failures_are_scoped_without_an_exception_whitelist(self):
+    def test_ordinary_comment_metadata_is_inert_even_when_legacy_length_is_invalid(self):
         for value in ("not-a-number", "", [], [1], {}, {"value": 1}, float("inf"), float("nan")):
-            with self.subTest(numeric=value):
-                self.check_invalid("commented", {"author": "operator", "len": value})
+            with self.subTest(numeric=value), self.event_case("commented", {"author": "operator", "len": value}, invalid=False) as case:
+                case.reporter.tick()
+                self.assertEqual(case.reporter.store.get(native.ISSUE)["last_event_id"], case.event_id)
+                self.assertNotIn(COMMENT, case.remote.bodies(native.ISSUE))
+                self.check_independent_delivery(case)
 
     def test_nested_unhashable_metadata_and_formatter_input_failures_are_scoped(self):
         for kind, payload in (("blocked", {"kind": ["unexpected"]}),
@@ -116,15 +119,16 @@ class EventDataScenarios(unittest.TestCase):
                 case.reporter.tick()
                 self.assertEqual(case.reporter.store.get(native.ISSUE)["last_event_id"], case.event_id)
                 self.check_independent_delivery(case)
-                if payload and payload.get("note"):
-                    self.assertTrue(any("Valid native progress" in body for body in case.remote.bodies(native.ISSUE)))
+                self.assertFalse(any("Valid native progress" in body for body in case.remote.bodies(native.ISSUE)))
 
-    def test_native_generated_comment_and_legacy_numeric_string_retain_exact_body(self):
+    def test_native_generated_comment_and_legacy_numeric_string_stay_internal(self):
         for payload in (GENERATED, {"author": "operator", "len": str(len(COMMENT))}):
             with self.subTest(payload=payload), self.event_case("commented", payload, invalid=False, comment=True) as case:
                 case.reporter.tick()
                 self.assertEqual(case.reporter.store.get(native.ISSUE)["last_event_id"], case.event_id)
-                self.assertIn(COMMENT, case.remote.bodies(native.ISSUE))
+                self.assertNotIn(COMMENT, case.remote.bodies(native.ISSUE))
+                with case.board.read_conn() as conn:
+                    self.assertEqual(case.board.comments(conn, case.task_id)[-1].body, COMMENT)
                 self.check_independent_delivery(case)
 
     def test_actual_global_rate_limit_propagates_instead_of_becoming_a_bad_binding(self):

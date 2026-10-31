@@ -1429,7 +1429,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertFalse(any("issueUpdate" in query for query in self.authority.mutations))
 
 
-    def test_worker_progress_becomes_agent_action_activity(self):
+    def test_worker_heartbeat_stays_ephemeral_and_only_checkpoint_becomes_human_activity(self):
         from types import SimpleNamespace
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
@@ -1439,6 +1439,12 @@ class SessionRequesterTests(unittest.TestCase):
         self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(id=10, kind="heartbeat", payload={}), "running", {})
         self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(
             id=11, kind="commented", payload={"author": "worker", "len": 29}, created_at=11), "running", {})
+        self.assertFalse(any(item["payload"]["content"].get("body") == "Checked the Sydney stock file"
+                             for item in self.store.pending() if item["kind"] == "activity"))
+        self.bridge._task_event(self.store.get(ISSUE), SimpleNamespace(
+            id=12, kind="checkpoint", payload={"body": "Checked the Sydney stock file",
+                                                 "request_id": "stock-checkpoint-1"}, created_at=12),
+            "running", {})
         actions = [item["payload"] for item in self.store.pending()
                    if item["kind"] == "activity" and item["payload"]["content"].get("type") == "action"]
         thoughts = [item["payload"]["content"].get("body") for item in self.store.pending()

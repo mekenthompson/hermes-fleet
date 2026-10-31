@@ -194,7 +194,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def inspected(self, ref):
         return await asyncio.to_thread(origin.inspect, ref, self.settings)
 
-    async def async_registered_tool(self, action, **selectors):
+    async def async_registered_tool(self, action, *, expect_refusal=False, **selectors):
         """The native tool_call bridge on a provider loop, off the owner RPC loop."""
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
         from tools.registry import registry
@@ -216,7 +216,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 "action": action, **selectors}}]}, enabled_tools=["linear"], enabled_toolsets=["linear"],
                 session_id=self.sid)
             result = json.loads(result)
-            self.assertIn("ok", result, result)  # The registered plugin must actually run.
+            if expect_refusal:
+                self.assertTrue(result.get("error") or result.get("ok") is False, result)
+            else:
+                self.assertIn("ok", result, result)  # The registered plugin must actually run.
             return result
 
         # Native conversation execution is off the owner loop; provider SDK callbacks
@@ -257,8 +260,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         for action in ("origin_reference", "work_reference"):
             for selector in ("profile", "session_id", "home", "task_id", "issue"):
                 with self.subTest(action=action, selector=selector):
-                    result = await self.async_registered_tool(action, **{selector: "forged"})
-                    self.assertFalse(result["ok"])
+                    result = await self.async_registered_tool(action, expect_refusal=True,
+                                                              **{selector: "forged"})
+                    self.assertFalse(result.get("ok", False))
         self.assertEqual(self.calls, [])
 
     async def test_registered_origin_tool_on_async_provider_loop_refuses_settled_admission(self):

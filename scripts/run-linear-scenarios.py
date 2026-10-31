@@ -27,7 +27,7 @@ def expected_revision(manifest: Path) -> str:
     return module.load_manifest(manifest)["revision"]
 
 
-def run(agent_source: Path, manifest: Path, tests_dir: Path) -> int:
+def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "test_linear_*scenarios.py") -> int:
     if not agent_source.is_dir():
         print(f"Agent source missing: {agent_source}", file=sys.stderr)
         return 1
@@ -63,15 +63,15 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path) -> int:
         try:
             os.environ.clear()
             os.environ.update(isolated)
-            return run_suite(tests_dir)
+            return run_suite(tests_dir, pattern)
         finally:
             os.environ.clear()
             os.environ.update(inherited)
 
 
-def run_suite(tests_dir: Path) -> int:
+def run_suite(tests_dir: Path, pattern: str = "test_linear_*scenarios.py") -> int:
     suite = unittest.defaultTestLoader.discover(
-        start_dir=str(tests_dir), pattern="test_linear_*scenarios.py",
+        start_dir=str(tests_dir), pattern=pattern,
     )
     if suite.countTestCases() == 0:
         print("Linear scenario suite has zero tests", file=sys.stderr)
@@ -88,8 +88,9 @@ def main() -> int:
     parser.add_argument("--agent-source", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=ROOT / "release/agent-image-manifest.json")
     parser.add_argument("--tests-dir", type=Path, default=ROOT / "tests")
+    parser.add_argument("--pattern", default="test_linear_*scenarios.py")
     args = parser.parse_args()
-    return run(args.agent_source, args.manifest, args.tests_dir)
+    return run(args.agent_source, args.manifest, args.tests_dir, args.pattern)
 
 
 if __name__ == "__main__":

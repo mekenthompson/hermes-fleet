@@ -980,10 +980,10 @@ class Store:
                        (int(applied), row_id))
             return True
     def native_status_receipt(self, issue_id: str, task_id: str) -> dict | None:
-        """Read the latest acknowledged native status response from the existing outbox."""
+        """Read the latest acknowledged issue write for this native binding."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
-            row = db.execute("SELECT payload FROM outbox WHERE kind='status' AND state='sent' AND hold_reason IS NULL "
+            row = db.execute("SELECT payload FROM outbox WHERE kind IN ('status','delegate') AND state='sent' AND hold_reason IS NULL "
                              "AND json_extract(payload,'$.applied')=1 AND json_extract(payload,'$.issue_id')=? "
                              "AND json_extract(payload,'$.task_id')=? AND json_type(payload,'$.issue_write_receipt')='object' "
                              "ORDER BY rowid DESC LIMIT 1", (issue_id, task_id)).fetchone()

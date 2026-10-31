@@ -13,6 +13,8 @@ SCHEMA = {
     "description": (
         "Read Linear status, link an existing native task for reporting, or edit issues and projects. "
         "track requires issue and task_id and never starts, claims, resumes or transfers work. "
+        "For an unfinished task on an undelegated issue, track queues this app as Linear delegate; "
+        "a different current delegate is held for explicit coordination. "
         "Use completion_scope=progress for an internal stage; outcome (default) means this task covers the agreed issue outcome. "
         "Specification changes hold automatic issue completion until the agent inspects and reconciles the reporting link. "
         "For an already completed entire outcome, guarded replace with reconcile_complete=true queues its verified completion only; no worker or prior progress is replayed. "
@@ -48,7 +50,7 @@ SCHEMA = {
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123; mutations require the exact identifier or id."},
-        "task_id": {"type": "string", "description": "track: existing native task assigned to this profile."},
+        "task_id": {"type": "string", "description": "track: existing native task assigned to this profile; an undelegated issue queues this app as Linear delegate."},
         "completion_scope": {"type": "string", "enum": ["outcome", "progress"], "description": "track: outcome (default) can complete the agreed issue; progress reports an internal stage without closing it. Choose after inspecting acceptance; no execution grant."},
         "reconcile_complete": {"type": "boolean", "description": "track with replace and outcome only: deliberately reconcile an already completed entire outcome after inspecting acceptance/evidence. Reuses this UUID; no native execution or historical progress replay. Queued reporting is not confirmed delivery."},
         "board": {"type": "string", "description": "track: existing native board; defaults to the caller's current native board. A target selector, never identity or permission."},
@@ -308,15 +310,31 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             replace = args.get("replace", False)
             if type(replace) is not bool:
                 raise ValueError("track replace must be a boolean.")
+            native = bridge.track(issue_id, task_id, board=context.native_board, replace=replace,
+                requester_session=context.thread_id if context.platform == "linear" else None,
+                requester_activity=(context.message_id if context.platform == "linear" and
+                    context.message_id != context.thread_id else None),
+                expected_revision=args.get("expected_binding_revision"),
+                completion_scope=args.get("completion_scope", "outcome"),
+                reconcile_complete=args.get("reconcile_complete", False),
+                request_id=_uuid(args.get("id")) if replace else None)
+            routing = "already_delegated" if (issue.get("delegate") or {}).get("id") == bridge.api.viewer_id() else "held"
+            if not context.delegated_child and issue.get("delegate") is None and native["status"] not in ("done", "archived"):
+                revision = bridge.store.binding_revision(issue_id)
+                route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
+                prior = bridge.store.outbox_row(route_id)
+                try:
+                    requester = _content_requester(bridge, issue_id, prior,
+                        context.thread_id if context.platform == "linear" else None,
+                        context.message_id if context.platform == "linear" and context.message_id != context.thread_id else None)
+                    bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
+                        expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
+                        expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester)
+                    routing = "queued"
+                except (LinearError, ValueError) as exc:
+                    routing = f"held: {exc}"
             return _reply(True, "Existing native task linked for reporting; execution state was not changed.",
-                          native=bridge.track(issue_id, task_id, board=context.native_board, replace=replace,
-                              requester_session=context.thread_id if context.platform == "linear" else None,
-                              requester_activity=(context.message_id if context.platform == "linear" and
-                                  context.message_id != context.thread_id else None),
-                              expected_revision=args.get("expected_binding_revision"),
-                              completion_scope=args.get("completion_scope", "outcome"),
-                              reconcile_complete=args.get("reconcile_complete", False),
-                              request_id=_uuid(args.get("id")) if replace else None))
+                          native=native, routing=routing)
         if action == "followup":
             if context.delegated_child:
                 return _reply(False, "Native delegated children cannot mutate Kanban; return findings to the parent agent.",

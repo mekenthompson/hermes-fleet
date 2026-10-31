@@ -92,6 +92,11 @@ An existing task can be linked on the native caller's board or an explicitly sel
 board. Native scope and worker pins still apply. Its recorded board routes later follow-ups
 and reporting; the configured Linear creation board does not require moving or duplicating
 ordinary or project work. Missing and archived boards are not created or reopened by tracking.
+For unfinished chat-origin work on an undelegated issue, tracking queues the current app as
+Linear delegate. Native claim events then report the active workflow state. The guarded
+delegate response is an acknowledged issue version for that status write; a later human
+edit or different delegate still holds the write. The resulting assignment webhook
+acknowledges the already bound native task and run without starting another worker.
 
 Human issue edits, closure and reassignment are inspected again at remote mutation boundaries.
 Status intents retain the source event time so delayed catch-up cannot overwrite a later
@@ -159,8 +164,8 @@ Inspection reuses the accepted canonical tracked read transaction and discovery 
 while preserving its no-create construction boundary. Outcome acceptance still requires the
 actual native owner, current authorization and separate physical quiescence verification.
 
-The native scenario suite exercises upstream task creation, claiming, lifecycle and comment
-consumption; the registered tool and private socket are exercised with actual upstream session
+The native scenario suite exercises upstream task creation, claiming, lifecycle and explicit
+human checkpoint consumption; the registered tool and private socket are exercised with actual upstream session
 producers, including a separate API process. Cases cover concurrent and duplicate requests,
 lost replies, parked creation during Stop, stale run rejection, reporting restart, human edits,
 outages and specialist assessments. The source is also exercised against the pre-release core

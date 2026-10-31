@@ -98,7 +98,7 @@ class NativeTextScenarios(unittest.TestCase):
                 if table in ("task_runs", "tasks"):
                     self.assertEqual(case.remote.state(native.ISSUE), "Done")
                 if table == "task_comments":
-                    self.assertIn(COMMENT, case.remote.bodies(native.ISSUE))
+                    self.assertNotIn(COMMENT, case.remote.bodies(native.ISSUE))
             fixture.check_independent_delivery(case)
             context = SimpleNamespace(profile="default", home=case.reporter.profile_home, pinned_db_path="")
             status = json.loads(chat.handle(case.reporter, {"action": "status", "issue": native.ISSUE}, context))

@@ -15,7 +15,7 @@ API is required. The plugin is disabled by default.
 
 | Action | Result |
 | --- | --- |
-| `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. No task creation, claim, restart, resume or transfer. |
+| `track` with `issue`, `task_id`, optional `board` | Link an existing task on the caller's native board or an explicitly selected existing board. For unfinished work on an undelegated issue, queue this app as Linear delegate. No task creation, claim, restart, resume or transfer. |
 | `track` with `completion_scope: progress` | Report an internal stage without completing the issue. The default `outcome` means the task covers the agreed human outcome. |
 | `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
 | `status` with `issue` | Read the issue, bounded recent comment evidence, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. Starts no work. |
@@ -87,6 +87,11 @@ work. Link the task that owns the agreed issue outcome with `completion_scope: o
 (the default); use `progress` for preparation, a hold, or another internal stage. The agent
 manages this distinction without asking the user to maintain task IDs or activate reporting.
 Linear assignment creates and admits a fully populated outcome task automatically.
+Tracking an unfinished native task on an undelegated issue queues the current app as
+Linear delegate through the existing guarded outbox. The next reporting pass projects
+the native active state. A different current delegate or newer issue edit holds routing
+for explicit coordination; the human assignee is never changed. An assignment echo
+acknowledges the bound task and current run without starting another execution.
 
 The existing binding records the accepted native title, body and completion-contract digest
 and specification-event version. Normal comments and follow-ups do not change that boundary.
@@ -105,7 +110,10 @@ finishes or is archived, obsolete Started and heartbeat messages are omitted. Qu
 explicitly identified as native progress recheck the current phase immediately before
 publication. Native comments, current wait/review milestones, partial-stage summaries and
 uncertain sends remain intact; status reporting still preserves later human edits and ownership changes.
-Only progress durably recorded as unstarted is omitted. Publication admission records an
+Ordinary native comments and heartbeat notes stay internal. Only an explicit native human
+checkpoint with a stable request ID is projected to an issue comment, preserving its authored
+Markdown. Agent Session keepalives remain ephemeral session activities. Only progress durably
+recorded as unstarted is omitted. Publication admission records an
 attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
 on retry; a missing historical attempt marker never proves that a message was unsent.
 Current native status is projected before ordinary history that is durably unattempted,
@@ -308,8 +316,9 @@ linking new native work. A reporting link is metadata, never a competing ownersh
 
 Native create-task retry lookup is not an atomic exactly-once guarantee. A durable local
 intent coalesces duplicate ingress; ambiguous in-flight creation stays pending for inspection.
-Native comments have no idempotency key: the plugin retains ambiguous delivery and inspects
-actual comments before retrying. Marker text is provenance, never authorization. Guarded
+Explicit native checkpoints have a stable source request ID; their Linear writes retain an
+outbox UUID and reconcile ambiguous delivery by exact readback. Legacy outbox comments remain
+reconcilable without replay. Marker text is provenance, never authorization. Guarded
 native controls reject stale observations. The integration does not interpret arbitrary
 tracker prose as permission to resume stopped work. Linear Stop uses guarded native controls
 when source ordering is verifiable, including initial queued work; conflicting controls remain

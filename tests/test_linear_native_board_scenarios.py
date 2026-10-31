@@ -134,7 +134,7 @@ class NativeBoardScenarios(unittest.TestCase):
         with board.conn() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
 
-    def test_other_board_native_comment_event_reports_its_actual_body(self):
+    def test_other_board_native_comment_stays_internal_to_that_board(self):
         board, task_id = self.existing("project-board", "issue-comment")
         self.bridge.track("issue-comment", task_id, board="project-board")
         body = "Native operator confirmed the remaining project endpoint."
@@ -144,7 +144,7 @@ class NativeBoardScenarios(unittest.TestCase):
         self.bridge.pump_kanban()
         self.clock.now += 10
         self.bridge.flush()
-        self.assertIn(body, self.remote.bodies("issue-comment"))
+        self.assertNotIn(body, self.remote.bodies("issue-comment"))
         with self.creation.conn() as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM task_comments").fetchone()[0], 0)
 
