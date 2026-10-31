@@ -434,6 +434,51 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.pump_kanban()
         return clock, remote, reporter, task_id
 
+    def test_track_normal_running_task_reports_active_without_claiming_delegate(self):
+        from linear_fake_api import Clock, FakeLinear
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock = Clock()
+        remote = FakeLinear(clock)
+        self.addCleanup(remote.close)
+        remote.add_issue(ISSUE, "OPS-1", project=None)
+        reporter = Bridge(Store(self.home / "normal-running.db"),
+                          LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            task_id = kb.create_task(conn, title="Already running native work", assignee="default")
+            self.assertEqual(kb.get_task(conn, task_id).status, "ready")
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-test-worker"))
+        self.assertEqual(self.board.get(task_id).status, "running")
+        reporter.track(ISSUE, task_id)
+        clock.now += 1
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "In Progress")
+        self.assertIsNone(remote.issues[ISSUE]["delegate"])
+        self.assertIsNone(remote.issues[ISSUE]["assignee"])
+        self.assertEqual(reporter.native_status(ISSUE)["status"], "running")
+
+    def test_normal_running_claim_does_not_override_newer_human_status(self):
+        from linear_fake_api import Clock, FakeLinear
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock = Clock()
+        remote = FakeLinear(clock)
+        self.addCleanup(remote.close)
+        remote.add_issue(ISSUE, "OPS-1", project=None)
+        reporter = Bridge(Store(self.home / "human-running.db"),
+                          LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            task_id = kb.create_task(conn, title="Native work under human edit", assignee="default")
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-test-worker"))
+        reporter.track(ISSUE, task_id)
+        clock.now += 2
+        remote.set_state(ISSUE, "Blocked")
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertEqual(self.board.get(task_id).status, "running")
+
     def complete_reported_task(self, clock, task_id):
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):

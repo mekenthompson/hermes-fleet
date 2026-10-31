@@ -15,7 +15,7 @@ concurrency:
 jobs:
   source-checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -95,6 +95,42 @@ jobs:
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-notification-contract" \
             --expected-revision 1436af4a930a65faff42cf2d79a88b65b69a5fdc
+      # Test-only companion source. The release manifest lane above remains the
+      # only release compatibility claim; this checkout proves the candidate pair.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: mekenthompson/hermes-agent
+          ref: 6d019deb88645ff47beea14694b1d97cdb058bb3
+          path: agent-candidate
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Exact companion Core candidate scenarios
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          candidate = dict(json.loads(Path('release/agent-image-manifest.json').read_text()))
+          candidate['revision'] = '6d019deb88645ff47beea14694b1d97cdb058bb3'
+          Path(os.environ['RUNNER_TEMP'], 'hf578-candidate-test-only.json').write_text(json.dumps(candidate))
+          PY
+          echo 'Candidate evidence only: temporary revision selector is not a release manifest.'
+          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-candidate" \
+            --manifest "$RUNNER_TEMP/hf578-candidate-test-only.json"
+          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-candidate" \
+            --manifest "$RUNNER_TEMP/hf578-candidate-test-only.json" \
+            --pattern candidate_hf578.py
+      - name: Exact companion Core checkpoint and origin tests
+        run: |
+          (cd agent-candidate && python -m pm.build_env --source . \
+            --out "$RUNNER_TEMP/hf578-core-test-env" --group dev --group test --extra all --ci)
+          (cd agent-candidate && HERMES_PYTHON="$RUNNER_TEMP/hf578-core-test-env/bin/python" \
+            scripts/run_tests.sh tests/hermes_cli/test_kanban_human_checkpoint.py \
+            tests/gateway/test_kanban_checkpoint_local.py \
+            tests/tui_gateway/test_kanban_checkpoint_passive.py \
+            tests/tools/test_kanban_trusted_profile_origin.py -j 2 --file-retries 0)
 
   history-root:
     runs-on: ubuntu-latest

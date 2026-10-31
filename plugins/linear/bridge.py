@@ -994,7 +994,10 @@ class Bridge:
             if task.get("reconciliation_required"):
                 self._decline(issue["id"], session_id, task["message"])
                 return False
-            self._decline(issue["id"], session_id, f"Existing work: {task.get('status')}. Use native task controls to resume stopped work.")
+            note = f"Existing native work: {task.get('status')}. The linked task and run remain authoritative; no new execution was started."
+            if task.get("status") in ("blocked", "todo", "triage"):
+                note += " Use current native task controls for any authorized resume."
+            self._decline(issue["id"], session_id, note)
             return True  # The original durable binding was verified; do not resume it.
         return self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
     def _prompted(self, event, issue, session_id, row, activity) -> None:
@@ -1606,10 +1609,20 @@ class Bridge:
         if (applied.get("id") != payload["issue_id"] or
                 (applied.get("delegate") or {}).get("id") != payload["target_delegate_id"] or not applied.get("updatedAt")):
             self._hold_terminal(row, "Delegate change could not be verified; inspect Linear before retrying")
+        before, after = self._issue_version(current), self._issue_version(applied)
+        if (not before or not after or any(before[key] != after[key]
+                for key in ("state_id", "assignee_id")) or
+                iso_ms(after["updatedAt"]) < iso_ms(before["updatedAt"])):
+            self._hold_terminal(row, "Delegate response changed state or assignee; reporting needs reconciliation")
+        adapter = self._binding_adapter(payload["issue_id"])
+        issue_receipt = {"task_id": payload["task_id"], "profile": adapter.executor_profile,
+                         "board": adapter.board or "default", "issue": after}
+        if not self._receipt_scope(payload, issue_receipt):
+            self._hold_terminal(row, "Delegate response no longer matches the native reporting binding")
         fresh = self.store.outbox_row(row["id"])
         self.store.rewrite(row["id"], {**fresh["payload"], "delegate_receipt": {
             "issue_id": applied["id"], "delegate_id": payload["target_delegate_id"],
-            "updated_at": applied["updatedAt"]}}, fresh["next_at"])
+            "updated_at": applied["updatedAt"]}, "issue_write_receipt": issue_receipt}, fresh["next_at"])
         return True
 
     def followup(self, issue_id: str, body: str, request_id: str, *, requester_session: str | None = None, source_ms: float | None = None) -> dict:
@@ -1867,6 +1880,10 @@ class Bridge:
                       f"(last error: {payload.get('error') or 'unknown'}). Inspect native task history and use native controls for a new attempt.")]
         elif event.kind == "unblocked":
             writes = [status("blocked" if task_status == "todo" else "in_progress")]
+        elif event.kind == "claimed" and task_status == "running":
+            latest = self.store.latest_status(issue_id)
+            if not latest or latest["state"] != "in_progress":
+                writes = [status("in_progress")]
         elif event.kind in ("review_requested", "changes_requested", "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"):
             # Only the native landing phase can justify a delayed milestone after restart.
             allowed, state, label, field, fallback = {

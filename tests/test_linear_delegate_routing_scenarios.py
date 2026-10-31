@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import os
+import time
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -95,6 +96,113 @@ class DelegateRoutingScenarios(unittest.TestCase):
 
     def mutations(self):
         return [q for q in self.remote.requests if q.startswith("mutation IssueUpdate")]
+
+    def test_chat_running_track_routes_delegate_and_status_then_echo_keeps_same_run(self):
+        self.fixture.clock.now = time.time() - 2
+        self.remote.set_delegate("issue-1", None)
+        with self.board.conn() as db:
+            task = self.board.kb.create_task(db, title="Current chat work", board=self.board.board,
+                assignee=self.board.executor_profile, created_by="operator",
+                body="Linear issue issue-1: " + self.issue["url"])
+            running = self.board.kb.claim_task(db, task, claimer="native-worker")
+        self.assertEqual(running.status, "running")
+        self.fixture.bind_api()
+        linked = self.call({"action": "track", "issue": "ABC-1", "task_id": task})
+        self.assertTrue(linked["ok"], linked)
+        self.bridge.pump_kanban()
+        self.fixture.clock.now = time.time() + 2
+        self.bridge.flush()
+        self.assertEqual(self.issue["delegate"]["id"], SELF)
+        self.assertEqual(self.remote.state("issue-1"), "In Progress")
+        before = self.snapshot()
+        session = "chat-assignment-echo"
+        self.remote.session_records[session] = {"id": session, "creator": None,
+            "appUser": {"id": SELF}, "issue": {"id": "issue-1"}}
+        event = self.remote.session_event("created", "issue-1", session, creator=None)
+        event["agentSession"].pop("creatorId")
+        self.assertTrue(self.bridge.handle_webhook(event))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.bridge.store.native_binding("issue-1")["task_id"], task)
+        self.assertEqual(self.board.get(task).current_run_id, running.current_run_id)
+        self.assertIsNone(self.bridge.store.native_intent("create:issue-1"))
+        self.bridge.flush()
+        self.assertTrue(any("Existing native work: running" in body for body in self.remote.bodies("issue-1")))
+        self.remote.set_delegate("issue-1", OTHER)
+        activity = "revoked-stop"
+        self.remote.activity_records[activity] = {"id": activity, "user": {"id": "human-1"},
+            "agentSession": {"id": session}}
+        revoked = self.remote.session_event("prompted", "issue-1", session,
+            signal="stop", activity_id=activity, creator=None, at=1)
+        self.assertFalse(self.bridge.handle_webhook(revoked))
+        self.assertEqual(self.board.get(task).current_run_id, running.current_run_id)
+        self.assertEqual(self.snapshot(), before)
+        self.remote.set_delegate("issue-1", {"id": SELF})
+        activity = "authorized-stop"
+        self.remote.activity_records[activity] = {"id": activity, "user": {"id": "human-1"},
+            "agentSession": {"id": session}}
+        stop = self.remote.session_event("prompted", "issue-1", session,
+            signal="stop", activity_id=activity, creator=None, at=4)
+        self.assertTrue(self.bridge.handle_webhook(stop))
+        self.assertEqual(self.board.get(task).status, "blocked")
+        self.assertIsNone(self.bridge.store.native_intent("create:issue-1"))
+
+    def human_assignment(self, session="human-assignment"):
+        self.remote.set_delegate("issue-1", {"id": SELF})
+        self.remote.session_records[session] = {"id": session,
+            "creator": {"id": "human-1"}, "appUser": {"id": SELF}, "issue": {"id": "issue-1"}}
+        return self.remote.session_event("created", "issue-1", session)
+
+    def test_human_assignment_creates_one_native_task_and_chat_status_only_reads_it(self):
+        event = self.human_assignment()
+        self.assertTrue(self.bridge.handle_webhook(event))
+        binding = self.bridge.store.native_binding("issue-1")
+        self.assertIsNotNone(binding)
+        task = self.board.get(binding["task_id"])
+        self.assertEqual(task.status, "ready")
+        self.assertIsNone(task.current_run_id)
+        before = self.snapshot()
+        self.fixture.bind_api()
+        status = self.call({"action": "status", "issue": "ABC-1"})
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(status["native"]["task_id"], task.id)
+        self.assertTrue(self.bridge.handle_webhook(event))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len(self.board.discover(self.issue)), 1)
+
+    def test_human_assignment_discovers_existing_running_executor_without_second_run(self):
+        self.remote.set_delegate("issue-1", {"id": SELF})
+        with self.board.conn() as db:
+            task_id = self.board.kb.create_task(db, title="Already running", board=self.board.board,
+                assignee=self.board.executor_profile, created_by="operator",
+                body="Linear issue issue-1: " + self.issue["url"],
+                idempotency_key="chat-work:issue-1")
+            running = self.board.kb.claim_task(db, task_id, claimer="native-worker")
+        before = self.snapshot()
+        event = self.human_assignment("assignment-existing")
+        self.assertTrue(self.bridge.handle_webhook(event))
+        self.assertEqual(self.bridge.store.native_binding("issue-1")["task_id"], task_id)
+        after = self.snapshot()
+        self.assertEqual(after["tasks"], before["tasks"])
+        self.assertEqual(after["task_events"], before["task_events"])
+        self.assertEqual(self.board.get(task_id).current_run_id, running.current_run_id)
+        self.assertIsNone(self.bridge.store.native_intent("create:issue-1"))
+
+    def test_chat_track_delegate_response_loss_restarts_without_resend_or_new_task(self):
+        from hermes_fleet_linear_plugin.store import Store
+        self.remote.set_delegate("issue-1", None)
+        self.fixture.bind_api()
+        task = self.link()
+        before = self.snapshot()
+        route = next(row for row in self.bridge.store.pending() if row["kind"] == "delegate")
+        self.remote.lose_next_response = True
+        self.assertEqual(self.bridge.flush(only_id=route["id"]), 0)
+        self.assertEqual(self.issue["delegate"]["id"], SELF)
+        self.bridge.store = Store(self.bridge.store.path)
+        self.fixture.clock.now += 3601
+        self.assertEqual(self.bridge.flush(only_id=route["id"]), 1)
+        self.assertEqual(len(self.mutations()), 1)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.bridge.store.native_binding("issue-1")["task_id"], task.id)
 
     def test_blocked_remainder_delegate_and_authoritative_assignment_echo_reuse_task(self):
         task = self.link()
