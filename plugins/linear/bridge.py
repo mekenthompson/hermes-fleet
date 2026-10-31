@@ -1884,15 +1884,12 @@ class Bridge:
             note = _progress_text(payload.get("note"))
             if note:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
-        elif event.kind == "commented":
-            reader = getattr(self._binding_adapter(issue_id), "comment_text", None)
-            event_at = getattr(event, "created_at", None)
-            body = (_progress_text(reader(row["task_id"], str(payload.get("author") or ""), (int(payload["len"]) if payload.get("len") is not None else 0), event_at), 800)
-                    if callable(reader) and event_at is not None else "")
-            if body:
-                writes = [message("thought", body)]
+        elif event.kind == "checkpoint":
+            if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
+                    and payload["request_id"]):
+                writes = [message("thought", payload["body"])]
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
-        if activity and not (writes and writes[0][1].get("ephemeral")):
+        if activity and event.kind != "checkpoint" and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
             if captured.get(key, 0):
                 captured[key] -= 1; writes = []
@@ -1905,6 +1902,8 @@ class Bridge:
     def _report_writes(row: dict, writes: list) -> list:
         if row.get("owner_ref"):
             return writes
+        writes = [(kind, payload) for kind, payload in writes
+                  if kind != "activity" or not payload.get("ephemeral")]
         return [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                              "body": _visible_activity(payload.get("content") or {})})
                 if kind == "activity" else (kind, payload) for kind, payload in writes]

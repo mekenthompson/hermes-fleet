@@ -105,7 +105,10 @@ finishes or is archived, obsolete Started and heartbeat messages are omitted. Qu
 explicitly identified as native progress recheck the current phase immediately before
 publication. Native comments, current wait/review milestones, partial-stage summaries and
 uncertain sends remain intact; status reporting still preserves later human edits and ownership changes.
-Only progress durably recorded as unstarted is omitted. Publication admission records an
+Ordinary native comments and heartbeat notes stay internal. Only an explicit native human
+checkpoint with a stable request ID is projected to an issue comment, preserving its authored
+Markdown. Agent Session keepalives remain ephemeral session activities. Only progress durably
+recorded as unstarted is omitted. Publication admission records an
 attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
 on retry; a missing historical attempt marker never proves that a message was unsent.
 Current native status is projected before ordinary history that is durably unattempted,
@@ -308,8 +311,9 @@ linking new native work. A reporting link is metadata, never a competing ownersh
 
 Native create-task retry lookup is not an atomic exactly-once guarantee. A durable local
 intent coalesces duplicate ingress; ambiguous in-flight creation stays pending for inspection.
-Native comments have no idempotency key: the plugin retains ambiguous delivery and inspects
-actual comments before retrying. Marker text is provenance, never authorization. Guarded
+Explicit native checkpoints have a stable source request ID; their Linear writes retain an
+outbox UUID and reconcile ambiguous delivery by exact readback. Legacy outbox comments remain
+reconcilable without replay. Marker text is provenance, never authorization. Guarded
 native controls reject stale observations. The integration does not interpret arbitrary
 tracker prose as permission to resume stopped work. Linear Stop uses guarded native controls
 when source ordering is verifiable, including initial queued work; conflicting controls remain

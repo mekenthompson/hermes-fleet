@@ -159,8 +159,8 @@ Inspection reuses the accepted canonical tracked read transaction and discovery 
 while preserving its no-create construction boundary. Outcome acceptance still requires the
 actual native owner, current authorization and separate physical quiescence verification.
 
-The native scenario suite exercises upstream task creation, claiming, lifecycle and comment
-consumption; the registered tool and private socket are exercised with actual upstream session
+The native scenario suite exercises upstream task creation, claiming, lifecycle and explicit
+human checkpoint consumption; the registered tool and private socket are exercised with actual upstream session
 producers, including a separate API process. Cases cover concurrent and duplicate requests,
 lost replies, parked creation during Stop, stale run rejection, reporting restart, human edits,
 outages and specialist assessments. The source is also exercised against the pre-release core

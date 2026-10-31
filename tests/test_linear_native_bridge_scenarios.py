@@ -84,6 +84,21 @@ class NativeBridgeScenarios(unittest.TestCase):
         with self.board.conn() as conn:
             return kb.list_comments_after(conn, task_id)
 
+    def checkpoint(self, conn, task_id, author, body):
+        """Produce an explicit checkpoint on candidate Core and its historical event shape on the pinned host."""
+        import inspect
+        import uuid
+
+        request_id = str(uuid.uuid4())
+        if "human_checkpoint" in inspect.signature(kb.add_comment).parameters:
+            return kb.add_comment(conn, task_id, author, body,
+                                  human_checkpoint=True, request_id=request_id)
+        with kb.write_txn(conn):
+            comment_id = kb.add_comment(conn, task_id, author, body)
+            kb._append_event(conn, task_id, "checkpoint", {"author": author, "body": body,
+                                                         "comment_id": comment_id, "request_id": request_id})
+        return comment_id
+
     def tasks(self):
         with self.board.conn() as conn:
             return list(conn.execute("SELECT id FROM tasks"))
@@ -492,8 +507,8 @@ class NativeBridgeScenarios(unittest.TestCase):
                     self.native_progress(clock, task_id)
                     clock.now += 1
                     with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                        kb.add_comment(conn, task_id, "worker", "Preserve this ordinary native checkpoint")
-                        kb.add_comment(conn, task_id, "worker-secondary", "Preserve the second ordinary checkpoint too")
+                        self.checkpoint(conn, task_id, "worker", "Preserve this ordinary native checkpoint")
+                        self.checkpoint(conn, task_id, "worker-secondary", "Preserve the second ordinary checkpoint too")
                     if captured:
                         reporter.pump_kanban()
                     self.land_reported_task(clock, task_id, state)
@@ -522,7 +537,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.flush()
                     self.native_progress(clock, task_id)
                     with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                        kb.add_comment(conn, task_id, "worker", "Ordinary history must survive denied status")
+                        self.checkpoint(conn, task_id, "worker", "Ordinary history must survive denied status")
                     reporter.pump_kanban()
                     self.land_reported_task(clock, task_id, phase)
                     clock.now += 10
@@ -555,7 +570,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 clock.now += 1
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
                     kb.claim_task(conn, task_id, claimer="ordinary-history-worker")
-                    kb.add_comment(conn, task_id, "worker", "Original ordinary delivery must not be moved or replayed")
+                    self.checkpoint(conn, task_id, "worker", "Original ordinary delivery must not be moved or replayed")
                 reporter.pump_kanban()
                 ordinary = next(row for row in reporter.store.pending() if row["kind"] == "comment")
                 class ProcessCrash(BaseException):
@@ -596,7 +611,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                                    expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
                 clock.now += 1
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                    kb.add_comment(conn, task_id, "worker", "Late native history after own completion")
+                    self.checkpoint(conn, task_id, "worker", "Late native history after own completion")
                 reporter.pump_kanban()
                 reporter.flush()
                 self.assertEqual(sum("Late native history after own completion" in body for body in remote.bodies(ISSUE)), 0)
@@ -614,7 +629,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 remote.sessions[SESSION] = ISSUE
                 clock.now += 1
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                    kb.add_comment(conn, task_id, "worker", "Archived history after verified release")
+                    self.checkpoint(conn, task_id, "worker", "Archived history after verified release")
                 reporter.pump_kanban()
                 self.land_reported_task(clock, task_id, "archived")
                 self.assertTrue(reporter.store.finish(ISSUE, [("status", {"issue_id": ISSUE, "task_id": task_id,
@@ -673,7 +688,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     clock, remote, reporter, task_id = self.session_reporting_fixture("session-history-" + state + str(captured))
                     self.native_progress(clock, task_id)
                     with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                        kb.add_comment(conn, task_id, "worker", "Authenticated session ordinary history")
+                        self.checkpoint(conn, task_id, "worker", "Authenticated session ordinary history")
                     if captured:
                         reporter.pump_kanban()
                     if state == "done":
@@ -699,7 +714,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             kb.claim_task(conn, task_id, claimer="session-native-worker")
-            kb.add_comment(conn, task_id, "worker", "Session history whose HTTP response is lost")
+            self.checkpoint(conn, task_id, "worker", "Session history whose HTTP response is lost")
         reporter.pump_kanban()
         row = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
         remote.lose_next_response = True
@@ -721,7 +736,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 clock, remote, reporter, task_id = self.reporting_fixture("done-history-http-" + change)
                 reporter.flush()
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                    kb.add_comment(conn, task_id, "worker", "History held after human change at HTTP boundary")
+                    self.checkpoint(conn, task_id, "worker", "History held after human change at HTTP boundary")
                 reporter.pump_kanban()
                 self.complete_reported_task(clock, task_id)
                 reporter.recover()
@@ -746,7 +761,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             kb.claim_task(conn, task_id, claimer="ordinary-http-worker")
-            kb.add_comment(conn, task_id, "worker", "Ordinary checkpoint preserved after a boundary halt")
+            self.checkpoint(conn, task_id, "worker", "Ordinary checkpoint preserved after a boundary halt")
         reporter.pump_kanban()
         create = reporter.api.create_comment
         def halt_before_http(*args, **kwargs):
@@ -765,7 +780,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             kb.claim_task(conn, task_id, claimer="session-http-worker")
-            kb.add_comment(conn, task_id, "worker", "Session checkpoint preserved across deferred native halt")
+            self.checkpoint(conn, task_id, "worker", "Session checkpoint preserved across deferred native halt")
         reporter.pump_kanban()
         ordinary = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
         create = reporter.api.create_activity
@@ -790,7 +805,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             kb.claim_task(conn, task_id, claimer="admission-race-worker")
-            kb.add_comment(conn, task_id, "worker", "Ordinary history protected by the final dependency check")
+            self.checkpoint(conn, task_id, "worker", "Ordinary history protected by the final dependency check")
         reporter.pump_kanban()
         admit = reporter.store.admit_mutation
         def concurrent_capture_before_admission(*args, **kwargs):
@@ -823,7 +838,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 self.assertEqual(remote.state(ISSUE), "Blocked")
                 clock.now += 1
                 with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                    kb.add_comment(conn, task_id, "worker", "Preserved ordinary history during native Stop")
+                    self.checkpoint(conn, task_id, "worker", "Preserved ordinary history during native Stop")
                 reporter.pump_kanban()
                 method = "create_activity" if session_route else "create_comment"
                 create = getattr(reporter.api, method)
@@ -857,7 +872,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                         clock.now += 1
                         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
                             kb.claim_task(conn, task_id, claimer="uncaptured-admission-worker")
-                            kb.add_comment(conn, task_id, "worker", "Ordinary history retained after uncaptured admission halt")
+                            self.checkpoint(conn, task_id, "worker", "Ordinary history retained after uncaptured admission halt")
                     reporter.pump_kanban()
                     target = next(row for row in reporter.store.pending() if row["payload"].get("native_history") and not row["payload"].get("ephemeral"))
                     admit = reporter.store.admit_mutation
@@ -1044,7 +1059,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.pump_kanban()
                     reporter.flush()
                 self.assertTrue(any("Reading the ticket" in body for body in remote.bodies(ISSUE)))
-                self.assertTrue(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
+                self.assertFalse(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
 
     def test_native_operator_stop_survives_reporting_catchup_without_reactivation(self):
         clock, remote, reporter, task_id = self.reporting_fixture("stopped-progress")
@@ -1149,7 +1164,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                        expected_revision=reporter.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
         self.native_progress(clock, task_id)
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-            kb.add_comment(conn, task_id, "worker", "Checkpoint evidence retained")
+            self.checkpoint(conn, task_id, "worker", "Checkpoint evidence retained")
         reporter.pump_kanban()
         reporter.comment(ISSUE, "Started: Reading the ticket — explicitly requested comment")
         self.complete_reported_task(clock, task_id)
