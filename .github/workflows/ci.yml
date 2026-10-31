@@ -15,7 +15,7 @@ concurrency:
 jobs:
   source-checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -95,7 +95,18 @@ jobs:
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-notification-contract" \
             --expected-revision 1436af4a930a65faff42cf2d79a88b65b69a5fdc
-      # Test-only companion source. The release manifest lane above remains the
+  candidate-hf578:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.7'
+      # Test-only companion source. The source-checks manifest lane remains the
       # only release compatibility claim; this checkout proves the candidate pair.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -106,6 +117,9 @@ jobs:
           fetch-depth: 1
       - name: Exact companion Core candidate scenarios
         run: |
+          python -m venv "$RUNNER_TEMP/linear-scenarios"
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt
           python3 - <<'PY'
           import json
           import os
