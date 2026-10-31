@@ -80,6 +80,16 @@ Keep the exact image digest, source commits, policy SHA256 and result JSON with
 the release. An `about:blank` dump, binary inventory, green unit tests, or a
 source-mounted prototype alone is not deployment acceptance.
 
+## Source provenance and attribution
+
+The original reviewed implementation is commit
+`68583c9a82761469282dcbbefeab68aa8f813e6d` in
+[PR #244](https://github.com/mekenthompson/hermes-fleet/pull/244), authored by
+Ken Thompson with GPT-6 Astra; independent source/security review used GPT-6 Luna.
+The squash commit retained the policy bytes but escaped the intended co-author
+trailer as literal text. This record preserves attribution without rewriting
+published history. Source review is not final-image or live acceptance.
+
 ## Rollback
 
 Before activation retain the exact previous image, per-target Compose security
