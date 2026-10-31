@@ -42,7 +42,11 @@ SCHEMA = {
         "its original requester is unknown and it grants no permission. "
         "create_issue, create_project, link_issue, update_description and add_comment work without "
         "a task link or chat claim. Description replacement requires the exact expected_description. "
-        "Reuse the same UUID id and content after a lost mutation response."),
+        "Reuse the same UUID id and content after a lost mutation response. "
+        "Write for the human reading Linear: lead with current outcome/status, remaining work and next action. "
+        "Use actual newlines, short headings, bullets and acceptance checklists where useful, not a long single paragraph. "
+        "Short one-sentence updates are fine. Setup or monitoring verified is not an unresolved outcome completed. "
+        "Formatting tips are advisory: preserve authored content, code and links; never silently rewrite it."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123; mutations require the exact identifier or id."},
@@ -56,11 +60,11 @@ SCHEMA = {
         "expected_updated_at": {"type": "string", "description": "delegate_self: exact issue.updatedAt from a fresh status read; optimistic preflight, not remote compare-and-swap."},
         "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
-        "description": {"type": "string", "description": "Readable Linear Markdown."},
+        "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
         "project": {"type": "string"}, "parent": {"type": "string"}, "related": {"type": "string"},
         "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"]},
-        "body": {"type": "string", "description": "Comment or instruction; never an execution grant."},
+        "body": {"type": "string", "description": "Human-readable comment or instruction; never an execution grant. Lead with verified progress, remaining work and next action. Use Linear Markdown and actual newlines for longer updates; a short sentence needs no empty headings. Preserve code and links."},
     }, "required": ["action"], "additionalProperties": False},
 }
 
@@ -201,6 +205,13 @@ def _content_requester(bridge: Any, issue_id: str, prior: dict | None, session: 
     return {"requester_sessions": sessions, **({"requester_activities": activities} if activities else {})}
 
 
+def _formatting_tip(content: Any) -> str:
+    """Advise without modifying the authored payload or its delivery semantics."""
+    if isinstance(content, str) and len(content) > 500 and "\n" not in content:
+        return " Formatting tip: split this long paragraph into headings and bullets."
+    return ""
+
+
 def _plan(bridge: Any, args: dict, action: str) -> str:
     if action == "create_issue":
         client_id, title, team = _uuid(args.get("id")), _text(args, "title"), _text(args, "team")
@@ -208,15 +219,13 @@ def _plan(bridge: Any, args: dict, action: str) -> str:
             raise ValueError("create_issue needs title and team.")
         created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
                                           project_id=args.get("project") or None, parent_id=args.get("parent") or None)
-        warning = (" Formatting tip: split this long paragraph into headings and bullets." if
-                   isinstance(args.get("description"), str) and len(args["description"]) > 500 and "\n" not in args["description"] else "")
-        return _reply(True, "Created an undelegated issue." + warning, issue=created)
+        return _reply(True, "Created an undelegated issue." + _formatting_tip(args.get("description")), issue=created)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
         if not name or not team:
             raise ValueError("create_project needs name and team.")
         created = bridge.api.create_project(client_id, name, [team], description=args.get("description"))
-        return _reply(True, "Created a project.", project=created)
+        return _reply(True, "Created a project." + _formatting_tip(args.get("description")), project=created)
     issue, related, relation = (_text(args, key) for key in ("issue", "related", "relation"))
     if not issue or not related or relation not in {"blocks", "blocked_by", "related"}:
         raise ValueError("link_issue needs issue, related, and a supported relation.")
@@ -362,8 +371,6 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             row_id = bridge.store.enqueue(kind, payload, at=bridge.clock())
         if not row_id:
             return _reply(False, "An uncertain issue write or authorization fence needs reconciliation.", code="reconciliation_required")
-        warning = (" Formatting tip: split this long paragraph into headings and bullets." if
-                   len(body) > 500 and "\n" not in body else "")
-        return _reply(True, "Content queued durably; Linear delivery is not yet confirmed." + warning, outbox_id=row_id)
+        return _reply(True, "Content queued durably; Linear delivery is not yet confirmed." + _formatting_tip(body), outbox_id=row_id)
     except (ValueError, LinearError, transport.Unavailable) as exc:
         return _reply(False, str(exc), code="request_refused")
