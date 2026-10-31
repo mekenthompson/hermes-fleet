@@ -523,6 +523,74 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
         self.assertEqual(self.board.get(task_id).status, "done")
 
+    async def test_generic_notifier_retains_authorization_and_deduplicates_replies(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from gateway.kanban_watchers_notifier import _KanbanNotification
+        from hermes_cli import kanban_db as kb, kanban_db_notify as notify
+        from hermes_cli.kanban_db_connect import connect
+
+        self.event("notice-source", "A verified fixture request")
+        for scenario in ("valid", "absent", "foreign", "stale"):
+            with self.subTest(scenario=scenario):
+                database = self.home / (scenario + "-notifications.db")
+                conn = connect(database)
+                try:
+                    task_id = kb.create_task(conn, title="Bounded notice", assignee="default")
+                    key = dict(task_id=task_id, platform="linear", chat_id=self.ISSUE,
+                               thread_id=self.SESSION)
+                    anchor = {} if scenario == "absent" else {"reply_to": "notice-source"}
+                    notify.add_notify_sub(conn, **key, delivery_mode="notify", delivery_metadata=anchor)
+                    sub = notify.list_notify_subs(conn)[0]
+                    old_cursor = sub["last_event_id"]
+                    cursor = old_cursor + 1
+                    notify.advance_notify_cursor(conn, **key, new_cursor=cursor)
+                finally:
+                    conn.close()
+
+                def operation(_board, name, _sub, **kwargs):
+                    connection = connect(database)
+                    try:
+                        getattr(notify, name)(connection, **key, **kwargs)
+                    finally:
+                        connection.close()
+
+                runner = SimpleNamespace(
+                    _kanban_sub_op=operation,
+                    _kanban_rewind=lambda sub, claimed, old, board: operation(
+                        board, "rewind_notify_cursor", sub, claimed_cursor=claimed, old_cursor=old),
+                    _kanban_unsub=lambda sub, board: operation(board, "remove_notify_sub", sub),
+                    _deliver_kanban_artifacts=AsyncMock(),
+                )
+                event = SimpleNamespace(id=cursor, kind="completed", payload={"summary": "Bounded outcome"})
+                notice = _KanbanNotification(runner, dict(sub=sub, task=None, events=[event],
+                    cursor=cursor, old_cursor=old_cursor, board="default"),
+                    platform_cls=None, sub_fail_counts={})
+                notice.adapter = self.adapter
+                if scenario == "foreign":
+                    self.provider.activities["notice-source"]["agentSession"] = {"id": "other-session"}
+                elif scenario == "stale":
+                    self.provider.activities.pop("notice-source")
+                before = len(self.provider.mutations)
+                delivered = await notice._send_pings()
+                self.assertEqual(delivered, scenario == "valid")
+                # Reconstruct the notice as the next poll would. A real outbox
+                # must suppress a replay even with a stale local ping snapshot.
+                repeat = _KanbanNotification(runner, notice.d, platform_cls=None, sub_fail_counts={})
+                repeat.adapter = self.adapter
+                self.assertEqual(await repeat._send_pings(), scenario == "valid")
+                self.assertEqual(len(self.provider.mutations) - before, int(scenario == "valid"))
+                connection = connect(database)
+                try:
+                    retained = notify.list_notify_subs(connection)
+                finally:
+                    connection.close()
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0]["delivery_mode"], "notify")
+                self.assertEqual(retained[0]["last_event_id"], cursor if delivered else old_cursor)
+                self.assertEqual(retained[0]["last_ping_event_id"], cursor if delivered else 0)
+                self.assertEqual(self.rows(), [])  # Reporting did not admit engineering work.
+
     async def test_adapter_reply_outage_keeps_same_outbox_identity_until_actual_sent(self):
         self.event("reply-origin", "A verified fixture request")
         original = self.bridge.api.transport
