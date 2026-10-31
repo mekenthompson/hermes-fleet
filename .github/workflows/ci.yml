@@ -90,6 +90,8 @@ jobs:
           fetch-depth: 1
       - name: Guarded native notification delivery contract
         run: |
+          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
+            --require-hashes --only-binary=:all: -r tests/native-input-requirements.txt
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-notification-contract" \
             --expected-revision 1436af4a930a65faff42cf2d79a88b65b69a5fdc
