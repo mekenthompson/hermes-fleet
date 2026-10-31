@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           repository: mekenthompson/hermes-agent
-          ref: d4a8435812e9554ff31efaf822aa700e35f79cb5
+          ref: 769d1be0a24dd28d44d27894094cc77e9359dbea
           path: agent-candidate
           persist-credentials: false
           fetch-depth: 1
@@ -125,7 +125,7 @@ jobs:
           import os
           from pathlib import Path
           candidate = dict(json.loads(Path('release/agent-image-manifest.json').read_text()))
-          candidate['revision'] = 'd4a8435812e9554ff31efaf822aa700e35f79cb5'
+          candidate['revision'] = '769d1be0a24dd28d44d27894094cc77e9359dbea'
           Path(os.environ['RUNNER_TEMP'], 'hf578-candidate-test-only.json').write_text(json.dumps(candidate))
           PY
           echo 'Candidate evidence only: temporary revision selector is not a release manifest.'
