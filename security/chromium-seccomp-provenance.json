@@ -1,0 +1,10 @@
+{
+  "docker_version": "29.4.1",
+  "docker_git_commit": "6c91b92",
+  "architecture": "linux/amd64",
+  "capability_contract": "Docker default capability set; no capabilities added",
+  "source": "Effective OCI linux.seccomp from Docker 29.4.1 credential-free container, UID1000, no-new-privileges, default capabilities",
+  "docker_effective_default_sha256": "30f3f34a8336b491b755c7ab67b475d558c50a85da18190f89b78a1d42e4bd31",
+  "license": "Apache-2.0 (Moby Docker default seccomp policy)",
+  "delta": "Exactly clone(NEWUSER|SIGCHLD), unshare(NEWUSER), clone(NEWUSER|NEWPID|NEWNET|SIGCHLD), clone(NEWPID|SIGCHLD); clone3 ENOSYS unchanged"
+}
