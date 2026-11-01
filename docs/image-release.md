@@ -56,7 +56,7 @@ Agent source and checks context resolution, aliases and override precedence.
 
 The native deny list keeps every previously denied name, including
 `AppifactRepl`, `FetchInboxMessage`, and `SubagentHandback`, which remain in
-the reviewed executable. It also denies new native tools from 2.1.296 and the 2.1.316 addition `SubscribePR`, including
+the reviewed executable. It also denies new native tools from 2.1.296 and the 2.1.316 additions `SubscribePR`, `SendToProject` and `SendToProjectContext`, including
 `OfferChromeSetup`, `ListConnectors`, `PublishPlugin`, `PowerShell`, and
 `WaitForMcpServers`. Those tools are denied, not approved. `ToolSearch` stays
 available only to discover profile-authorized connectors. Review actual

@@ -141,6 +141,8 @@ _NATIVE_TOOL_DENY = (
     "WaitForMcpServers",
     # Present in the 2.1.316 executable. Denied, not approved.
     "SubscribePR",
+    "SendToProject",
+    "SendToProjectContext",
 )
 _CONNECTOR_PREFIX = "mcp__claude_ai_"
 _CONNECTOR_WILDCARD = "mcp__claude_ai_*"

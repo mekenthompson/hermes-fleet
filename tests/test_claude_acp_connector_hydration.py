@@ -42,7 +42,8 @@ class ConnectorHydrationTests(unittest.TestCase):
                    "BashOutput", "Design", "EndConversation", "ExitPlanModeV2",
                    "ListConnectors", "OfferChromeSetup", "PowerShell", "PublishPlugin",
                    "SearchMcpRegistry", "SendFile", "SendUserFile", "SuggestConnectors",
-                   "WaitForMcpServers", "SubscribePR"}
+                   "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext",
+                   "SendToProject", "SendToProjectContext"}
         with tempfile.TemporaryDirectory() as tmp:
             options = client.claude_code_session_options(set(), tmp)
         self.assertEqual(
@@ -183,7 +184,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             "BashOutput", "Design", "EndConversation", "ExitPlanModeV2",
             "ListConnectors", "OfferChromeSetup", "PowerShell", "PublishPlugin",
             "SearchMcpRegistry", "SendFile", "SendUserFile", "SuggestConnectors",
-            "WaitForMcpServers", "SubscribePR",
+            "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext",
         }
         self.assertEqual(set(denied[:-1]), expected_native)
         self.assertEqual(denied[-1], "mcp__claude_ai_Slack__write_*")
