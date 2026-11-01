@@ -280,7 +280,9 @@ plugins:
           connect_env_file: /opt/data/.op.env
           cache_file: /opt/data/secrets/linear-oauth.json
         states:
+          todo: Todo
           in_progress: In Progress
+          in_review: In Review
           done: Done
           blocked: Blocked
         ingress_database: /opt/data/workspace/linear/ingress.db
@@ -293,6 +295,16 @@ profile state. The immutable viewer/workspace binding is revalidated on requests
 defaults to `<profile home>/linear/state.db`; optional `board` selects the destination for
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
 `completion_contracts` retain their existing meanings.
+Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
+running shows In Progress, review or a task held by the open-PR guard shows In Review,
+blocked or triage shows the team's Blocked state, and an internal stage that finished shows
+the next step (In Review with a PR, else Todo). Done comes only from verified completion.
+Archived work leaves Linear as it is. A team without a named state uses its first state of
+the same type (unstarted, started, completed); without Blocked or In Review the state stays
+and the plain blocker sentence still posts. A newer human state, assignee or delegate change
+in Linear's issue history wins. The reporting recheck retires records whose native task no
+longer exists (including pre-rebuild chat records): a started state this app set becomes
+Todo once, unless someone else changed it since.
 `ingress_profile` selects the trusted inbox route only; it does not change caller authorization.
 When omitted, CLI routing uses Hermes' resolved native profile, including a multiplexed
 named profile. Set it explicitly when a fleet deployment's inbox has a different name.

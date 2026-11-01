@@ -16,7 +16,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from .api import markdown_matches, LinearAPI, LinearError, RateLimited, state_id
+from .api import markdown_matches, LinearAPI, LinearError, RateLimited
 from .oauth import ReauthorizationRequired
 from .store import Store, advisory
 from . import transport
@@ -26,6 +26,9 @@ class ProjectUpdateDeferred(Exception):
 class NativeProgressSuperseded(Exception):
     """Native work entered a wait, halt or terminal state before transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
+# A team without the configured name falls back to its first state of this Linear type.
+# Blocked and In Review have no type equivalent: a team without them keeps its state.
+STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
 # Core's ready/running phases can still use current progress. Known waits,
 # halts and terminal phases supersede earlier Started/Working projections.
 NATIVE_PROGRESS_SUPERSEDED = frozenset({"todo", "scheduled", "blocked", "triage", "review", "done", "archived"})
@@ -699,7 +702,8 @@ class Bridge:
         self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
-        self.states = {"in_progress": "In Progress", "done": "Done", "blocked": "Blocked", **(settings.get("states") or {})}
+        self.states = {"todo": "Todo", "in_progress": "In Progress", "in_review": "In Review", "done": "Done",
+                       "blocked": "Blocked", **(settings.get("states") or {})}
         self.team_states = settings.get("team_states") or {}
         self.contracts = settings.get("completion_contracts") or {}
         self.quiet = float(settings.get("quiet_minutes", 30)) * 60
@@ -755,6 +759,18 @@ class Bridge:
         team = issue.get("team") or {}
         override = self.team_states.get(team.get("key")) or self.team_states.get(team.get("id")) or {}
         return override[key] if key in override else self.states.get(key)
+    def state_id(self, issue: dict[str, Any], key: str) -> str | None:
+        """This team's workflow state for a reporting key, by name, else by Linear type; None leaves it alone."""
+        name = self.state_name(issue, key)
+        nodes = ((issue.get("team") or {}).get("states") or {}).get("nodes") or []
+        if not name:
+            return None
+        found = next((n for n in nodes if str(n.get("name", "")).casefold() == name.casefold()), None)
+        found = found or min((n for n in nodes if n.get("type") == STATE_TYPES.get(key)),
+                             key=lambda n: n.get("position") or 0, default=None)
+        if not found:
+            log.info("linear: team %s has no '%s' state; status left unchanged", (issue.get("team") or {}).get("key"), name)
+        return str(found["id"]) if found else None
     @staticmethod
     def closure_ms(issue: dict[str, Any]) -> float:
         state = (issue.get("state") or {}).get("type")
@@ -1128,13 +1144,8 @@ class Bridge:
                 **self._alert_route(row)})]
             self._capture_native_event(issue_id, event_id, self._report_writes(row, writes), at=self.clock())
             return
-        body = ("The agent's task was archived without accepted completion evidence, so this work is unfinished. "
-                "Ask the agent to pick it up again if it is still needed.")
-        route = {"task_id": row["task_id"], "terminal": True, "owner_issue_id": issue_id}
-        self._finish_work(issue_id, [
-            ("status", {"issue_id": issue_id, "state": "blocked", **route}),
-            ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                          "content": {"type": "error", "body": body}, **route})], at=self.clock(), event_id=event_id)
+        # Archived or cancelled with no outcome: whoever archived it decided; leave Linear as it is.
+        self._capture_native_event(issue_id, event_id, [], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
         issue_id = issue["id"]
         if self.store.get(issue_id):
@@ -1652,12 +1663,15 @@ class Bridge:
         for node in nodes:
             if iso_ms(node.get("createdAt")) <= since_ms:
                 continue  # Precedes the fence; no reliance on Linear's ordering.
-            routed = (node.get("fromStateId") != node.get("toStateId")
-                      or node.get("fromAssigneeId") != node.get("toAssigneeId")
-                      or (node.get("fromDelegate") or {}).get("id") != (node.get("toDelegate") or {}).get("id"))
-            if routed and node.get("actorId") != viewer:
+            if self._routed(node) and node.get("actorId") != viewer:
                 return True
         return more
+    @staticmethod
+    def _routed(node: dict) -> bool:
+        """An IssueHistory entry that changed state, assignee or delegate."""
+        return (node.get("fromStateId") != node.get("toStateId")
+                or node.get("fromAssigneeId") != node.get("toAssigneeId")
+                or (node.get("fromDelegate") or {}).get("id") != (node.get("toDelegate") or {}).get("id"))
 
     def _send_delegate(self, row: dict) -> bool:
         payload = row["payload"]
@@ -1919,7 +1933,7 @@ class Bridge:
                     log.warning("linear: native reporting held for issue %s task %s event %s (%s)",
                                 issue_id, task_id, event_id, type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
-                for step in (self._project_consumed_claim, self._recover_binding_delegate) if caught_up else ():
+                for step in (self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
                     try:
                         step(row, adapter)
                     except RateLimited:
@@ -1975,30 +1989,57 @@ class Bridge:
                                                           "binding_revision": revision, "route": False})
         if first:
             self.store.native_intent_settle(key, {"state": "applied", "routed": False})
-    def _project_consumed_claim(self, row: dict | None, adapter) -> None:
-        """Report a still-current native claim whose event an older consumer passed.
+    def _reconcile_status(self, row: dict | None, adapter) -> None:
+        """Show in Linear what native execution is doing now; queue a write only when that changes.
 
-        Never rewinds the cursor or replays history: one status intent keeps
-        the original claim time. may_write fences it on Linear's issue history
-        after that claim, so a later human state edit or reassignment wins
-        while comments and agent activity (which only move updatedAt) do not.
-        An In Progress intent that was refused (e.g. by an older updatedAt
-        fence) gets one recovery attempt per claim.
+        Runs after every caught-up pump, so consumed claims, finished stages
+        and upgraded bindings converge without rewinding the cursor. The source
+        time is the native fact behind the state (the current claim, else the
+        newest consumed event): may_write's routing-history fence lets a later
+        human state move, reassignment or closure win. A refused In Progress is
+        retried once per claim (an older build's updatedAt fence refused it).
         """
         if not row or row.get("origin") != "native":
             return
-        latest = self.store.latest_status(row["issue_id"]) or {}
-        if latest.get("state") == "in_progress" and (not latest.get("refused") or latest.get("recovered")):
-            return  # Steady state (or this claim's one recovery already refused): no per-tick history scan.
-        task = adapter.require_task(row["task_id"])
-        claim = self._current_claim(adapter, task)
-        if claim is None or claim.id > row["last_event_id"]:
-            return  # An unconsumed claim uses the ordinary ordered event path.
+        task, latest = adapter.require_task(row["task_id"]), self.store.latest_status(row["issue_id"]) or {}
+        if task.status == "running":
+            if latest.get("state") == "in_progress" and (not latest.get("refused") or latest.get("recovered")):
+                return  # Steady state: no per-tick history scan.
+            claim = self._current_claim(adapter, task)
+            if claim is None or claim.id > row["last_event_id"]:
+                return  # An unconsumed claim is reconciled once the pump consumes it.
+            payload = {"state": "in_progress", "source_ms": claim.created_at * 1000, "recovered_claim": {
+                "task_id": task.id, "run_id": task.current_run_id, "event_id": claim.id}}
+        else:
+            if task.status == "archived" or (task.status == "done" and
+                                             self.store.terminal_captured(task.id, issue_id=row["issue_id"])):
+                return  # Archived work leaves Linear alone; verified closeout belongs to _finished.
+            last = next(iter(adapter.history(task.id, row["last_event_id"] - 1)), None) if row["last_event_id"] else None
+            state = self._native_state(task, adapter, last)
+            if state is None or state == latest.get("state"):
+                return
+            payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
         self._native_effect_task(row["issue_id"])
-        payload = {"issue_id": row["issue_id"], "state": "in_progress", "source_ms": claim.created_at * 1000,
-                   "write_started": False, "recovered_claim": {"task_id": task.id, "run_id": task.current_run_id,
-                                                               "event_id": claim.id}, **self._alert_route(row)}
-        self.store.recover_claim_status(row["issue_id"], payload, since=claim.created_at, at=self.clock())
+        self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
+                                                      **self._alert_route(row)}, at=self.clock())
+    def _native_state(self, task, adapter, last) -> str | None:
+        """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
+        status, payload = task.status, native_event_payload(last) if last else {}
+        if status in ("blocked", "triage"):
+            # Native creation parks a new task until admission: that is queued, not stopped.
+            queued = (getattr(last, "kind", None) == "blocked" and payload.get("reason") == "initial_status"
+                      and getattr(adapter, "guarded_controls", False) and adapter.initial_activation_event(task.id) == last.id)
+            return "todo" if queued else "blocked"
+        if status == "review" or (status == "ready" and getattr(last, "kind", None) == "respawn_guarded"
+                                  and payload.get("reason") == "active_pr"):
+            return "in_review"  # A finished stage awaits review, CI or merge.
+        if status in ("ready", "todo", "scheduled"):
+            return "todo"
+        if status == "done":
+            # A stage ended but the outcome is open (_finished alone verifies Done): show the next step.
+            links = evidence_links(adapter.evidence_text(task))
+            return "in_review" if any(PR_URL.fullmatch(url) for url in links) else "todo"
+        return None
     @staticmethod
     def _current_claim(adapter, task):
         """The claimed event of a running task's current run, or None."""
@@ -2024,14 +2065,14 @@ class Bridge:
             else:
                 self._capture_native_event(issue_id, event.id, [], at=self.clock())
             return
+        # Linear status is reconciled from the task's current native status after
+        # the batch (_reconcile_status); events only carry what people should read.
         writes: list[tuple[str, dict[str, Any]]] = []
         route = self._alert_route(row)
-        def status(state: str) -> tuple[str, dict[str, Any]]:
-            return "status", {"issue_id": issue_id, "state": state, "source_ms": getattr(event, "created_at", self.clock()) * 1000, **route}
         def message(kind: str, body: str) -> tuple[str, dict[str, Any]]:
             return "activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "content": {"type": kind, "body": body}, **route}
         if event.kind in ("blocked", "block_loop_detected") and str(payload.get("reason") or "").startswith(OWN):
-            writes = [status("blocked")]
+            pass  # Our own Stop: the chat that asked already has the answer.
         elif (event.kind == "blocked" and payload.get("reason") == "initial_status"
               and getattr(self._binding_adapter(issue_id), "guarded_controls", False)
               and self._binding_adapter(issue_id).initial_activation_event(row["task_id"]) == event.id):
@@ -2039,31 +2080,24 @@ class Bridge:
             # that pristine create+block pair proves preparation; a later Stop,
             # even with this same reason, remains a real block. Reporting cannot
             # admit the task or promise that a parked task will be started.
-            writes = [status("blocked"), message("thought",
-                "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
+            writes = [message("thought", "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
         elif event.kind in ("blocked", "block_loop_detected"):
             # One plain sentence for people. Raw runtime detail stays in native Kanban history.
-            writes = [status("blocked"), message(*_block_message(payload, task_status))]
+            writes = [message(*_block_message(payload, task_status))]
         elif event.kind == "gave_up":
-            writes = [status("blocked"), message("error", "Stopped after several failed attempts. Nothing more will run "
+            writes = [message("error", "Stopped after several failed attempts. Nothing more will run "
                       "until an operator checks the task on the agent's board and starts a new attempt.")]
-        elif event.kind == "unblocked":
-            writes = [status("blocked" if task_status == "todo" else "in_progress")]
-        elif event.kind == "claimed" and task_status == "running":
-            latest = self.store.latest_status(issue_id)
-            if not latest or latest["state"] != "in_progress" or latest.get("refused"):
-                writes = [status("in_progress")]
         elif event.kind in ("review_requested", "changes_requested", "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"):
             # Only the native landing phase can justify a delayed milestone after restart.
-            allowed, state, label, field, fallback = {
-                "review_requested": ({"review", "running"}, None, "Review requested", "summary", "Awaiting independent review"), "review_reopened": ({"todo", "ready", "running"}, None, "Review reopened", None, "Implementation resumed"),
-                "changes_requested": ({"todo", "ready", "running"}, "in_progress", "Changes requested", "reason", "rework is pending"), "promoted": ({"ready", "review"}, "in_progress", "Ready", None, "Dependencies satisfied"),
-                "scheduled": ({"scheduled"}, "blocked", "Scheduled", "reason", "waiting for the scheduled time"), "dependency_wait": ({"todo"}, "blocked", "Waiting for a dependency", None, "work cannot continue"),
-                "descendant_invalidated": ({"todo"}, "blocked", "Waiting for a dependency", None, "work cannot continue"),
+            allowed, label, field, fallback = {
+                "review_requested": ({"review", "running"}, "Review requested", "summary", "Awaiting independent review"), "review_reopened": ({"todo", "ready", "running"}, "Review reopened", None, "Implementation resumed"),
+                "changes_requested": ({"todo", "ready", "running"}, "Changes requested", "reason", "rework is pending"), "promoted": ({"ready", "review"}, "Ready", None, "Dependencies satisfied"),
+                "scheduled": ({"scheduled"}, "Scheduled", "reason", "waiting for the scheduled time"), "dependency_wait": ({"todo"}, "Waiting for a dependency", None, "work cannot continue"),
+                "descendant_invalidated": ({"todo"}, "Waiting for a dependency", None, "work cannot continue"),
             }[event.kind]
             if task_status in allowed:
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
-                writes = ([status(state)] if state else []) + [message("thought", _sentence(f"{label}: {detail or fallback}"))]
+                writes = [message("thought", _sentence(f"{label}: {detail or fallback}"))]
         elif (event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED
               and not self.store.progress_reported(issue_id, row["task_id"], "Started")):
             # Started is said once per binding; retries and restarts spawn again silently.
@@ -2082,8 +2116,7 @@ class Bridge:
             if captured.get(key, 0):
                 captured[key] -= 1; writes = []
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
-                (event.kind == "block_loop_detected" and task_status != "triage") or
-                (event.kind == "unblocked" and task_status not in ("todo", "ready", "review", "running"))): writes = []
+                (event.kind == "block_loop_detected" and task_status != "triage")): writes = []
         writes = self._report_writes(row, writes)
         self._capture_native_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     @staticmethod
@@ -2276,9 +2309,12 @@ class Bridge:
         if not force and now - self._last_recheck < self.recheck_every:
             return
         self._last_recheck = now
-        for row in self.store.active("native"):
+        for row in self.store.active():
             with self.lock(row["issue_id"]):
                 try:
+                    if row["origin"] != "native" or self._task_gone(row):
+                        self._retire_untracked(row)
+                        continue
                     self._native_task(row["issue_id"])
                     issue = self._effect_issue(row["issue_id"])
                     if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
@@ -2292,6 +2328,36 @@ class Bridge:
                         if not exc.retryable:
                             self._fence_scope_denial(row["issue_id"], exc)
                     log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
+    def _task_gone(self, row: dict) -> bool:
+        """The bound task was deleted from a board that still has tasks (a wiped board proves nothing)."""
+        if not self.store.native_binding(row["issue_id"], self.kanban.executor_profile):
+            return False
+        adapter = self._binding_adapter(row["issue_id"])
+        if adapter.get(row["task_id"]) is not None:
+            return False
+        with adapter.read_conn() as conn:
+            return conn.execute("SELECT 1 FROM tasks LIMIT 1").fetchone() is not None
+    def _retire_untracked(self, row: dict) -> None:
+        """Stop tracking a record whose native task does not exist (pre-rebuild chat rows, deleted tasks).
+
+        Nothing runs for it, so a started state this app set becomes Todo, once,
+        unless anyone else changed state, assignee or delegate since. Idempotent.
+        """
+        issue_id = row["issue_id"]
+        if ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
+                or not self.authorize_specialist_effect(issue_id) or self.store.issue_reconciliation_blocked(issue_id)):
+            return  # No session authority here, or an uncertain write needs an operator first.
+        issue, viewer = self._effect_issue(issue_id), self.api.viewer_id()
+        state, target = issue.get("state") or {}, self.state_id(issue, "todo")
+        if state.get("type") == "started" and target and (issue.get("delegate") or {}).get("id") in (None, viewer):
+            routed = [node for node in self.api.routing_history(issue_id)[0] if self._routed(node)]
+            moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
+                        key=lambda node: iso_ms(node.get("createdAt")), default=None)
+            if (moved and moved.get("actorId") == viewer and moved.get("toStateId") == state.get("id") and
+                    all(node.get("actorId") == viewer for node in routed
+                        if iso_ms(node.get("createdAt")) > iso_ms(moved.get("createdAt")))):
+                self.api.update_issue(issue_id, {"stateId": target})
+        self.store.retire_untracked(issue_id, row.get("task_id"))
     def recover(self, ingress: Path | None = None) -> None:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
@@ -2465,7 +2531,7 @@ class Bridge:
             if row and row["kind"] == "status":
                 current = self._effect_issue(payload["issue_id"])
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                      payload.get("seen"), payload.get("source_ms"), payload.get("state") == "in_progress"):
+                                      payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
@@ -2614,7 +2680,7 @@ class Bridge:
             if payload.get("admission_id"):
                 return False
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen"), payload.get("source_ms"), payload.get("state") == "in_progress"):
+                                  payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
                 if (payload.get("terminal") and payload.get("state") == "done"
                         and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):
@@ -2630,14 +2696,14 @@ class Bridge:
                     if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
                     raise LinearError(acceptance_refusal(delivery_failures, where="delivery"), retryable=False)
-            name = self.state_name(issue, payload["state"])
+            name, target = self.state_name(issue, payload["state"]), self.state_id(issue, payload["state"])
             current = issue.get("state") or {}
             if (payload["state"] == "in_progress" and current.get("type") == "started" and
-                    str(current.get("name", "")).casefold() != str(self.state_name(issue, "blocked") or "").casefold()):
-                name = None  # Linear: move only unstarted work; a human's later started state stands
-            if payload.get("release") and not name:
+                    current.get("id") not in (self.state_id(issue, "blocked"), self.state_id(issue, "in_review"))):
+                target = None  # A human's own started state (e.g. QA) stands over In Progress.
+            if payload.get("release") and not target:
                 raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
-            fields = {"stateId": state_id(issue, name, first_started=payload["state"] == "in_progress")} if name else {}
+            fields = {"stateId": target} if target and (target != current.get("id") or payload.get("release")) else {}
             if payload.get("claim"):
                 fields["delegateId"] = self.api.viewer_id()
             if payload.get("release"):

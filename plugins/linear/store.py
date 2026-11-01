@@ -691,6 +691,15 @@ class Store:
             if not self._admitted(db, issue_id): return False
             db.execute("DELETE FROM work WHERE issue_id = ? AND origin != 'native'", (issue_id,))
             return True
+    def retire_untracked(self, issue_id: str, task_id: str | None) -> bool:
+        """Stop tracking a record whose native task does not exist; outbox history stays inspectable."""
+        with self._tx() as db:
+            if not self._admitted(db, issue_id):
+                return False
+            gone = db.execute("DELETE FROM work WHERE issue_id=? AND task_id IS ?", (issue_id, task_id)).rowcount
+            if gone and task_id is not None:  # A fresh link can bind this issue again.
+                db.execute("DELETE FROM metadata WHERE key=?", (f"native-binding:{issue_id}",))
+            return bool(gone)
     def scope_fenced(self, issue_id: str) -> bool:
         with self._tx() as db:
             return db.execute("SELECT 1 FROM specialist_scope_fence WHERE issue_id = ?",
@@ -1014,19 +1023,26 @@ class Store:
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                        (payload["id"], "delegate", json.dumps({**payload, "enqueued_at": at}), at))
             return True
-    def recover_claim_status(self, issue_id: str, payload: dict[str, Any], *, since: float, at: float) -> bool:
-        """Once per claim: queue In Progress only if no status intent follows that claim."""
+    def reconcile_status(self, issue_id: str, payload: dict[str, Any], *, at: float) -> bool:
+        """Queue a native-derived state only when the newest intent differs.
+
+        A refused In Progress is retried once per claim. Pending native messages
+        are sequenced after it, so people read them under the current state.
+        """
         with self._tx() as db:
             if not self._effect_admitted(db, issue_id) or not db.execute(
-                    "SELECT 1 FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone():
+                    "SELECT 1 FROM work WHERE issue_id=? AND origin='native' AND task_id=?",
+                    (issue_id, payload.get("task_id"))).fetchone():
                 return False
             latest = db.execute(self._LATEST_STATUS, (issue_id,)).fetchone()
-            retry = (latest and self._refused_in_progress(latest)
-                     and latest["claim_event"] != payload["recovered_claim"]["event_id"])
-            if latest and not retry and (latest["intent"] == "in_progress" or float(latest["at"] or 0) >= since):
+            claim = (payload.get("recovered_claim") or {}).get("event_id")
+            retry = (latest and claim is not None and self._refused_in_progress(latest)
+                     and latest["claim_event"] != claim)
+            if latest and latest["intent"] == payload["state"] and not retry:
                 return False
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                        (str(uuid.uuid4()), "status", json.dumps({**payload, "enqueued_at": at}), at))
+            self._sequence_native_history(db, issue_id)
             return True
     _LATEST_STATUS = ("SELECT id, state AS row_state, hold_reason, json_extract(payload, '$.state') AS intent, "
                       "json_extract(payload, '$.enqueued_at') AS at, json_extract(payload, '$.applied') AS applied, "

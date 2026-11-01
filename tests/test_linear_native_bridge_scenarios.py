@@ -415,6 +415,11 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.make_bridge().handle_webhook(old)
         self.assertEqual(self.board.get(task_id).current_run_id, next_run.current_run_id)
 
+    @staticmethod
+    def deliver_status(reporter):
+        """Deliver only the reconciled status, which every native message waits behind."""
+        assert reporter.flush(only_id=reporter.store.latest_status(ISSUE)["id"]) == 1
+
     def reporting_fixture(self, name):
         from linear_fake_api import Clock, FakeLinear
         from hermes_fleet_linear_plugin.api import LinearAPI
@@ -422,6 +427,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         remote = FakeLinear(clock)
         self.addCleanup(remote.close)
         remote.add_issue(ISSUE, "OPS-1", project=None)
+        remote.issues[ISSUE]["state"] = {"id": "st-backlog", "name": "Backlog", "type": "backlog"}
         path = self.home / (name + ".db")
         reporter = Bridge(Store(path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
                           self.board, profile="default", clock=clock)
@@ -675,7 +681,9 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock), self.board, profile="default", clock=clock)
                     reporter.recover()
                     reporter.flush()
-                    self.assertEqual(remote.state(ISSUE), "Done" if state == "done" else "Blocked")
+                    # Waiting on a dependency or a time is queued (Todo); archived leaves Linear as it was.
+                    self.assertEqual(remote.state(ISSUE), {"done": "Done", "todo": "Todo", "scheduled": "Todo",
+                        "archived": "In Progress" if captured else "Todo"}.get(state, "Blocked"))
                     bodies = remote.bodies(ISSUE)
                     self.assertEqual(sum("Preserve this ordinary native checkpoint" in body for body in bodies), 1)
                     self.assertEqual(sum("Preserve the second ordinary checkpoint too" in body for body in bodies), 1)
@@ -700,8 +708,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     self.land_reported_task(clock, task_id, phase)
                     clock.now += 10
                     if change == "assignee":
-                        remote.issues[ISSUE]["assignee"] = {"id": "different-human"}
-                        remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                        remote.set_assignee(ISSUE, {"id": "different-human"})
                     elif change == "delegate":
                         remote.set_delegate(ISSUE, {"id": "different-agent"})
                     else:
@@ -730,6 +737,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     kb.claim_task(conn, task_id, claimer="ordinary-history-worker")
                     self.checkpoint(conn, task_id, "worker", "Original ordinary delivery must not be moved or replayed")
                 reporter.pump_kanban()
+                self.deliver_status(reporter)
                 ordinary = next(row for row in reporter.store.pending() if row["kind"] == "comment")
                 class ProcessCrash(BaseException):
                     pass
@@ -812,6 +820,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         remote = FakeLinear(clock)
         self.addCleanup(remote.close)
         remote.add_issue(ISSUE, "OPS-1", project=None)
+        remote.issues[ISSUE]["state"] = {"id": "st-backlog", "name": "Backlog", "type": "backlog"}
         remote.set_delegate(ISSUE, {"id": SELF})
         remote.sessions[SESSION] = ISSUE
         remote.comment_updates_issue = remote.activity_updates_issue = True
@@ -860,7 +869,8 @@ class NativeBridgeScenarios(unittest.TestCase):
                     clock.now += 10
                     reporter.recover()
                     reporter.flush()
-                    self.assertEqual(remote.state(ISSUE), "Done" if state == "done" else "Blocked")
+                    self.assertEqual(remote.state(ISSUE), {"done": "Done", "blocked": "Blocked"}.get(
+                        state, "In Progress" if captured else "Todo"))  # archived leaves Linear as it was
                     self.assertEqual(sum("Authenticated session ordinary history" in body for body in remote.bodies(ISSUE)), 1)
                     self.assertTrue(any(item["content"].get("body") == "Authenticated session ordinary history" for item in remote.activities))
                     self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
@@ -874,6 +884,7 @@ class NativeBridgeScenarios(unittest.TestCase):
             kb.claim_task(conn, task_id, claimer="session-native-worker")
             self.checkpoint(conn, task_id, "worker", "Session history whose HTTP response is lost")
         reporter.pump_kanban()
+        self.deliver_status(reporter)
         row = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
         remote.lose_next_response = True
         reporter.flush()
@@ -965,13 +976,17 @@ class NativeBridgeScenarios(unittest.TestCase):
             kb.claim_task(conn, task_id, claimer="admission-race-worker")
             self.checkpoint(conn, task_id, "worker", "Ordinary history protected by the final dependency check")
         reporter.pump_kanban()
-        admit = reporter.store.admit_mutation
+        self.deliver_status(reporter)
+        admit, raced = reporter.store.admit_mutation, []
         def concurrent_capture_before_admission(*args, **kwargs):
-            self.halt_reported_task(clock, task_id, "blocked")
-            work = reporter.store.get(ISSUE)
-            for event in self.board.history(task_id, work["last_event_id"]):
-                reporter._task_event(work, event, "blocked", {})
+            if not raced:  # one concurrent native Stop and its capture
+                raced.append(True)
+                self.halt_reported_task(clock, task_id, "blocked")
                 work = reporter.store.get(ISSUE)
+                for event in self.board.history(task_id, work["last_event_id"]):
+                    reporter._task_event(work, event, "blocked", {})
+                    work = reporter.store.get(ISSUE)
+                reporter._reconcile_status(work, reporter._binding_adapter(ISSUE))  # as the pump does
             return admit(*args, **kwargs)
         with patch.object(reporter.store, "admit_mutation", side_effect=concurrent_capture_before_admission):
             reporter.flush()
@@ -1141,8 +1156,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 if change == "same_state":
                     remote.set_state(ISSUE, "In Progress")
                 elif change == "assignee":
-                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
-                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                    remote.set_assignee(ISSUE, {"id": "new-human-assignee"})
                 elif change == "delegate":
                     remote.set_delegate(ISSUE, {"id": "different-agent"})
                 else:
@@ -1157,7 +1171,7 @@ class NativeBridgeScenarios(unittest.TestCase):
 
     def test_other_native_waits_keep_current_milestones_instead_of_old_progress(self):
         for state, milestone in (("todo", "Waiting for a dependency"), ("scheduled", "Scheduled"),
-                                 ("review", "Review requested"), ("archived", "unfinished")):
+                                 ("review", "Review requested")):
             with self.subTest(state=state):
                 clock, remote, reporter, task_id = self.reporting_fixture("stationary-" + state)
                 remote.comment_updates_issue = True
@@ -1303,8 +1317,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 if change == "same_state":
                     remote.set_state(ISSUE, "In Progress")
                 elif change == "assignee":
-                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
-                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                    remote.set_assignee(ISSUE, {"id": "new-human-assignee"})
                 elif change == "delegate":
                     remote.set_delegate(ISSUE, {"id": "different-agent"})
                 else:
@@ -1344,6 +1357,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.flush()
         self.native_progress(clock, task_id)
         reporter.pump_kanban()
+        self.deliver_status(reporter)  # In Progress lands first; the next write is the progress message
         remote.lose_next_response = True
         self.assertEqual(reporter.flush(), 0)
         self.assertEqual(len(remote.bodies(ISSUE)), 1)
@@ -1467,8 +1481,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 if change == "same_state":
                     remote.set_state(ISSUE, "In Progress")
                 elif change == "assignee":
-                    remote.issues[ISSUE]["assignee"] = {"id": "new-human-assignee"}
-                    remote.issues[ISSUE]["updatedAt"] = clock.iso()
+                    remote.set_assignee(ISSUE, {"id": "new-human-assignee"})
                 elif change == "delegate":
                     remote.set_delegate(ISSUE, {"id": "different-agent"})
                 else:
@@ -1487,7 +1500,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock.now += 10
         remote.lose_next_response = True
         self.assertEqual(reporter.flush(), 0)
-        self.assertEqual(remote.state(ISSUE), "In Progress")
+        self.assertEqual(remote.state(ISSUE), "Todo")  # queued work's status write; its response was lost
         pending = next(row for row in reporter.store.pending() if row["kind"] == "status")
         self.assertFalse(pending["payload"].get("issue_write_receipt"))
         reporter.pump_kanban()

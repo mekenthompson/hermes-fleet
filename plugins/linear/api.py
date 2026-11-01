@@ -496,17 +496,3 @@ class LinearAPI:
                 or (relation_row.get("relatedIssue") or {}).get("id") != related_issue_id):
             raise LinearError("Linear issue link readback does not match the create", retryable=False)
         return relation_row
-
-def state_id(issue: dict[str, Any], name: str, *, first_started: bool = False) -> str:
-    """Resolve a workflow state by name on the issue's team (case-insensitive). For starting work, a team
-    without that name uses its first started state by position, as Linear recommends."""
-    nodes = ((issue.get("team") or {}).get("states") or {}).get("nodes") or []
-    for node in nodes:
-        if str(node.get("name", "")).casefold() == name.casefold():
-            return str(node["id"])
-    started = sorted((n for n in nodes if n.get("type") == "started"), key=lambda n: n.get("position") or 0)
-    if first_started and started:
-        logging.getLogger("linear").warning("linear: team has no '%s' state; using first started state '%s'",
-                                            name, started[0].get("name"))
-        return str(started[0]["id"])
-    raise LinearError(f"team has no '{name}' workflow state; add it or fix the states config", retryable=False)

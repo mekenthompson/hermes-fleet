@@ -310,18 +310,21 @@ class DurableCloseoutTests(unittest.TestCase):
             bridge._keepalive(row)  # an elicitation is awaiting input: a thought would hide it
             self.assertEqual(len([r for r in store.pending(ISSUE) if r['kind'] == 'activity']), 1)
 
-    def test_started_issue_keeps_its_status_and_a_missing_name_uses_first_started(self):
-        from hermes_fleet_linear_plugin.api import state_id
-        team = {'states': {'nodes': [{'id': 'review', 'name': 'In Review', 'type': 'started', 'position': 3},
+    def test_started_issue_keeps_its_status_and_a_missing_name_uses_its_type(self):
+        team = {'key': 'AUT', 'states': {'nodes': [{'id': 'qa', 'name': 'QA', 'type': 'started', 'position': 3},
                                      {'id': 'doing', 'name': 'Doing', 'type': 'started', 'position': 1},
-                                     {'id': 'todo', 'name': 'Todo', 'type': 'unstarted', 'position': 0}]}}
-        self.assertEqual(state_id({'team': team}, 'In Progress', first_started=True), 'doing')
-        with self.assertRaises(Exception):
-            state_id({'team': team}, 'Blocked')
+                                     {'id': 'backlog', 'name': 'Backlog', 'type': 'backlog', 'position': 0},
+                                     {'id': 'queued', 'name': 'Queued', 'type': 'unstarted', 'position': 2}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge(Store(Path(directory) / 'state.db'), None, FakeKanban(), profile='synthetic')
+        self.assertEqual(bridge.state_id({'team': team}, 'in_progress'), 'doing')
+        self.assertEqual(bridge.state_id({'team': team}, 'todo'), 'queued')
+        self.assertIsNone(bridge.state_id({'team': team}, 'blocked'))  # no Blocked: status stays, the sentence still posts
+        self.assertIsNone(bridge.state_id({'team': team}, 'in_review'))
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
             authority.issues[ISSUE]['delegate'] = {'id': VIEWER}
-            authority.issues[ISSUE]['state'] = {'id': 'review', 'name': 'In Review', 'type': 'started'}
+            authority.issues[ISSUE]['state'] = {'id': 'qa', 'name': 'QA', 'type': 'started'}
             api, sent = authority.api(), []
             original = api.update_issue
             api.update_issue = lambda issue_id, fields: sent.append(fields) or original(issue_id, fields)

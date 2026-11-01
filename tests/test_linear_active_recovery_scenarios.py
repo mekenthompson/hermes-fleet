@@ -374,6 +374,10 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.ticks(1)
         self.assertEqual(f.remote.state("issue-1"), "Todo")
         self.assertTrue(f.bridge.store.latest_status("issue-1")["refused"])
+        # The older build's claimed-event row carried no claim provenance.
+        refused = f.bridge.store.outbox_row(f.bridge.store.latest_status("issue-1")["id"])
+        refused["payload"].pop("recovered_claim")
+        f.bridge.store.rewrite(refused["id"], refused["payload"], refused["next_at"])
         f.bridge.may_write = current  # upgrade
         self.ticks()
         self.assertEqual(f.remote.state("issue-1"), "In Progress")
