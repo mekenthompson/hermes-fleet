@@ -112,6 +112,13 @@ How to work this task:
    metadata.published_pr), the merged commit, the deploy check, or the findings link. A run without
    evidence is reported to Linear as unfinished.
 3. If you need a human decision, kanban_block with kind needs_input and say exactly what you need.
+4. Keep the people following this issue informed without noise. At each meaningful milestone or blocker, call
+   kanban_comment on this task with human_checkpoint=true and a new stable request_id (reuse it on
+   retry). Write it for a person: a few complete sentences in Linear Markdown saying what changed,
+   what is next and any blocker. Never post reasoning, tool output, logs, process IDs or raw errors.
+5. Your kanban_complete summary is the closing note people read in Linear. Write it in Linear Markdown
+   with three short sections: **Delivered** (what changed, in plain words), **Evidence** (PR, CI,
+   deploy and live check links or results) and **Remaining** (what is left, or "Nothing").
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 
@@ -208,8 +215,57 @@ _SECRET = re.compile(r"(?i)(?:\b(?:ghp_|github_pat_|gho_|ghu_|ghs_|sk-)[A-Za-z0-
 def _public(text: str) -> str:
     """Refusal text may quote a receipt detail, never a token that leaked into one."""
     return _SECRET.sub("[redacted]", text)
-def _project_summary(text: str, limit: int = 300) -> str:
-    return " ".join(re.sub(r"(?<![\w:/])(?:(?:file://)?/|[A-Za-z]:\\|[A-Za-z0-9_.-]+[/\\])[^\s,;]+", "[local artifact]", _public(text)).split())[:limit].strip()
+# Only real local paths: file:// URLs, ~/ and ./ or ../ paths, Windows drive paths and
+# absolute paths with at least two segments (/opt/data/x). Ordinary word/word text such
+# as CI/CD, and/or or read/write, URLs and single-segment slash commands stay as written.
+_LOCAL_PATH = re.compile(r"(?<![\w.~/:-])(?:file://[^\s)\]>`\"']+|~/[^\s)\]>`\"',;]+|\.\.?/[^\s)\]>`\"',;]+"
+                         r"|[A-Za-z]:\\[^\s)\]>`\"',;]+|/[\w.@+-]+(?:/[\w.@+-]+)+/?)")
+def _mask_path(match: re.Match) -> str:
+    path = match.group(0)
+    tail = len(path) - len(path.rstrip(".:!?"))
+    return "[local artifact]" + (path[-tail:] if tail else "")
+def _trim_readable(text: str, limit: int) -> str:
+    """Cut at a paragraph, sentence or word boundary, never inside a word."""
+    if len(text) <= limit:
+        return text
+    window = text[:limit + 1]
+    for boundary in (r"\n[ \t]*\n", r"(?<=[.!?])[\"')\]*_`]*\s", r"\n"):
+        cut = max((m.start() for m in re.finditer(boundary, window) if m.start() >= limit // 3), default=0)
+        if cut:
+            return text[:cut].rstrip()
+    cut = window.rstrip().rfind(" ")
+    return (text[:cut] if cut > 0 else text[:limit]).rstrip() + "\u2026"
+def _project_summary(text: str, limit: int = 300, *, one_line: bool = False) -> str:
+    """Human-readable result text: secrets redacted, local paths masked, Markdown and line breaks kept."""
+    masked = _LOCAL_PATH.sub(_mask_path, _public(text))
+    if one_line:
+        masked = " ".join(masked.split())
+    else:
+        lines = [line.rstrip() for line in masked.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        masked = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return _trim_readable(masked, limit).strip()
+def _sentence(text: str) -> str:
+    text = text.rstrip()
+    return text if text.endswith((".", "!", "?", "`", ")")) else text + "."
+def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
+    """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
+    kind = payload.get("kind")
+    internal = kind in {"capability", "transient"}  # Malformed native kinds fail this event, scoped.
+    if task_status == "triage":
+        return "error", ("Paused after the same problem came back several times. An operator needs to check "
+                         "the task on the agent's board before work continues.")
+    if internal:
+        return "error", ("Paused by a technical problem on the agent's side. Nothing is needed from you; "
+                         "the same task continues once the problem is cleared.")
+    reason = _project_summary(payload.get("reason") or "", 400, one_line=True)
+    if kind == "dependency":
+        return "thought", _sentence(f"Waiting for a dependency: {reason or 'earlier work must finish first'}") + \
+            " Work continues when it is done."
+    if kind == "needs_input":
+        return "elicitation", _sentence(f"Waiting on you: {reason or 'the agent needs a decision'}") + \
+            " Once this is answered, ask the agent to resume and it continues the same task."
+    return "elicitation", _sentence(f"Paused: {reason or 'work was stopped'}") + \
+        " Ask the agent to resume when ready and it continues the same task."
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
     if isinstance(receipt, dict) and receipt:
@@ -1068,11 +1124,12 @@ class Bridge:
         if completed:
             # Archive is not evidence that an earlier completion was undone.
             writes = [("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
-                "content": {"type": "response", "body": "Native task archived with a prior completion in its history. Inspect the native result and evidence; no new work was started."},
+                "content": {"type": "response", "body": "The agent's task was archived after it had already finished. No new work was started."},
                 **self._alert_route(row)})]
             self._capture_native_event(issue_id, event_id, self._report_writes(row, writes), at=self.clock())
             return
-        body = "Kanban task archived without accepted completion evidence. Work remains unfinished."
+        body = ("The agent's task was archived without accepted completion evidence, so this work is unfinished. "
+                "Ask the agent to pick it up again if it is still needed.")
         route = {"task_id": row["task_id"], "terminal": True, "owner_issue_id": issue_id}
         self._finish_work(issue_id, [
             ("status", {"issue_id": issue_id, "state": "blocked", **route}),
@@ -1144,7 +1201,7 @@ class Bridge:
                 self._pending_assignment_stop(self.store.get(issue_id))
                 task = adapter.require_task(task.id)
                 self.activity(issue_id, session_id, "thought",
-                    f"Existing native task linked for progress on its original board; current state is {task.status}. Discovery does not verify completion of the issue outcome. Inspect acceptance before reconciling an outcome link. No replacement worker was created or work resumed; native controls remain authoritative.")
+                    f"Linked to the agent's existing task for this issue, which is currently {task.status}. No new work was started; the agent checks that work before changing anything.")
                 return True
         context = "\n\n".join(x for x in (fresh.get("description") or "", self._thread(issue_id, until_ms=stamp), prompt) if x)
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
@@ -1203,9 +1260,9 @@ class Bridge:
             return True
         unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
-            self._decline(issue_id, session_id, "Stop arrived while task creation was in flight. The native task was created blocked and linked; inspect current native controls before any activation.")
+            self._decline(issue_id, session_id, "Stop arrived while the task was being created, so it was created paused. Nothing runs until someone asks the agent to resume.")
         else:
-            self.activity(issue_id, session_id, "thought", "Native task created and linked in blocked state. A current authorized native task control is required to activate it; Linear has not started a worker.")
+            self.activity(issue_id, session_id, "thought", "Task created but not started yet. It starts once the agent's board activates it; no worker is running.")
         return True
 
     def _assignment_activation(self, row: dict | None) -> bool:
@@ -1280,7 +1337,7 @@ class Bridge:
         self._pending_assignment_stop(row)
         task = adapter.require_task(row["task_id"])
         self.activity(issue_id, row["owner_ref"], "thought",
-                      f"Native task linked; current state is {task.status}. Native scheduling and task controls own execution.")
+                      f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
         return True
 
     def _pending_assignment_stop(self, row: dict) -> bool | None:
@@ -1983,17 +2040,13 @@ class Bridge:
             # even with this same reason, remains a real block. Reporting cannot
             # admit the task or promise that a parked task will be started.
             writes = [status("blocked"), message("thought",
-                "Native task prepared; waiting for native admission. No user input is requested.")]
+                "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
         elif event.kind in ("blocked", "block_loop_detected"):
-            internal_block = payload.get("kind") in {"capability", "transient"}
-            instruction = ("Resolve Kanban triage on the board." if task_status == "triage" else
-                           "Reconcile the runtime failure before resuming the existing task; no user input is requested."
-                           if internal_block else "Use native task controls to resume after resolving the block.")
-            block_type, block_label = (("error", f"Blocked ({payload['kind']})") if internal_block else ("elicitation", "Blocked"))
-            writes = [status("blocked"), message(block_type, f"{block_label}: {payload.get('reason') or 'needs input'}. {instruction}")]
+            # One plain sentence for people. Raw runtime detail stays in native Kanban history.
+            writes = [status("blocked"), message(*_block_message(payload, task_status))]
         elif event.kind == "gave_up":
-            writes = [status("blocked"), message("error", f"Stopped after repeated failed attempts "
-                      f"(last error: {payload.get('error') or 'unknown'}). Inspect native task history and use native controls for a new attempt.")]
+            writes = [status("blocked"), message("error", "Stopped after several failed attempts. Nothing more will run "
+                      "until an operator checks the task on the agent's board and starts a new attempt.")]
         elif event.kind == "unblocked":
             writes = [status("blocked" if task_status == "todo" else "in_progress")]
         elif event.kind == "claimed" and task_status == "running":
@@ -2010,8 +2063,10 @@ class Bridge:
             }[event.kind]
             if task_status in allowed:
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
-                writes = ([status(state)] if state else []) + [message("thought", f"{label}: {detail or fallback}.")]
-        elif event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
+                writes = ([status(state)] if state else []) + [message("thought", _sentence(f"{label}: {detail or fallback}"))]
+        elif (event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED
+              and not self.store.progress_reported(issue_id, row["task_id"], "Started")):
+            # Started is said once per binding; retries and restarts spawn again silently.
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
         elif event.kind == "heartbeat" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             note = _progress_text(payload.get("note"))
@@ -2081,13 +2136,12 @@ class Bridge:
                 self._capture_native_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
-        summary = _project_summary(adapter.completion_summary(task), 1500)
+        summary = _project_summary(adapter.completion_summary(task), 4000)
         if not self._completion_scope_matches(row["issue_id"], task, adapter):
-            body = ("Native stage finished. The Linear outcome remains unfinished: this task reports progress, "
-                    "or its accepted completion scope is missing or changed. Inspect the agreed outcome and "
-                    "remaining work before reconciling the reporting link; no execution was started.")
+            body = ("This stage is finished, but the issue's agreed outcome is not done yet. No new work was "
+                    "started; the agent checks what remains before the next step.")
             if summary:
-                body += f"\n\nNative stage result: {summary}"
+                body += f"\n\n**This stage delivered**\n\n{summary}"
             if event_id is not None:
                 self._capture_native_event(row["issue_id"], event_id, self._report_writes(row, [
                     ("activity", {"issue_id": row["issue_id"], "session_id": row["owner_ref"],
@@ -2100,8 +2154,8 @@ class Bridge:
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
         residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", summary, flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
-            body = ("The run ended without evidence (PR, merge, deploy check or findings link), so it is "
-                    "unfinished. Review native task history before creating a deliberate new increment.") if not evidence else acceptance_refusal(failures, where="kanban")
+            body = ("The run ended without evidence (a PR, merge, deploy check or findings link), so this "
+                    "issue stays unfinished. A new attempt needs to deliver and show that evidence.") if not evidence else acceptance_refusal(failures, where="kanban")
             if not self.authorize_specialist_effect(issue_id): return
             self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
@@ -2118,7 +2172,7 @@ class Bridge:
             raw = reader(task)
             assessment = _fit_assessment(raw if isinstance(raw, str) else "")
             if not assessment:
-                body = "The assessment did not include a recommendation. Inspect native history before creating a deliberate new increment."
+                body = "The assessment finished without a recommendation, so it is not complete. A new attempt needs to produce one."
                 if not self.authorize_specialist_effect(issue_id): return
                 self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                         "task_id": row["task_id"], "terminal": True,
@@ -2143,7 +2197,7 @@ class Bridge:
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else f"Done: {links or _project_summary(summary)}"},
+                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else f"Done: {links or _project_summary(summary, one_line=True)}"},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
         if assessment:
             prior_id = self.store.assessment_comment_id(issue_id, assessment,
@@ -2787,8 +2841,8 @@ class Bridge:
                             if issue_id:
                                 work = self.store.get(issue_id)
                                 self.store.enqueue_once("comment", {"issue_id": issue_id,
-                                    "body": "A Linear delivery could not be processed after 24 hours and is parked "
-                                            "in this agent's inbox. Investigate the ingress failure before retrying.",
+                                    "body": "An update to this issue could not be processed for 24 hours, so the agent set it "
+                                            "aside. An operator needs to check the agent's Linear inbox and retry it.",
                                     **self._alert_route(work)}, f"{agent}:{delivery}", at=self.clock())
                             else:
                                 log.error("linear: parked delivery %s has no issue destination", delivery)
