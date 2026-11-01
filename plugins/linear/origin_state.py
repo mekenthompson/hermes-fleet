@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from .transport import NativeContext, Unavailable
 
-INTERACTIVE_SOURCES = frozenset({"cli", "tui", "gui", "acp"})
+# Core's interactive local surfaces (gateway/session_queued_controls.py). "desktop" is the stored
+# label a Desktop chat keeps after the owner adopts it from main.
+INTERACTIVE_SOURCES = frozenset({"cli", "tui", "gui", "desktop", "acp"})
 
 
 def stop_evidence(home: Path, session_id: str) -> dict:

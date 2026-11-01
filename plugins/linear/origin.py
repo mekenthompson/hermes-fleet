@@ -137,6 +137,9 @@ def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
 def current(context: NativeContext, settings: dict, *, api=None) -> dict:
     if context.delegated_child:
         _refuse("A delegated child cannot supply the originating user's request.")
+    if context.platform == "desktop":
+        # A legacy Desktop host has no native owner receipt; an owner-adopted Desktop chat runs as "local".
+        _refuse("This Desktop chat is not on the agent's native session owner yet, so its request cannot be verified.")
     if context.platform not in {"local", "api_server", "telegram", "slack", "linear"}:
         _refuse("This surface cannot supply an ordinary native origin reference.")
     evidence = _run(Path(context.home), context.profile, scope(settings), None, context, api)

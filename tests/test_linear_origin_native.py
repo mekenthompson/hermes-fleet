@@ -187,6 +187,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.claim()
         self.bind("api_server", self.sid, user="api_server")
 
+    async def desktop(self):
+        """A Desktop chat from main after the supported owner adoption (Agent #196).
+
+        Adoption commits a native local receipt with Desktop's ``gui`` policy while the stored row
+        keeps its ``desktop`` label; its turns bind ``source=desktop`` and the conversation as chat.
+        (Adoption itself loads the gateway model bootstrap, which this proof forbids importing.)"""
+        await self.local(source="gui")
+        self.authority.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
+        self.bind("local", self.sid, source="desktop", chat=self.sid)
+
     async def current(self):
         context = transport.capture_context()
         return await asyncio.to_thread(origin.current, context, self.settings)
@@ -2019,6 +2029,62 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(evidence["reference"]["admission_id"], self.admission)
                 self.assertNotIn("session_id", evidence["reference"])
                 self.assertNotIn("input_id", evidence["reference"])
+
+    async def test_desktop_chat_supplies_origin_for_its_authenticated_owner(self):
+        # Review 1 Nov: an adopted Desktop chat keeps stored source "desktop", which was refused.
+        await self.desktop()
+        current = await self.current()
+        self.assertEqual(set(current), {"reference", "permission_granted"})
+        self.assertFalse(current["permission_granted"])
+        self.assertEqual(current["reference"]["admission_id"], self.admission)
+        evidence = await self.inspected(current["reference"])
+        self.assertEqual(evidence["original_message"], "Take over ABC-1")
+        self.assertEqual(evidence["requester"], {"principal_id": self.conn.actor.subject,
+                                                 "kind": "local_principal", "platform": "local"})
+        self.assertEqual(evidence["policy"]["source"], "gui")
+        self.assertFalse(evidence["permission_granted"])
+
+    async def test_desktop_label_without_the_native_owner_is_still_refused(self):
+        from hermes_state_runtime import admit_session_input, settle_session_input
+        await self.desktop()
+        # Input admitted for someone other than the conversation's authenticated owner.
+        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+            admission_id=self.admission, generation=self.row["generation"], outcome="interrupted")
+        row = admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="uid:someone-else",
+                                  session_id=self.sid, request_id="foreign-request", payload={"text": "Take over ABC-1"})
+        self.admission = row["admission_id"]
+        self.claim()
+        with self.assertRaises(transport.Unavailable):
+            await self.current()
+        # A legacy Desktop host binds platform "desktop" and has no native owner receipt.
+        self.bind("desktop", self.sid, source="desktop")
+        with self.assertRaisesRegex(transport.Unavailable, "Desktop"):
+            await self.current()
+
+    async def test_messaging_input_cannot_borrow_a_desktop_label(self):
+        await self.messaging("telegram")
+        self.authority.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
+        with self.assertRaises(transport.Unavailable):
+            await self.current()
+
+    async def test_desktop_work_reports_resolve_to_the_desktop_conversation(self):
+        # Chat updates use native Kanban notify subscriptions. From an adopted Desktop turn the
+        # subscription targets the native local route for this conversation (notify+wake), and
+        # the owner's read-only delivery handle resolves that same live Desktop session.
+        from tools.kanban_tools import _resolve_notify_target
+        await self.desktop()
+        target = _resolve_notify_target()
+        self.assertEqual((target["platform"], target["chat_id"], target["delivery_mode"]),
+                         ("local", self.sid, "notify+wake"))
+        handle = await self.conn.dispatch({"id": 901, "method": "session.delivery_handle",
+                                           "params": {"session_id": target["chat_id"]}})
+        self.assertEqual(handle.get("result", {}).get("session_id"), self.sid, handle)
+        self.assertEqual(handle["result"]["stored_session_id"], self.sid)
+        self.assertEqual(handle["result"]["profile_id"], str(self.home))
+        live = self.authority.sessions[self.sid].source  # What the native local adapter delivers to.
+        self.assertEqual((live.platform.value, live.chat_id), (target["platform"], target["chat_id"]))
+        # The origin reference from the same turn still verifies after the delivery read.
+        self.assertEqual((await self.current())["reference"]["admission_id"], self.admission)
 
     async def test_native_registered_tool_captures_the_actual_current_caller(self):
         from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
