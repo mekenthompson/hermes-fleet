@@ -39,8 +39,9 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.bridge.pump_kanban()
         contents = self.pending_contents()
         self.assertFalse(any(content["type"] == "elicitation" for content in contents))
-        self.assertTrue(any(content["type"] == "thought" and "prepared" in content["body"]
-                            and "No user input" in content["body"] for content in contents))
+        self.assertTrue(any(content["type"] == "thought" and content["body"].startswith("Queued.")
+                            and "nothing is needed from you" in content["body"] for content in contents))
+        self.assertFalse(any("admission" in (content.get("body") or "") for content in contents))
         self.assertEqual(self.board.get(task_id).status, "blocked")
         events = self.board.history(task_id, 0)
         self.assertEqual([event.kind for event in events], ["created", "blocked"])

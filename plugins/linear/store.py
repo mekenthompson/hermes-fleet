@@ -1311,6 +1311,19 @@ class Store:
                 "(c.state = 'pending' OR (c.state = 'failed' AND c.attempts > 0 AND NOT EXISTS ("
                 "SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > c.rowid AND "
                 "json_extract(l.payload, '$.issue_id') = ?))) LIMIT 1", (issue_id, issue_id)).fetchone())
+    def progress_reported(self, issue_id: str, task_id: str, action: str) -> bool:
+        """A native progress milestone for this binding is already queued or published.
+
+        Obsolete progress that never reached Linear is deleted, so it does not count.
+        """
+        with self._tx() as db:
+            return bool(db.execute(
+                "SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind IN ('activity', 'comment') AND "
+                "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.task_id') = ? AND "
+                "json_extract(payload, '$.native_progress') = 1 AND "
+                "(json_extract(payload, '$.content.action') = ? OR "
+                "substr(json_extract(payload, '$.body'), 1, length(?) + 1) = ? || ':') LIMIT 1",
+                (issue_id, task_id, action, action, action)).fetchone())
     def has_start_ack(self, issue_id: str, task_id: str) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)

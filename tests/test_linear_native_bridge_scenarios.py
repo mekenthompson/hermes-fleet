@@ -486,6 +486,89 @@ class NativeBridgeScenarios(unittest.TestCase):
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             self.assertTrue(kb.complete_task(conn, task_id, result="Verified investigation found the precise bounded outcome"))
 
+    def respawn(self, clock, task_id):
+        """The native dispatcher starts the same task's worker again (retry or restart)."""
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "spawned", {"pid": 654321},
+                                 run_id=self.board.get(task_id).current_run_id)
+
+    def test_started_is_posted_once_across_respawns_and_restarts(self):
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        clock, remote, reporter, task_id = self.reporting_fixture("started-once")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        # A retry respawns the worker before the reporter restarts, then again after.
+        self.respawn(clock, task_id)
+        reporter.pump_kanban()
+        reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                          self.board, profile="default", clock=clock)
+        self.respawn(clock, task_id)
+        reporter.recover()
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(self.board.get(task_id).status, "running")
+
+    def test_runtime_block_posts_one_plain_sentence_without_raw_error(self):
+        raw = "pid 1591346 exited with code 130 [owner admission settled interrupted]"
+        clock, remote, reporter, task_id = self.reporting_fixture("plain-runtime-block")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.block_task(conn, task_id, reason=raw, kind="transient",
+                                         expected_run_id=self.board.get(task_id).current_run_id))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        bodies = remote.bodies(ISSUE)
+        self.assertIn("Paused by a technical problem on the agent's side. Nothing is needed from you; "
+                      "the same task continues once the problem is cleared.", bodies)
+        for leaked in ("pid", "1591346", "exited with code", "admission", "reconcil", "native"):
+            self.assertFalse(any(leaked in body for body in bodies), leaked)
+        # The raw detail stays in the native record.
+        self.assertTrue(any((event.payload or {}).get("reason") == raw for event in self.board.history(task_id, 0)))
+
+    def test_needs_input_block_keeps_the_human_question(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("plain-needs-input")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.block_task(conn, task_id, reason="Which region should the CI/CD job deploy to?",
+                                         kind="needs_input", expected_run_id=self.board.get(task_id).current_run_id))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertIn("Waiting on you: Which region should the CI/CD job deploy to? Once this is answered, "
+                      "ask the agent to resume and it continues the same task.", remote.bodies(ISSUE))
+
+    def test_closing_summary_keeps_markdown_line_breaks_and_words(self):
+        result = ("**Delivered**\n\nCI/CD passed.\n\nNext: read/write split, and/or deploy.\n\n"
+                  "**Remaining**\n\n- Nothing; logs in /opt/data/runs/42/out.log")
+        clock, remote, reporter, task_id = self.reporting_fixture("readable-closing")
+        reporter.flush()
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.complete_task(conn, task_id, result=result))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Done")
+        done = [body for body in remote.bodies(ISSUE) if body.startswith("Done.")]
+        self.assertEqual(len(done), 1)
+        self.assertIn("CI/CD passed.\n\nNext: read/write split, and/or deploy.", done[0])
+        self.assertIn("**Remaining**\n\n- Nothing; logs in [local artifact]", done[0])
+        self.assertNotIn("/opt/data", done[0])
+
     def test_delayed_progress_and_completion_flush_reaches_done_once(self):
         clock, remote, reporter, task_id = self.reporting_fixture("delayed-completion")
         self.complete_reported_task(clock, task_id)
@@ -986,7 +1069,9 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.flush()
                     self.assertEqual(remote.state(ISSUE), "Blocked")
                     bodies = remote.bodies(ISSUE)
-                    self.assertTrue(any("Runtime reconciliation pending" in body for body in bodies))
+                    # One plain sentence for people; the raw native reason stays in Kanban.
+                    self.assertTrue(any(body.startswith("Paused ") for body in bodies))
+                    self.assertFalse(any("Runtime reconciliation pending" in body for body in bodies))
                     self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in bodies))
                     self.assertEqual(self.board.get(task_id), native)
                     self.assertEqual(self.board.history(task_id, 0), history)
