@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -391,7 +392,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         held = self.store.native_intent(f"unbound-stop:{ISSUE}")
         self.assertEqual(held["state"], "reconcile")
         bodies = [row["payload"].get("content", {}).get("body", "") for row in self.store.pending()]
-        self.assertTrue(any("in flight" in body for body in bodies))
+        self.assertTrue(any("while the task was being set up" in body for body in bodies))
         self.assertFalse(any("worker stopped" in body for body in bodies))
 
     def test_native_stop_is_once_and_stale_stop_after_native_resume_is_held(self):
@@ -401,6 +402,10 @@ class NativeBridgeScenarios(unittest.TestCase):
         stop = self.event("prompted", signal="stop", stamp=time.time() + 2)
         self.bridge.handle_webhook(stop)
         self.assertEqual(self.board.get(task_id).status, "blocked")
+        replies = [row["payload"]["content"]["body"] for row in self.store.pending()
+                   if (row["payload"].get("content") or {}).get("type") == "response"]
+        self.assertIn("Stopped. The agent won't continue this until someone asks it to resume.", replies)
+        self.assertFalse([body for body in replies if re.search(r"(?i)native|inspect|reconcil", body)])
         with patch.object(self.board, "block", side_effect=AssertionError("Stop cannot replay")):
             self.make_bridge().handle_webhook(stop)
         with self.board.conn() as conn:

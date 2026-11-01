@@ -343,7 +343,7 @@ class NativeMigrationTests(unittest.TestCase):
         self.assertEqual(fresh["payload"]["reporting_notice_version"], 1)
         self.assertEqual(self.bridge.flush(), 1)
         self.assertEqual(len(self.remote.activities), 1)
-        self.assertIn("Retained legacy work", self.remote.activities[0]["content"]["body"])
+        self.assertIn("older work from a previous setup", self.remote.activities[0]["content"]["body"])
         self.assertTrue(any("AgentSessionAuthorization" in request for request in self.remote.requests))
         self.assertTrue(any("AgentActivityAuthorization" in request for request in self.remote.requests))
         self.assertEqual(self.store.get(ISSUE), before_work)
