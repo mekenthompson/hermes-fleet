@@ -1856,7 +1856,7 @@ class Bridge:
         revision = self.store.binding_revision(issue_id)
         key = f"delegate-recovery:{issue_id}:{revision}"
         if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
-            return  # Cheap local check first: decided for this revision.
+            return  # Cheap local check first: decided for this revision, or issue writes still pending.
         task = adapter.require_task(row["task_id"])
         if task.status in ("done", "archived"):
             return

@@ -988,12 +988,13 @@ class Store:
                              "AND json_extract(payload,'$.task_id')=? AND json_type(payload,'$.issue_write_receipt')='object' "
                              "ORDER BY rowid DESC LIMIT 1", (issue_id, task_id)).fetchone()
         return json.loads(row[0])["issue_write_receipt"] if row else None
+    _ISSUE_PENDING = "SELECT 1 FROM outbox WHERE state='pending' AND json_extract(payload, '$.issue_id')=? LIMIT 1"
     def delegate_routed(self, issue_id: str, revision: str) -> bool:
-        """Any delegate routing intent (chat or recovery) already exists for this binding revision."""
+        """A delegate intent exists for this binding revision, or other issue writes are still pending."""
         with self._tx() as db:
-            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
-                                   "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1",
-                                   (issue_id, revision)).fetchone())
+            return bool(db.execute(self._ISSUE_PENDING, (issue_id,)).fetchone() or db.execute(
+                "SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1", (issue_id, revision)).fetchone())
     def recover_binding_delegate(self, issue_id: str, payload: dict[str, Any], *, at: float) -> bool:
         """Queue one recovery delegate intent; no caller/requester or work_owner fields are invented."""
         with self._tx() as db:
@@ -1005,6 +1006,8 @@ class Store:
                           "AND json_extract(payload, '$.expected_binding_revision')=?)",
                           (payload["id"], issue_id, payload["expected_binding_revision"])).fetchone():
                 return False
+            if db.execute(self._ISSUE_PENDING, (issue_id,)).fetchone():
+                return False  # Route only when quiescent: pending writes would stale its updatedAt guard.
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                        (payload["id"], "delegate", json.dumps({**payload, "enqueued_at": at}), at))
             return True

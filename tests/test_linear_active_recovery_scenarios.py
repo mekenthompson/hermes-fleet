@@ -137,6 +137,20 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.assertEqual(f.board.get(task).current_run_id, run)
         self.assertIsNone(f.bridge.store.native_intent("create:issue-1"))
 
+    def test_human_delegate_after_recovery_queue_wins_at_delivery(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        f.bridge.recover()
+        self.assertEqual(len(self.delegate_rows()), 1)
+        self.later()
+        f.remote.set_delegate("issue-1", OTHER)
+        f.bridge.flush()
+        f.bridge.flush()
+        self.assertEqual(f.issue["delegate"]["id"], OTHER["id"])
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+        self.assertEqual(f.mutations(), [])  # neither delegate nor stale status overwrites the human
+        self.assertEqual(f.snapshot(), before)
+
     def test_recovery_holds_delegate_routing_when_scope_requires_requester_session(self):
         task, run, before = self.retained_running(delegate=None)
         f = self.fixture
