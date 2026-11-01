@@ -155,6 +155,23 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
             for uses in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
                 self.assertRegex(uses, r"^[^@]+@[0-9a-f]{40}$", path)
 
+    def test_plugin_pin_handoff_starts_after_green_main_ci(self) -> None:
+        # Starting on the push raced CI, so the opener's green-CI guard always refused.
+        text = (WORKFLOWS / "plugin-pin-handoff.yml").read_text(encoding="utf-8")
+        on = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_run:", on)
+        self.assertIn('workflows: ["CI"]', on)
+        self.assertIn("types: [completed]", on)
+        self.assertIn("branches: [main]", on)
+        self.assertNotIn("push:", on)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", text)
+        self.assertIn("github.event.workflow_run.event == 'push'", text)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", text)
+        self.assertIn(f"ref: {HEAD_SHA}", text)
+        self.assertIn(f"PUBLIC_SHA: {HEAD_SHA}", text)
+        self.assertIn('--public-sha "$PUBLIC_SHA"', text)
+        self.assertNotIn("github.sha", text)
+
     def test_documentation_describes_the_private_handoff(self) -> None:
         doc = DOC.read_text(encoding="utf-8")
         self.assertIn("## Private Stage A handoff", doc)
