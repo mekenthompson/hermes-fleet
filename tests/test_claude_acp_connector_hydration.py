@@ -42,8 +42,7 @@ class ConnectorHydrationTests(unittest.TestCase):
                    "BashOutput", "Design", "EndConversation", "ExitPlanModeV2",
                    "ListConnectors", "OfferChromeSetup", "PowerShell", "PublishPlugin",
                    "SearchMcpRegistry", "SendFile", "SendUserFile", "SuggestConnectors",
-                   "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext",
-                   "SendToProject", "SendToProjectContext"}
+                   "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext"}
         with tempfile.TemporaryDirectory() as tmp:
             options = client.claude_code_session_options(set(), tmp)
         self.assertEqual(
