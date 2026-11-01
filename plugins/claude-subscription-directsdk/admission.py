@@ -125,19 +125,21 @@ def _breakpoints(value):
 
 
 def _frame_first(messages, queried):
-    """Put Hermes' first user turn ahead of the context native prepends to it (#77).
+    """Send Hermes' first user turn without the context native prepends to it (#77, #195).
 
-    On the opening request native puts its per-request context block (the account-email
-    reminder) *before* the frame Hermes queried; on every later request that turn is replayed
-    without it. Nothing of the first turn therefore recurs, and call #2 re-writes the whole of
-    it, which is most of a cron run whose first turn carries a source pack. On later turns
-    native already appends its context after the host content. Moving the prepended text
-    blocks behind the frame uses that same order for the first turn: no block is added,
-    dropped or edited, and the frame becomes a prefix the next request replays byte-identically.
+    On the opening request native puts its per-request context (the account-email reminder,
+    and any CLAUDE.md or auto-memory contents it loaded) *before* the frame Hermes queried; on
+    every later request that turn is replayed without it, and later turns' prepended context
+    is already dropped by ``stable_request_context``. Kept, that text sat in the user's turn,
+    where Claude read Claude Code's own notes as an injection attempt by the user (#195), and
+    nothing of the first turn recurred, so call #2 re-wrote all of it, which is most of a cron
+    run whose first turn carries a source pack. Dropping the prepended text blocks sends the
+    first turn exactly as every later request replays it. A cache marker on a dropped block
+    moves onto the frame with setdefault, never multiplying.
 
     Only the conversation's first turn is touched (no assistant message yet), only when the
     queried frame occurs exactly once, and only when everything before it is plain text.
-    Returns whether the order changed."""
+    Returns whether the turn changed."""
     if any(m.get('role') == 'assistant' for m in messages):
         return False
     first = next((m for m in messages if m.get('role') == 'user'), {})
@@ -150,9 +152,13 @@ def _frame_first(messages, queried):
     if len(starts) != 1 or starts[0] == 0:
         return False
     k = starts[0]
-    if not all(isinstance(b, dict) and b.get('type') == 'text' for b in content[:k]):
+    if not all(isinstance(b, dict) and b.get('type') == 'text' and set(b) <= {'type', 'text', 'cache_control'}
+               for b in content[:k]):
         return False
-    first['content'] = content[k:k + len(queried)] + content[:k] + content[k + len(queried):]
+    mark = next((b['cache_control'] for b in content[:k] if 'cache_control' in b), None)
+    del content[:k]
+    if mark is not None:
+        content[0].setdefault('cache_control', mark)
     return True
 
 
@@ -312,8 +318,8 @@ def pin_message_breakpoint(payload, queried):
     The count grows by at most that one mark and only within Anthropic's four across tools,
     system and messages; system and tools marks are never touched, and a moved or added
     marker keeps native's own order of TTLs.
-    The breakpoint never moves later, content never changes, and any payload that does not
-    parse forwards as is."""
+    The breakpoint never moves later, content changes only where ``_frame_first`` drops native's
+    context from the opening request, and any payload that does not parse forwards as is."""
     if not queried:
         return payload
     try:
@@ -323,7 +329,7 @@ def pin_message_breakpoint(payload, queried):
         blocks = [(i, j, b) for i, m in enumerate(messages) if isinstance(m.get('content'), list)
                   for j, b in enumerate(m['content'])]
         marked = [(i, j, b) for i, j, b in blocks if isinstance(b, dict) and 'cache_control' in b]
-        if not marked:
+        if not marked and not reordered:
             return payload
         last = max((i for i, m in enumerate(messages) if m.get('role') == 'assistant'), default=-1)
         stable = [(i, j, b) for i, j, b in blocks if i <= last]
@@ -374,6 +380,25 @@ def drop_message_breakpoints(payload):
             return payload
         return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     except (ValueError, TypeError, KeyError, AttributeError):
+        return payload
+
+
+def stream_tool_input(payload):
+    """Ask the API to stream every tool's arguments as the model writes them (``eager_input_streaming``).
+
+    Native turns fine-grained tool streaming on only for a first-party base URL, so behind this relay its
+    tools go out without the flag and the API holds a large argument (a whole file in one ``write_file``)
+    until it is complete. Hermes' stall detector then sees minutes of silence and cancels a healthy call.
+    A value native already set wins, and a payload with no tools or that does not parse forwards as is."""
+    try:
+        body = json.loads(payload)
+        tools = [t for t in body.get('tools') or () if isinstance(t, dict) and 'eager_input_streaming' not in t]
+        if not tools:
+            return payload
+        for tool in tools:
+            tool['eager_input_streaming'] = True
+        return json.dumps(body, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    except (ValueError, TypeError, AttributeError):
         return payload
 
 
@@ -505,6 +530,7 @@ class Capture:
         self.pending = ''
         self.decoder = codecs.getincrementaldecoder('utf-8')()
         self.arguments = {}
+        self.unparsed = []
 
     def feed(self, chunk):
         self.pending += self.decoder.decode(chunk)
@@ -549,13 +575,21 @@ class Capture:
         if index in self.arguments:
             # A no-argument tool call streams one input_json_delta with an empty partial_json.
             raw = self.arguments.pop(index)
-            self.message['content'][index]['input'] = json.loads(raw) if raw.strip() else {}
+            try:
+                self.message['content'][index]['input'] = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                # Streamed tool input is not validated (``eager_input_streaming``): a reply cut off at
+                # max_tokens ends mid-argument. The call is dropped at message_stop, never run with guessed
+                # arguments, and the stop reason (finish ``length``) tells Hermes the reply was cut short.
+                self.unparsed.append(index)
 
     def _delta(self, event):
         self.message.update(event.get('delta', {}))
         self.message['usage'].update(event.get('usage', {}))
 
     def _stop(self, event):
+        for index in sorted(self.unparsed, reverse=True):
+            del self.message['content'][index]
         self.complete = bool(self.message and self.message.get('stop_reason') and not self.arguments)
 
 
@@ -764,6 +798,7 @@ class Handler(BaseHTTPRequestHandler):
                 gate.unrestored = str(exc)
             payload = stable_request_context(payload, gate.queried)
             payload = pin_message_breakpoint(payload, gate.queried)
+            payload = stream_tool_input(payload)
             target = gate.upstream
             conn, upstream_socket = self._connect_upstream()
             if conn is None:

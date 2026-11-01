@@ -111,7 +111,7 @@ class PublicGenericPluginTests(unittest.TestCase):
         import hashlib
         provenance = json.loads((DIRECTSDK / "upstream.json").read_text(encoding="utf-8"))
         self.assertEqual(provenance["source_repository"], "https://github.com/NousResearch/hermes-official-plugins")
-        self.assertEqual(provenance["source_revision"], "9b074e160dbd84427ef59d092e62d9e3e5d44cf7")
+        self.assertEqual(provenance["source_revision"], "01fa168f3608185e8ce9ab7bcc1dbc60d5fa6731")
         self.assertEqual(provenance["license"], "MIT")
         self.assertTrue((DIRECTSDK / "LICENSE").is_file())
         self.assertEqual(provenance["license_file"], "LICENSE")
