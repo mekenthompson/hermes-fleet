@@ -494,11 +494,12 @@ def register(ctx: Any) -> None:
                       check_fn=no_cache_check_fn(chat.native_work_inventory), description=chat.WORK_SCHEMA["description"])
 
     def paths() -> tuple[Path, Path, str]:
+        from hermes_cli.profiles import get_active_profile_name
         home = active_home()
         return (Path(ctx.get_config("state_database") or home / "linear" / "state.db"),
                 Path(ctx.get_config("ingress_database") or home / "workspace" / "linear" / "ingress.db"),
                 validate_ingress_profile(ctx.get_config("ingress_profile")) or
-                os.getenv("HERMES_PROFILE") or os.getenv("HERMES_AGENT_PROFILE") or "default")
+                get_active_profile_name() or "default")
     def origin_settings():
         return {key: ctx.get_config(key) for key in ("identity", "specialist_scope")}
     if hasattr(ctx, "register_cli_command"):

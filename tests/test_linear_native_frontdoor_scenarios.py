@@ -111,7 +111,7 @@ class NativeFrontdoorTests(unittest.TestCase):
     def call(self, args):
         return json.loads(self.tool(args))
 
-    def bind_messaging(self, platform, *, profile=None, launch="sample-agent"):
+    def bind_messaging(self, platform, *, profile=None, launch="default"):
         """Execute the real gateway producer without starting a gateway or its adapters."""
         from gateway.config import Platform
         from gateway.run import GatewayRunner
@@ -126,10 +126,33 @@ class NativeFrontdoorTests(unittest.TestCase):
                                  session_key=f"{platform}:chat-1:thread-1", session_id="messaging-run")
         return runner._set_session_env(context)
 
-    def test_standalone_launch_label_reaches_service_from_real_messaging_producers(self):
+    def test_existing_named_profile_is_resolved_without_deployment_alias(self):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_cli.profiles import get_active_profile_name
+        nested = self.home / 'profiles' / 'nested'
+        nested.mkdir(parents=True)
+        (nested / 'config.yaml').write_text('gateway:\n  multiplex_profiles: false\n')
+        token = set_hermes_home_override(nested)
+        try:
+            self.assertEqual(get_active_profile_name(), 'nested')
+            self.assertEqual(transport._native_profile('nested', nested), 'nested')
+            for foreign in ('default', 'sample-agent'):
+                with self.assertRaises(transport.Unavailable):
+                    transport._native_profile(foreign, nested)
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_deployment_label_cannot_alias_native_default(self):
         with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
+            self.bind_api(profile="sample-agent")
+            result = self.call({"action": "status", "issue": "ABC-1"})
+            self.assertFalse(result["ok"], result)
+        self.assertEqual(self.seen, [])
+
+    def test_native_default_reaches_service_from_real_messaging_producers(self):
+        with patch.dict(os.environ, {"HERMES_PROFILE": "default"}):
             for platform in ("telegram", "slack"):
-                for profile in (None, "sample-agent"):
+                for profile in (None, "default"):
                     with self.subTest(platform=platform, profile=profile):
                         self.bind_messaging(platform, profile=profile)
                         result = self.call({"action": "status", "issue": "ABC-1"})
@@ -141,9 +164,9 @@ class NativeFrontdoorTests(unittest.TestCase):
                         self.assertEqual((got.chat_id, got.thread_id), ("chat-1", "thread-1"))
         self.assertIsNone(self.bridge.store.get("issue-1"), "reading must not start or bind execution")
 
-    def test_api_default_and_launch_label_use_same_native_profile(self):
-        with patch.dict(os.environ, {"HERMES_PROFILE": "sample-agent"}):
-            for profile in ("", "sample-agent"):
+    def test_api_uses_native_default_profile(self):
+        with patch.dict(os.environ, {"HERMES_PROFILE": "default"}):
+            for profile in ("", "default"):
                 with self.subTest(profile=profile):
                     self.bind_api(profile=profile)
                     result = self.call({"action": "status", "issue": "ABC-1"})
