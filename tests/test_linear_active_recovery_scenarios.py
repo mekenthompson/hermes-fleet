@@ -213,11 +213,101 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         task, run, before = self.retained_running(delegate={"id": SELF})
         f = self.fixture
         self.later()
-        f.remote.set_state("issue-1", "Todo")  # a deliberate later human edit
+        # A deliberate later human move (Linear records no history for a
+        # same-state no-op, which is just a touch).
+        f.remote.set_state("issue-1", "Blocked")
         f.bridge.recover()
         f.bridge.flush()
-        self.assertEqual(f.remote.state("issue-1"), "Todo")
+        self.assertEqual(f.remote.state("issue-1"), "Blocked")
         self.assertEqual(f.mutations(), [])
+
+    def test_later_comment_or_activity_does_not_strand_delegated_running_work_in_todo(self):
+        # Review probe: the issue is already delegated to this agent, then
+        # touched after the claim (a comment, attachment, label or agent
+        # activity). updatedAt moves but nobody changed routing, so the
+        # running work must still show In Progress.
+        task, run, before = self.retained_running(delegate={"id": SELF})
+        f = self.fixture
+        self.later()
+        f.remote.touch("issue-1")
+        f.remote.comment_updates_issue = f.remote.activity_updates_issue = True
+        f.bridge.recover()
+        f.bridge.flush()
+        self.assertEqual(f.remote.state("issue-1"), "In Progress")
+        self.assertEqual(f.issue["delegate"]["id"], SELF)
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+        self.assertEqual(len(self.recovered_status_rows()), 1)
+        self.assertEqual(f.snapshot(), before)
+
+    def test_human_state_edit_after_claim_wins_even_after_later_touches(self):
+        task, run, before = self.retained_running(delegate={"id": SELF})
+        f = self.fixture
+        self.later()
+        f.remote.set_state("issue-1", "Blocked")  # a deliberate later human move
+        f.fixture.clock.now += 1
+        f.remote.touch("issue-1")  # then an unrelated comment
+        f.bridge.recover()
+        f.bridge.flush()
+        self.assertEqual(f.remote.state("issue-1"), "Blocked")
+        self.assertEqual(f.mutations(), [])
+
+    def test_delegate_recovery_is_not_starved_by_unrelated_pending_issue_writes(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        f.bridge.store.enqueue("comment", {"issue_id": "issue-1", "body": "unrelated pending note",
+                                           "id": "00000000-0000-4000-8000-000000000001"}, at=f.fixture.clock())
+        f.bridge.pump_kanban()
+        self.assertEqual(len(self.delegate_rows()), 1)
+
+    def test_delegate_recovery_survives_agent_comment_landing_before_it(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        f.bridge.recover()
+        self.assertEqual(len(self.delegate_rows()), 1)
+        self.later()
+        f.remote.touch("issue-1")  # own progress comment lands first
+        f.bridge.flush()
+        f.bridge.flush()
+        self.assertEqual(f.issue["delegate"]["id"], SELF)
+        self.assertEqual(f.remote.state("issue-1"), "In Progress")
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+
+    def test_human_state_move_after_delegate_recovery_queue_wins(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        f.bridge.recover()
+        self.assertEqual(len(self.delegate_rows()), 1)
+        self.later()
+        f.remote.set_state("issue-1", "Blocked")
+        f.bridge.flush()
+        f.bridge.flush()
+        self.assertEqual(f.remote.state("issue-1"), "Blocked")
+        self.assertIsNone(f.issue["delegate"])
+        self.assertEqual(f.mutations(), [])
+
+    def test_human_state_move_after_claim_blocks_delegate_recovery(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        self.later()
+        f.remote.set_state("issue-1", "Blocked")
+        for _ in range(2):
+            f.bridge.recover()
+            f.bridge.flush()
+        self.assertEqual(f.remote.state("issue-1"), "Blocked")
+        self.assertIsNone(f.issue["delegate"])
+        self.assertEqual(self.delegate_rows(), [])
+        self.assertEqual(f.mutations(), [])
+
+    def test_status_recovery_runs_even_when_delegate_recovery_fails(self):
+        task, run, before = self.retained_running(delegate={"id": SELF})
+        f = self.fixture
+        def broken(*args, **kwargs):
+            raise RuntimeError("delegate recovery unavailable")
+        f.bridge._recover_binding_delegate = broken
+        f.bridge.recover()
+        self.later()
+        f.bridge.flush()
+        self.assertEqual(f.remote.state("issue-1"), "In Progress")
 
     def test_stopped_native_work_is_not_reported_as_running(self):
         task, run, _ = self.retained_running(delegate={"id": SELF})

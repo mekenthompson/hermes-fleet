@@ -65,6 +65,7 @@ class FakeLinear:
     def __init__(self, clock: Clock) -> None:
         self.clock = clock
         self.issues: dict[str, dict] = {}
+        self.history: dict[str, list[dict]] = {}  # IssueHistory, oldest first
         self.comments: list[dict] = []
         self.activities: list[dict] = []
         self.project_updates: list[dict] = []
@@ -112,12 +113,30 @@ class FakeLinear:
         self.issues[issue_id] = issue
         return issue
 
-    def set_delegate(self, issue_id: str, delegate: dict | None) -> None:
+    def record_history(self, issue_id: str, actor: str | None, before: dict, after: dict) -> None:
+        """Linear records who changed state, assignee or delegate, and when."""
+        ident = lambda value: (value or {}).get("id")
+        self.history.setdefault(issue_id, []).append({
+            "createdAt": self.clock.iso(), "actorId": actor,
+            "fromStateId": ident(before.get("state")), "toStateId": ident(after.get("state")),
+            "fromAssigneeId": ident(before.get("assignee")), "toAssigneeId": ident(after.get("assignee")),
+            "fromDelegate": before.get("delegate") and {"id": ident(before["delegate"])},
+            "toDelegate": after.get("delegate") and {"id": ident(after["delegate"])}})
+
+    def set_delegate(self, issue_id: str, delegate: dict | None, *, actor: str | None = "human-1") -> None:
+        before = dict(self.issues[issue_id])
         self.issues[issue_id]["delegate"] = delegate
         self.issues[issue_id]["updatedAt"] = self.clock.iso()
+        self.record_history(issue_id, actor, before, self.issues[issue_id])
 
-    def set_state(self, issue_id: str, name: str) -> None:
+    def set_state(self, issue_id: str, name: str, *, actor: str | None = "human-1") -> None:
+        before = dict(self.issues[issue_id])
         self.issues[issue_id]["state"] = dict(next(s for s in STATES if s["name"] == name))
+        self.issues[issue_id]["updatedAt"] = self.clock.iso()
+        self.record_history(issue_id, actor, before, self.issues[issue_id])
+
+    def touch(self, issue_id: str) -> None:
+        """A comment, attachment, label or agent activity: updatedAt moves, routing does not."""
         self.issues[issue_id]["updatedAt"] = self.clock.iso()
 
     def state(self, issue_id: str) -> str:
@@ -152,6 +171,7 @@ class FakeLinear:
                                               "issue": {"id": comment["issueId"]}} if comment else None)}}
         if "issueUpdate" in query:
             issue = self.issues[variables["id"]]
+            before = dict(issue)
             fields = variables["input"]
             if "stateId" in fields:
                 issue["state"] = dict(next(s for s in issue["team"]["states"]["nodes"] if s["id"] == fields["stateId"]))
@@ -159,6 +179,7 @@ class FakeLinear:
                 issue["delegate"] = (None if fields["delegateId"] is None else
                                      {"id": SELF, "name": "This Agent"} if fields["delegateId"] == SELF else OTHER)
             issue["updatedAt"] = self.clock.iso()
+            self.record_history(issue["id"], SELF, before, issue)
             return 200, {"data": {"issueUpdate": {"success": True, "issue": json.loads(json.dumps(issue))}}}
         for mutation, store, entity in (("commentCreate", self.comments, "Comment"),
                                         ("agentActivityCreate", self.activities, "AgentActivity"),
@@ -187,6 +208,11 @@ class FakeLinear:
             issue = self.issues.get(variables["id"]) or next(
                 (i for i in self.issues.values() if i["identifier"] == variables["id"]), None)
             issue = json.loads(json.dumps(issue)) if issue else None
+            if issue and "history(" in query:
+                # Linear connections are newest first.
+                nodes = list(reversed(self.history.get(issue["id"], [])))
+                count = int(re.search(r"history\(first: (\d+)", query)[1])
+                issue["history"] = {"nodes": nodes[:count], "pageInfo": {"hasNextPage": len(nodes) > count}}
             if issue and "comments(" in query:
                 comments = [
                     {"id": c.get("id"), "url": c.get("url"),
