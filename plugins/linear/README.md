@@ -299,7 +299,9 @@ Linear status follows the bound native task: queued (ready, todo, scheduled) sho
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and an internal stage that finished shows
 the next step (In Review with a PR, else Todo). Done comes only from verified completion.
-Archived work leaves Linear as it is. A team without a named state uses its first state of
+Work archived or cancelled without a verified outcome posts nothing; a started state this app
+set (In Progress, Blocked, In Review) becomes Todo, since no agent is working on it now.
+Backlog, Todo, Done and Canceled stay as they are. A team without a named state uses its first state of
 the same type (unstarted, started, completed); without Blocked or In Review the state stays
 and the plain blocker sentence still posts. A newer human state, assignee or delegate change
 in Linear's issue history wins. The reporting recheck retires records whose native task no

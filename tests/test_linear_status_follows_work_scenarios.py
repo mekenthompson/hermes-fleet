@@ -151,15 +151,77 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.ticks()
         self.assertEqual(self.state(), "Done")
 
-    def test_archived_without_outcome_leaves_state_and_says_nothing(self):
+    def test_archived_without_outcome_moves_in_progress_to_todo_quietly(self):
         task, _ = self.task(claim=True)
         self.ticks()
+        self.assertEqual(self.state(), "In Progress")
         said, writes = list(self.remote.bodies("issue-1")), len(self.mutations())
         self.native("archive_task", task)
         self.ticks()
-        self.assertEqual(self.state(), "In Progress")
+        self.assertEqual(self.state(), "Todo")  # In Progress means an agent is working on it now
         self.assertEqual(self.remote.bodies("issue-1"), said)
+        self.assertEqual(len(self.mutations()), writes + 1)  # Todo, once
+        self.ticks()
+        self.assertEqual(len(self.mutations()), writes + 1)
+        self.assertEqual(self.failed(), [])
+
+    def test_archived_without_outcome_from_blocked_moves_to_todo(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.native("block_task", task, reason="Need the API key", kind="needs_input", expected_run_id=run)
+        self.ticks()
+        self.assertEqual(self.state(), "Blocked")
+        self.native("archive_task", task)
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+
+    def test_archived_without_outcome_leaves_a_later_human_move_alone(self):
+        task, _ = self.task(claim=True)
+        self.ticks()
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.set_state("Blocked")  # Ken moved it himself after the agent started
+        self.native("archive_task", task)
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "Blocked")
         self.assertEqual(len(self.mutations()), writes)
+
+    def test_archived_without_outcome_leaves_a_later_human_reassignment_alone(self):
+        task, _ = self.task(claim=True)
+        self.ticks()
+        self.fixture.fixture.clock.now = time.time() + 2
+        before = dict(self.fixture.issue)
+        self.fixture.issue["assignee"] = {"id": "human-2"}
+        self.fixture.issue["updatedAt"] = self.fixture.fixture.clock.iso()
+        self.remote.record_history("issue-1", "human-1", before, self.fixture.issue)
+        self.native("archive_task", task)
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")
+        self.assertEqual(len(self.mutations()), writes)
+
+    def archived_from(self, name):
+        """The issue shows ``name`` (set by this app) when its native task is archived without an outcome."""
+        task, _ = self.task(claim=True)
+        self.ticks()
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.set_state(name, actor=SELF)
+        self.native("archive_task", task)
+        writes = len(self.mutations())
+        self.ticks()
+        return self.state(), len(self.mutations()) - writes
+
+    def test_archived_without_outcome_leaves_done_alone(self):
+        self.assertEqual(self.archived_from("Done"), ("Done", 0))
+
+    def test_archived_without_outcome_leaves_canceled_alone(self):
+        self.assertEqual(self.archived_from("Canceled"), ("Canceled", 0))
+
+    def test_archived_without_outcome_leaves_backlog_alone(self):
+        self.assertEqual(self.archived_from("Backlog"), ("Backlog", 0))
+
+    def test_archived_without_outcome_leaves_todo_alone(self):
+        self.assertEqual(self.archived_from("Todo"), ("Todo", 0))
 
     # -- the newer human edit wins (#254's routing-history fence) --------
 

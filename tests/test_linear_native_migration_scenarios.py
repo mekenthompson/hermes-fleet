@@ -269,10 +269,11 @@ class NativeMigrationTests(unittest.TestCase):
         self.bridge.kanban.history = lambda task_id, after_id: [event] if after_id < event.id else []
         self.bridge.pump_kanban()
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], event.id)
-        # Archived with no outcome: whoever archived it decided. No status, no message.
-        self.assertEqual(self.store.pending(), [])
-        self.assertEqual(self.bridge.flush(), 0)
+        # Archived with no outcome: no message; only a Todo intent, a no-op on an issue already in Todo.
+        self.assertEqual([(row["kind"], row["payload"]["state"]) for row in self.store.pending()], [("status", "todo")])
+        self.bridge.flush()
         self.assertEqual(self.remote.state(ISSUE), "Todo")
+        self.assertFalse([q for q in self.remote.requests if q.startswith("mutation IssueUpdate")])
         self.assertEqual(self.remote.comments, [])
         for key in sent:
             self.assertEqual(self.history(key), before[key])
