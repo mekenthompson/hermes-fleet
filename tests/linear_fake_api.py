@@ -26,6 +26,7 @@ STATES = [
     {"id": "st-blocked", "name": "Blocked", "type": "started"},
     {"id": "st-done", "name": "Done", "type": "completed"},
     {"id": "st-canceled", "name": "Canceled", "type": "canceled"},
+    {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
 ]
 
 
@@ -126,6 +127,12 @@ class FakeLinear:
     def set_delegate(self, issue_id: str, delegate: dict | None, *, actor: str | None = "human-1") -> None:
         before = dict(self.issues[issue_id])
         self.issues[issue_id]["delegate"] = delegate
+        self.issues[issue_id]["updatedAt"] = self.clock.iso()
+        self.record_history(issue_id, actor, before, self.issues[issue_id])
+
+    def set_assignee(self, issue_id: str, assignee: dict | None, *, actor: str | None = "human-1") -> None:
+        before = dict(self.issues[issue_id])
+        self.issues[issue_id]["assignee"] = assignee
         self.issues[issue_id]["updatedAt"] = self.clock.iso()
         self.record_history(issue_id, actor, before, self.issues[issue_id])
 

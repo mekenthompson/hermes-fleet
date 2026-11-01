@@ -391,7 +391,9 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.kanban.tasks[task_id].status, "ready")
         self.assertEqual(self.kanban.tasks[other_task].status, "ready")
         self.assertEqual(self.authority.mutations, [])
-        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.store.pending(ISSUE), [])
+        # The correctly resolved issue only gets its native-derived state: queued work shows Todo.
+        self.assertEqual([(row["kind"], row["payload"]["state"]) for row in self.store.pending()], [("status", "todo")])
 
     def test_session_payload_issue_mismatch_preserves_both_existing_tasks(self):
         other = "issue-other"
@@ -1328,7 +1330,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.authority.fail_issue = False
         self.bridge.pump_kanban()
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 1)
-        self.assertEqual([row["kind"] for row in self.store.pending(ISSUE)], ["status", "activity"])
+        # The blocker sentence is captured with the event; the state is reconciled after the batch
+        # and delivered first (the sentence waits on it).
+        rows = self.store.pending(ISSUE)
+        self.assertEqual([row["kind"] for row in rows], ["activity", "status"])
+        self.assertEqual(rows[0]["payload"]["requires_status_id"], rows[1]["id"])
 
     def test_all_specialist_effects_recheck_the_authoritative_resource_before_mutation(self):
         for name, action in (

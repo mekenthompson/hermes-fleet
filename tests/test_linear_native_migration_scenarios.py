@@ -247,7 +247,7 @@ class NativeMigrationTests(unittest.TestCase):
             self.assertEqual(self.history(key), before[key])
             self.assertTrue(self.store.outbox_row(key)["hold_reason"])
 
-    def test_historical_sent_receipts_do_not_suppress_current_native_archive_reporting(self):
+    def test_archive_without_outcome_leaves_linear_quietly_beside_historical_receipts(self):
         self.assertTrue(self.store.bind_native(ISSUE, "native-task", "default", "default", at=self.clock() * 1000))
         body = "Historical recommendation"
         sent = [
@@ -269,10 +269,11 @@ class NativeMigrationTests(unittest.TestCase):
         self.bridge.kanban.history = lambda task_id, after_id: [event] if after_id < event.id else []
         self.bridge.pump_kanban()
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], event.id)
-        self.assertEqual(len(self.store.pending()), 2)
-        self.assertEqual(self.bridge.flush(), 2)
-        self.assertEqual(self.remote.state(ISSUE), "Blocked")
-        self.assertIn("archived without accepted completion evidence", self.remote.comments[0]["body"])
+        # Archived with no outcome: whoever archived it decided. No status, no message.
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.bridge.flush(), 0)
+        self.assertEqual(self.remote.state(ISSUE), "Todo")
+        self.assertEqual(self.remote.comments, [])
         for key in sent:
             self.assertEqual(self.history(key), before[key])
             self.assertTrue(self.store.outbox_row(key)["hold_reason"])

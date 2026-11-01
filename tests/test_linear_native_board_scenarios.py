@@ -230,13 +230,16 @@ class NativeBoardScenarios(unittest.TestCase):
         bodies = [row["body"] for row in self.remote.project_updates]
         self.assertTrue(any("issue-default" in body for body in bodies))
         self.assertTrue(any("issue-project" in body for body in bodies))
-        # Another board's prior terminal must not suppress an unfinished archive.
+        # Another board's prior terminal is not this archive's: archived without an
+        # outcome leaves Linear as it was, quietly.
         other, task_id = self.existing("archive-board", "issue-archive", collide=True)
         self.bridge.track("issue-archive", task_id, board="archive-board")
         self.assertFalse(self.store.terminal_captured(task_id, issue_id="issue-archive"))
+        before = self.remote.state("issue-archive")
         self.operator(other, self.kb.archive_task, task_id)
         self.bridge.pump_kanban()
         self.clock.now += 10
         self.bridge.flush()
-        self.assertEqual(self.remote.state("issue-archive"), "Blocked")
-        self.assertTrue(any("unfinished" in body for body in self.remote.bodies("issue-archive")))
+        self.assertEqual(self.remote.state("issue-archive"), before)
+        self.assertFalse(self.store.terminal_captured(task_id, issue_id="issue-archive"))
+        self.assertEqual(self.remote.bodies("issue-archive"), [])
