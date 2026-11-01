@@ -1828,11 +1828,34 @@ class Bridge:
                         row = self.store.get(row["issue_id"])
                         if not row or row["last_event_id"] < event.id:
                             break  # Retry this event before consuming any later one.
+                    else:
+                        self._project_consumed_claim(row, adapter)
                 except RateLimited:
                     raise
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     log.warning("linear: native reporting held for issue %s task %s event %s (%s)",
                                 issue_id, task_id, event_id, type(exc).__name__)
+    def _project_consumed_claim(self, row: dict | None, adapter) -> None:
+        """Report a still-current native claim whose event an older consumer passed.
+
+        Never rewinds the cursor or replays history: one status intent keeps
+        the original claim time, so a later human edit, reassignment or Stop
+        still fences it in may_write and delivery.
+        """
+        if not row or row.get("origin") != "native":
+            return
+        task = adapter.require_task(row["task_id"])
+        if task.status != "running" or task.current_run_id is None:
+            return
+        claim = next((event for event in reversed(adapter.history(task.id, 0))
+                      if event.kind == "claimed" and getattr(event, "run_id", None) == task.current_run_id), None)
+        if claim is None or claim.id > row["last_event_id"]:
+            return  # An unconsumed claim uses the ordinary ordered event path.
+        self._native_effect_task(row["issue_id"])
+        payload = {"issue_id": row["issue_id"], "state": "in_progress", "source_ms": claim.created_at * 1000,
+                   "write_started": False, "recovered_claim": {"task_id": task.id, "run_id": task.current_run_id,
+                                                               "event_id": claim.id}, **self._alert_route(row)}
+        self.store.recover_claim_status(row["issue_id"], payload, since=claim.created_at, at=self.clock())
     def _task_event(self, row: dict[str, Any], event, task_status: str,
                     captured: dict[tuple[str, str], int]) -> None:
         payload, issue_id = native_event_payload(event), row["issue_id"]

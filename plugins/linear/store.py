@@ -988,6 +988,22 @@ class Store:
                              "AND json_extract(payload,'$.task_id')=? AND json_type(payload,'$.issue_write_receipt')='object' "
                              "ORDER BY rowid DESC LIMIT 1", (issue_id, task_id)).fetchone()
         return json.loads(row[0])["issue_write_receipt"] if row else None
+    def recover_claim_status(self, issue_id: str, payload: dict[str, Any], *, since: float, at: float) -> bool:
+        """Once per claim: queue In Progress only if no status intent follows that claim."""
+        with self._tx() as db:
+            if not self._effect_admitted(db, issue_id) or not db.execute(
+                    "SELECT 1 FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone():
+                return False
+            latest = db.execute("SELECT json_extract(payload, '$.state') AS state, "
+                                "json_extract(payload, '$.enqueued_at') AS at FROM outbox "
+                                "WHERE kind='status' AND json_extract(payload, '$.issue_id')=? "
+                                "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
+                                (issue_id,)).fetchone()
+            if latest and (latest["state"] == "in_progress" or float(latest["at"] or 0) >= since):
+                return False
+            db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
+                       (str(uuid.uuid4()), "status", json.dumps({**payload, "enqueued_at": at}), at))
+            return True
     def latest_status(self, issue_id: str) -> dict[str, Any] | None:
         """Newest status intent, including a pending or failed closeout."""
         with self._tx() as db:
