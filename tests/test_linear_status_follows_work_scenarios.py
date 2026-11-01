@@ -334,6 +334,12 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.assertEqual(self.state(), "Blocked")
         self.assertEqual(len(self.mutations()), writes)
 
+    def test_history_paging_is_bounded_and_an_unproven_answer_counts_as_changed(self):
+        since = self.fixture.fixture.clock.now * 1000
+        self.history_entries(10 * 50 + 1, SELF)  # newer than the fence, beyond the page bound
+        self.assertTrue(self.bridge._human_routing_changed("issue-1", since))
+        self.assertFalse(self.bridge._human_routing_changed("issue-1", self.fixture.fixture.clock.now * 1000))
+
     def test_steady_state_is_idempotent_across_restarts(self):
         self.task(claim=True)
         self.ticks()
