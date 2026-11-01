@@ -138,12 +138,15 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertNotIn("write-all", self.text)
         self.assertNotIn("GITHUB_TOKEN", self.text)
 
-    def test_release_bot_secret_is_referenced_only_here_and_every_action_is_sha_pinned(self) -> None:
+    def test_release_bot_secret_is_referenced_only_by_handoffs_and_every_action_is_sha_pinned(self) -> None:
         workflows = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+        pin_handoff = WORKFLOWS / "plugin-pin-handoff.yml"
+        allowed = {HANDOFF, pin_handoff}
         self.assertIn(HANDOFF, workflows)
+        self.assertIn(pin_handoff, workflows)
         for path in workflows:
             text = path.read_text(encoding="utf-8")
-            if path == HANDOFF:
+            if path in allowed:
                 self.assertEqual(text.count("secrets."), 1, path)
                 self.assertEqual(text.count("secrets.RELEASE_BOT_PRIVATE_KEY"), 1, path)
             else:
