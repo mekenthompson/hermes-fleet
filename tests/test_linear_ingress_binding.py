@@ -135,6 +135,28 @@ class IngressBindingTests(unittest.TestCase):
         with closing(sqlite3.connect(self.inbox)) as db:
             self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("imported", 1))
 
+    def test_cli_route_uses_explicit_ingress_or_native_profile_never_deployment_env(self):
+        import os
+        import sys
+        from unittest.mock import patch
+        plugin = load_plugin()
+        for native in ('default', 'nested'):
+            for configured in (None, 'worker-a'):
+                values: dict[str, object] = {'enabled': True}
+                if configured is not None:
+                    values['ingress_profile'] = configured
+                commands = {}
+                context = SimpleNamespace(get_config=lambda key, default=None: values.get(key, default),
+                    register_tool=lambda **kwargs: None, register_hook=lambda *args: None,
+                    register_cli_command=lambda name, description, setup, handler: commands.update({name: handler}))
+                with patch.dict(os.environ, {'HERMES_PROFILE': 'foreign-deployment', '_HERMES_GATEWAY': ''}), \
+                     patch.dict(sys.modules, {'hermes_constants': SimpleNamespace(get_hermes_home=lambda: self.home),
+                        'hermes_cli.profiles': SimpleNamespace(get_active_profile_name=lambda: native)}), \
+                     patch.object(plugin.ops, 'run', return_value=0) as run:
+                    plugin.register(context)
+                    commands['linear'](SimpleNamespace())
+                    self.assertEqual(run.call_args.args[3], configured or native)
+
     def test_registered_service_forwards_explicit_binding_to_bridge(self):
         import asyncio
         from unittest.mock import patch

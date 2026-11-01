@@ -294,6 +294,11 @@ defaults to `<profile home>/linear/state.db`; optional `board` selects the desti
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
 `completion_contracts` retain their existing meanings.
 `ingress_profile` selects the trusted inbox route only; it does not change caller authorization.
+When omitted, CLI routing uses Hermes' resolved native profile, including a multiplexed
+named profile. Set it explicitly when a fleet deployment's inbox has a different name.
+Deployment/container names and display names are never aliases for native `default`:
+private RPC requires the exact resolved native profile/home pair even when a launcher
+supplies a deployment-shaped `HERMES_PROFILE` value.
 `activation_cutoff_ms` imports older signals without executing them and cannot retroactively
 activate an existing state database. API quota backoff remains durable and profile-local.
 A Linear outage delays reporting; unrelated native work and ordinary conversation continue.

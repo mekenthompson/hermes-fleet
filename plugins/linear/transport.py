@@ -114,29 +114,11 @@ def native_board_target(board: Any = None) -> tuple[str, str]:
 
 
 def _native_profile(profile: str, home: Path) -> str:
-    """Resolve the host's standalone launch label without accepting a foreign profile.
-
-    A one-home container can be launched as an agent label even though its native
-    filesystem profile is ``default``. Only that process's exact configured label
-    may name its own home this way; routed homes and existing other profiles may not.
-    """
-    from hermes_constants import get_routing_process_hermes_home
-    from hermes_cli.profiles import (get_active_profile_name, normalize_profile_name,
-                                     profile_exists, profile_matches_home, validate_profile_name)
-    if profile_matches_home(profile, home):
-        return profile
-    launch = os.getenv('HERMES_PROFILE') or os.getenv('HERMES_AGENT_PROFILE') or ''
-    try:
-        launch = normalize_profile_name(launch)
-        validate_profile_name(launch)
-    except ValueError:
-        launch = ''
-    native = get_active_profile_name()
-    if (not launch or profile != launch or profile_exists(profile) or
-            home != Path(get_routing_process_hermes_home()).resolve(strict=True) or
-            not profile_matches_home(native, home)):
+    """Validate native session ownership; deployment labels are never aliases."""
+    from hermes_cli.profiles import profile_matches_home
+    if not profile_matches_home(profile, home):
         raise Unavailable('The native session profile does not match its Hermes home')
-    return native
+    return profile
 
 
 def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
@@ -144,8 +126,8 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
 
     Upstream set_session_vars binds the named ContextVars for API and messaging turns. The
     public bound_session_key excludes environment fallback; copy_context excludes it for every
-    other caller field too. Process configuration can only normalize an already-bound launch
-    label to the native profile/home; it cannot supply a missing caller or session.
+    other caller field too. Only an exact native profile/home match is accepted;
+    deployment configuration cannot supply a missing caller or alias its identity.
     """
     try:
         from gateway.session_context import bound_session_key
