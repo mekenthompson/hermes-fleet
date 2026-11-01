@@ -420,6 +420,11 @@ addresses or credential-shaped text; neither requester principals nor original i
 the owner in a cross-agent reference.
 Delegated children, bots, automation, ambiguous steering, unknown execution and stale owners
 cannot supply this reference. Unsupported native hosts fail closed.
+Desktop is a chat surface like Telegram and Slack: a Desktop chat on the native local owner,
+including one adopted from main that keeps its stored `desktop` label, supplies a reference
+for its authenticated owner. A Desktop chat still on a legacy host has no owner receipt and is
+refused by name. Kanban subscriptions from such a turn target the same native local
+conversation, so results return to the Desktop chat that asked.
 
 Provider SDKs can invoke the registered synchronous tool from their own asyncio loop.
 Origin and work evidence use Core's existing bounded coroutine bridge on that path,
