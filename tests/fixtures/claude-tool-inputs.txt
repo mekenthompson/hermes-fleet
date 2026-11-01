@@ -1,5 +1,5 @@
 // ToolInputSchemas copied verbatim from the reviewed SDK declaration.
-// Full declaration SHA256: 63e378f4585427786c6cd0e876f094c8ade8d284d86554ef44f83a5cdf396cfb
+// Full declaration SHA256: e36072cc125f5215f3b02f1eb5977262bb418b9cdf005001a3ccafe6caaaac27
 export type ToolInputSchemas =
   | AgentInput
   | BashInput
