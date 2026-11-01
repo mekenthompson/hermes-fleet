@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "scripts/verify-trivy-vex.py"
-IMAGE = "docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a"
+IMAGE = "docker.io/1password/op@sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438"
 
 
 class TrivyVexGateTests(unittest.TestCase):

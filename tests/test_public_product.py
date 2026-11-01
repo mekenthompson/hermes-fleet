@@ -118,7 +118,7 @@ class PublicProductTests(unittest.TestCase):
         )
         op_image = (
             "docker.io/1password/op@"
-            "sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a"
+            "sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438"
         )
         self.assertEqual(
             re.findall(r"(?m)^FROM\s+(.+)$", text),

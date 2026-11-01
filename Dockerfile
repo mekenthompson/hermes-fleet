@@ -1,22 +1,22 @@
 ARG AGENT_IMAGE
-ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a
+ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438
 FROM ${ONEPASSWORD_CLI_IMAGE} AS onepassword_cli
 FROM ${AGENT_IMAGE}
 
 USER root
 
-ARG GH_VERSION=2.102.0
-ARG GH_LINUX_AMD64_SHA256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+ARG GH_VERSION=2.103.3
+ARG GH_LINUX_AMD64_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
 ARG CLAUDE_CODE_VERSION=2.1.316
-ARG CLAUDE_AGENT_ACP_VERSION=0.89.0
-ARG CODEX_VERSION=0.162.1
-ARG GROK_VERSION=1.0.50
+ARG CLAUDE_AGENT_ACP_VERSION=0.99.1
+ARG CODEX_VERSION=0.166.0
+ARG GROK_VERSION=1.0.70
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
 ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
 ENV DISABLE_AUTOUPDATER=1
 
 COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op
-RUN test "$(/usr/local/bin/op --version)" = "2.40.0"
+RUN test "$(/usr/local/bin/op --version)" = "2.41.1"
 RUN set -eux; \
     archive="gh_${GH_VERSION}_linux_amd64.tar.gz"; \
     curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o "/tmp/${archive}"; \

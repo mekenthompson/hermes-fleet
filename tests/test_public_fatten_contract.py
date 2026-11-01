@@ -13,15 +13,15 @@ PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
 SCOPE = ROOT / "scripts" / "fleet-image-change-scope.py"
 VERIFY = ROOT / "scripts" / "verify-public-tree.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "fleet-image.yml"
-GH_VERSION = "2.102.0"
+GH_VERSION = "2.103.3"
 GH_LINUX_AMD64_SHA256 = (
-    "bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386"
+    "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d"
 )
 HONCHO_AI_VERSION = "2.5.1"
 EXTRA_CLIS = {
-    "@openai/codex": "0.162.1",
-    "@xai-official/grok": "1.0.50",
-    "opencode-ai": "1.18.35",
+    "@openai/codex": "0.166.0",
+    "@xai-official/grok": "1.0.70",
+    "opencode-ai": "1.19.5",
 }
 
 
