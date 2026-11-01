@@ -396,18 +396,18 @@ class PublicProductTests(unittest.TestCase):
     def test_ci_is_source_only_and_pinned(self) -> None:
         text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("permissions:\n  contents: read", text)
-        self.assertIn("python3 -m unittest discover", text)
+        self.assertIn("python3 scripts/source-ci.py units", text)
         self.assertIn("scripts/verify-public-tree.py", text)
         self.assertIn("python3 scripts/compose.py config -q", text)
         self.assertNotIn("packages: write", text)
         self.assertNotIn("docker/build-push-action", text)
         for uses in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text):
             self.assertRegex(uses, r"^[^@]+@[0-9a-f]{40}$")
-        source = _workflow_job(text, "source-checks")
+        source = _workflow_job(text, "source-tests")
         history = _workflow_job(text, "history-root")
         self.assertIn("fetch-depth: 1", source)
         self.assertNotIn("fetch-depth: 0", source)
-        self.assertIn("python3 -m unittest discover", source)
+        self.assertIn("python3 scripts/source-ci.py units", source)
         self.assertIn("fetch-depth: 0", history)
         self.assertIn(
             "tests.test_public_product.PublicProductTests.test_repository_has_no_remote_and_clean_history_contract",

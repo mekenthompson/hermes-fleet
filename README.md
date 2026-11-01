@@ -147,9 +147,38 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/verify-public-tree.py
 ```
 
-CI also runs the Linear Kanban scenarios in a separate process with the exact manifest-pinned
-Agent source; see [the local invocation](plugins/linear/README.md#tests). A green source run does
-not establish image publication or deployment readiness.
+Source CI uses `scripts/source-ci.py` to select a conservative component-level subset:
+
+- Markdown-only changes (including plugin documentation) run the cheap
+  public-tree, compose, immutable-reference, and full-history checks, without runtime integrations.
+- Test-only edits run the changed modules and their real-Agent contract runners.
+  Test modules used as shared fixtures broaden to their component's consumers.
+- Linear selects its tests plus pinned-Agent worker journeys, guarded origin/input, and retained
+  HF-578 companion compatibility. Claude ACP and account connectors select the
+  shared Claude tests and pinned-Agent context contract. Browser, sidecar,
+  Perplexity, and tooling edits select their component and public contract tests.
+- Agent/release manifests, CI/selector edits, unknown paths, unresolved ranges,
+  and renamed/deleted paths run the full existing inventory. PRs compare against
+  merge-base; pushes use the actual before/after range.
+- Manual **CI** dispatch and the weekly scheduled CI run always validate everything.
+  The `source-checks` aggregate requires every selected job to succeed; missing,
+  failed, cancelled, or skipped selected work blocks it. `preflight` and
+  `history-root` remain separate required contexts.
+
+Inspect a route locally (this is routing evidence, not execution evidence):
+
+```bash
+python3 scripts/source-ci.py select --files docs/image-release.md
+python3 scripts/source-ci.py select --files plugins/web/perplexity/provider.py
+python3 scripts/source-ci.py select --event pull_request --base <base-sha> --head <head-sha>
+```
+
+The explicit map deliberately broadens rather than guessing new dependencies.
+Image/sidecar scope, scans, immutable provenance, exact-main publication gates,
+and release handoff are independent and unchanged. To roll back selection,
+revert the source-CI change; manual full validation is the immediate backstop.
+A green source run does not establish image publication or deployment readiness.
+For real-Agent local execution see [the Linear invocation](plugins/linear/README.md#tests).
 
 Pull requests build a non-publishing `linux/amd64` candidate, verify runtime/provenance, and run the critical-vulnerability gate. Pushes to `main` that touch image inputs publish the exact scanned candidate. See [`docs/image-release.md`](docs/image-release.md).
 
