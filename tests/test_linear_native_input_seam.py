@@ -853,11 +853,16 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             "native-session-ack", "default", self.ISSUE, self.SESSION))
         self.assertEqual((ack["state"], ack["payload"]["content"]["type"]), ("sent", "thought"))
         self.assertEqual(self.inbox_row("human-mention"), ("default", raw, "imported", 1))
-        activities = len([query for query in self.provider.mutations if "agentActivityCreate" in query])
+        def activity_creates():
+            return len([query for query in self.provider.mutations if "agentActivityCreate" in query])
+        # The acknowledgment and then the model's own reply; nothing else.
+        await self.until(lambda: activity_creates() == 2)
+        activities = activity_creates()
         # A redelivered mention neither posts a second acknowledgment nor starts a second model turn.
         await self.deliver_raw("human-mention-redelivery", event)
         await self.until(lambda: self.inbox_row("human-mention-redelivery")[2] == "imported")
-        self.assertEqual(len([query for query in self.provider.mutations if "agentActivityCreate" in query]), activities)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(activity_creates(), activities)
         self.assertEqual(len(seen), 1)
         with self.board.conn() as conn:
             self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], [task_id])
