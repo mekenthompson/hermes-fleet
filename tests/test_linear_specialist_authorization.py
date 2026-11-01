@@ -83,6 +83,7 @@ class Authority:
         self.mutations: list[str] = []
         self.comments: dict[str, list] = {}
         self.comment_records: dict[str, dict] = {}
+        self.history: dict[str, list] = {}  # IssueHistory, oldest first
         self.fail_session = False
         self.fail_issue = False
 
@@ -103,6 +104,10 @@ class Authority:
         elif "query IssueThread(" in query or "query IssueProgress(" in query:
             issue = self.issues.get(variables["id"])
             data = {"issue": {**issue, "comments": {"nodes": self.comments.get(variables["id"], [])}} if issue else None}
+        elif "query IssueRoutingHistory(" in query:
+            issue = self.issues.get(variables["id"])
+            nodes = list(reversed(self.history.get(variables["id"], [])))  # Linear connections are newest first
+            data = {"issue": {**issue, "history": {"nodes": nodes, "pageInfo": {"hasNextPage": False}}} if issue else None}
         elif "query Issue(" in query:
             if self.fail_issue:
                 return 503, {}, json.dumps({"errors": [{"message": "fixture unavailable"}]}).encode()
