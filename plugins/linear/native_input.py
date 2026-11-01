@@ -74,8 +74,8 @@ class NativeInput:
     signal: str | None = None
     # How the session started: "delegation", "mention", or None for a later prompt.
     source: str | None = None
-    # Current native work facts. Read fresh on each delivery, so they are
-    # context only and never part of the provider input's retry identity.
+    # Native work facts as first seen for this provider input; redeliveries reuse
+    # them. Context only, never part of the provider input's identity.
     work_facts: str = field(default="", compare=False)
 
     def channel_context(self):
@@ -221,6 +221,11 @@ def project_input(bridge, event) -> NativeInput | None:
         if event["action"] == "created" and session.get("creator") is None:
             return None
         facts = "" if activity.get("signal") == "stop" else _work_facts(bridge, issue["id"])
+    # Native admission compares a redelivered input with the admitted one, context included:
+    # the first facts recorded for this provider input are the ones it keeps.
+    if facts:
+        source_id = session_id if event["action"] == "created" else str(activity.get("id") or "")
+        facts = bridge.store.first_value(f"native-input-facts:{session_id}:{source_id}", facts)
 
     signal = None
     source = None

@@ -881,6 +881,11 @@ class Store:
         with self._tx() as db:
             db.execute("UPDATE outbox SET attempts=MAX(attempts, 1), "
                        "payload=json_set(payload, '$.reconcile_required', 1) WHERE id=?", (row_id,))
+    def first_value(self, key: str, value: str) -> str:
+        """Keep the first value recorded for ``key`` and return it; later calls cannot change it."""
+        with self._tx() as db:
+            db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)", (key, value))
+            return db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
     # -- outbox -----------------------------------------------------------
     def enqueue(self, kind: str, payload: dict[str, Any], *, at: float | None = None) -> str:
         row_id = str(payload.get("id") or uuid.uuid4())

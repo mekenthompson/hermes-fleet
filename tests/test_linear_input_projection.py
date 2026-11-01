@@ -132,8 +132,10 @@ class InputProjectionTests(unittest.TestCase):
         later = project_input(self.bridge, self.event())
         self.assertIsNone(later.source)
 
-    def test_existing_native_work_facts_reach_the_session_context(self):
+    def test_no_linked_work_is_stated_in_the_session_context(self):
         self.assertIn("none is linked", project_input(self.bridge, self.mention()).channel_context())
+
+    def test_existing_native_work_facts_reach_the_session_context(self):
         task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
         task.status = "running"
         self.bridge.track(ISSUE, task.id, requester_session=SESSION)
@@ -144,13 +146,15 @@ class InputProjectionTests(unittest.TestCase):
         self.assertIn("do not create another task", context)
         self.assertEqual(len(self.kanban.creates), 1)
 
-    def test_changed_work_facts_do_not_make_a_redelivery_conflict(self):
+    def test_redelivery_keeps_the_first_work_facts_so_native_admission_sees_identical_input(self):
         first = project_input(self.bridge, self.mention())
         task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
         self.bridge.track(ISSUE, task.id, requester_session=SESSION)
         second = project_input(self.bridge, self.mention())
-        self.assertNotEqual(first.work_facts, second.work_facts)
         self.assertEqual(first, second)
+        self.assertEqual(first.channel_context(), second.channel_context())
+        # A different provider input on the same session sees the current facts.
+        self.assertIn(f"task {task.id}", project_input(self.bridge, self.event()).channel_context())
 
     def test_unreadable_task_state_degrades_to_the_link_and_still_says_no_second_worker(self):
         task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
