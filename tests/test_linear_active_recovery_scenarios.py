@@ -82,7 +82,9 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.assertEqual(f.board.get(task).current_run_id, run)
         # Repeated recovery/service loops are idempotent: one intent, one write.
         mutations = len(f.mutations())
+        from hermes_fleet_linear_plugin.store import Store
         for _ in range(3):
+            f.bridge.store = Store(f.bridge.store.path)  # restart between ticks
             f.bridge.recover()
             f.bridge.pump_kanban()
             f.bridge.flush()
@@ -103,6 +105,30 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.assertIsNone(f.issue["delegate"])
         self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
         self.assertEqual(len(f.mutations()), 1)
+        self.assertEqual(f.snapshot(), before)
+
+    def test_background_recovery_cannot_fabricate_session_delegate_routing(self):
+        # Delegate routing is a caller-authorized content action. A session-owned
+        # binding on an undelegated issue stays held until an authorized caller
+        # links/routes it; recovery neither assigns a delegate nor executes.
+        f = self.fixture
+        f.fixture.clock.now = time.time() - 2
+        f.remote.set_delegate("issue-1", None)
+        with f.board.conn() as db:
+            task = f.board.kb.create_task(db, title="Session work", board=f.board.board,
+                assignee=f.board.executor_profile, created_by="operator",
+                body="Linear issue issue-1: " + f.issue["url"])
+            f.board.kb.claim_task(db, task, claimer="native-worker")
+        f.bridge.track("issue-1", task, completion_scope="progress", requester_session="linear-session-1")
+        for event in f.board.history(task, 0):
+            f.bridge.store.capture_event("issue-1", event.id, [], at=f.fixture.clock())
+        before = f.snapshot()
+        f.bridge.recover()
+        self.later()
+        f.bridge.flush()
+        self.assertIsNone(f.issue["delegate"])
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+        self.assertEqual(f.mutations(), [])
         self.assertEqual(f.snapshot(), before)
 
     def test_human_reassignment_after_claim_wins_over_recovery(self):

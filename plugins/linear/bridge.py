@@ -1844,6 +1844,8 @@ class Bridge:
         """
         if not row or row.get("origin") != "native":
             return
+        if (self.store.latest_status(row["issue_id"]) or {}).get("state") == "in_progress":
+            return  # Steady state: no per-tick history scan.
         task = adapter.require_task(row["task_id"])
         if task.status != "running" or task.current_run_id is None:
             return
