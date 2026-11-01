@@ -122,7 +122,7 @@ class Store:
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1
                 and payload.get("one_try") is True and bool(payload.get("session_id"))
-                and (payload.get("content") or {}).get("type") in ("response", "error")
+                and (payload.get("content") or {}).get("type") in ("response", "error", "thought")
                 and not any(payload.get(key) for key in (
                     "work_owner", "session_key", "admission_id", "claim", "release", "stop_intent_id", "task_id", "terminal")))
     @classmethod
