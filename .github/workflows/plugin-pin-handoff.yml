@@ -1,0 +1,67 @@
+name: Plugin pin handoff
+
+# A public main push that touches plugins/ may move a bundle plugin tree.
+# Open one private pin PR. This workflow never builds or publishes an image.
+# The checkout ref below is github.sha for this push, not a pull request head.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-pin-handoff
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Open private bundle pin PR
+    if: github.repository == 'mekenthompson/hermes-fleet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out this public commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: public
+
+      - name: Mint a release bot token scoped to hermes-fleet-private
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: mekenthompson
+          repositories: hermes-fleet-private
+
+      - name: Check out the private pin opener
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: mekenthompson/hermes-fleet-private
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          path: private
+
+      - name: Refuse until the pin opener is on private main
+        run: test -f private/scripts/open-plugin-pin-pr.py
+
+      - name: Open or reuse the pin PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git -C private config user.name "hermes-release-bot"
+          git -C private config user.email "41898282+hermes-release-bot@users.noreply.github.com"
+          python3 private/scripts/open-plugin-pin-pr.py \
+            --public public \
+            --private private \
+            --public-sha "$GITHUB_SHA" \
+            --apply --open
