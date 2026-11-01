@@ -27,7 +27,7 @@ class SourceSelectionTests(unittest.TestCase):
 
     def test_test_only_selects_exact_module_and_required_runner(self):
         for name, lane in [('test_perplexity_provider.py', None),
-                           ('test_linear_delegate_routing_scenarios.py', 'linear'),
+                           ('test_linear_active_recovery_scenarios.py', 'linear'),
                            ('test_claude_acp_context.py', 'acp'),
                            ('test_linear_origin_mapping_native.py', 'origin'),
                            ('test_linear_native_input_seam.py', 'input')]:

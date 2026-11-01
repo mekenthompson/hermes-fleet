@@ -434,7 +434,9 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.pump_kanban()
         return clock, remote, reporter, task_id
 
-    def test_track_normal_running_task_reports_active_without_claiming_delegate(self):
+    def test_track_normal_running_task_reports_active_and_routes_own_delegate_keeping_assignee(self):
+        # Session-less running work shows this agent as delegate (#254 policy);
+        # the human assignee is never touched.
         from linear_fake_api import Clock, FakeLinear
         from hermes_fleet_linear_plugin.api import LinearAPI
         clock = Clock()
@@ -454,7 +456,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.pump_kanban()
         reporter.flush()
         self.assertEqual(remote.state(ISSUE), "In Progress")
-        self.assertIsNone(remote.issues[ISSUE]["delegate"])
+        self.assertEqual(remote.issues[ISSUE]["delegate"]["id"], "app-self")
         self.assertIsNone(remote.issues[ISSUE]["assignee"])
         self.assertEqual(reporter.native_status(ISSUE)["status"], "running")
 

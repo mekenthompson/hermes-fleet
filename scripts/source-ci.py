@@ -42,7 +42,8 @@ SELECTOR_INPUTS = {'scripts/source-ci.py', 'tests/test_source_ci_scope.py'}
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
-    'test_linear_content_actions.py', 'test_linear_event_data_scenarios.py',
+    'test_linear_content_actions.py', 'test_linear_delegate_routing_scenarios.py',
+    'test_linear_event_data_scenarios.py',
     'test_linear_existing_work_scenarios.py', 'test_linear_isolation_scenarios.py',
     'test_linear_namespace_dispositions.py', 'test_linear_native_bridge_scenarios.py',
     'test_linear_native_frontdoor_scenarios.py', 'test_linear_origin_native.py',
