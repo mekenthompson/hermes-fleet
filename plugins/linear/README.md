@@ -22,7 +22,7 @@ API is required. The plugin is disabled by default.
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
-| `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
+| `create_issue` with UUIDv4 `id`, `title`, `team` and `project` | Create an undelegated issue; optional description/parent. `project` is a project id or exact name; without it the parent's project is used. With neither, nothing is created and the reply lists the team's active projects so the agent can choose one itself; `project: "none"` is the explicit opt-out. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
 | `update_description` with `issue`, UUIDv4 `id`, `description`, `expected_description` | Queue a description replacement after checking the exact previous text. |
