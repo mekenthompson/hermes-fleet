@@ -1829,12 +1829,56 @@ class Bridge:
                         if not row or row["last_event_id"] < event.id:
                             break  # Retry this event before consuming any later one.
                     else:
+                        self._recover_binding_delegate(row, adapter)
                         self._project_consumed_claim(row, adapter)
                 except RateLimited:
                     raise
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     log.warning("linear: native reporting held for issue %s task %s event %s (%s)",
                                 issue_id, task_id, event_id, type(exc).__name__)
+    def _recover_binding_delegate(self, row: dict | None, adapter) -> None:
+        """Route this app as delegate for an already linked, undelegated issue.
+
+        Provenance is native-binding recovery, never a fabricated caller: the
+        authority is the existing session-less reporting link (the same one
+        _report_delegate_allowed uses for undelegated reporting). Eligibility
+        matches chat track; _delegate_preflight and delivery guards still apply.
+        One decision per (issue, binding revision), durable across reopen.
+        """
+        if not row or row.get("origin") != "native" or row.get("owner_ref"):
+            return  # Linear-session-owned links route only through their caller.
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            return  # Scope requires a bound requester session; hold, do not route.
+        issue_id = row["issue_id"]
+        binding = self.store.native_binding(issue_id, adapter.executor_profile)
+        if not binding or binding.get("task_id") != row["task_id"]:
+            return
+        revision = self.store.binding_revision(issue_id)
+        key = f"delegate-recovery:{issue_id}:{revision}"
+        if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
+            return  # Cheap local check first: decided for this revision.
+        task = adapter.require_task(row["task_id"])
+        if task.status in ("done", "archived"):
+            return
+        issue = self._effect_issue(issue_id)
+        route = (issue.get("delegate") is None and "delegate" in issue
+                 and (issue.get("state") or {}).get("type") not in CLOSED)
+        payload = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-binding-recovery:{issue_id}:{revision}")),
+                   "issue_id": issue_id, "delegate_routing_version": 1, "write_started": False,
+                   "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": None,
+                   "expected_updated_at": issue.get("updatedAt"), "expected_binding_revision": revision,
+                   "native_binding": binding, "task_id": task.id,
+                   "recovered_binding": {"task_id": task.id, "binding_revision": revision}}
+        if route:
+            # A refusal is logged by pump and retried; the atomic outbox row is the marker.
+            self._delegate_preflight(payload)
+            self.store.recover_binding_delegate(issue_id, payload, at=self.clock())
+            return
+        # A human-chosen delegate or closed issue wins for this revision: record once.
+        _, first = self.store.native_intent_prepare(key, {"issue_id": issue_id, "task_id": task.id,
+                                                          "binding_revision": revision, "route": False})
+        if first:
+            self.store.native_intent_settle(key, {"state": "applied", "routed": False})
     def _project_consumed_claim(self, row: dict | None, adapter) -> None:
         """Report a still-current native claim whose event an older consumer passed.
 

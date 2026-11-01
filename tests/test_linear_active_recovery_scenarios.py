@@ -4,6 +4,7 @@ An older consumer could advance the reporting cursor over a native ``claimed``
 event without projecting In Progress. Real pinned Core tasks, the plugin Store,
 the registered chat RPC and the HTTP fake API exercise the current entrypoints.
 """
+import json
 import os
 import time
 import unittest
@@ -92,20 +93,71 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.assertEqual(len(f.mutations()), mutations)
         self.assertEqual(f.snapshot(), before)
 
-    def test_background_recovery_reports_but_never_claims_an_undelegated_issue(self):
-        # Existing policy: a session-less native binding may report status on
-        # an undelegated issue. Background recovery has no caller identity, so
-        # it must never assign itself as delegate or touch the human assignee.
+    def delegate_rows(self):
+        with self.fixture.bridge.store._tx() as db:
+            return [json.loads(row[0]) for row in db.execute(
+                "SELECT payload FROM outbox WHERE kind='delegate' ORDER BY rowid")]
+
+    def test_recovery_routes_own_delegate_for_linked_undelegated_work_and_echo_keeps_run(self):
+        # Authority is the existing session-less reporting link, recorded with
+        # recovery provenance and no fabricated caller/requester.
+        from hermes_fleet_linear_plugin.store import Store
         task, run, before = self.retained_running(delegate=None)
         f = self.fixture
         f.bridge.recover()
         self.later()
         f.bridge.flush()
+        self.assertEqual(f.issue["delegate"]["id"], SELF)
         self.assertEqual(f.remote.state("issue-1"), "In Progress")
-        self.assertIsNone(f.issue["delegate"])
         self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
-        self.assertEqual(len(f.mutations()), 1)
+        rows = self.delegate_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["recovered_binding"]["task_id"], task)
+        for field in ("caller_context", "requester_sessions", "requester_activities", "work_owner", "content_action"):
+            self.assertNotIn(field, rows[0])
         self.assertEqual(f.snapshot(), before)
+        mutations = len(f.mutations())
+        for _ in range(3):
+            f.bridge.store = Store(f.bridge.store.path)
+            f.bridge.recover()
+            f.bridge.pump_kanban()
+            f.bridge.flush()
+        self.assertEqual(len(self.delegate_rows()), 1)
+        self.assertEqual(len(f.mutations()), mutations)
+        # Linear's own-assignment echo reuses the same native task and run.
+        session = "recovery-assignment-echo"
+        f.remote.session_records[session] = {"id": session, "creator": None,
+            "appUser": {"id": SELF}, "issue": {"id": "issue-1"}}
+        event = f.remote.session_event("created", "issue-1", session, creator=None)
+        event["agentSession"].pop("creatorId")
+        self.assertTrue(f.bridge.handle_webhook(event))
+        self.assertTrue(f.bridge.handle_webhook(event))  # repeated webhook delivery
+        self.assertEqual(f.snapshot(), before)
+        self.assertEqual(f.bridge.store.native_binding("issue-1")["task_id"], task)
+        self.assertEqual(f.board.get(task).current_run_id, run)
+        self.assertIsNone(f.bridge.store.native_intent("create:issue-1"))
+
+    def test_recovery_holds_delegate_routing_when_scope_requires_requester_session(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        f.bridge.api.specialist_scope = {**f.bridge.api.specialist_scope, "requester_basis": "agent_session"}
+        f.bridge.recover()
+        self.later()
+        f.bridge.flush()
+        self.assertIsNone(f.issue["delegate"])
+        self.assertEqual(self.delegate_rows(), [])
+        self.assertEqual(f.snapshot(), before)
+
+    def test_completed_internal_stage_is_not_routed_and_does_not_close_issue(self):
+        task, run, before = self.retained_running(delegate=None)
+        f = self.fixture
+        with f.board.conn() as db:
+            self.assertTrue(f.board.kb.complete_task(db, task, summary="stage done"))
+        self.later()
+        f.bridge.recover()
+        f.bridge.flush()
+        self.assertNotEqual(f.remote.state("issue-1"), "Done")
+        self.assertEqual(self.delegate_rows(), [])
 
     def test_background_recovery_cannot_fabricate_session_delegate_routing(self):
         # Delegate routing is a caller-authorized content action. A session-owned

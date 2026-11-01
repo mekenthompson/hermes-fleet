@@ -988,6 +988,26 @@ class Store:
                              "AND json_extract(payload,'$.task_id')=? AND json_type(payload,'$.issue_write_receipt')='object' "
                              "ORDER BY rowid DESC LIMIT 1", (issue_id, task_id)).fetchone()
         return json.loads(row[0])["issue_write_receipt"] if row else None
+    def delegate_routed(self, issue_id: str, revision: str) -> bool:
+        """Any delegate routing intent (chat or recovery) already exists for this binding revision."""
+        with self._tx() as db:
+            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                                   "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1",
+                                   (issue_id, revision)).fetchone())
+    def recover_binding_delegate(self, issue_id: str, payload: dict[str, Any], *, at: float) -> bool:
+        """Queue one recovery delegate intent; no caller/requester or work_owner fields are invented."""
+        with self._tx() as db:
+            if not self._effect_admitted(db, issue_id) or not db.execute(
+                    "SELECT 1 FROM work WHERE issue_id=? AND origin='native' AND task_id=?",
+                    (issue_id, payload["task_id"])).fetchone():
+                return False
+            if db.execute("SELECT 1 FROM outbox WHERE id=? OR (kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                          "AND json_extract(payload, '$.expected_binding_revision')=?)",
+                          (payload["id"], issue_id, payload["expected_binding_revision"])).fetchone():
+                return False
+            db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
+                       (payload["id"], "delegate", json.dumps({**payload, "enqueued_at": at}), at))
+            return True
     def recover_claim_status(self, issue_id: str, payload: dict[str, Any], *, since: float, at: float) -> bool:
         """Once per claim: queue In Progress only if no status intent follows that claim."""
         with self._tx() as db:
