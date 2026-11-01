@@ -27,17 +27,17 @@ AGENT_DIGEST = _AGENT_MANIFEST_DATA["digest"]
 AGENT_REF = f"{AGENT_REPOSITORY}@{AGENT_DIGEST}"
 ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
-    "sha256:515a00a06792c8a0aaa46a442b2cfc106e2dcef6ab25f6c367cd575f6172952a"
+    "sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438"
 )
 CLAUDE_CODE_VERSION = "2.1.316"
 CLAUDE_CODE_INTEGRITY = "sha512-i3BpzyDkcCPnsa0CSkWgxGPs7WMsyqDkxkqT0SDxyEC5XMIxEmcUmluWRHG9VSeBY8Vyv+l9X34JvJ/Bj54nBQ=="
 CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-RQDM6N285IjNKcmlPRriayNzpTkEJreAw5/vBU+V0R3qljkQ5z6/pSbzcVUAXvasoOlvub0RIma3NWvSuZA8Cg=="
-CODEX_VERSION = "0.162.1"
-CODEX_INTEGRITY = "sha512-NWZdi/kxyjv/8EUGFupziGU38YyleugZRM4JXgY5XFH7FUmaFA33NZS2Bmq0HPazf7S3jJQQWsZ/jAK9jsrV3Q=="
-GROK_VERSION = "1.0.50"
-GROK_INTEGRITY = "sha512-eXY/+nWHgRn8ti4DYoW+ICBRwfmTzP68HNiaC+Q+DkybD51/of13Yp7Taef5oeZUZB1D0jP3B5njnsn8tDkveA=="
-CLAUDE_AGENT_ACP_VERSION = "0.89.0"
-CLAUDE_AGENT_ACP_INTEGRITY = "sha512-MZr7aWNb9HijspcYpfDx2N91vIeaEmGB6TaCBXVvYwFymYfLDfUChlBvnwNWxj48VL16hc6WVhyB33Ie8OLxGw=="
+CODEX_VERSION = "0.166.0"
+CODEX_INTEGRITY = "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q=="
+GROK_VERSION = "1.0.70"
+GROK_INTEGRITY = "sha512-Q2Ncoez//mk1Z9CNhgvp9eAYfZJZmshDAPxs0XAhhGnilH3abGAyTwqOSvqVnsFCUjjzT9TCYZIgAH2A2XL6CQ=="
+CLAUDE_AGENT_ACP_VERSION = "0.99.1"
+CLAUDE_AGENT_ACP_INTEGRITY = "sha512-tK5lNtoI85IS0K8PVKYK86t/ARgCS1AjEw+u6QSNmdu0tbhyeB6FTNzFnGNIgsL/3xYwrQUMFDC6osT1aIPReQ=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
 CLAUDE_ACP_PLUGIN_REVISION = "0526610a3945cc376ac517b63ca358a5b838a2fc"
 
@@ -121,7 +121,7 @@ class FleetImageReleaseTests(unittest.TestCase):
         for token in (
             f"ARG ONEPASSWORD_CLI_IMAGE={ONEPASSWORD_CLI_IMAGE}",
             "COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op",
-            'test "$(/usr/local/bin/op --version)" = "2.40.0"',
+            'test "$(/usr/local/bin/op --version)" = "2.41.1"',
             "ARG FLEET_GIT_SHA",
             "ARG FLEET_IMAGE_IDENTITY",
             "HERMES_FLEET_GIT_SHA=${FLEET_GIT_SHA}",
@@ -182,7 +182,7 @@ class FleetImageReleaseTests(unittest.TestCase):
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
                 "@openai/codex": CODEX_VERSION,
                 "@xai-official/grok": GROK_VERSION,
-                "opencode-ai": "1.18.35",
+                "opencode-ai": "1.19.5",
             },
         )
         self.assertTrue(package["private"])
@@ -757,7 +757,7 @@ class FleetImageReleaseTests(unittest.TestCase):
             "no production deployment",
             "fleet-image-publish",
             "rollback",
-            "1password cli 2.40.0",
+            "1password cli 2.41.1",
             "official image digest",
             "contains no credentials",
         ):

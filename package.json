@@ -3,11 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.89.0",
+    "@agentclientprotocol/claude-agent-acp": "0.99.1",
     "@anthropic-ai/claude-code": "2.1.316",
-    "@openai/codex": "0.162.1",
-    "@xai-official/grok": "1.0.50",
-    "opencode-ai": "1.18.35"
+    "@openai/codex": "0.166.0",
+    "@xai-official/grok": "1.0.70",
+    "opencode-ai": "1.19.5"
   },
   "overrides": {
     "proxy-addr": "2.0.8"
