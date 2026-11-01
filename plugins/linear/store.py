@@ -1020,25 +1020,36 @@ class Store:
             if not self._effect_admitted(db, issue_id) or not db.execute(
                     "SELECT 1 FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone():
                 return False
-            latest = db.execute("SELECT json_extract(payload, '$.state') AS state, "
-                                "json_extract(payload, '$.enqueued_at') AS at FROM outbox "
-                                "WHERE kind='status' AND json_extract(payload, '$.issue_id')=? "
-                                "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
-                                (issue_id,)).fetchone()
-            if latest and (latest["state"] == "in_progress" or float(latest["at"] or 0) >= since):
+            latest = db.execute(self._LATEST_STATUS, (issue_id,)).fetchone()
+            retry = (latest and self._refused_in_progress(latest)
+                     and latest["claim_event"] != payload["recovered_claim"]["event_id"])
+            if latest and not retry and (latest["intent"] == "in_progress" or float(latest["at"] or 0) >= since):
                 return False
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                        (str(uuid.uuid4()), "status", json.dumps({**payload, "enqueued_at": at}), at))
             return True
+    _LATEST_STATUS = ("SELECT id, state AS row_state, hold_reason, json_extract(payload, '$.state') AS intent, "
+                      "json_extract(payload, '$.enqueued_at') AS at, json_extract(payload, '$.applied') AS applied, "
+                      "json_extract(payload, '$.recovered_claim.event_id') AS claim_event FROM outbox "
+                      "WHERE kind='status' AND json_extract(payload, '$.issue_id')=? "
+                      "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1")
+    @staticmethod
+    def _refused_in_progress(row) -> bool:
+        """An In Progress intent that was delivered as a no-op: Linear does not show it."""
+        return (row["intent"] == "in_progress" and row["row_state"] == "sent" and not row["applied"]
+                and row["hold_reason"] is None)
     def latest_status(self, issue_id: str) -> dict[str, Any] | None:
-        """Newest status intent, including a pending or failed closeout."""
+        """Newest status intent, including a pending or failed closeout.
+
+        ``refused`` marks an In Progress intent that was refused (not applied),
+        so it is not mistaken for Linear already showing In Progress;
+        ``recovered`` marks a background claim recovery row.
+        """
         with self._tx() as db:
-            row = db.execute("SELECT id, json_extract(payload, '$.state') AS intent FROM outbox "
-                             "WHERE kind='status' AND json_extract(payload, '$.issue_id')=? "
-                             "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
-                             (issue_id,)).fetchone()
+            row = db.execute(self._LATEST_STATUS, (issue_id,)).fetchone()
         if not row or not row["intent"]: return None
-        return {"id": row["id"], "state": row["intent"]}
+        return {"id": row["id"], "state": row["intent"], "refused": self._refused_in_progress(row),
+                "recovered": row["claim_event"] is not None}
     def verified_release(self, row_id: str) -> bool:
         row = self.outbox_row(row_id)
         return bool(row and not row.get("hold_reason") and row["state"] == "sent" and row["kind"] == "status"

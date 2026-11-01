@@ -1594,7 +1594,7 @@ class Bridge:
         viewer = self.api.viewer_id()
         for node in nodes:
             if iso_ms(node.get("createdAt")) <= since_ms:
-                return False  # Newest first: everything older precedes the fence.
+                continue  # Precedes the fence; no reliance on Linear's ordering.
             routed = (node.get("fromStateId") != node.get("toStateId")
                       or node.get("fromAssigneeId") != node.get("toAssigneeId")
                       or (node.get("fromDelegate") or {}).get("id") != (node.get("toDelegate") or {}).get("id"))
@@ -1925,11 +1925,14 @@ class Bridge:
         the original claim time. may_write fences it on Linear's issue history
         after that claim, so a later human state edit or reassignment wins
         while comments and agent activity (which only move updatedAt) do not.
+        An In Progress intent that was refused (e.g. by an older updatedAt
+        fence) gets one recovery attempt per claim.
         """
         if not row or row.get("origin") != "native":
             return
-        if (self.store.latest_status(row["issue_id"]) or {}).get("state") == "in_progress":
-            return  # Steady state: no per-tick history scan.
+        latest = self.store.latest_status(row["issue_id"]) or {}
+        if latest.get("state") == "in_progress" and (not latest.get("refused") or latest.get("recovered")):
+            return  # Steady state (or this claim's one recovery already refused): no per-tick history scan.
         task = adapter.require_task(row["task_id"])
         claim = self._current_claim(adapter, task)
         if claim is None or claim.id > row["last_event_id"]:
@@ -1995,7 +1998,7 @@ class Bridge:
             writes = [status("blocked" if task_status == "todo" else "in_progress")]
         elif event.kind == "claimed" and task_status == "running":
             latest = self.store.latest_status(issue_id)
-            if not latest or latest["state"] != "in_progress":
+            if not latest or latest["state"] != "in_progress" or latest.get("refused"):
                 writes = [status("in_progress")]
         elif event.kind in ("review_requested", "changes_requested", "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"):
             # Only the native landing phase can justify a delayed milestone after restart.
@@ -2212,7 +2215,7 @@ class Bridge:
                 if ((not self._receipt_scope({"issue_id": issue["id"], "task_id": row["task_id"]}, receipt)
                         or receipt["issue"] != self._issue_version(issue))
                         and (not history_fence or self._human_routing_changed(issue["id"], fence))):
-                    return False  # Own acknowledged version, or (recovery) no human routing change since the claim.
+                    return False  # Own acknowledged version, or (In Progress) no human routing change since the source event.
         return self._report_delegate_allowed(issue)
     def recheck(self, force: bool = False) -> None:
         now = self.clock()
@@ -2408,7 +2411,7 @@ class Bridge:
             if row and row["kind"] == "status":
                 current = self._effect_issue(payload["issue_id"])
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                      payload.get("seen"), payload.get("source_ms"), bool(payload.get("recovered_claim"))):
+                                      payload.get("seen"), payload.get("source_ms"), payload.get("state") == "in_progress"):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
@@ -2557,7 +2560,7 @@ class Bridge:
             if payload.get("admission_id"):
                 return False
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen"), payload.get("source_ms"), bool(payload.get("recovered_claim"))):
+                                  payload.get("seen"), payload.get("source_ms"), payload.get("state") == "in_progress"):
                 if (payload.get("terminal") and payload.get("state") == "done"
                         and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):

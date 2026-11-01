@@ -22,6 +22,9 @@ class ActiveRecoveryScenarios(unittest.TestCase):
 
     def retained_running(self, delegate=None):
         f = self.fixture
+        # Shared setUp stamps issue history on its fixed (2030) clock; real
+        # Linear history for this issue precedes the claim made below.
+        f.remote.history.pop("issue-1", None)
         f.fixture.clock.now = time.time() - 2
         f.remote.set_delegate("issue-1", delegate)
         with f.board.conn() as db:
@@ -37,6 +40,28 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         from hermes_fleet_linear_plugin.store import Store
         f.bridge.store = Store(f.bridge.store.path)
         return task, running.current_run_id, f.snapshot()
+
+    def running_unconsumed(self, delegate):
+        """Current build: the claimed event is captured by the ordinary path."""
+        f = self.fixture
+        # Shared setUp stamps issue history on its fixed (2030) clock; real
+        # Linear history for this issue precedes the claim made below.
+        f.remote.history.pop("issue-1", None)
+        f.fixture.clock.now = time.time() - 2
+        f.remote.set_delegate("issue-1", delegate)
+        with f.board.conn() as db:
+            task = f.board.kb.create_task(db, title="Fresh active work", board=f.board.board,
+                assignee=f.board.executor_profile, created_by="operator",
+                body="Linear issue issue-1: " + f.issue["url"])
+            f.board.kb.claim_task(db, task, claimer="native-worker")
+        f.bridge.track("issue-1", task, completion_scope="progress")
+        return task
+
+    def ticks(self, count=3):
+        for _ in range(count):
+            self.fixture.bridge.recover()
+            self.fixture.bridge.pump_kanban()
+            self.fixture.bridge.flush()
 
     def later(self):
         self.fixture.fixture.clock.now = time.time() + 2
@@ -308,6 +333,52 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.later()
         f.bridge.flush()
         self.assertEqual(f.remote.state("issue-1"), "In Progress")
+
+    def test_comment_before_ordinary_claim_send_still_shows_in_progress(self):
+        # Review probe: the claim is not yet projected (worker just claimed, or
+        # a restart backlog) and a comment touches the issue before the status
+        # send. updatedAt moves; routing does not. Running work is In Progress.
+        self.running_unconsumed(delegate={"id": SELF})
+        f = self.fixture
+        self.later()
+        f.remote.touch("issue-1")
+        self.ticks()
+        self.assertEqual(f.remote.state("issue-1"), "In Progress")
+        self.assertEqual(f.issue["delegate"]["id"], SELF)
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+
+    def test_human_state_move_before_ordinary_claim_send_wins(self):
+        self.running_unconsumed(delegate={"id": SELF})
+        f = self.fixture
+        self.later()
+        f.remote.set_state("issue-1", "Blocked")
+        f.fixture.clock.now += 1
+        f.remote.touch("issue-1")
+        self.ticks()
+        self.assertEqual(f.remote.state("issue-1"), "Blocked")
+        self.assertEqual(f.mutations(), [])
+        # Bounded: at most one recovery retry after the refused claim status.
+        self.assertLessEqual(len(self.recovered_status_rows()), 1)
+
+    def test_in_progress_refused_by_older_build_is_recovered(self):
+        # Live upgrade case: an older build fenced the claim status on
+        # updatedAt, so a comment made it record In Progress as sent but not
+        # applied. The current build must not read that as "already shown".
+        self.running_unconsumed(delegate={"id": SELF})
+        f = self.fixture
+        self.later()
+        f.remote.touch("issue-1")
+        current = f.bridge.may_write
+        f.bridge.may_write = lambda issue, claim, queued_at=0.0, seen=None, source_ms=None, history_fence=False: \
+            current(issue, claim, queued_at, seen, source_ms, False)  # the older updatedAt-only fence
+        self.ticks(1)
+        self.assertEqual(f.remote.state("issue-1"), "Todo")
+        self.assertTrue(f.bridge.store.latest_status("issue-1")["refused"])
+        f.bridge.may_write = current  # upgrade
+        self.ticks()
+        self.assertEqual(f.remote.state("issue-1"), "In Progress")
+        self.assertEqual(f.issue["assignee"], {"id": "human-assignee"})
+        self.assertEqual(len(self.recovered_status_rows()), 1)
 
     def test_stopped_native_work_is_not_reported_as_running(self):
         task, run, _ = self.retained_running(delegate={"id": SELF})
