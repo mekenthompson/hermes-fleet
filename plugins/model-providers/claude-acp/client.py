@@ -51,11 +51,11 @@ _BRIDGE_PREFIX = "mcp__hermes_bridge__"
 _CLAUDE_CODE_EXECUTABLE = "/opt/coding-clis/node_modules/.bin/claude"
 _CLAUDE_CODE_PACKAGE = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/package.json")
 _CLAUDE_SDK_TOOLS = Path("/opt/coding-clis/node_modules/@anthropic-ai/claude-code/sdk-tools.d.ts")
-# Reviewed 2.1.296. Opus 5.5 remains the existing opus / opus[1m] slot.
+# Reviewed 2.1.316. Opus 5.5 remains the existing opus / opus[1m] slot.
 # The adapter does not offer claude-opus-5-5. Do not add that API id as an alias.
-_REVIEWED_CLAUDE_CODE_VERSION = "2.1.296"
-_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de"
-_REVIEWED_SDK_TOOLS_SHA256 = "63e378f4585427786c6cd0e876f094c8ade8d284d86554ef44f83a5cdf396cfb"
+_REVIEWED_CLAUDE_CODE_VERSION = "2.1.316"
+_REVIEWED_CLAUDE_EXECUTABLE_SHA256 = "fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824"
+_REVIEWED_SDK_TOOLS_SHA256 = "e36072cc125f5215f3b02f1eb5977262bb418b9cdf005001a3ccafe6caaaac27"
 _DISCOVERY_TOOLS = ("ToolSearch",)
 # Claude.ai cloud connectors only hydrate when the full Claude Code preset is
 # selected. Deny every native tool in the reviewed, pinned Claude Code release;
@@ -139,6 +139,8 @@ _NATIVE_TOOL_DENY = (
     "SendUserFile",
     "SuggestConnectors",
     "WaitForMcpServers",
+    # Present in the 2.1.316 executable. Denied, not approved.
+    "SubscribePR",
 )
 _CONNECTOR_PREFIX = "mcp__claude_ai_"
 _CONNECTOR_WILDCARD = "mcp__claude_ai_*"
