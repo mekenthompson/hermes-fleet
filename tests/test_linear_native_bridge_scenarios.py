@@ -681,9 +681,10 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock), self.board, profile="default", clock=clock)
                     reporter.recover()
                     reporter.flush()
-                    # Waiting on a dependency or a time is queued (Todo); archived leaves Linear as it was.
+                    # Waiting on a dependency or a time is queued (Todo); archived without an outcome
+                    # parks the In Progress this app set back to Todo (nobody is working on it now).
                     self.assertEqual(remote.state(ISSUE), {"done": "Done", "todo": "Todo", "scheduled": "Todo",
-                        "archived": "In Progress" if captured else "Todo"}.get(state, "Blocked"))
+                        "archived": "Todo"}.get(state, "Blocked"))
                     bodies = remote.bodies(ISSUE)
                     self.assertEqual(sum("Preserve this ordinary native checkpoint" in body for body in bodies), 1)
                     self.assertEqual(sum("Preserve the second ordinary checkpoint too" in body for body in bodies), 1)
@@ -870,7 +871,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.recover()
                     reporter.flush()
                     self.assertEqual(remote.state(ISSUE), {"done": "Done", "blocked": "Blocked"}.get(
-                        state, "In Progress" if captured else "Todo"))  # archived leaves Linear as it was
+                        state, "Todo"))  # archived without an outcome parks the app's In Progress at Todo
                     self.assertEqual(sum("Authenticated session ordinary history" in body for body in remote.bodies(ISSUE)), 1)
                     self.assertTrue(any(item["content"].get("body") == "Authenticated session ordinary history" for item in remote.activities))
                     self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))

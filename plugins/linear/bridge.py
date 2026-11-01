@@ -1144,7 +1144,8 @@ class Bridge:
                 **self._alert_route(row)})]
             self._capture_native_event(issue_id, event_id, self._report_writes(row, writes), at=self.clock())
             return
-        # Archived or cancelled with no outcome: whoever archived it decided; leave Linear as it is.
+        # Archived or cancelled with no outcome: nothing posts; _reconcile_status parks a
+        # started state this app set back to Todo (no agent is working on it now).
         self._capture_native_event(issue_id, event_id, [], at=self.clock())
     def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
         issue_id = issue["id"]
@@ -2011,14 +2012,25 @@ class Bridge:
             payload = {"state": "in_progress", "source_ms": claim.created_at * 1000, "recovered_claim": {
                 "task_id": task.id, "run_id": task.current_run_id, "event_id": claim.id}}
         else:
-            if task.status == "archived" or (task.status == "done" and
-                                             self.store.terminal_captured(task.id, issue_id=row["issue_id"])):
-                return  # Archived work leaves Linear alone; verified closeout belongs to _finished.
-            last = next(iter(adapter.history(task.id, row["last_event_id"] - 1)), None) if row["last_event_id"] else None
-            state = self._native_state(task, adapter, last)
-            if state is None or state == latest.get("state"):
-                return
-            payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
+            if task.status in ("archived", "done") and self.store.terminal_captured(task.id, issue_id=row["issue_id"]):
+                return  # Verified closeout belongs to _finished.
+            if task.status == "archived":
+                if latest.get("state") == "todo":
+                    return  # Already parked (or refused as a no-op): no per-tick history scan.
+                history = adapter.history(task.id, 0)
+                archived = next((event for event in reversed(history) if event.kind == "archived"), None)
+                if (archived is None or archived.id > row["last_event_id"]
+                        or any(event.kind == "completed" for event in history)):
+                    return  # Unconsumed, or archived after a finished outcome: leave Linear as it is.
+                # Archived or cancelled without an outcome: nobody works on it now, so a started
+                # state this app set becomes Todo (send time checks the app made the last move).
+                payload = {"state": "todo", "source_ms": archived.created_at * 1000, "archived": True}
+            else:
+                last = next(iter(adapter.history(task.id, row["last_event_id"] - 1)), None) if row["last_event_id"] else None
+                state = self._native_state(task, adapter, last)
+                if state is None or state == latest.get("state"):
+                    return
+                payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
         self._native_effect_task(row["issue_id"])
         self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
                                                       **self._alert_route(row)}, at=self.clock())
@@ -2347,17 +2359,24 @@ class Bridge:
         if ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
                 or not self.authorize_specialist_effect(issue_id) or self.store.issue_reconciliation_blocked(issue_id)):
             return  # No session authority here, or an uncertain write needs an operator first.
-        issue, viewer = self._effect_issue(issue_id), self.api.viewer_id()
-        state, target = issue.get("state") or {}, self.state_id(issue, "todo")
-        if state.get("type") == "started" and target and (issue.get("delegate") or {}).get("id") in (None, viewer):
-            routed = [node for node in self.api.routing_history(issue_id)[0] if self._routed(node)]
-            moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
-                        key=lambda node: iso_ms(node.get("createdAt")), default=None)
-            if (moved and moved.get("actorId") == viewer and moved.get("toStateId") == state.get("id") and
-                    all(node.get("actorId") == viewer for node in routed
-                        if iso_ms(node.get("createdAt")) > iso_ms(moved.get("createdAt")))):
-                self.api.update_issue(issue_id, {"stateId": target})
+        issue = self._effect_issue(issue_id)
+        target = self.state_id(issue, "todo")
+        if target and (issue.get("delegate") or {}).get("id") in (None, self.api.viewer_id()) and self._app_set_started_state(issue):
+            self.api.update_issue(issue_id, {"stateId": target})
         self.store.retire_untracked(issue_id, row.get("task_id"))
+    def _app_set_started_state(self, issue: dict) -> bool:
+        """The issue shows a started state that this app set, and nobody else changed
+        state, assignee or delegate since. Backlog, Todo and closed states never qualify."""
+        state, viewer = issue.get("state") or {}, self.api.viewer_id()
+        if state.get("type") != "started":
+            return False
+        nodes, more = self.api.routing_history(issue["id"])
+        routed = [node for node in nodes if self._routed(node)]
+        moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
+                    key=lambda node: iso_ms(node.get("createdAt")), default=None)
+        return bool(moved and moved.get("actorId") == viewer and moved.get("toStateId") == state.get("id") and
+                    all(node.get("actorId") == viewer for node in routed
+                        if iso_ms(node.get("createdAt")) > iso_ms(moved.get("createdAt"))))
     def recover(self, ingress: Path | None = None) -> None:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
@@ -2701,6 +2720,8 @@ class Bridge:
             if (payload["state"] == "in_progress" and current.get("type") == "started" and
                     current.get("id") not in (self.state_id(issue, "blocked"), self.state_id(issue, "in_review"))):
                 target = None  # A human's own started state (e.g. QA) stands over In Progress.
+            if payload.get("archived") and not self._app_set_started_state(issue):
+                target = None  # Backlog, Todo, closed, or a human's later choice stays as it is.
             if payload.get("release") and not target:
                 raise LinearError("Unfinished release requires a configured parked workflow state", retryable=False)
             fields = {"stateId": target} if target and (target != current.get("id") or payload.get("release")) else {}
