@@ -1312,13 +1312,18 @@ class Store:
                 "SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > c.rowid AND "
                 "json_extract(l.payload, '$.issue_id') = ?))) LIMIT 1", (issue_id, issue_id)).fetchone())
     def progress_reported(self, issue_id: str, task_id: str, action: str) -> bool:
-        """A native progress milestone for this binding is already queued or published.
+        """A native progress milestone for this binding is queued, published, or may have landed.
 
-        Obsolete progress that never reached Linear is deleted, so it does not count.
+        Progress coalesced unsent (sent with applied=0) or given up before any send attempt
+        never reached Linear, so it does not count and the next spawn says it again.
+        A timed-out send (failed after an attempt) may have landed and is revived with the
+        same client id, so it counts.
         """
         with self._tx() as db:
             return bool(db.execute(
                 "SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind IN ('activity', 'comment') AND "
+                "(state = 'pending' OR (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 1) "
+                "OR (state = 'failed' AND attempts > 0)) AND "
                 "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.task_id') = ? AND "
                 "json_extract(payload, '$.native_progress') = 1 AND "
                 "(json_extract(payload, '$.content.action') = ? OR "

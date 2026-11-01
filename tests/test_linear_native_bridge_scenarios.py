@@ -516,6 +516,34 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
         self.assertEqual(self.board.get(task_id).status, "running")
 
+    def test_started_superseded_before_send_is_posted_on_the_next_spawn(self):
+        # A Started coalesced unsent (task blocked before the flush) never reached Linear,
+        # so the respawn after unblocking must still say Started, exactly once.
+        clock, remote, reporter, task_id = self.reporting_fixture("started-superseded")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.block_task(conn, task_id, reason="worker crashed", kind="transient",
+                                         expected_run_id=self.board.get(task_id).current_run_id))
+        clock.now += 10
+        reporter.flush()
+        self.assertFalse(any(body.startswith("Started") for body in remote.bodies(ISSUE)))
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.unblock_task(conn, task_id))
+        reporter.pump_kanban()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.respawn(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+
     def test_runtime_block_posts_one_plain_sentence_without_raw_error(self):
         raw = "pid 1591346 exited with code 130 [owner admission settled interrupted]"
         clock, remote, reporter, task_id = self.reporting_fixture("plain-runtime-block")
