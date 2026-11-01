@@ -1,14 +1,16 @@
 name: Plugin pin handoff
 
-# A public main push that touches plugins/ may move a bundle plugin tree.
-# Open one private pin PR. This workflow never builds or publishes an image.
-# The checkout ref below is github.sha for this push, not a pull request head.
+# A public main commit may move a bundle plugin tree. After that commit's
+# push CI succeeds, open one private pin PR (the opener no-ops when no tracked
+# plugin path moved). Starting on the push itself raced CI, so the opener's
+# green-CI guard always refused. This workflow never builds or publishes an
+# image. Under workflow_run the checkout ref is the CI run's head_sha.
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
-    paths:
-      - "plugins/**"
 
 permissions:
   contents: read
@@ -20,14 +22,19 @@ concurrency:
 jobs:
   bump:
     name: Open private bundle pin PR
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.repository == 'mekenthompson/hermes-fleet'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out this public commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 1
           persist-credentials: false
           path: public
@@ -56,6 +63,7 @@ jobs:
       - name: Open or reuse the pin PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PUBLIC_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           git -C private config user.name "hermes-release-bot"
@@ -63,5 +71,5 @@ jobs:
           python3 private/scripts/open-plugin-pin-pr.py \
             --public public \
             --private private \
-            --public-sha "$GITHUB_SHA" \
+            --public-sha "$PUBLIC_SHA" \
             --apply --open
