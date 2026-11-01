@@ -87,6 +87,13 @@ class Authority:
         self.fail_session = False
         self.fail_issue = False
 
+    def human_edit(self, issue_id, stamp):
+        """A person changes the issue's state: Linear records it in IssueHistory and moves updatedAt."""
+        self.issues[issue_id]["updatedAt"] = stamp
+        self.history.setdefault(issue_id, []).append({
+            "createdAt": stamp, "actorId": USER, "fromStateId": "state-progress", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": None, "toDelegate": None})
+
     def transport(self, _url, body, _headers):
         payload = json.loads(body)
         query, variables = payload["query"], payload.get("variables") or {}

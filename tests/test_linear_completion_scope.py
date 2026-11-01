@@ -37,12 +37,7 @@ class CompletionScopeTests(unittest.TestCase):
         self.bridge = Bridge(self.store, self.api, self.kanban, profile='synthetic', clock=lambda: 1800000000)
 
     def human_edit(self, at):
-        """A person changes the issue's state: Linear records it in IssueHistory and moves updatedAt."""
-        stamp = datetime.datetime.fromtimestamp(at, datetime.timezone.utc).isoformat()
-        self.authority.issues[ISSUE]['updatedAt'] = stamp
-        self.authority.history.setdefault(ISSUE, []).append({
-            'createdAt': stamp, 'actorId': USER, 'fromStateId': 'state-progress', 'toStateId': 'state-todo',
-            'fromAssigneeId': USER, 'toAssigneeId': USER, 'fromDelegate': {'id': VIEWER}, 'toDelegate': {'id': VIEWER}})
+        self.authority.human_edit(ISSUE, datetime.datetime.fromtimestamp(at, datetime.timezone.utc).isoformat())
 
     def event(self, kind, payload=None):
         history = self.kanban.histories[self.task.id]
