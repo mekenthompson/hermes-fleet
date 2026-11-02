@@ -58,7 +58,7 @@ class GraphQLErrorDetailTests(unittest.TestCase):
 
     def _records(self):
         handler = _Capture()
-        logger = logging.getLogger("linear")
+        logger = logging.getLogger("hermes_plugins.linear")
         previous = logger.level
         logger.setLevel(logging.DEBUG)
         logger.addHandler(handler)
@@ -99,6 +99,11 @@ class GraphQLErrorDetailTests(unittest.TestCase):
             self.assertNotIn(TOKEN, text)
         self.assertTrue(created["message"].startswith("Linear GraphQL error"))
 
+        decisions = [record for record in records if record.getMessage().startswith("linear.evt ")]
+        records = [record for record in records if record not in decisions]
+        for record in decisions:  # metadata-only decision lines never repeat the rejection text
+            self.assertNotIn(MESSAGE, record.getMessage())
+            self.assertNotIn(TOKEN, record.getMessage())
         self.assertGreaterEqual(len(records), 1)
         self.assertTrue(any("Authorization" in headers for _, headers in seen))
         for record in records:

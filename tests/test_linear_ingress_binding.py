@@ -78,12 +78,12 @@ class IngressBindingTests(unittest.TestCase):
             seen.append(event["tag"])
             if event["tag"].startswith("bad"): raise RuntimeError("synthetic failure")
         with patch.object(bridge, "handle_webhook", side_effect=handle):
-            with self.assertLogs("linear", "ERROR"):
+            with self.assertLogs("hermes_plugins.linear", "ERROR"):
                 bridge.drain_ingress(self.inbox, limit=2)  # both failures fill the batch
             bridge.drain_ingress(self.inbox, limit=2)  # backing off: the newer delivery is not held
             self.assertEqual(seen, ["bad-1", "bad-2", "good"])
             now[0] = 1005  # first retry is due 5 s after receipt, and logs one line, not a traceback
-            with self.assertLogs("linear", "WARNING") as logs:
+            with self.assertLogs("hermes_plugins.linear", "WARNING") as logs:
                 bridge.drain_ingress(self.inbox)
             self.assertTrue(all(r.levelname == "WARNING" and not r.exc_info for r in logs.records))
             bridge.drain_ingress(self.inbox)
@@ -95,7 +95,7 @@ class IngressBindingTests(unittest.TestCase):
         with closing(sqlite3.connect(self.inbox)) as db, db:  # stuck under the old every-tick loop
             db.execute("UPDATE deliveries SET received_at = 1000, attempts = 1800 WHERE delivery_id = 'stuck'")
         now[0] = 1000 + 86_402  # still tried once after a day, so it parks loudly instead of idling
-        with patch.object(bridge, "handle_webhook", side_effect=handle), self.assertLogs("linear", "ERROR"):
+        with patch.object(bridge, "handle_webhook", side_effect=handle), self.assertLogs("hermes_plugins.linear", "ERROR"):
             bridge.drain_ingress(self.inbox)
         self.assertEqual(self.statuses()["stuck"], "failed")
 
