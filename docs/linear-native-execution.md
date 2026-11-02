@@ -73,6 +73,11 @@ Native creation retry lookup remains non-atomic; ambiguous creation is reconcile
 On older hosts, running cancellation is relayed only with verified ordering and a concrete
 native run ID; queued cancellation remains a visible reconciliation request for native controls.
 On guarded hosts, native Stop also covers queued work when source ordering can be verified.
+Only an explicit native resume, completion or archive after the click supersedes a Linear Stop;
+the dispatcher claiming or starting the work does not. An unverified attempt is retried on
+redelivery from the latest native event, guarded by that event. The same guarded native block is
+applied to unfinished tasks the stopped task started (`creator_task_id`, transitively, on the same
+board); one a human resumed after the click is left alone.
 A blocked state or an acknowledged request
 does not prove external processes or effects ended. Native process observation and terminal
 reaping remain necessary. The plugin never kills a PID or clears revoked authority.
