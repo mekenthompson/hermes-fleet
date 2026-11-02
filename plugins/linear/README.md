@@ -66,18 +66,21 @@ reported, never duplicated. An unlinked task already on the board is adopted onl
 definition of done matches the project's, and then as progress: it never closes the issue by
 itself. Delegated children return the request to their parent.
 
-When work starts, the delegate is queued inside the issue's lock, before admission, from the
-issue version read under that lock, so the status writes that follow from the work are queued
-after it. A chat admission that finds no delegate proceeds only when no person changed state,
-assignee or delegate since the chat request (the history read is skipped only when Linear has
-not moved since the request). If admission is superseded, its queued delegate is dropped and
-recovery adds none while the parked task has never been claimed: parked work is not shown as
-worked on. Once someone resumes it and a worker claims it, recovery routes the delegate as
-usual, fenced from that claim (the change that parked it came before).
+When work starts, the delegate is queued inside the issue's lock right after admission (which
+writes nothing to Linear), from the issue version read under that lock, so the status writes
+that follow from the work are queued after it. Chat work that was not admitted (parked by a
+Stop, a person's change, or unsafe controls) gets no delegate, however often chat asks again.
+A chat admission that finds no delegate proceeds only when no person changed state, assignee
+or delegate since the chat request (the history read is skipped only when Linear has not moved
+since the request). Recovery adds no delegate to parked chat work that was never claimed; once
+someone resumes it and a worker claims it, recovery routes the delegate as usual, fenced from
+its latest claim (the change that parked it came before).
 The chat reply says only what is true: Linear shows the delegate, is being updated (a delegate
 write is still pending), the update will be retried (only when delegate recovery's own
-conditions hold), a person removed this agent as delegate or otherwise changed routing (not
-re-added; only when Linear history proves it), or it was not updated and nothing retries it now.
+conditions hold), a person removed this agent as delegate or changed the issue's status,
+assignee or delegate (not re-added; only when Linear history proves it), Linear's history
+couldn't be checked (nothing is changed over it), or it was not updated and the agent can't
+confirm a retry.
 Delegate recovery retries chat-started routing that was refused before any write, once per
 binding revision (which changes as native work moves). Asking again from chat never re-adds a
 delegate after a person's proven routing change since the request. For chat-started work every delegate recovery is fenced from the earlier of the

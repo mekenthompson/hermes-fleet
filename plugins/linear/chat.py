@@ -322,11 +322,12 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
         revision = bridge.store.binding_revision(issue_id)
         route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
         prior = bridge.store.outbox_row(route_id)
-        if not prior and hasattr(bridge, "chat_route_outlook") and bridge._chat_started(bridge.store.get(issue_id)):
-            # A person's routing change since the chat request wins, however many ticks ran since:
-            # asking again never re-adds a delegate someone removed.
-            outlook = bridge.chat_route_outlook(issue_id)
-            if outlook in ("removed", "changed"):
+        if not prior and hasattr(bridge, "chat_route_outlook"):
+            # Chat-started work: a person's routing change since the chat request wins, however many
+            # ticks ran since, and an unprovable history changes nothing. Asking again never
+            # re-adds a delegate someone removed.
+            outlook = bridge.chat_route_outlook(issue_id, issue)
+            if outlook in ("removed", "changed", "unprovable"):
                 return HELD[outlook]
         try:
             requester = _content_requester(bridge, issue_id, prior, *_linear_coordinates(context))
@@ -346,7 +347,8 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
 
 
 HELD = {"retry": "held: will retry automatically", "removed": "held: a person removed this agent as delegate",
-        "changed": "held: a person changed who works on this issue", "closed": "held: the issue is closed"}
+        "changed": "held: a person changed this issue's status, assignee or delegate",
+        "unprovable": "held: Linear's history couldn't be checked", "closed": "held: the issue is closed"}
 
 
 def _held(bridge: Any, issue_id: str, detail: str) -> str:
@@ -381,9 +383,11 @@ def _delegate_sentence(routing: str) -> str:
     if routing == HELD["removed"]:
         return "a person removed this agent as delegate in Linear, so it was not re-added"
     if routing == HELD["changed"]:
-        return ("a person changed who works on this issue in Linear after this request, so this agent was not "
-                "added as delegate")
-    return "Linear was not updated to show this agent as delegate, and nothing retries that now"
+        return ("a person changed this issue's status, assignee or delegate in Linear after this request, so "
+                "this agent was not added as delegate")
+    if routing == HELD["unprovable"]:
+        return "Linear's history couldn't be checked, so the delegate was not changed"
+    return "Linear was not updated to show this agent as delegate, and the agent can't confirm it will retry"
 
 
 def _entrust_message(result: dict) -> str:

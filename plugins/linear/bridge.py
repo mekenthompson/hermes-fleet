@@ -1602,21 +1602,23 @@ class Bridge:
             return False
         return True
 
-    def chat_route_outlook(self, issue_id: str) -> str:
+    def chat_route_outlook(self, issue_id: str, issue: dict | None = None) -> str:
         """After chat routing was not queued: what happens to the delegate of chat-started work.
 
         "retry" only when delegate recovery will retry it (its own conditions: chat-started
         binding, no recovery decision for this binding, no written or pending delegate, an open
         undelegated issue and no person changing routing since the request); "removed" when a
-        person removed this app as delegate; "changed" for another human routing change;
-        "closed"; else "unknown" (no promise is made).
+        person removed this app as delegate; "changed" for another human change of state,
+        assignee or delegate; "unprovable" when Linear history could not be read or checked to
+        the request; "closed"; else "unknown" (not chat-started work, or no promise is made).
+        issue: the version just read under the issue lock, saving a read.
         """
         try:
             row = self.store.get(issue_id)
             if (not self._chat_started(row) or row.get("owner_ref") or
                     (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
                 return "unknown"
-            issue = self._effect_issue(issue_id)
+            issue = issue or self._effect_issue(issue_id)
             if (issue.get("state") or {}).get("type") in CLOSED:
                 return "closed"
             if issue.get("delegate") is not None:
@@ -1624,14 +1626,20 @@ class Bridge:
             created = self.store.native_intent(f"create:{issue_id}") or {}
             since = float(created["payload"]["source_ms"])
             viewer = self.api.viewer_id()
-            nodes, complete = self._routing_scan(issue_id, lambda page: any(
-                iso_ms(node.get("createdAt")) <= since for node in page))
+            if iso_ms(issue.get("updatedAt")) <= since:
+                nodes, complete = [], True  # Nothing moved since the request: no history read.
+            else:
+                try:
+                    nodes, complete = self._routing_scan(issue_id, lambda page: any(
+                        iso_ms(node.get("createdAt")) <= since for node in page))
+                except LinearError:
+                    return "unprovable"
             human = [node for node in nodes if iso_ms(node.get("createdAt")) > since and self._routed(node)
                      and node.get("actorId") != viewer]
             if any((node.get("fromDelegate") or {}).get("id") == viewer and not node.get("toDelegate") for node in human):
                 return "removed"
             if not complete:
-                return "unknown"  # Unprovable: blame nobody.
+                return "unprovable"  # Blame nobody, and change nothing over it.
             if human:
                 return "changed"
             revision = self.store.binding_revision(issue_id)
@@ -1741,10 +1749,11 @@ class Bridge:
         key are shared with assignment, so our own delegation echo finds the same work. The
         asking chat gets a native notify subscription. With record_done, work already finished
         in chat is created parked and completed with its evidence; it is never runnable.
-        route_delegate(issue, task_status) queues Linear routing inside this issue's lock, before
-        admission, with the issue version read under that lock: no tick write can land between
-        that read and the queued delegate, and the status writes that follow from the work are
-        queued after it. Its result is returned as "routing".
+        route_delegate(issue, task_status) queues Linear routing inside this issue's lock, right
+        after admission (admission writes nothing to Linear), with the issue version read under
+        that lock: no tick write can land between that read and the queued delegate, and the
+        status writes that follow from the work are queued after it. Work that was not admitted
+        gets no delegate. Its result is returned as "routing".
         """
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
@@ -1878,15 +1887,22 @@ class Bridge:
             diag.evt("chat.entrust", "refused", "record_done_parked", iss=issue_id, task=task_id)
             raise LinearError("This issue is being recorded as already done from chat; repeat that request "
                               "to finish it. Nothing was started", retryable=False)
-        routing = route_delegate(issue, task.status) if route_delegate is not None else None
         if ours:
             self._assignment_activation(row)  # Idempotent: an applied admission is never repeated.
         task = adapter.require_task(task_id)
+        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
+        routing = None
+        if route_delegate is not None:
+            if ours and not activation.get("accepted"):
+                # Parked chat work, never admitted, is not shown as worked on: no delegate is queued.
+                self.store.drop_unsent_delegate(issue_id, task_id, at=self.clock())
+                routing = "held: not started"
+            else:
+                routing = route_delegate(issue, task.status)
         subscribed = bool(route) and task.status not in ("done", "archived")
         if subscribed:
             # After admission, so the chat hears checkpoints and the result, not our own unblock.
             adapter.subscribe_origin(task_id, route)
-        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
         admitted = bool(activation.get("accepted"))
         result = {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
                   "admitted": admitted, "chat_subscribed": subscribed}
@@ -2521,7 +2537,11 @@ class Bridge:
             return self._log_delegate(row, "admission_superseded", quiet=True)
         if task.status == "running" and claim is None:
             return self._log_delegate(row, "claim_unconsumed")  # Running without a readable claim yet; decide once it is consumed.
-        source = claim.created_at if claim is not None else getattr(task, "created_at", None)
+        if claim is None and superseded:
+            claims = [event.created_at for event in adapter.history(task.id, 0) if event.kind == "claimed"]
+            source = max(claims) if claims else getattr(task, "created_at", None)  # Resumed parked work: its latest claim.
+        else:
+            source = claim.created_at if claim is not None else getattr(task, "created_at", None)
         if source is None:
             return self._log_delegate(row, "no_human_fence")  # No provable fence for a human change: leave routing alone.
         if not self.store.effect_admitted(issue_id):

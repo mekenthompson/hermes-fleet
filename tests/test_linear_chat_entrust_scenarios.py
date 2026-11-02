@@ -640,11 +640,11 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.bridge.tick()
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
 
-    def test_recovered_admission_with_a_pending_delegate_still_yields_to_a_later_reassignment(self):
+    def test_recovered_admission_still_yields_to_a_later_reassignment(self):
         with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertEqual(self.delegate_rows(), ["pending"])  # queued before admission
+        self.assertEqual(self.delegate_rows(), [])  # routing follows admission
         task_id = self.bridge.store.get(ISSUE)["task_id"]
         later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
         self.authority.issues[ISSUE]["updatedAt"] = later
@@ -655,22 +655,55 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge._recover_admissions()
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertNotIn("unblocked", self.history(task_id))
-        # The parked task is not shown as worked on: its queued delegate never goes out.
-        self.assertEqual(self.delegate_rows(), ["failed"])
+        # The parked task is not shown as worked on: no delegate is queued.
+        self.assertEqual(self.delegate_rows(), [])
         for _ in range(4):
             self.bridge.tick()
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
         self.assertEqual(self.board.get(task_id).status, "blocked")
 
-    def test_superseded_chat_admission_drops_its_queued_delegate(self):
+    def test_superseded_chat_admission_queues_no_delegate_even_when_asked_again(self):
         self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
                                               activity_id="stop-1", actor=USER)
         reply = self.ask({"action": "work_on", "issue": ISSUE})
         self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
-        self.assertEqual(self.delegate_rows(), ["failed"])
+        self.assertEqual(reply["routing"], "held: not started")
         for _ in range(3):
             self.bridge.tick()
+        again = self.ask({"action": "work_on", "issue": ISSUE})  # after ticks moved the binding revision
+        self.assertEqual(again["routing"], "held: not started")
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.delegate_rows(), [])
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        self.assertEqual(self.board.get(reply["native"]["task_id"]).status, "blocked")
+
+    def test_work_that_cannot_start_safely_gets_no_delegate(self):
+        with patch.object(Kanban, "guarded_controls", False, create=True):
+            reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(reply["native"]["admitted"])
+        self.bridge.flush()
+        self.assertEqual(self.delegate_rows(), [])
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_a_status_only_change_is_not_described_as_reassignment(self):
+        self.ask({"action": "work_on", "issue": ISSUE})
+        self.bridge.flush()
+        self.undelegate_by_person(ISSUE)
+        node = self.authority.history[ISSUE][-1]
+        node.update(fromDelegate=None, toDelegate=None, fromStateId="state-todo", toStateId="state-progress")
+        self.authority.issues[ISSUE]["delegate"] = None
+        for _ in range(2):
+            self.bridge.tick()
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertIn("changed this issue's status, assignee or delegate", again["message"])
+        self.assertNotIn("who works on", again["message"])
+
+    def test_first_chat_route_costs_no_extra_linear_reads(self):
+        before = len(self.authority.requests)
+        self.ask({"action": "work_on", "issue": ISSUE})
+        reads = self.authority.requests[before:]
+        self.assertFalse(any("IssueRoutingHistory" in query for query in reads), reads)
 
     def test_asking_again_after_a_crash_and_a_reassignment_does_not_start_the_work(self):
         with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
@@ -687,7 +720,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertFalse(again["native"]["admitted"], again)
         self.assertTrue(again["message"].startswith("Not started:"), again["message"])
         self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertEqual(again["routing"], "held: a person changed who works on this issue")
+        self.assertEqual(again["routing"], "held: not started")
         self.assertEqual(self.delegate_rows(), [])  # no delegate is queued over the person's change
         for _ in range(3):
             self.bridge.tick()
