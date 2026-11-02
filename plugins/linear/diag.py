@@ -65,7 +65,7 @@ REASONS = frozenset({
     # delegate recovery / delegate write
     "session_owned", "agent_session_scope", "binding_mismatch", "already_decided", "not_running",
     "human_delegate", "human_edit", "moot_before_write", "binding_recovery", "already_delegate",
-    "task_finished", "claim_unconsumed", "no_human_fence",
+    "task_finished", "claim_unconsumed", "no_human_fence", "effect_unresolved",
     # outbox
     "rate_limited", "retryable_http", "non_retryable", "auth_unavailable", "scope_denied",
     "give_up_24h", "reconciliation_blocked", "uncertain_terminal", "uncertain_prior",
@@ -73,7 +73,7 @@ REASONS = frozenset({
     # webhook
     "activation_cutoff", "superseded", "scope_fenced", "scope_refused", "unbound_issue",
     "not_session_event", "stamp_missing", "invalid_payload", "native_routed", "bound_issue_recheck",
-    "delivery_failed", "no_issue_destination",
+    "delivery_failed", "no_issue_destination", "own_echo", "recheck_coalesced",
     # session / claim / handoff
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
@@ -82,7 +82,7 @@ REASONS = frozenset({
     "already_stopped", "block_failed", "unverified",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
-    "hourly_cap", "invalid_diagnostics", "internal_wording",
+    "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",
@@ -458,7 +458,7 @@ def outbox_failure(row: dict[str, Any], exc: BaseException, *, gave_up: bool | N
 # -- webhook ------------------------------------------------------------------
 
 _STALE = frozenset({"activation_cutoff", "superseded"})
-_IGNORED = frozenset({"scope_fenced", "unbound_issue", "not_session_event"})
+_IGNORED = frozenset({"scope_fenced", "unbound_issue", "not_session_event", "own_echo"})
 _REFUSED = frozenset({"stamp_missing", "scope_refused", "invalid_payload"})
 
 

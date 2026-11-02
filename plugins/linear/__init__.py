@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import logging
 import os
 import threading
@@ -10,10 +11,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from . import chat, ops
-from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
+from . import api as api_module, chat, ops
+from .api import ENDPOINT, LinearAPI, LinearError, RateLimited, backoff_delay
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
-from .oauth import token_provider
+from .oauth import ReauthorizationRequired, token_provider
 from .store import Store
 from . import diag
 
@@ -21,6 +22,12 @@ log = logging.getLogger(diag.LOGGER_NAME)
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
             "specialist_scope", "diagnostics")
+IDENTITY_TTL = 600.0  # seconds a verified credential->actor/workspace binding is reused for reads
+HISTORY_CURSOR_TTL = 600.0
+def rate_limit_path(state_database: Any, home: Path) -> Path:
+    """The one pause/budget file per profile. Every client of this profile's Linear app user
+    (reporting service, chat tools, skills, cron) must pass it so they share Linear's hourly budget."""
+    return Path(str(state_database or home / "linear" / "state.db") + ".rate-limit.json")
 class BoundLinearAPI(LinearAPI):
     """Bind credentials to an actor/workspace and, optionally, a bounded specialist scope."""
 
@@ -38,6 +45,8 @@ class BoundLinearAPI(LinearAPI):
         self.identity = {k: list(v) if isinstance(v, list) else v for k, v in identity.items()}
         self.specialist_scope = self._validate_specialist_scope(specialist_scope)
         self._graphql_permit = threading.local()
+        self._binding: tuple[str, float] | None = None  # (sha256 of a verified credential, verified until)
+        self._history_cursors: dict[tuple[str, str], float] = {}
         super().__init__(token, **kwargs)
     @classmethod
     def _validate_specialist_scope(cls, scope):
@@ -96,11 +105,33 @@ class BoundLinearAPI(LinearAPI):
                            requester_activity=(session_id, activity_id) if activity_id else None)
     def verify_identity(self):
         self._verified_credential(self.token)
-    def _verified_credential(self, provider):
+    def _credential_rejected(self):
+        self._binding = None
+    def _verified_credential(self, provider, *, mutation=False):
+        """Prove the credential belongs to the configured actor and workspace.
+
+        Reads reuse a proof for the same credential (keyed on its hash, never stored) for
+        IDENTITY_TTL; a new token, a 401 or the TTL forces a fresh check. Mutations always
+        re-check. Without this every read cost two requests and halved the hourly budget."""
+        prefetched = None
+        if not mutation and self._binding is not None:
+            try:
+                prefetched = provider()
+            except Exception as exc:  # noqa: BLE001 - credential providers may include secrets in errors
+                log.error("linear: credentials unavailable")
+                if isinstance(exc, ReauthorizationRequired):
+                    raise LinearError("Linear credentials unavailable") from exc
+                raise LinearError("Linear credentials unavailable") from None
+            digest, until = self._binding
+            if (hashlib.sha256(prefetched.encode()).hexdigest() == digest and self.clock() < until):
+                return provider, prefetched
         credential = None
         def capture():
-            nonlocal credential
-            credential = provider()
+            nonlocal credential, prefetched
+            if prefetched is not None:
+                credential, prefetched = prefetched, None
+            else:
+                credential = provider()
             return credential
         def invalidate():
             nonlocal provider
@@ -112,13 +143,16 @@ class BoundLinearAPI(LinearAPI):
         if any(not isinstance(identity.get(field), dict) or
                identity[field].get("id") != self.identity[expected]
                for field, expected in (("viewer", "viewer_id"), ("organization", "organization_id"))):
+            self._binding = None
             raise LinearError("Linear actor/workspace does not match configured identity", retryable=False)
+        if isinstance(credential, str):
+            self._binding = (hashlib.sha256(credential.encode()).hexdigest(), self.clock() + IDENTITY_TTL)
         return provider, credential
     def graphql(self, query, variables=None):
         if self.specialist_scope is not None and not getattr(self._graphql_permit, "depth", 0):
             raise LinearError("Arbitrary Linear GraphQL is disabled by specialist_scope", retryable=False)
         def verify(provider):
-            result = self._verified_credential(provider)
+            result = self._verified_credential(provider, mutation=query.lstrip().startswith("mutation"))
             if (query.lstrip().startswith("mutation") and self.specialist_scope is not None and
                     self.specialist_scope.get("requester_basis") == "agent_session"):
                 targets = getattr(self._graphql_permit, "issue_targets", ())
@@ -188,10 +222,20 @@ class BoundLinearAPI(LinearAPI):
         self._check_issue(issue)
         return issue
     def routing_history(self, issue_id, limit=50, after=None):
-        """Issue routing history page, scoped like any issue read."""
+        """Issue routing history page, scoped like any issue read. A later page whose cursor came from
+        a scoped page of the same issue moments ago asks only for history, not the full issue again."""
+        now = self.clock()
+        self._history_cursors = {key: at for key, at in self._history_cursors.items() if now - at < HISTORY_CURSOR_TTL}
+        lean = after is not None and (issue_id, after) in self._history_cursors
         with self._permit_specialist_operation():
-            issue, nodes, cursor = super()._routing_history(issue_id, limit, after)
-        self._scoped(issue, issue_id)
+            issue, nodes, cursor = super()._routing_history(
+                issue_id, max(limit, api_module.LEAN_HISTORY_PAGE) if lean else limit, after, lean=lean)
+        if not lean:
+            self._scoped(issue, issue_id)
+        elif not isinstance(issue, dict) or issue.get("id") != issue_id:
+            raise LinearError("Linear issue resolution does not match the requested ref")
+        if cursor is not None:
+            self._history_cursors[(issue_id, cursor)] = now
         return nodes, cursor
     def delegated_started_issues(self, delegate_id, *, after=None, limit=50):
         """Listing only; every issue is re-read through issue() (scoped) before any effect."""
@@ -393,9 +437,10 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
     validate_ingress_profile(settings.get("ingress_profile"))
     api = BoundLinearAPI(lambda: "", identity=settings.get("identity"),
                          specialist_scope=settings.get("specialist_scope"),
-                         rate_limit_path=Path(str(settings.get("state_database") or home / "linear" / "state.db") + ".rate-limit.json"),
+                         rate_limit_path=rate_limit_path(settings.get("state_database"), home),
                          endpoint=settings.get("api_url") or ENDPOINT)
     api.token = token_provider(settings, home)
+    failures = 0
     while not stop_requested.is_set():
         try:
             await asyncio.to_thread(api.viewer_id)
@@ -407,8 +452,15 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
         except LinearError as exc:
             if not exc.retryable:
                 raise
-            diag.warn("service.start", "retry", "identity_unavailable")
-            retry_until = time.monotonic() + max(1.0, float(settings.get("tick_seconds", 2)))
+            failures += 1
+            # Capped exponential backoff with jitter: a revoked app or a Linear outage must not
+            # spend the hourly budget (or hammer the token endpoint) every couple of seconds.
+            reauthorize = isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired)
+            delay = backoff_delay(failures + (8 if reauthorize else 0),
+                                  base=max(1.0, float(settings.get("tick_seconds", 2))), cap=300.0)
+            diag.warn("service.start", "retry", "auth_unavailable" if reauthorize else "identity_unavailable",
+                      next_s=delay, attempt=failures)
+            retry_until = time.monotonic() + delay
             while not stop_requested.is_set() and time.monotonic() < retry_until:
                 await asyncio.sleep(min(0.25, max(0.01, retry_until - time.monotonic())))
     if stop_requested.is_set():
@@ -445,8 +497,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                 if not recovered:
                     await asyncio.to_thread(bridge.recover, ingress)
                     recovered = True
-                await asyncio.to_thread(bridge.tick, ingress)
-                await asyncio.to_thread(bridge.flush)
+                await asyncio.to_thread(bridge.tick, ingress)  # tick ends with its own flush
             except Exception as exc:  # one bad remote delivery must not stop native execution
                 diag.evt("service.tick", "failed", "tick_exception", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
             wake_wait = asyncio.create_task(running["wake"].wait())
