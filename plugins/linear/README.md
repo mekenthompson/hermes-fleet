@@ -86,7 +86,9 @@ The agent finalizes the full native task scope before tracking and admitting cha
 work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
 (the default); use `progress` for preparation, a hold, or another internal stage. The agent
 manages this distinction without asking the user to maintain task IDs or activate reporting.
-Linear assignment creates and admits a fully populated outcome task automatically.
+An automatic (creator-null) Linear assignment creates and admits a fully populated outcome
+task automatically. A human delegation or @mention opens a native conversation instead (see
+Native Agent Session conversations below).
 Tracking an unfinished native task on an undelegated issue queues the current app as
 Linear delegate through the existing guarded outbox. The next reporting pass projects
 the native active state. A different current delegate or newer issue edit holds routing
@@ -374,6 +376,15 @@ and replies. It uses the existing profile inbox and scoped outbox. Current reque
 can inspect stopped, scheduled or completed work and decide the authorized next
 action; a status request creates no task. The model uses native Kanban controls and
 the work-tracking skill for durable work and handoff.
+
+A new human session gets one immediate `thought` activity before the model turn, so
+Linear shows a response within seconds. Its outbox id is derived from the session, so a
+redelivered webhook never posts it twice, and a failed post never holds the input. An
+@mention reaches the agent as the comment text itself, marked as a mention to answer
+rather than a work request; a delegation is framed as delegated work. Each conversation
+turn also carries the current linked native task and its status (or that none is
+linked), so continuing existing work with `linear followup` does not rely on the skill
+alone.
 
 Enable it through native platform configuration and the real permitted Linear user
 IDs, with an explicit per-profile toolset:
