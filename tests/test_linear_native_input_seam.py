@@ -355,7 +355,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.provider.mutations), 1)
         self.assertEqual(self.rows(), [])
 
-    async def test_rejected_task_stop_remains_pending_and_old_retry_cannot_stop_new_run(self):
+    async def test_rejected_task_stop_is_retried_and_stops_work_claimed_after_the_click(self):
         from hermes_cli import kanban_db as kb
         task_id = self.fixture_task()
         with self.board.conn() as conn:
@@ -373,18 +373,20 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             conn.execute("DROP TRIGGER fixture_refuse_stop")
             newer = kb.claim_task(conn, task_id)
         self.assertIsNotNone(newer)
-        event_id = self.board.history(task_id, 0)[-1].id
         await self.deliver_raw("rejected-stop-redelivery", event)
         for _ in range(3):
             await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
             await asyncio.sleep(0.02)
         await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
-        self.assertEqual(self.board.get(task_id).status, "running")
-        self.assertEqual(self.board.get(task_id).current_run_id, newer.current_run_id)
-        self.assertEqual(self.board.history(task_id, 0)[-1].id, event_id)
+        # The dispatcher claiming the work after the click is not a newer human
+        # decision, and one refused attempt does not freeze the Stop: the retry
+        # stops the run that started in between, from the same Stop request.
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.board.history(task_id, 0)[-1].run_id, newer.current_run_id)
+        self.assertEqual(self.bridge.store.native_intent(key)["state"], "applied")
         self.assertEqual(self.bridge.store.native_intent(key)["payload"], original["payload"])
-        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "pending")
-        self.assertEqual(self.inbox_row("rejected-stop-redelivery")[2], "pending")
+        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "imported")
+        self.assertEqual(self.inbox_row("rejected-stop-redelivery")[2], "imported")
 
     async def test_lost_task_stop_response_reconciles_original_receipt_without_stopping_resumed_run(self):
         from hermes_cli import kanban_db as kb

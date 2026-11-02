@@ -44,6 +44,8 @@ def ingress_due(gap: int) -> str:
     more after a day so it parks loudly. One bad event cannot flood logs and quota or hold newer ones back."""
     return ("(attempts <= 0 OR received_at + MIN(86401, %d * attempts, CASE WHEN attempts > 7 THEN 635 + "
             "(attempts - 7) * 900 ELSE 5 * ((1 << attempts) - 1) END) <= ?)" % gap)
+# Only an explicit human resume or a finish after a Stop click supersedes it.
+STOP_SUPERSEDERS = ("unblocked", "completed", "archived")
 OWN = "linear:"  # reason prefix on blocks this plugin makes, so their events are not echoed back
 def stable_uuid4(*parts: str) -> str:
     """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
@@ -660,6 +662,44 @@ class Kanban:
                 require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input",
                                       expected_run_id=run_id, expected_event_id=expected_event_id)
+
+    def stop_started(self, task_id: str, reason: str, *, after: float) -> list[str]:
+        """Apply the same native Stop to unfinished tasks this task started, transitively.
+
+        Native create records ``creator_task_id`` on the task's ``created`` event;
+        Core has no Stop-descendants call, so each one gets the ordinary guarded
+        ``block_task``. Idempotent: a task already carrying this Stop, or one a
+        human explicitly resumed or finished after ``after``, is left alone.
+        Only this board is visible; tasks started on another board are not.
+        """
+        stopped, seen, pending = [], {task_id}, [task_id]
+        while pending:
+            creator = pending.pop(0)
+            with self.read_conn() as conn:
+                children = []
+                for row in conn.execute("SELECT task_id, payload FROM task_events WHERE kind='created'"):
+                    try:
+                        payload = json.loads(row["payload"] or "null")
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(payload, dict) and payload.get("creator_task_id") == creator and row["task_id"] not in seen:
+                        children.append(row["task_id"])
+            for child in children:
+                seen.add(child)
+                pending.append(child)
+                for _ in range(3):
+                    events, task = self.history(child, 0), self.get(child)
+                    if (task is None or task.status in ("blocked", "triage", "done", "archived") or
+                            any((event.payload or {}).get("reason") == reason or
+                                (event.kind in STOP_SUPERSEDERS and event.created_at > after) for event in events)):
+                        break
+                    with self.conn() as conn:
+                        if self.kb.block_task(conn, child, reason=reason, kind="needs_input",
+                                              expected_run_id=task.current_run_id if task.status == "running" else None,
+                                              expected_event_id=events[-1].id if events else None):
+                            stopped.append(child)
+                            break
+        return stopped
 
     def comment(self, task_id: str, body: str, *, marker: str = "", issue: dict | None = None) -> int:
         # The integration author is provenance, never a human credential.
@@ -1897,32 +1937,34 @@ class Bridge:
         return stopped
 
     def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> bool:
+        """Apply one Linear Stop to its native task and the tasks that task started.
+
+        Only an explicit human resume or completion after the click supersedes
+        it; the dispatcher claiming or starting the work does not. An unverified
+        attempt is retried on redelivery from the latest native event, never
+        frozen: the guarded block still refuses to act on a changed history.
+        """
         issue_id = row["issue_id"]
         key = f"stop:{issue_id}:{activity_id}"
         prior = self.store.native_intent(key)
-        if prior and prior.get("state") == "applied":
+        if prior and (prior.get("state") == "applied" or prior.get("superseded") is True):
             return True
         reason = f"{OWN} stopped by {who} [{activity_id}]"
         if prior:
-            if prior.get("superseded") is True:
-                return True
-            if (prior["payload"].get("task_id") == task.id and
-                    prior["payload"].get("profile") == adapter.executor_profile and
-                    prior["payload"].get("board") == (adapter.board or "default")) and any(
-                    event.kind in ("blocked", "block_loop_detected") and
-                    (event.payload or {}).get("reason") == reason for event in adapter.history(task.id, 0)):
-                self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
-                return True  # Exact native response-loss receipt, never a repeated Stop.
-            return False
-        events = adapter.history(task.id, 0)
-        task = adapter.require_task(task.id)
-        payload = {"kind": "stop", "issue_id": issue_id, "task_id": task.id, "stamp": stamp,
-                   "control": "native-event-guard-v1", "profile": adapter.executor_profile,
-                   "board": adapter.board or "default", "expected_event_id": events[-1].id if events else None,
-                   "run_id": task.current_run_id}
-        _, first = self.store.native_intent_prepare(key, payload)
-        if not first:
-            return False  # Another observer prepared this exact request; never capture a new generation.
+            if (prior["payload"].get("task_id") != task.id or
+                    prior["payload"].get("profile") != adapter.executor_profile or
+                    prior["payload"].get("board") != (adapter.board or "default")):
+                return False  # The binding moved since this Stop; never stop other work.
+        else:
+            events = adapter.history(task.id, 0)
+            task = adapter.require_task(task.id)
+            payload = {"kind": "stop", "issue_id": issue_id, "task_id": task.id, "stamp": stamp,
+                       "control": "native-event-guard-v1", "profile": adapter.executor_profile,
+                       "board": adapter.board or "default", "expected_event_id": events[-1].id if events else None,
+                       "run_id": task.current_run_id}
+            _, first = self.store.native_intent_prepare(key, payload)
+            if not first:
+                return False  # Another observer is sending this exact request.
         stopped = False
         for _ in range(4):
             events = adapter.history(task.id, 0)
@@ -1931,8 +1973,8 @@ class Bridge:
                    (event.payload or {}).get("reason") == reason for event in events):
                 # This request's native record is also its response-loss receipt.
                 # A later explicit resume stays authoritative; do not repeat Stop.
-                self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
-                return True
+                stopped = True
+                break
             try:
                 require_task_issue_scope(task, self._effect_issue(issue_id))
             except RateLimited:
@@ -1944,9 +1986,9 @@ class Bridge:
             if task.status in ("done", "archived", "triage"):
                 stopped = True
                 break
-            controls = [event for event in events if event.kind in (
-                "claimed", "spawned", "unblocked", "blocked", "completed", "archived",
-                "review_requested", "changes_requested")]
+            # The dispatcher claiming/starting work and the worker's own
+            # transitions are not a human decision about this Stop.
+            controls = [event for event in events if event.kind in STOP_SUPERSEDERS]
             # For initial admission, the signed Stop is causally newer than its
             # assignment even when native second-resolution timestamps coincide.
             # A subsequent explicit native control removes that inference.
@@ -1955,29 +1997,37 @@ class Bridge:
                 superseded = any(stamp / 1000 < event.created_at for event in controls)
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable",
                                                      "superseded": superseded})
-                self._decline(issue_id, session_id, STALE_STOP)
+                self._decline(issue_id, session_id, "Not stopped: someone resumed or finished this work after Stop was pressed." if superseded else
+                              "Stop was not applied: the work was resumed or finished at the same moment, so the order is unclear. Press Stop again if it should stop.")
                 return superseded
             if not events:
                 break
             try:
-                stopped = adapter.stop(task.id, reason, expected_event_id=payload["expected_event_id"],
-                                       run_id=payload["run_id"], issue=self._effect_issue(issue_id))
+                # Guarded by the event just inspected: any later change makes
+                # this a no-op and the loop re-reads it.
+                stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
+                                       run_id=task.current_run_id, issue=self._effect_issue(issue_id))
             except RateLimited:
                 raise
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
-                self._decline(issue_id, session_id, UNCONFIRMED_STOP)
-                return False
+                if prior is None:
+                    self._decline(issue_id, session_id, "Stop is not confirmed yet; it will be retried.")
+                return False  # Delivery stays pending; redelivery retries this Stop.
             except Exception as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
-                self._decline(issue_id, session_id, UNCONFIRMED_STOP)
                 raise
             if stopped:
                 break
-        self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "stopped": stopped})
-        self._decline(issue_id, session_id, STOPPED_NOTICE if stopped else
-                      "The work changed while it was being stopped, so the Stop couldn't be confirmed. An operator needs to check the task on the agent's board.")
-        return stopped
+        if not stopped:
+            self.store.native_intent_settle(key, {"state": "reconcile", "stopped": False})
+            self._decline(issue_id, session_id, "Stop is not confirmed yet: the work kept changing. It will be retried.")
+            return False
+        started = adapter.stop_started(task.id, reason, after=stamp / 1000)
+        self.store.native_intent_settle(key, {"state": "applied", "stopped": True, "started_stopped": started})
+        extra = f" Also stopped {len(started)} task(s) it had started." if started else ""
+        self._decline(issue_id, session_id, STOPPED_NOTICE + extra)
+        return True
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
