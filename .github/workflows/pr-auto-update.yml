@@ -1,0 +1,75 @@
+name: PR auto-update
+
+# main requires PRs to be up to date before merging (strict), so an auto-merge
+# PR stalls as soon as main moves until someone clicks "Update branch". After
+# every push to main (and on a short schedule as a fallback) this merges main
+# into each open, same-repository PR that has auto-merge armed and is BEHIND.
+# The update uses the hermes-release-bot App token: a branch update pushed with
+# GITHUB_TOKEN would not trigger the PR's CI, so auto-merge would never fire.
+# It never force-pushes (the update-branch API only adds a merge commit, bound
+# to the head SHA we saw), never touches fork PRs, and skips conflicting PRs.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # One sweep at a time; a queued sweep supersedes an older queued one.
+  group: pr-auto-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update auto-merge PRs that are behind main
+    if: github.repository == 'mekenthompson/hermes-fleet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Mint a release bot token scoped to hermes-fleet
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: mekenthompson
+          repositories: hermes-fleet
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Update behind auto-merge PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prs="$(gh pr list -R "$REPO" --state open --base main --limit 100 \
+            --json number,isCrossRepository,isDraft,autoMergeRequest,mergeStateStatus,mergeable,headRefOid \
+            --jq '.[] | select(.autoMergeRequest != null and (.isCrossRepository | not) and (.isDraft | not))
+                  | [.number, .mergeStateStatus, .mergeable, .headRefOid] | @tsv')"
+          if [ -z "$prs" ]; then
+            echo "No open same-repository auto-merge PRs."
+            exit 0
+          fi
+          while IFS=$'\t' read -r number state mergeable head; do
+            if [ "$mergeable" = "CONFLICTING" ] || [ "$state" = "DIRTY" ]; then
+              echo "::warning title=PR auto-update skipped::#$number conflicts with main; resolve it by hand."
+              continue
+            fi
+            if [ "$state" != "BEHIND" ]; then
+              echo "#$number is $state; nothing to do."
+              continue
+            fi
+            # Default update method is a merge of main into the head; never a rebase or force.
+            if gh api -X PUT "repos/$REPO/pulls/$number/update-branch" \
+                -f expected_head_sha="$head" >/dev/null; then
+              echo "#$number updated with main."
+            else
+              echo "::warning title=PR auto-update failed::#$number could not be updated (it may need the workflows permission, or its head moved); it will be retried on the next sweep."
+            fi
+          done <<< "$prs"
