@@ -44,13 +44,21 @@ SCHEMA = {
         "its original requester is unknown and it grants no permission. "
         "create_issue, create_project, link_issue, update_description and add_comment work without "
         "a task link or chat claim. Description replacement requires the exact expected_description. "
+        "Questions, status checks and short commands need no issue: just answer in the conversation. "
+        "When the user asks you to do a longer outcome, create_issue with start_work=true (or work_on for an existing issue): "
+        "one native task starts on this agent's board, this app becomes the Linear delegate (the human assignee is kept), "
+        "Linear status follows the work, and checkpoints and the result come back to this chat. "
+        "The task's worker does the work; do not also do it in this chat. Leave start_work false for a note or "
+        "an issue someone else will pick up. Repeating work_on or start_work never starts a second task. "
+        "For work you already finished in this chat, use record_done=true with summary and evidence links: "
+        "the issue is linked and closed with that evidence and nothing runs again. "
         "Reuse the same UUID id and content after a lost mutation response. "
         "Write for the human reading Linear: lead with current outcome/status, remaining work and next action. "
         "Use actual newlines, short headings, bullets and acceptance checklists where useful, not a long single paragraph. "
         "Short one-sentence updates are fine. Setup or monitoring verified is not an unresolved outcome completed. "
         "Formatting tips are advisory: preserve authored content, code and links; never silently rewrite it."),
     "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
+        "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "work_on", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
         "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123; mutations require the exact identifier or id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile; an undelegated issue queues this app as Linear delegate."},
         "completion_scope": {"type": "string", "enum": ["outcome", "progress"], "description": "track: outcome (default) can complete the agreed issue; progress reports an internal stage without closing it. Choose after inspecting acceptance; no execution grant."},
@@ -65,6 +73,10 @@ SCHEMA = {
         "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
         "project": {"type": "string", "description": "create_issue: project id or exact project name. Required unless parent has a project, which is then used. If unsure, omit it: the reply lists the team's active projects; pick the one that fits the work and retry. Use \"none\" only when the work fits no project. Never ask the user for project ids."},
+        "start_work": {"type": "boolean", "description": "create_issue: true when the user asked for a longer outcome to be carried out now; starts one native task, delegates the issue to this app and reports back to this chat. false (default) for a quick note or someone else's issue. work_on always starts."},
+        "record_done": {"type": "boolean", "description": "create_issue or work_on: link and close work already finished in this chat; requires summary. Nothing is started or re-run."},
+        "summary": {"type": "string", "description": "record_done: what was delivered and what remains, for the closing Linear summary."},
+        "evidence": {"type": "array", "items": {"type": "string"}, "description": "record_done: evidence links such as the PR, merged commit, deploy check or findings."},
         "parent": {"type": "string"}, "related": {"type": "string"},
         "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"]},
         "body": {"type": "string", "description": "Human-readable comment or instruction; never an execution grant. Lead with verified progress, remaining work and next action. Use Linear Markdown and actual newlines for longer updates; a short sentence needs no empty headings. Preserve code and links."},
@@ -250,19 +262,127 @@ def _issue_project(bridge: Any, team: str, project: str, parent: str | None) -> 
                         "do not ask the user for ids.", code="project_required", projects=active)
 
 
-def _plan(bridge: Any, args: dict, action: str) -> str:
+def _entrust_request(args: dict, action: str, context: Any) -> tuple[bool, dict | None]:
+    """Validate start_work/record_done before any write: (start, record_done)."""
+    start, done = args.get("start_work", action == "work_on"), args.get("record_done", False)
+    if type(start) is not bool or type(done) is not bool:
+        raise ValueError("start_work and record_done must be booleans.")
+    if done:
+        summary, evidence = _text(args, "summary"), args.get("evidence", [])
+        if not summary:
+            raise ValueError("record_done needs a summary of what was delivered.")
+        if not isinstance(evidence, list) or any(not isinstance(item, str) or not item.strip() for item in evidence):
+            raise ValueError("evidence must be a list of links or short evidence strings.")
+        if args.get("start_work") is True:
+            raise ValueError("Use record_done for finished work or start_work for new work, not both.")
+        record = {"summary": summary, "evidence": [item.strip() for item in evidence]}
+    else:
+        record = None
+    if (start or done) and context.delegated_child:
+        raise LinearError("Native delegated children cannot start work; return the request to the parent agent.")
+    return bool(start or done), record
+
+
+def _origin_route(context: Any) -> dict | None:
+    """The asking chat as a native notify subscription, as core's kanban_create auto-subscribe builds it."""
+    platform, chat_id = context.platform, context.chat_id
+    if platform == "linear":
+        return None  # Linear-origin conversations already report on their issue.
+    if not platform or not chat_id:
+        if not context.session_key:
+            return None
+        platform, chat_id = "tui", context.session_key
+    metadata = {key: value for key, value in (("thread_id", context.thread_id), ("chat_type", context.chat_type),
+                                              ("scope_id", context.scope_id)) if value}
+    if platform == "telegram" and context.thread_id and context.chat_type.lower() in {"dm", "direct", "private"}:
+        metadata["telegram_dm_topic_reply_fallback"] = True
+        if context.thread_id not in {"", "1"}:
+            metadata["direct_messages_topic_id"] = context.thread_id
+        if context.message_id:
+            metadata["telegram_reply_to_message_id"] = context.message_id
+    # Wake: the woken chat agent's reply is the single update in that chat (core #110068 notes).
+    return {"platform": platform, "chat_id": chat_id, "thread_id": context.thread_id or None,
+            "chat_type": context.chat_type or None, "user_id": context.user_id or None,
+            "user_id_alt": context.user_id_alt or None, "notifier_profile": context.profile,
+            "delivery_mode": "wake" if platform != "tui" else None, "delivery_metadata": metadata or None}
+
+
+def _linear_coordinates(context: Any) -> tuple[str | None, str | None]:
+    if context.platform != "linear":
+        return None, None
+    return context.thread_id, (context.message_id if context.message_id != context.thread_id else None)
+
+
+def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, recorded_done: bool = False) -> str:
+    """Queue this app as Linear delegate for undelegated linked work; never touches the assignee."""
+    issue_id = issue["id"]
+    routing = "already_delegated" if (issue.get("delegate") or {}).get("id") == bridge.api.viewer_id() else "held"
+    if (not context.delegated_child and issue.get("delegate") is None
+            and (recorded_done or native["status"] not in ("done", "archived"))):
+        revision = bridge.store.binding_revision(issue_id)
+        route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
+        prior = bridge.store.outbox_row(route_id)
+        try:
+            requester = _content_requester(bridge, issue_id, prior, *_linear_coordinates(context))
+            bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
+                expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
+                expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester,
+                **({"recorded_done": True} if recorded_done else {}))
+            routing = "queued"
+        except (LinearError, ValueError) as exc:
+            routing = f"held: {exc}"
+    return routing
+
+
+def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any) -> dict:
+    if context.pinned_db_path:
+        _, path = transport.native_board_target(bridge.kanban.board or "default")
+        if path != context.pinned_db_path:
+            raise LinearError("New work starts on this agent's creation board, outside the caller's native board pin.")
+    native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record)
+    return {"native": native, "routing": _route_to_self(bridge, issue, native, context, recorded_done=bool(record))}
+
+
+def _entrust_message(result: dict) -> str:
+    native = result["native"]
+    if native.get("recorded_done"):
+        return ("Linked the finished work and recorded it as done; the issue closes with this summary "
+                "once its evidence is verified. Nothing was started or re-run.")
+    if native["status"] in ("done", "archived"):
+        return "This issue's work has already finished, so nothing new was started."
+    if native.get("not_started_reason"):
+        return (f"Not started: {native['not_started_reason']}. The task is linked to the issue but parked, "
+                "and nothing is doing this work yet; an operator should check it before it is retried.")
+    if not native.get("created_from_chat"):
+        return ("This issue already has work on this agent's board, so nothing new was started; "
+                "its updates now also come back to this chat.")
+    return ("One native task now carries out this work: its worker does it, Linear shows this agent as "
+            "delegate and follows the status, and checkpoints and the result come back to this chat. "
+            "Do not also do this work here.")
+
+
+def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
     if action == "create_issue":
         client_id, title, team = _uuid(args.get("id")), _text(args, "title"), _text(args, "team")
         if not title or not team:
             raise ValueError("create_issue needs title and team.")
         parent = _text(args, "parent") or None
+        entrust, record = _entrust_request(args, action, context)
         project_id, refusal = _issue_project(bridge, team, _text(args, "project"), parent)
         if refusal:
             return refusal
         created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
                                           project_id=project_id, parent_id=parent)
-        return _reply(True, "Created an undelegated issue." + _stored_differently(created)
-                      + _formatting_tip(args.get("description")), issue=created)
+        if not entrust:
+            return _reply(True, "Created an undelegated issue." + _stored_differently(created)
+                          + _formatting_tip(args.get("description")), issue=created)
+        if not bridge.authorize_specialist_effect(created["id"]):
+            return _reply(False, "Created the issue, but specialist authorization is fenced, so no work was started.",
+                          code="authorization_unavailable", issue=created)
+        # The readback carries no issue version; routing needs the current one.
+        result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
+        return _reply(not result["native"].get("not_started_reason"), "Created the issue. " + _entrust_message(result) + _stored_differently(created)
+                      + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
         if not name or not team:
@@ -303,7 +423,7 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         return _reply(False, "Use track/status for native reporting or a supported content action.", code="unsupported_action")
     try:
         if action in {"create_issue", "create_project", "link_issue"}:
-            return _plan(bridge, args, action)
+            return _plan(bridge, args, action, context)
         ref = _text(args, "issue")
         if not ref:
             raise ValueError(f"{action} needs an issue identifier.")
@@ -334,6 +454,11 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
         if action in {"track", "followup", "delegate_self"}:
             _check_native_route(bridge, action, issue_id, context)
+        if action == "work_on":
+            _, record = _entrust_request(args, action, context)
+            result = _entrust(bridge, issue, record, context)
+            return _reply(not result["native"].get("not_started_reason"), _entrust_message(result), issue={"id": issue_id, "identifier": issue.get("identifier"),
+                                                                 "url": issue.get("url")}, **result)
         if action == "delegate_self":
             if context.delegated_child:
                 return _reply(False, "Return routing changes to the parent agent.", code="native_scope_refused")
@@ -367,21 +492,7 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
                 completion_scope=args.get("completion_scope", "outcome"),
                 reconcile_complete=args.get("reconcile_complete", False),
                 request_id=_uuid(args.get("id")) if replace else None)
-            routing = "already_delegated" if (issue.get("delegate") or {}).get("id") == bridge.api.viewer_id() else "held"
-            if not context.delegated_child and issue.get("delegate") is None and native["status"] not in ("done", "archived"):
-                revision = bridge.store.binding_revision(issue_id)
-                route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
-                prior = bridge.store.outbox_row(route_id)
-                try:
-                    requester = _content_requester(bridge, issue_id, prior,
-                        context.thread_id if context.platform == "linear" else None,
-                        context.message_id if context.platform == "linear" and context.message_id != context.thread_id else None)
-                    bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
-                        expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
-                        expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester)
-                    routing = "queued"
-                except (LinearError, ValueError) as exc:
-                    routing = f"held: {exc}"
+            routing = _route_to_self(bridge, issue, native, context)
             return _reply(True, "Existing native task linked for reporting; execution state was not changed.",
                           native=native, routing=routing)
         if action == "followup":

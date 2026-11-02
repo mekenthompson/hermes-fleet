@@ -17,8 +17,11 @@ review. Actual handoff and client journeys still need their separate acceptance 
 The mechanisms below describe implementation and compatibility limits, not passed live UAT.
 
 Ordinary conversation, short commands and status questions require no Linear issue. When
-work needs durability, use one native task and optionally link its human outcome with
-`linear track`. An authenticated conversation can discuss or follow that task from another
+a chat asks for a longer outcome, `linear create_issue` with `start_work` (or `work_on` for an
+existing issue) starts one native task through the guarded admission an assignment uses,
+queues this app as delegate and subscribes the asking chat to native notifications; work
+already finished in chat is closed with `record_done` and its evidence without running.
+An existing native task can still be linked with `linear track`. An authenticated conversation can discuss or follow that task from another
 surface without moving its executor or returning to an old chat.
 
 | Before | After |
