@@ -367,7 +367,7 @@ class GuardedAdmissionScenarios(unittest.TestCase):
             self.assign()
         def notices():
             return [row for row in self.store.pending() if
-                    (row["payload"].get("content") or {}).get("body", "").startswith("Native work changed after creation;")]
+                    (row["payload"].get("content") or {}).get("body", "").startswith("The task changed right after it was created")]
         before = len(notices())
         self.fixture.make_bridge().recover()
         self.fixture.make_bridge().recover()

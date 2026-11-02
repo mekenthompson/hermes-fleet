@@ -26,6 +26,7 @@ class ProjectUpdateDeferred(Exception):
 class NativeProgressSuperseded(Exception):
     """Native work entered a wait, halt or terminal state before transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
+HISTORY_PAGES = 10  # IssueHistory pages (50 entries each) read before a routing answer counts as unprovable
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
 STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
@@ -221,18 +222,37 @@ def _public(text: str) -> str:
     """Refusal text may quote a receipt detail, never a token that leaked into one."""
     return _SECRET.sub("[redacted]", text)
 # Only real local paths: file:// URLs, ~/ and ./ or ../ paths, Windows drive paths and
-# absolute paths with at least two segments (/opt/data/x). Ordinary word/word text such
-# as CI/CD, and/or or read/write, URLs and single-segment slash commands stay as written.
+# absolute paths with at least two segments (/opt/data/x) that start at a filesystem root
+# or end in a file name. Ordinary word/word text such as CI/CD, and/or or read/write, URLs,
+# API routes (/api/v1/x) and single-segment slash commands stay as written.
 _LOCAL_PATH = re.compile(r"(?<![\w.~/:-])(?:file://[^\s)\]>`\"']+|~/[^\s)\]>`\"',;]+|\.\.?/[^\s)\]>`\"',;]+"
                          r"|[A-Za-z]:\\[^\s)\]>`\"',;]+|/[\w.@+-]+(?:/[\w.@+-]+)+/?)")
+_FS_ROOTS = frozenset("app bin boot data dev etc home lib lib64 media mnt nix opt private proc root run sbin snap "
+                      "srv sys tmp usr var workspace Applications Library System Users Volumes".split())
 def _mask_path(match: re.Match) -> str:
     path = match.group(0)
+    if path.startswith("/") and not path.startswith("//"):
+        segments = path.rstrip(".:!?/").split("/")
+        if segments[1] not in _FS_ROOTS and not re.search(r"\.[A-Za-z][A-Za-z0-9]{0,7}$", segments[-1]):
+            return path  # An API route or URL path, not a file on the agent's machine.
     tail = len(path) - len(path.rstrip(".:!?"))
     return "[local artifact]" + (path[-tail:] if tail else "")
+def _open_fence(text: str) -> bool:
+    return sum(1 for line in text.split("\n") if re.match(r" {0,3}```", line)) % 2 == 1
 def _trim_readable(text: str, limit: int) -> str:
-    """Cut at a paragraph, sentence or word boundary, never inside a word."""
+    """Cut at a paragraph, sentence or word boundary, never inside a word or with a code fence left open."""
     if len(text) <= limit:
         return text
+    cut = _trim_at_boundary(text, limit)
+    if _open_fence(cut):
+        before = cut[:max(m.start() for m in re.finditer(r"(?m)^ {0,3}```", cut))].rstrip()
+        if len(before) >= limit // 3:
+            return before  # End before the code block rather than show half of it.
+        cut = _trim_at_boundary(text, max(limit - 5, 1))
+        if _open_fence(cut):
+            cut = cut.rstrip() + "\n```"
+    return cut
+def _trim_at_boundary(text: str, limit: int) -> str:
     window = text[:limit + 1]
     for boundary in (r"\n[ \t]*\n", r"(?<=[.!?])[\"')\]*_`]*\s", r"\n"):
         cut = max((m.start() for m in re.finditer(boundary, window) if m.start() >= limit // 3), default=0)
@@ -252,6 +272,53 @@ def _project_summary(text: str, limit: int = 300, *, one_line: bool = False) -> 
 def _sentence(text: str) -> str:
     text = text.rstrip()
     return text if text.endswith((".", "!", "?", "`", ")")) else text + "."
+_EVIDENCE_HEADING = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]*|[*_]{1,2})?evidence\b")
+def _done_body(summary: str, evidence: list[str]) -> str:
+    """The closing note: "Done." then the worker's summary, then any proof links it did not already show."""
+    missing = [link for link in dict.fromkeys(evidence) if link not in summary]
+    body = "Done."
+    if summary:
+        body += ("\n\n" if "\n" in summary or summary.lstrip()[:1] in "*#-_`>|" else " ") + summary
+    if missing:
+        body += ("\n\nAlso: " if _EVIDENCE_HEADING.search(summary) else "\n\nEvidence: ") + " ".join(missing)
+    return body
+# Replies to a Linear session are read by people; internal mechanics stay in logs and Kanban history.
+HELD_NOTICE = ("The agent couldn't safely act on this, so nothing changed. An operator needs to check the "
+               "task on the agent's board.")
+_INTERNAL_WORDS = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|executor|binding|completion contract|"
+                             r"inspect\w*|ordering|run-scoped|increment|authoritative|exact head|worker/effect|"
+                             r"effects?|idempoten\w*|retry key|profile)\b")
+def _plain_notice(body: str) -> str:
+    if _INTERNAL_WORDS.search(body or ""):
+        log.info("linear: session reply kept internal: %s", _public(body)[:300])
+        return HELD_NOTICE
+    return body
+def _followup_notice(result: dict) -> str:
+    message, status = str(result.get("message") or ""), result.get("status")
+    if message.startswith(("Instruction saved", "Instruction already saved")):
+        return "Got it. Your note was passed to the agent working on this; it picks it up at its next step."
+    if status in ("done", "archived"):
+        return ("Work on this issue has already finished, so your note wasn't passed on. Delegate the issue "
+                "again if more is needed.")
+    if message.startswith("Work is stopped or waiting"):
+        return ("Work on this issue is paused, so your note wasn't passed on. Ask the agent to resume, then "
+                "send it again.")
+    if message.startswith("Follow-up ordering"):
+        return ("Your note arrived out of order with other changes to this work, so it wasn't passed on. "
+                "Please send it again.")
+    return _sentence(_plain_notice(message)) if message else HELD_NOTICE
+def _existing_work_notice(status: str | None) -> str:
+    if status in ("running", "ready", "review"):
+        return "The agent is already working on this, so nothing new was started. Updates continue here."
+    if status in ("done", "archived"):
+        return "Earlier work on this issue has already finished, so nothing new was started."
+    return ("This issue already has paused work, so nothing new was started. Ask the agent to resume it "
+            "when ready.")
+STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
+UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
+                    "board.")
+STALE_STOP = ("This Stop arrived after newer changes to the work, so it wasn't applied. Send Stop again "
+              "if the work should still stop.")
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
     kind = payload.get("kind")
@@ -296,9 +363,11 @@ def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
     cause = _public("; ".join(failures) if failures else "no acceptance receipt")
     if where == "delivery":
         return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
-    tail = (". The result remains unfinished; reconcile the PR before marking Done." if where == "kanban" else
-            "; leave this issue open and reconcile the PR.")
-    return f"PR acceptance on the exact head and required checks could not be verified ({cause}){tail}"
+    if where == "kanban":
+        return (f"The work finished, but its pull request could not be verified as ready ({cause}). The issue "
+                "stays open until the PR's required checks pass on its latest commit.")
+    return (f"The pull request could not be verified as ready ({cause}), so leave this issue open until its "
+            "required checks pass on its latest commit.")
 def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
     """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
     try:
@@ -1074,7 +1143,7 @@ class Bridge:
             row = self.store.get(issue_id)
             stamp = activation_event_ms(event)
             if stamp is None:
-                self._decline(issue_id, session_id, "Request held: source action time is unavailable.")
+                self._decline(issue_id, session_id, "This request couldn't be dated reliably, so the agent didn't act on it. Please send it again.")
                 return
             if row and stamp < float(row["last_updated_at"]):
                 return True  # A newer reporting/admission observation superseded this input.
@@ -1090,7 +1159,7 @@ class Bridge:
                     current = self.store.get(issue_id)
                     if current and current.get("origin") == "native":
                         return self._pending_assignment_stop(current)
-                    self._decline(issue_id, session_id, "Stop recorded before a native task binding. Inspect in-flight task creation; no stopped worker state is claimed.")
+                    self._decline(issue_id, session_id, "Stop noted while the task was still being set up. The agent won't start it; an operator should confirm nothing is already running.")
                     return True  # Durable unbound Stop fences subsequent native admission.
                 return self._stop(row, session_id, (activity.get("user") or {}).get("id") or "Linear user", stamp,
                                   str(activity.get("id") or ""))
@@ -1106,33 +1175,30 @@ class Bridge:
             if task.get("reconciliation_required"):
                 self._decline(issue["id"], session_id, task["message"])
                 return False
-            note = f"Existing native work: {task.get('status')}. The linked task and run remain authoritative; no new execution was started."
-            if task.get("status") in ("blocked", "todo", "triage"):
-                note += " Use current native task controls for any authorized resume."
-            self._decline(issue["id"], session_id, note)
+            self._decline(issue["id"], session_id, _existing_work_notice(task.get("status")))
             return True  # The original durable binding was verified; do not resume it.
         return self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
-            self._decline(issue["id"], session_id, "No native task is linked. Delegate durable work explicitly to request one.")
+            self._decline(issue["id"], session_id, "There is no task for this issue yet, so your note wasn't passed on. Delegate the issue to the agent to start work.")
             return
         if row.get("origin") != "native":
-            self._decline(issue["id"], session_id, "Retained legacy work needs inspection. No task was started or resumed; use current authorized native controls after reconciliation.")
+            self._decline(issue["id"], session_id, "This issue has older work from a previous setup that needs a check first. Nothing was started or resumed; an operator needs to look at it.")
             return
         marker = str(activity.get("id") or "")
         if not marker:
-            self._decline(issue["id"], session_id, "Follow-up held: authoritative activity identity unavailable.")
+            self._decline(issue["id"], session_id, "This note couldn't be matched to its Linear message, so it wasn't passed on. Please send it again.")
             return
         result = self.followup(issue["id"], body, marker, requester_session=session_id, source_ms=event_ms(event))
-        self._decline(issue["id"], session_id, result["message"])
+        self._decline(issue["id"], session_id, _followup_notice(result))
 
     def _decline(self, issue_id: str, session_id: str, body: str) -> None:
         """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent."""
         if self.authorize_specialist_effect(issue_id):
             self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "one_try": True,
                                "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
-                               "content": {"type": "response", "body": body}}, at=self.clock())
+                               "content": {"type": "response", "body": _plain_notice(body)}}, at=self.clock())
     def _thread(self, issue_id: str, since_ms: float = 0, until_ms: float = math.inf) -> str:
         """The Linear thread for a detached worker, which cannot read Linear: comments after `since_ms` and before
         the event itself. Best effort and bounded; the newest comments win. A quota pause retries the delivery."""
@@ -1161,8 +1227,8 @@ class Bridge:
             return
         task = self._native_effect_task(row["issue_id"])
         if task.status in ("running", "ready"):
-            kind, payload = self._progress_activity(row, self._alert_route(row), "Working" if task.status == "running"
-                                                    else "Waiting for native execution", "Native work remains active", ephemeral=True)
+            kind, payload = self._progress_activity(row, self._alert_route(row), *(("Working", "Still on this; nothing is needed from you") if task.status == "running"
+                                                      else ("Queued", "Waiting for a free worker to pick this up")), ephemeral=True)
             self.store.enqueue(kind, payload, at=self.clock())
 
     def _unfinished(self, row: dict, *, event_id: int | None = None) -> None:
@@ -1210,7 +1276,7 @@ class Bridge:
                 return False
             if existing:
                 if len(existing) != 1:
-                    self._decline(issue_id, session_id, "Several native tasks explicitly reference this issue. Inspect their work and effects before admitting a replacement; no new task was created.")
+                    self._decline(issue_id, session_id, "More than one task already points at this issue, so no new one was started. An operator needs to decide which one continues.")
                     return False
                 adapter, task = existing[0]
                 try:
@@ -1223,13 +1289,13 @@ class Bridge:
                     self._decline(issue_id, session_id, message)
                     raise LinearError(message, retryable=False)
                 if task.assignee != adapter.executor_profile:
-                    self._decline(issue_id, session_id, "Existing native work belongs to another executor. Coordinate its checkpoint and verified stop through an authorized route before replacement; no new task was created.")
+                    self._decline(issue_id, session_id, "Another agent already has work on this issue, so no new task was started. That work needs to finish or be handed over first.")
                     return False
                 if getattr(adapter, "history_only", False) or task.status == "archived":
                     completed = any(event.kind == "completed" for event in adapter.history(task.id, 0))
                     self._decline(issue_id, session_id,
-                        f"Existing native history has status {task.status}" + (" and records an earlier completed outcome" if completed else "") +
-                        ". Review its saved progress or explicitly create a new increment. No archived board was reopened, task linked or work restarted.")
+                        ("Earlier work on this issue already finished" if completed else "Earlier work on this issue was closed") +
+                        ", so it wasn't reopened and nothing new was started. An operator can start a fresh task if more is needed.")
                     return True
                 # Re-read native and Linear state at the reporting boundary.
                 task = adapter.require_task(task.id)
@@ -1238,11 +1304,11 @@ class Bridge:
                         (current.get("state") or {}).get("type") in CLOSED):
                     return False
                 if not task_issue_link(task, current):
-                    self._decline(issue_id, session_id, "Native task issue link changed during inspection; no reporting link or replacement work was created. Inspect current work before a new instruction.")
+                    self._decline(issue_id, session_id, "The existing task changed while the agent was checking it, so nothing new was started. Please try again in a moment.")
                     return False
                 contract = self.contracts.get((current.get("project") or {}).get("id"))
                 if contract and (task.completion_contract or "local-only") != contract:
-                    self._decline(issue_id, session_id, "Existing native work has a different completion contract. Reconcile its acceptance evidence through native controls before linking; no replacement worker was created or existing work stopped.")
+                    self._decline(issue_id, session_id, "Existing work on this issue was set up with a different definition of done, so nothing new was started and nothing was stopped. An operator needs to line the two up.")
                     return False
                 if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                         adapter.board or "default", owner_ref=session_id,
@@ -1278,7 +1344,7 @@ class Bridge:
                 unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
                 if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
                     self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "A newer Stop preceded native creation"})
-                    self._decline(issue_id, session_id, "Creation held because a newer Stop was recorded. Inspect native work before a current authorized action.")
+                    self._decline(issue_id, session_id, "Not started: a Stop came in while the task was being set up. Ask the agent to resume when ready.")
                     return False
                 current = self._effect_issue(issue_id)
                 if (current.get("delegate") or {}).get("id") != me or (current.get("state") or {}).get("type") in CLOSED:
@@ -1293,7 +1359,7 @@ class Bridge:
             tasks = self.kanban.find_created(key)
             if len(tasks) != 1:
                 self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native create outcome is ambiguous"})
-                self._decline(issue_id, session_id, "Task creation outcome is unknown. Inspect native tasks before retrying.")
+                self._decline(issue_id, session_id, "It isn't clear whether the task was created, so the agent won't try again on its own. An operator needs to check the agent's board.")
                 return False
             task = tasks[0]
         task = self.kanban.require_task(task.id)
@@ -1362,7 +1428,7 @@ class Bridge:
         if token is None:
             self.store.native_intent_prepare(key, request)
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native work changed after creation"})
-            self._decline(issue_id, row["owner_ref"], "Native work changed after creation; current task controls take precedence. No automatic activation was attempted.")
+            self._decline(issue_id, row["owner_ref"], "The task changed right after it was created, so the agent left it as it is and didn't start it.")
             return True
         self.store.native_intent_prepare(key, request)
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
@@ -1373,7 +1439,7 @@ class Bridge:
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
             if stop:
                 self._pending_assignment_stop(row)
-            self._decline(issue_id, row["owner_ref"], "Assignment changed or Stop was recorded while task creation was in flight. No new activation was attempted; inspect native worker and effect state.")
+            self._decline(issue_id, row["owner_ref"], "The assignment changed or a Stop came in while the task was being set up, so it wasn't started. An operator should confirm nothing is already running.")
             return True
         require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
         accepted = adapter.activate(row["task_id"], token, issue=issue)
@@ -1697,16 +1763,27 @@ class Bridge:
 
         Comments, attachments, labels and our own writes move updatedAt but
         are not a human decision about who works on the issue or its status.
-        An unprovable answer (history longer than one page) counts as changed.
+        History is read page by page back to since_ms; an unprovable answer
+        (more than HISTORY_PAGES pages newer than since_ms) counts as changed.
         """
-        nodes, more = self.api.routing_history(issue_id)
         viewer = self.api.viewer_id()
-        for node in nodes:
-            if iso_ms(node.get("createdAt")) <= since_ms:
-                continue  # Precedes the fence; no reliance on Linear's ordering.
-            if self._routed(node) and node.get("actorId") != viewer:
-                return True
-        return more
+        def human(node):
+            return iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") != viewer
+        nodes, complete = self._routing_scan(issue_id, lambda page: any(human(node) for node in page) or any(
+            iso_ms(node.get("createdAt")) <= since_ms for node in page))
+        # Every node is checked against the fence; no reliance on Linear's ordering within what was read.
+        return any(human(node) for node in nodes) or not complete
+    def _routing_scan(self, issue_id: str, enough) -> tuple[list[dict], bool]:
+        """Newest-first IssueHistory, one page at a time until enough(page) or the end.
+
+        Bounded at HISTORY_PAGES pages; complete is False when that bound stopped the scan."""
+        nodes, cursor = [], None
+        for _ in range(HISTORY_PAGES):
+            page, cursor = self.api.routing_history(issue_id, after=cursor)
+            nodes += page
+            if cursor is None or enough(page):
+                return nodes, True
+        return nodes, False
     @staticmethod
     def _routed(node: dict) -> bool:
         """An IssueHistory entry that changed state, assignee or delegate."""
@@ -1833,19 +1910,19 @@ class Bridge:
             controls = [event for event in adapter.history(task.id, 0)
                         if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")]
             if any(stamp // 1000 <= event.created_at for event in controls):
-                self._decline(row["issue_id"], session_id, "Stop ordering is stale or unverifiable. Use current native task controls.")
+                self._decline(row["issue_id"], session_id, STALE_STOP)
                 return any(stamp / 1000 < event.created_at for event in controls)
         saved, first = self.store.native_intent_prepare(key, payload)
         if not first:
             if saved.get("state") != "applied":
-                self._decline(row["issue_id"], session_id, "Stop outcome needs inspection using native task controls.")
+                self._decline(row["issue_id"], session_id, UNCONFIRMED_STOP)
             return saved.get("state") == "applied"
         if task.status in ("blocked", "triage", "done", "archived"):
             self.store.native_intent_settle(key, {"state": "applied", "status": task.status})
             return True
         if task.status != "running" or task.current_run_id is None:
             self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
-            self._decline(row["issue_id"], session_id, "Stop needs a current native task control; no run-scoped ordering was available.")
+            self._decline(row["issue_id"], session_id, "Nothing was running to stop, so nothing changed. If this work should not start later, an operator needs to pause it on the agent's board.")
             return False
         try:
             adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id, issue=issue)
@@ -1856,7 +1933,7 @@ class Bridge:
         latest = adapter.require_task(task.id)
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
-        self._decline(row["issue_id"], session_id, "Native Stop requested; inspect native worker/effect state." if stopped else "Stop was not verified. Use native task controls.")
+        self._decline(row["issue_id"], session_id, STOPPED_NOTICE if stopped else UNCONFIRMED_STOP)
         return stopped
 
     def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> bool:
@@ -1949,7 +2026,7 @@ class Bridge:
         started = adapter.stop_started(task.id, reason, after=stamp / 1000)
         self.store.native_intent_settle(key, {"state": "applied", "stopped": True, "started_stopped": started})
         extra = f" Also stopped {len(started)} task(s) it had started." if started else ""
-        self._decline(issue_id, session_id, "Stopped. The agent will not continue until someone resumes it." + extra)
+        self._decline(issue_id, session_id, STOPPED_NOTICE + extra)
         return True
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
@@ -2288,7 +2365,7 @@ class Bridge:
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads,
                               "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": "Assessment completed." if assessment else f"Done. {summary}" + (f"\n\nEvidence: {links}" if links else "")}}),
+                                "content": {"type": "response", "body": "Assessment completed." if assessment else _done_body(summary, evidence)}}),
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
@@ -2353,7 +2430,7 @@ class Bridge:
         current = self.store.outbox_row(row["id"])
         self.store.rewrite(row["id"], {**current["payload"], "issue_write_receipt": receipt}, current["next_at"])
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
-                  source_ms: float | None = None, history_fence: bool = False) -> bool:
+                  source_ms: float | None = None, history_fence: bool = True) -> bool:
         if claim or (issue.get("state") or {}).get("type") in CLOSED:
             return False
         row = self.store.get(issue["id"])
@@ -2364,7 +2441,7 @@ class Bridge:
                 if ((not self._receipt_scope({"issue_id": issue["id"], "task_id": row["task_id"]}, receipt)
                         or receipt["issue"] != self._issue_version(issue))
                         and (not history_fence or self._human_routing_changed(issue["id"], fence))):
-                    return False  # Own acknowledged version, or (In Progress) no human routing change since the source event.
+                    return False  # Not our own acknowledged version, and a human changed routing since the source event.
         return self._report_delegate_allowed(issue)
     def recheck(self, force: bool = False) -> None:
         now = self.clock()
@@ -2420,7 +2497,9 @@ class Bridge:
         state, viewer = issue.get("state") or {}, self.api.viewer_id()
         if state.get("type") != "started":
             return False
-        nodes, more = self.api.routing_history(issue["id"])
+        # Newest first: everything newer than the newest state move is read once that move is.
+        nodes, _ = self._routing_scan(issue["id"], lambda page: any(
+            node.get("fromStateId") != node.get("toStateId") for node in page))
         routed = [node for node in nodes if self._routed(node)]
         moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
                     key=lambda node: iso_ms(node.get("createdAt")), default=None)
@@ -2600,7 +2679,7 @@ class Bridge:
             if row and row["kind"] == "status":
                 current = self._effect_issue(payload["issue_id"])
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                      payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
+                                      payload.get("seen"), payload.get("source_ms")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
@@ -2749,7 +2828,7 @@ class Bridge:
             if payload.get("admission_id"):
                 return False
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
+                                  payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
                         and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):
