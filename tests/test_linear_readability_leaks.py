@@ -27,8 +27,8 @@ from test_linear_content_actions import ContentRemote
 from test_linear_specialist_authorization import (Authority, Bridge, FakeKanban, Store, ISSUE, SESSION,
                                                   USER, VIEWER)
 
-# HF-612's worker summary as Klanker wrote it (the workspace path is the agent's real root).
-HF_612_RAW = """Top 5 largest files in Klanker workspace (/opt/data/workspace), measured 2026-11-03 with `find -type f -printf '%s'` sorted by size:
+# HF-612's worker summary as Atlas wrote it (the workspace path is the agent's real root).
+HF_612_RAW = """Top 5 largest files in Atlas workspace (/opt/data/workspace), measured 2026-11-03 with `find -type f -printf '%s'` sorted by size:
 
 1. 1642.4 MiB: `rescuezilla-usb/rescuezilla-2.6.2-64bit.resolute.iso`
 2. 1330.1 MiB: `review-182/.git/objects/pack/pack-bd7d3271….pack`
@@ -40,24 +40,24 @@ Workspace total: 91G across ~3.77M files. Items 2-5 are near-identical git packs
 HF_612_READABLE = HF_612_RAW.replace(" (/opt/data/workspace)", "")
 HF_612_LIST = HF_612_READABLE.split("\n\nWorkspace total")[0]
 
-HF_616_START = ("I started HF-616. It's running as native task **t_d8c47a32** on the `klanker-linear-v1` board, "
+HF_616_START = ("I started HF-616. It's running as native task **t_d8c47a32** on the `atlas-linear-v1` board, "
                 "and that worker does the work, not this chat. Before starting it I checked the board and found "
                 "nothing already open for this issue.\n\nWhat happens next:\n"
                 "- The worker posts a checkpoint every 2 minutes for 10 minutes.\n- It ends with a summary.")
 HF_616_STOP = ("I've stopped HF-616. Task t_d8c47a32 is now **blocked**: the worker exited and nothing is running.\n\n"
                "- **Done before the stop:** checkpoints for minutes 0, 2, 4 and 6.")
-HF_617_START = ("HF-617 is running. Native task **t_bd03a4f7** (run 34) is live on the `klanker-linear-v1` board, "
+HF_617_START = ("HF-617 is running. Native task **t_bd03a4f7** (run 34) is live on the `atlas-linear-v1` board, "
                 "and the issue has moved from Backlog to In Progress.\n\nI checked first: nothing else on the "
                 "board was running, ready or queued, so this is the only task for the issue.")
 HF_617_TAKEOVER = ("**Takeover by Finn pending.** Ken asked Finn to take over HF-617 on 2026-11-03.\n\n"
-                   "- Klanker's task t_bd03a4f7 is stopped (native Stop event 340). No worker is live.\n"
+                   "- Atlas's task t_bd03a4f7 is stopped (native Stop event 340). No worker is live.\n"
                    "- The replacement is **held**: `inspect-cleanup` returns `quiescence_proven: false` "
                    "(`native_admission_not_settled`). Run 34's admission is still `unknown` because the gateway "
                    "restarted at 21:15:57Z, during the run.\n"
                    "- Only the minute-0 checkpoint landed.\n\n"
-                   "**Next:** Klanker is looking for a supported way to settle the admission. Once quiescence is "
+                   "**Next:** Atlas is looking for a supported way to settle the admission. Once quiescence is "
                    "proven, Finn starts a fresh 10-minute run under its own task and becomes the delegate.")
-LEAKS = ("t_d8c47a32", "t_bd03a4f7", "klanker-linear-v1", "run 34", "Run 34", "fence", "quiescence",
+LEAKS = ("t_d8c47a32", "t_bd03a4f7", "atlas-linear-v1", "run 34", "Run 34", "fence", "quiescence",
          "admission", "[local artifact]", "/opt/data", "Stop event")
 
 
@@ -190,7 +190,7 @@ class SessionReplyTests(unittest.TestCase):
     def test_hf_617_takeover_comment(self):
         self.assertEqual(_readable(HF_617_TAKEOVER),
                          "**Takeover by Finn pending.** Ken asked Finn to take over HF-617 on 2026-11-03.\n\n"
-                         "- Klanker's task is stopped. No worker is live.\n"
+                         "- Atlas's task is stopped. No worker is live.\n"
                          "- Only the minute-0 checkpoint landed.")
 
     def test_no_leak_survives_any_observed_text(self):
@@ -226,7 +226,7 @@ class NonRegressionTests(unittest.TestCase):
                 self.assertEqual(_project_summary(text, 4000), text)
 
     def test_code_blocks_the_user_asked_for_are_untouched(self):
-        text = ("Here is the command:\n\n```sh\nhermes kanban show t_d8c47a32 --board klanker-linear-v1\n"
+        text = ("Here is the command:\n\n```sh\nhermes kanban show t_d8c47a32 --board atlas-linear-v1\n"
                 "# run 34 hit the previous-execution fence\n```")
         self.assertEqual(_readable(text), text)
 

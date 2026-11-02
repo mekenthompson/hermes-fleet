@@ -298,7 +298,7 @@ def _mask_local_paths(text: str) -> str:
             continue
         before, after = text[last:start], text[end:]
         if not is_code and re.search(r" ?\($", before) and after.startswith(")"):
-            # "files in Klanker workspace (/opt/data/workspace)": the aside says nothing to a reader.
+            # "files in Atlas workspace (/opt/data/workspace)": the aside says nothing to a reader.
             out.append(re.sub(r" ?\($", "", before))
             last = end + 1
             continue
