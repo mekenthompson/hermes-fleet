@@ -149,9 +149,11 @@ The agent finalizes the full native task scope before tracking and admitting cha
 work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
 (the default); use `progress` for preparation, a hold, or another internal stage. The agent
 manages this distinction without asking the user to maintain task IDs or activate reporting.
-An automatic (creator-null) Linear assignment creates and admits a fully populated outcome
-task automatically. A human delegation or @mention opens a native conversation instead (see
-Native Agent Session conversations below).
+A Linear delegation, automatic (creator-null) or made by a person, creates and admits a fully
+populated outcome task through that same guarded admission before any model turn; with no
+prompt comment the issue title and description are the request. A person's delegation then
+also opens a native conversation that is told the work is already running as that task. An
+@mention opens only a conversation (see Native Agent Session conversations below).
 Tracking an unfinished native task on an undelegated issue queues the current app as
 Linear delegate through the existing guarded outbox. The next reporting pass projects
 the native active state. A different current delegate or newer issue edit holds routing
@@ -485,10 +487,31 @@ A new human session gets one immediate `thought` activity before the model turn,
 Linear shows a response within seconds. Its outbox id is derived from the session, so a
 redelivered webhook never posts it twice, and a failed post never holds the input. An
 @mention reaches the agent as the comment text itself, marked as a mention to answer
-rather than a work request; a delegation is framed as delegated work. Each conversation
-turn also carries the current linked native task and its status (or that none is
-linked), so continuing existing work with `linear followup` does not rely on the skill
-alone.
+rather than a work request. A mention is a session whose comment a person wrote (the
+webhook's `comment.userId`); Linear opens every delegated session on its own authorless
+thread-root comment ("This thread is for an agent session with ..."), which is never read as
+a request. Each conversation turn also carries the current linked native task and its status
+(or that none is linked), so continuing existing work with `linear followup` does not rely on
+the skill alone.
+
+A delegation does not wait for the model to decide to start work. After the acknowledgment
+the plugin runs the assignment admission (`session.admit` in the diagnostics), then:
+
+- Started (`delegation_started`) or linked to an existing task on this board
+  (`delegation_linked`): the model turn runs with that task in its context and is told not to
+  redo the work inline. While that turn runs, queued work shows In Progress; afterwards
+  Linear follows the native state (Todo while queued for a worker, In Progress once claimed,
+  then review or Done).
+- Answered by the plugin (`admission_declined`): the same work already runs from chat or
+  another session, the issue is closed or delegated elsewhere, a Stop came first, or an
+  operator decision is needed. The session gets that one plain answer and no model turn.
+- Not started yet (`admission_failed`, `admission_held`): one plain wait notice is posted
+  within seconds (once per session), no model turn runs, and the delivery stays pending so
+  the inbox retries the same admission. A retry never creates a second task.
+
+An Issue webhook that shows this app as the new delegate of an unlinked issue logs
+`delegated_awaiting_session`. If no Agent Session webhook follows, Linear never delivered
+the session (Linear then shows the agent as failed to start).
 
 Enable it through native platform configuration and the real permitted Linear user
 IDs, with an explicit per-profile toolset:

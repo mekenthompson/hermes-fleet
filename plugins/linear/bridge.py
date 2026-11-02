@@ -875,6 +875,9 @@ class Bridge:
         self._pump_authorized: dict[str, float] = {}  # issue id -> when its cached specialist-scope proof expires
         self._last_unbound_sweep = 0.0
         self.native_ingress = None
+        # (issue id, Agent Session id) of a delegation admission in progress -> _decline answered it.
+        self.session_notices: dict[tuple[str, str], bool] = {}
+        self._session_turns: dict[str, float] = {}  # issue id -> monotonic start of an admitted session turn
         diag.configure(settings.get("diagnostics"), agent=self.ingress_profile, profile=profile)
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
@@ -1215,6 +1218,12 @@ class Bridge:
         if event.get("type") == "Issue":
             issue_id = (event.get("data") or {}).get("id")
             actor = (event.get("actor") or {}).get("id") if isinstance(event.get("actor"), dict) else None
+            data = event.get("data") or {}
+            if (issue_id and not self.store.get(issue_id) and data.get("delegateId") and data.get("delegateId") == self._own_viewer()
+                    and (event.get("action") == "create" or "delegateId" in (event.get("updatedFrom") or {}))):
+                # Delegated to this app: Linear should open an Agent Session next. A missing
+                # session.admit or session webhook line after this one means it never arrived.
+                diag.evt("session.admit", "held", "delegated_awaiting_session", iss=issue_id)
             if issue_id and self.store.get(issue_id):
                 if actor and actor == self._own_viewer():
                     return diag.because("own_echo", None, "ignored")  # Our own write echoing back: nothing to recheck.
@@ -1304,10 +1313,27 @@ class Bridge:
         With the triggering activity id the reply has a stable client id: a retried delivery (an
         unconfirmed Stop is retried for hours) posts each distinct answer once, never per retry."""
         if self.authorize_specialist_effect(issue_id):
+            if (issue_id, session_id) in self.session_notices:
+                self.session_notices[(issue_id, session_id)] = True
             stable = {"id": stable_uuid4("decline", issue_id, session_id, activity_id, body)} if activity_id else {}
             self.store.enqueue("activity", {**stable, "issue_id": issue_id, "session_id": session_id, "one_try": True,
                                "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
                                "content": {"type": "response", "body": _plain_notice(body)}}, at=self.clock())
+    SESSION_TURN_TTL = 15 * 60  # seconds: a lost turn-end callback never pins In Progress
+    def session_turn(self, issue_id: str, active: bool) -> None:
+        """A Linear session turn on admitted delegated work started or ended (native_input).
+
+        While it runs, queued work shows In Progress: the agent is on it now. When it ends,
+        the next reconcile shows the native state again (Todo while still queued)."""
+        with self._guard:
+            if active:
+                self._session_turns[issue_id] = time.monotonic()
+            else:
+                self._session_turns.pop(issue_id, None)
+    def _session_turn_active(self, issue_id: str) -> bool:
+        with self._guard:
+            started = self._session_turns.get(issue_id)
+        return started is not None and time.monotonic() - started < self.SESSION_TURN_TTL
     def _thread(self, issue_id: str, since_ms: float = 0, until_ms: float = math.inf) -> str:
         """The Linear thread for a detached worker, which cannot read Linear: comments after `since_ms` and before
         the event itself. Best effort and bounded; the newest comments win. A quota pause retries the delivery."""
@@ -1430,7 +1456,9 @@ class Bridge:
                 self.activity(issue_id, session_id, "thought",
                     f"Linked to the agent's existing task for this issue, which is currently {task.status}. No new work was started; the agent checks that work before changing anything.")
                 return True
-        context = "\n\n".join(x for x in (fresh.get("description") or "", self._thread(issue_id, until_ms=stamp), prompt) if x)
+        # With no description, the title is the request (a delegation needs no prompt comment).
+        request = fresh.get("description") or f"Requested outcome (the issue title): {fresh.get('title') or 'see the issue'}"
+        context = "\n\n".join(x for x in (request, self._thread(issue_id, until_ms=stamp), prompt) if x)
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             context = "\n\n".join((context, ASSESSMENT_NOTE)).strip()
         project = (fresh.get("project") or {}).get("id")
@@ -1584,7 +1612,10 @@ class Bridge:
         task = adapter.require_task(row["task_id"])
         if row["owner_ref"]:  # A chat-started task answers in its chat; Linear hears from native events.
             self.activity(issue_id, row["owner_ref"], "thought",
-                          f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
+                          ("On it: the agent is working on this now; updates appear here." if task.status == "running" else
+                           "On it: this is queued for the next free worker and shows In Progress once one picks it up; "
+                           "updates appear here.") if accepted else
+                          f"Linked to the agent's task, which is currently {task.status}. Nothing new was started.")
         return True
 
     def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict) -> bool:
@@ -2626,16 +2657,21 @@ class Bridge:
             else:
                 last = next(iter(adapter.history(task.id, row["last_event_id"] - 1)), None) if row["last_event_id"] else None
                 state = self._native_state(task, adapter, last)
+                turn = state == "todo" and self._session_turn_active(row["issue_id"])
+                if turn:
+                    state = "in_progress"  # The agent's Linear session turn is working on it now.
                 if state is None or state == latest.get("state"):
                     return
-                payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
+                payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000,
+                           **({"session_turn": True} if turn else {})}
         if not self.store.effect_admitted(row["issue_id"]):
             return  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         self._native_effect_task(row["issue_id"])
         queued = self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
                                                                **self._alert_route(row)}, at=self.clock())
         if queued:
-            diag.count("status_q"); diag.detail("status.write", "queued", "-", iss=row["issue_id"], task=row["task_id"], state=payload["state"])
+            diag.count("status_q"); diag.detail("status.write", "queued", "session_turn" if payload.get("session_turn") else "-",
+                                                iss=row["issue_id"], task=row["task_id"], state=payload["state"])
         elif payload["state"] != latest.get("state"):
             raise LinearError("Status reconcile was not queued; retrying later")  # pump backs off
     def _native_state(self, task, adapter, last) -> str | None:
