@@ -60,8 +60,19 @@ it hears checkpoints and the result, not the admission itself. `record_done` nev
 worker or re-runs work, even after a crash part-way through: recovery and the assignment
 echo never admit a record_done task, `work_on` is refused, and repeating the same
 `record_done` finishes it. A chat admission recovered after a crash is held if the issue
-has since been delegated to someone else. Existing linked work, another agent's task or ambiguous links are
-reported, never duplicated. Delegated children return the request to their parent.
+has since been delegated to someone else, or if a person changed its state, assignee or
+delegate after the chat request while no delegate write of ours is pending. Existing linked work, another agent's task or ambiguous links are
+reported, never duplicated. An unlinked task already on the board is adopted only when its
+definition of done matches the project's, and then as progress: it never closes the issue by
+itself. Delegated children return the request to their parent.
+
+The delegate is queued inside the issue's lock, before admission, from the issue version
+read under that lock, so it is the issue's oldest pending write. The chat reply says only what
+is true: Linear shows the delegate, is being updated, or the update is pending and retried.
+Delegate recovery retries chat-started routing that was refused before any write, once per
+binding, under the same human-change fence. Until the delegate lands, a Linear Stop on
+chat-started work bound here is authorized by that binding and its chat origin; work
+delegated to anyone else still refuses it.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not

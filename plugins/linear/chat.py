@@ -339,12 +339,27 @@ def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any) -> dic
         _, path = transport.native_board_target(bridge.kanban.board or "default")
         if path != context.pinned_db_path:
             raise LinearError("New work starts on this agent's creation board, outside the caller's native board pin.")
-    native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record)
-    return {"native": native, "routing": _route_to_self(bridge, issue, native, context, recorded_done=bool(record))}
+    def route(current: dict, status: str) -> str:
+        # Called inside the issue's lock with the issue version read under it, before admission:
+        # a tick flush cannot move updatedAt between that read and this delegate's preflight.
+        return _route_to_self(bridge, current, {"status": status}, context, recorded_done=bool(record))
+    native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record,
+                            route_delegate=route)
+    return {"native": native, "routing": native.pop("routing", "held: routing was not checked")}
+
+
+def _delegate_sentence(routing: str) -> str:
+    """What Linear shows about the working agent; only what is true now."""
+    if routing == "already_delegated":
+        return "Linear shows this agent as delegate and follows the status"
+    if routing == "queued":
+        return "Linear is being updated to show this agent as delegate, and follows the status"
+    return ("the Linear delegate update is still pending and will be retried automatically, so Linear may not "
+            "show this agent as delegate yet")
 
 
 def _entrust_message(result: dict) -> str:
-    native = result["native"]
+    native, routing = result["native"], result.get("routing") or ""
     if native.get("recorded_done"):
         return ("Linked the finished work and recorded it as done; the issue closes with this summary "
                 "once its evidence is verified. Nothing was started or re-run.")
@@ -356,9 +371,8 @@ def _entrust_message(result: dict) -> str:
     if not native.get("created_from_chat"):
         return ("This issue already has work on this agent's board, so nothing new was started; "
                 "its updates now also come back to this chat.")
-    return ("One native task now carries out this work: its worker does it, Linear shows this agent as "
-            "delegate and follows the status, and checkpoints and the result come back to this chat. "
-            "Do not also do this work here.")
+    return ("One native task now carries out this work: its worker does it, " + _delegate_sentence(routing)
+            + ", and checkpoints and the result come back to this chat. Do not also do this work here.")
 
 
 def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:

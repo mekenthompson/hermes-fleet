@@ -1039,16 +1039,39 @@ class Store:
             return bool(db.execute(self._DELEGATE_PENDING, (issue_id,)).fetchone() or db.execute(
                 "SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
                 "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1", (issue_id, revision)).fetchone())
-    def recover_binding_delegate(self, issue_id: str, payload: dict[str, Any], *, at: float) -> bool:
-        """Queue one recovery delegate intent; no caller/requester or work_owner fields are invented."""
+    def delegate_pending(self, issue_id: str) -> bool:
+        """A delegate write for this issue is still queued."""
+        with self._tx() as db:
+            return bool(db.execute(self._DELEGATE_PENDING, (issue_id,)).fetchone())
+    _DELEGATE_WRITTEN = ("SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                         "AND json_extract(payload, '$.expected_binding_revision')=? AND NOT (state='failed' "
+                         "AND json_type(payload, '$.write_started')='false' AND json_type(payload, '$.delegate_receipt') IS NULL "
+                         "AND json_type(payload, '$.recovered_binding') IS NULL) LIMIT 1")
+    def delegate_unwritten(self, issue_id: str, revision: str) -> bool:
+        """This revision's delegate intents all failed before any write, none of them recovery's own."""
+        with self._tx() as db:
+            return bool(not db.execute(self._DELEGATE_PENDING, (issue_id,)).fetchone()
+                        and not db.execute(self._DELEGATE_WRITTEN, (issue_id, revision)).fetchone()
+                        and db.execute("SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                                       "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1",
+                                       (issue_id, revision)).fetchone())
+    def recover_binding_delegate(self, issue_id: str, payload: dict[str, Any], *, at: float,
+                                 supersede_unwritten: bool = False) -> bool:
+        """Queue one recovery delegate intent; no caller/requester or work_owner fields are invented.
+
+        supersede_unwritten: this revision's earlier intents all failed before any write
+        (delegate_unwritten), so one recovery intent may follow them."""
         with self._tx() as db:
             if not self._effect_admitted(db, issue_id) or not db.execute(
                     "SELECT 1 FROM work WHERE issue_id=? AND origin='native' AND task_id=?",
                     (issue_id, payload["task_id"])).fetchone():
                 return False
-            if db.execute("SELECT 1 FROM outbox WHERE id=? OR (kind='delegate' AND json_extract(payload, '$.issue_id')=? "
-                          "AND json_extract(payload, '$.expected_binding_revision')=?)",
-                          (payload["id"], issue_id, payload["expected_binding_revision"])).fetchone():
+            if db.execute("SELECT 1 FROM outbox WHERE id=?", (payload["id"],)).fetchone():
+                return False
+            if db.execute(self._DELEGATE_WRITTEN if supersede_unwritten else
+                          "SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
+                          "AND json_extract(payload, '$.expected_binding_revision')=?",
+                          (issue_id, payload["expected_binding_revision"])).fetchone():
                 return False
             if db.execute(self._DELEGATE_PENDING, (issue_id,)).fetchone():
                 return False  # One delegate write at a time; routing history fences the rest.
