@@ -141,9 +141,11 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
     def test_release_bot_secret_is_referenced_only_by_handoffs_and_every_action_is_sha_pinned(self) -> None:
         workflows = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
         pin_handoff = WORKFLOWS / "plugin-pin-handoff.yml"
-        allowed = {HANDOFF, pin_handoff}
+        pr_auto_update = WORKFLOWS / "pr-auto-update.yml"
+        allowed = {HANDOFF, pin_handoff, pr_auto_update}
         self.assertIn(HANDOFF, workflows)
         self.assertIn(pin_handoff, workflows)
+        self.assertIn(pr_auto_update, workflows)
         for path in workflows:
             text = path.read_text(encoding="utf-8")
             if path in allowed:
