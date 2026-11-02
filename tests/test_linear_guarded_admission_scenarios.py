@@ -367,11 +367,113 @@ class GuardedAdmissionScenarios(unittest.TestCase):
             self.assign()
         def notices():
             return [row for row in self.store.pending() if
-                    (row["payload"].get("content") or {}).get("body", "").startswith("Native work changed after creation;")]
+                    (row["payload"].get("content") or {}).get("body", "").startswith("The task changed right after it was created")]
         before = len(notices())
         self.fixture.make_bridge().recover()
         self.fixture.make_bridge().recover()
         self.assertEqual(len(notices()), before)
+
+    # -- Linear Stop reaches the actual work and stays effective --------------
+
+    def claimed_assignment(self, stamp):
+        with patch("time.time", return_value=stamp + 0.5):
+            self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        with patch("time.time", return_value=stamp + 2), self.board.conn() as conn:
+            # An earlier human pause/resume, so no initial-admission inference
+            # applies: only real event ordering decides the later Stop.
+            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="earlier pause"))
+            self.assertTrue(scenarios.kb.unblock_task(conn, task_id))
+        with self.board.conn() as conn:
+            # The dispatcher picks the work up after the human clicked Stop
+            # (stamp + 5) but before the Stop webhook was processed.
+            self.assertIsNotNone(scenarios.kb.claim_task(conn, task_id, claimer="native-test-worker"))
+        return task_id
+
+    def test_dispatcher_pickup_after_linear_stop_click_does_not_override_it(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        self.assertTrue(any(event.kind == "claimed" and event.created_at > stamp + 5
+                            for event in self.board.history(task_id, 0)))
+        self.assertTrue(self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 5)))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.fixture.make_bridge().recover()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_explicit_resume_after_linear_stop_click_still_supersedes_it(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="native Stop", kind="needs_input"))
+            self.assertTrue(scenarios.kb.unblock_task(conn, task_id))
+        self.assertTrue(self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 5)))
+        self.assertEqual(self.board.get(task_id).status, "ready")
+
+    def test_transient_error_on_first_linear_stop_attempt_is_retried(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        event = self.fixture.event("prompted", signal="stop", stamp=stamp + 5)
+        with patch.object(self.board, "stop", side_effect=scenarios.LinearError("temporary native outage")):
+            self.assertFalse(self.bridge.handle_webhook(event))
+        self.assertEqual(self.board.get(task_id).status, "running")
+        # Provider redelivery (or a restart) retries the same Stop and applies it.
+        self.assertTrue(self.fixture.make_bridge().handle_webhook(event))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertTrue(self.fixture.make_bridge().handle_webhook(event))
+        self.assertEqual(sum(event.kind == "blocked" for event in self.board.history(task_id, 0)), 3)
+
+    def test_unverified_stop_recorded_by_input_seam_is_retried(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        binding = self.store.native_binding(scenarios.ISSUE)
+        # Exactly what native_input._handle_control records when the first
+        # attempt failed before the bridge prepared its own Stop request.
+        key = f"stop:{scenarios.ISSUE}:{scenarios.ACTIVITY}"
+        self.store.native_intent_prepare(key, {"kind": "stop", "issue_id": scenarios.ISSUE,
+            "task_id": binding["task_id"], "profile": binding["profile"], "board": binding["board"],
+            "stamp": (stamp + 5) * 1000, "control": "native-event-guard-v1",
+            "expected_event_id": None, "run_id": None})
+        self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native task Stop was not verified"})
+        self.assertTrue(self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 5)))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def started_tasks(self, task_id):
+        with self.board.conn() as conn:
+            child = scenarios.kb.create_task(conn, title="child", assignee="default", creator_task_id=task_id)
+            grandchild = scenarios.kb.create_task(conn, title="grandchild", assignee="default", creator_task_id=child)
+            finished = scenarios.kb.create_task(conn, title="finished", assignee="default", creator_task_id=task_id)
+            self.assertTrue(scenarios.kb.complete_task(conn, finished, result="done"))
+            unrelated = scenarios.kb.create_task(conn, title="unrelated", assignee="default")
+            self.assertIsNotNone(scenarios.kb.claim_task(conn, child, claimer="native-test-worker"))
+        return child, grandchild, finished, unrelated
+
+    def test_linear_stop_reaches_tasks_the_stopped_worker_started(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        child, grandchild, finished, unrelated = self.started_tasks(task_id)
+        self.assertTrue(self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 5)))
+        status = lambda tid: self.board.get(tid).status
+        self.assertEqual([status(task_id), status(child), status(grandchild)], ["blocked"] * 3)
+        self.assertEqual(status(finished), "done")
+        self.assertEqual(status(unrelated), "ready")
+        # A human resuming one started task is final; redelivery never re-stops it.
+        with self.board.conn() as conn:
+            self.assertTrue(scenarios.kb.unblock_task(conn, grandchild))
+        self.assertTrue(self.fixture.make_bridge().handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 5)))
+        self.assertEqual(status(grandchild), "ready")
+
+    def test_started_tasks_are_stopped_on_retry_after_partial_stop(self):
+        stamp = int(time.time()) - 20 + 0.1
+        task_id = self.claimed_assignment(stamp)
+        child, grandchild, _, _ = self.started_tasks(task_id)
+        event = self.fixture.event("prompted", signal="stop", stamp=stamp + 5)
+        with patch.object(self.board, "stop_started", side_effect=ConnectionError("crash after parent Stop")):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(event)
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.board.get(child).status, "running")
+        self.assertTrue(self.fixture.make_bridge().handle_webhook(event))
+        self.assertEqual([self.board.get(tid).status for tid in (task_id, child, grandchild)], ["blocked"] * 3)
 
 
 if __name__ == "__main__":

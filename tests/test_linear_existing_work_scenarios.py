@@ -781,7 +781,7 @@ connection.close()
         self.assertIsNone(self.store.native_intent(f"create:{native.ISSUE}"))
         self.assertEqual(adapter.get(task_id).status, "archived")
         self.assertEqual([(event.id, event.kind) for event in adapter.history(task_id, 0)], before)
-        self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+        self.assertTrue(any("Earlier work on this issue already finished" in row["payload"]["content"]["body"]
                             for row in self.store.pending(native.ISSUE)))
 
     def test_archived_board_history_is_read_without_reopening_linking_or_file_changes(self):
@@ -822,7 +822,7 @@ connection.close()
             self.assertIsNone(self.store.get(native.ISSUE))
             self.assertEqual(self.fixture.tasks(), [])
             self.assertEqual(self.archive_bytes(path), before)
-            self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+            self.assertTrue(any("Earlier work on this issue already finished" in row["payload"]["content"]["body"]
                                 for row in self.store.pending(native.ISSUE)))
 
     def test_archive_reader_enforces_query_only(self):
@@ -845,7 +845,7 @@ connection.close()
         self.assign()
         self.assertIsNone(self.store.get(native.ISSUE))
         self.assertEqual(self.fixture.tasks(), [])
-        self.assertTrue(any("earlier completed outcome" in row["payload"]["content"]["body"]
+        self.assertTrue(any("Earlier work on this issue already finished" in row["payload"]["content"]["body"]
                             for row in self.store.pending(native.ISSUE)))
 
     def test_unrelated_intact_archived_board_does_not_block_new_authorized_assignment(self):
