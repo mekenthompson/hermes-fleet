@@ -714,6 +714,7 @@ class Bridge:
         self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
+        self._last_unbound_sweep = 0.0
         self.native_ingress = None
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
@@ -1641,8 +1642,7 @@ class Bridge:
             raise LinearError("Native reporting link or app identity changed; inspect current work", retryable=False)
         issue = self._effect_issue(issue_id)
         task = self._native_effect_task(issue_id, issue)
-        if (task.id != payload.get("task_id") or task.status in ("done", "archived")
-                or (payload.get("recovered_binding") and task.status != "running")):
+        if task.id != payload.get("task_id") or task.status in ("done", "archived"):
             raise LinearError("Native work has ended or changed; inspect its history", retryable=False)
         if (issue.get("state") or {}).get("type") in CLOSED:
             raise LinearError("Issue is closed; no routing change was made", retryable=False)
@@ -1946,9 +1946,11 @@ class Bridge:
 
         Provenance is native-binding recovery, never a fabricated caller: the
         authority is the existing session-less reporting link (the same one
-        _report_delegate_allowed uses for undelegated reporting). Only running
-        work is routed, and only when no human changed state, assignee or
-        delegate since its claim (Linear issue history, not updatedAt).
+        _report_delegate_allowed uses for undelegated reporting). Open work is
+        routed (running, queued, blocked, triage or in review: the delegate
+        persists while work waits), never ended work, and only when no human
+        changed state, assignee or delegate since the current claim, else since
+        the task was created (Linear issue history, not updatedAt).
         _delegate_preflight and delivery guards still apply. One decision per
         (issue, binding revision), durable across reopen.
         """
@@ -1965,11 +1967,16 @@ class Bridge:
         if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
             return  # Cheap local check first: decided for this revision, or a delegate write is pending.
         task = adapter.require_task(row["task_id"])
+        if task.status in ("done", "archived"):
+            return  # Ended work is not waiting on anyone; the assignee and state tell the rest.
         claim = self._current_claim(adapter, task)
-        if claim is None:
-            return  # Not running now; decide when it is.
+        if task.status == "running" and claim is None:
+            return  # Running without a readable claim yet; decide once it is consumed.
+        source = claim.created_at if claim is not None else getattr(task, "created_at", None)
+        if source is None:
+            return  # No provable fence for a human change: leave routing alone.
         issue = self._effect_issue(issue_id)
-        claim_ms = claim.created_at * 1000
+        claim_ms = source * 1000
         route = (issue.get("delegate") is None and "delegate" in issue
                  and (issue.get("state") or {}).get("type") not in CLOSED
                  and (iso_ms(issue.get("updatedAt")) <= claim_ms
@@ -2012,8 +2019,10 @@ class Bridge:
             payload = {"state": "in_progress", "source_ms": claim.created_at * 1000, "recovered_claim": {
                 "task_id": task.id, "run_id": task.current_run_id, "event_id": claim.id}}
         else:
-            if task.status in ("archived", "done") and self.store.terminal_captured(task.id, issue_id=row["issue_id"]):
+            if task.status == "done" and self.store.terminal_captured(task.id, issue_id=row["issue_id"]):
                 return  # Verified closeout belongs to _finished.
+            if task.status == "archived" and self.store.terminal_captured(task.id, issue_id=row["issue_id"], state="done"):
+                return  # A Done closeout stands; an older build's archive-time Blocked closeout does not.
             if task.status == "archived":
                 if latest.get("state") == "todo":
                     return  # Already parked (or refused as a no-op): no per-tick history scan.
@@ -2048,9 +2057,9 @@ class Bridge:
         if status in ("ready", "todo", "scheduled"):
             return "todo"
         if status == "done":
-            # A stage ended but the outcome is open (_finished alone verifies Done): show the next step.
-            links = evidence_links(adapter.evidence_text(task))
-            return "in_review" if any(PR_URL.fullmatch(url) for url in links) else "todo"
+            # The work finished but its outcome is not verified at the destination (_finished alone
+            # sets Done): it awaits review, CI or merge. Completed work never shows Todo.
+            return "in_review"
         return None
     @staticmethod
     def _current_claim(adapter, task):
@@ -2340,6 +2349,86 @@ class Bridge:
                         if not exc.retryable:
                             self._fence_scope_denial(row["issue_id"], exc)
                     log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
+        self.sweep_unbound()
+    # Unbound sweep bounds: one pass an hour, at most 4 pages of 50 issues and 25 moves per pass.
+    UNBOUND_SWEEP_EVERY = 3600.0
+    UNBOUND_SWEEP_MIN_AGE = 3600.0  # An issue touched in the last hour may be getting linked right now.
+    UNBOUND_SWEEP_PAGES = 4
+    UNBOUND_SWEEP_MOVES = 25
+    def sweep_unbound(self, *, force: bool = False) -> int:
+        """In Progress means an agent is working on it now, so park stale work nobody is doing.
+
+        Issues delegated to this app in a started state with no reporting link
+        in this store and no native task (work from before native execution,
+        records already retired) go to the team's Todo, once per issue version,
+        only when this app set that state (moved it there or created the issue
+        in it) and nobody else changed state, assignee or delegate since
+        (_app_set_started_state), and nothing changed for an hour. Anything
+        else is left alone. The delegate and assignee are unchanged. Bounded per
+        pass; a rate limit ends the pass. Logs one metadata line per decision.
+        """
+        now = self.clock()
+        if not force and now - self._last_unbound_sweep < self.UNBOUND_SWEEP_EVERY:
+            return 0
+        lister = getattr(self.api, "delegated_started_issues", None)
+        if (not callable(lister) or
+                (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
+            return 0  # No listing, or no session authority for session-less writes.
+        self._last_unbound_sweep = now
+        viewer, moved, after = self.api.viewer_id(), 0, None
+        for _ in range(self.UNBOUND_SWEEP_PAGES):
+            try:
+                nodes, after = lister(viewer, after=after)
+            except RateLimited:
+                raise
+            except LinearError as exc:
+                log.warning("linear: unbound sweep listing unavailable (%s)", type(exc).__name__)
+                return moved
+            for node in nodes:
+                if moved >= self.UNBOUND_SWEEP_MOVES:
+                    return moved
+                if not isinstance(node.get("id"), str) or not node["id"]:
+                    continue
+                with self.lock(node["id"]):
+                    try:
+                        moved += self._park_unbound(node, viewer, now)
+                    except RateLimited:
+                        raise
+                    except Exception as exc:  # One unreadable issue or board holds only itself.
+                        log.warning("linear: unbound sweep held for %s (%s)", node.get("identifier") or node["id"],
+                                    type(exc).__name__)
+            if not after:
+                break
+        return moved
+    def _park_unbound(self, node: dict, viewer: str, now: float) -> int:
+        issue_id, version = node["id"], node.get("updatedAt")
+        key = f"unbound-sweep:{issue_id}:{version}"
+        if self.store.get(issue_id) or self.store.native_intent(key):
+            return 0  # Linked work follows its task; or already decided for this issue version.
+        if now * 1000 - iso_ms(version) < self.UNBOUND_SWEEP_MIN_AGE * 1000:
+            return 0  # Too fresh to call stale; looked at again next pass.
+        if self.store.scope_fenced(issue_id) or self.store.issue_reconciliation_blocked(issue_id):
+            return 0  # An operator decision is pending for this issue.
+        decision, target = "left", None
+        if self.kanban.discover(node):
+            decision = "native task exists"
+        else:
+            issue = self.api.issue(issue_id)  # Fresh and scoped; never the listing's copy.
+            target = self.state_id(issue, "todo")
+            if (issue.get("id") != issue_id or (issue.get("delegate") or {}).get("id") != viewer or not target
+                    or not self._app_set_started_state(issue)):
+                target = None  # A human's state, assignee or delegate choice wins.
+            elif self.store.get(issue_id):
+                return 0  # Linked while we looked: its task decides.
+            else:
+                self.api.update_issue(issue_id, {"stateId": target})
+                decision = "moved to Todo"
+        _, first = self.store.native_intent_prepare(key, {"issue_id": issue_id, "updated_at": version})
+        if first:
+            self.store.native_intent_settle(key, {"state": "applied", "decision": decision})
+        log.info("linear: unbound sweep %s (%s): %s", node.get("identifier") or issue_id,
+                 (node.get("state") or {}).get("name"), decision)
+        return 1 if target else 0
     def _task_gone(self, row: dict) -> bool:
         """The bound task was deleted from a board that still has tasks (a wiped board proves nothing)."""
         if not self.store.native_binding(row["issue_id"], self.kanban.executor_profile):
@@ -2365,8 +2454,9 @@ class Bridge:
             self.api.update_issue(issue_id, {"stateId": target})
         self.store.retire_untracked(issue_id, row.get("task_id"))
     def _app_set_started_state(self, issue: dict) -> bool:
-        """The issue shows a started state that this app set, and nobody else changed
-        state, assignee or delegate since. Backlog, Todo and closed states never qualify."""
+        """The issue shows a started state that this app set (by a move, or by creating the
+        issue in it), and nobody else changed state, assignee or delegate since. Backlog,
+        Todo and closed states never qualify."""
         state, viewer = issue.get("state") or {}, self.api.viewer_id()
         if state.get("type") != "started":
             return False
@@ -2374,7 +2464,12 @@ class Bridge:
         routed = [node for node in nodes if self._routed(node)]
         moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
                     key=lambda node: iso_ms(node.get("createdAt")), default=None)
-        return bool(moved and moved.get("actorId") == viewer and moved.get("toStateId") == state.get("id") and
+        if moved is None:
+            # No state move on record (the whole history was read): the state is the one this
+            # app created the issue in, and every later routing change was its own.
+            return bool(not more and (issue.get("creator") or {}).get("id") == viewer and
+                        all(node.get("actorId") == viewer for node in routed))
+        return bool(moved.get("actorId") == viewer and moved.get("toStateId") == state.get("id") and
                     all(node.get("actorId") == viewer for node in routed
                         if iso_ms(node.get("createdAt")) > iso_ms(moved.get("createdAt"))))
     def recover(self, ingress: Path | None = None) -> None:

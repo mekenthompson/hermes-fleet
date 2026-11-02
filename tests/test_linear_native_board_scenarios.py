@@ -198,7 +198,7 @@ class NativeBoardScenarios(unittest.TestCase):
             self.operator(board, self.kb.complete_task, task_id,
                           result="Verified the bounded endpoint change with clear supporting findings")
             self.clock.now += 10
-            self.assertEqual(self.bridge.flush(), 1)
+            self.assertEqual(self.bridge.flush(), 2)  # progress, and a delegate recovery that went moot
             self.bridge = self.restart()
             self.bridge.recover()
             self.bridge.flush()

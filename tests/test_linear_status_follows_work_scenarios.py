@@ -137,8 +137,9 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.assertTrue(any("This stage is finished" in body for body in self.remote.bodies("issue-1")))
         return self.state()
 
-    def test_internal_stage_done_shows_the_next_step_never_done(self):
-        self.assertEqual(self.stage_done("Drafted the migration plan."), "Todo")
+    def test_internal_stage_done_awaits_review_never_todo_or_done(self):
+        # Finished work whose outcome is not verified awaits review, CI or merge (live: HF-182, HF-576, HF-585).
+        self.assertEqual(self.stage_done("Drafted the migration plan."), "In Review")
 
     def test_internal_stage_done_with_a_pr_awaits_review(self):
         self.assertEqual(self.stage_done("Opened https://github.com/example/repo/pull/12 for review."), "In Review")
@@ -174,6 +175,42 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.native("archive_task", task)
         self.ticks()
         self.assertEqual(self.state(), "Todo")
+
+    def test_archived_after_an_older_builds_blocked_closeout_moves_to_todo(self):
+        # Live HF-546/HF-575: an older build closed archived work out as Blocked (a terminal row);
+        # only a Done closeout is a verified outcome, so the Blocked this app set still parks at Todo.
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.native("block_task", task, reason="Need the API key", kind="needs_input", expected_run_id=run)
+        self.ticks()
+        self.assertEqual(self.state(), "Blocked")
+        self.native("archive_task", task)
+        self.bridge.pump_kanban()  # consume the archive before the legacy closeout lands
+        with self.bridge.store._tx() as db:
+            db.execute("DELETE FROM outbox WHERE kind='status' AND state='pending'")
+        self.bridge.store.enqueue("status", {"issue_id": "issue-1", "state": "blocked", "task_id": task,
+                                             "terminal": True, "owner_issue_id": "issue-1"}, at=self.bridge.clock())
+        self.bridge.flush()
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1"))
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+        self.assertEqual(len(self.mutations()), writes + 1)
+        self.ticks()
+        self.assertEqual(len(self.mutations()), writes + 1)
+
+    def test_archived_after_a_done_closeout_leaves_done(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.assertTrue(self.native("complete_task", task, summary="Rotated the staging certificate and checked it live.",
+                                    expected_run_id=run))
+        self.ticks()
+        self.assertEqual(self.state(), "Done")
+        self.native("archive_task", task)
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "Done")
+        self.assertEqual(len(self.mutations()), writes)
 
     def test_archived_without_outcome_leaves_a_later_human_move_alone(self):
         task, _ = self.task(claim=True)
@@ -308,6 +345,203 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.assertEqual(self.state(), "Blocked")
         self.assertEqual(self.mutations(), [])
         self.assertIsNone(self.bridge.store.get("issue-1"))
+
+
+    # -- the working agent stays visible while work waits (delegate) ------
+
+    def undelegated(self):
+        """An older build or restart left the issue without this app as delegate."""
+        self.remote.set_delegate("issue-1", None, actor=SELF)
+
+    def delegate_writes(self):
+        return [q for q in self.remote.requests if q.startswith("mutation IssueUpdate")]
+
+    def test_blocked_work_gets_its_agent_back_as_delegate_assignee_unchanged(self):
+        self.undelegated()
+        task, run = self.task(claim=True)
+        self.native("block_task", task, reason="Need the API key", kind="needs_input", expected_run_id=run)
+        self.ticks()
+        self.assertEqual(self.board.get(task).status, "blocked")
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+        self.assertEqual(self.fixture.issue["assignee"], {"id": "human-assignee"})
+
+    def test_queued_work_gets_its_agent_back_as_delegate(self):
+        self.undelegated()
+        task, _ = self.task()
+        self.assertEqual(self.board.get(task).status, "ready")
+        self.ticks()
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+        self.assertEqual(self.state(), "Todo")
+
+    def test_triage_work_gets_its_agent_back_as_delegate(self):
+        self.undelegated()
+        task, _ = self.task(triage=True)
+        self.assertEqual(self.board.get(task).status, "triage")
+        self.ticks()
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+
+    def test_work_in_review_gets_its_agent_back_as_delegate(self):
+        self.undelegated()
+        task, run = self.task(claim=True)
+        self.assertTrue(self.native("request_review", task, summary="PR is up for review", expected_run_id=run))
+        self.ticks()
+        self.assertEqual(self.state(), "In Review")
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+
+    def test_delegate_recovery_is_idempotent(self):
+        self.undelegated()
+        self.task(triage=True)
+        self.ticks()
+        writes = len(self.delegate_writes())
+        from hermes_fleet_linear_plugin.store import Store
+        for _ in range(3):
+            self.bridge.store = Store(self.bridge.store.path)
+            self.bridge.recover()
+            self.ticks(1)
+        self.assertEqual(len(self.delegate_writes()), writes)
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+
+    def test_a_human_who_removed_the_delegate_from_waiting_work_wins(self):
+        task, _ = self.task(triage=True)
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.remote.set_delegate("issue-1", None, actor="human-1")  # Ken took the agent off it
+        writes = len(self.delegate_writes())
+        self.ticks()
+        self.assertIsNone(self.fixture.issue["delegate"])
+        self.assertEqual(len(self.delegate_writes()), writes)
+
+    def test_finished_work_does_not_get_a_delegate_back(self):
+        task, run = self.task(scope="progress", claim=True)
+        self.ticks()
+        self.assertTrue(self.native("complete_task", task, summary="Drafted the plan.", expected_run_id=run))
+        self.ticks()
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.remote.set_delegate("issue-1", None, actor=SELF)
+        self.ticks()
+        self.assertIsNone(self.fixture.issue["delegate"])
+
+    # -- legacy In Progress with no link and no native task (unbound) -----
+
+    def unbound(self, ident, *, state="In Progress", delegate=SELF, age=7200.0):
+        """A pre-native issue this app delegated and moved to ``state``, last touched ``age`` seconds ago."""
+        clock = self.fixture.fixture.clock
+        clock.now = time.time() - age
+        issue = self.remote.add_issue(f"id-{ident}", ident)
+        issue["assignee"] = {"id": "human-assignee"}
+        self.remote.set_delegate(issue["id"], delegate and {"id": delegate, "name": "This Agent"}, actor=SELF)
+        self.remote.set_state(issue["id"], state, actor=SELF)
+        clock.now = time.time()
+        return issue
+
+    def sweep(self):
+        self.fixture.fixture.clock.now = time.time()
+        return self.bridge.sweep_unbound(force=True)
+
+    def test_unbound_in_progress_this_app_set_goes_to_todo_once(self):
+        issue = self.unbound("ABC-506")
+        self.assertEqual(self.sweep(), 1)
+        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+        self.assertEqual(issue["delegate"]["id"], SELF)  # delegate and assignee unchanged
+        self.assertEqual(issue["assignee"], {"id": "human-assignee"})
+        writes = len(self.mutations())
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(len(self.mutations()), writes)
+
+    def created_in_progress(self, ident, creator):
+        """Live HF-506..HF-564: created already In Progress and delegated, so no state move is on record."""
+        self.fixture.fixture.clock.now = time.time() - 7200
+        issue = self.remote.add_issue(f"id-{ident}", ident)
+        issue.update(creator={"id": creator}, delegate={"id": SELF, "name": "This Agent"},
+                     state=dict(next(s for s in self.states if s["name"] == "In Progress")))
+        return issue
+
+    def test_unbound_issue_this_app_created_in_progress_goes_to_todo(self):
+        self.bridge.api.specialist_scope = None  # this fixture's scope admits only human-1's issues
+        issue = self.created_in_progress("ABC-564", SELF)
+        self.assertEqual(self.sweep(), 1)
+        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+
+    def test_unbound_issue_a_person_created_in_progress_is_left(self):
+        self.bridge.api.specialist_scope = None
+        issue = self.created_in_progress("ABC-565", "human-1")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(issue["id"]), "In Progress")
+
+    def test_unbound_blocked_this_app_set_goes_to_todo(self):
+        issue = self.unbound("ABC-507", state="Blocked")
+        self.sweep()
+        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+
+    def test_unbound_issue_a_human_moved_is_left(self):
+        issue = self.unbound("ABC-508")
+        self.fixture.fixture.clock.now = time.time() - 3600 * 1.5
+        self.remote.set_state(issue["id"], "Blocked", actor="human-1")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(issue["id"]), "Blocked")
+        self.assertEqual(self.mutations(), [])
+
+    def test_unbound_issue_a_human_reassigned_is_left(self):
+        issue = self.unbound("ABC-509")
+        self.fixture.fixture.clock.now = time.time() - 3600 * 1.5
+        self.remote.set_assignee(issue["id"], {"id": "human-2"}, actor="human-1")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(issue["id"]), "In Progress")
+        self.assertEqual(self.mutations(), [])
+
+    def test_unbound_issue_with_a_native_task_is_left(self):
+        issue = self.unbound("ABC-510")
+        with self.board.conn() as db:
+            self.board.kb.create_task(db, title="Unlinked native work", board=self.board.board,
+                                      assignee=self.board.executor_profile, created_by="operator",
+                                      body=f"Linear issue {issue['id']}: {issue['url']}")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(issue["id"]), "In Progress")
+        self.assertEqual(self.mutations(), [])
+
+    def test_bound_running_work_is_not_touched_by_the_sweep(self):
+        self.task(claim=True)
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")
+        writes = len(self.mutations())
+        self.fixture.fixture.clock.now = time.time() + 7200
+        self.assertEqual(self.bridge.sweep_unbound(force=True), 0)
+        self.assertEqual(self.state(), "In Progress")
+        self.assertEqual(len(self.mutations()), writes)
+
+    def test_recently_touched_unbound_issue_waits_then_moves(self):
+        issue = self.unbound("ABC-511", age=60)
+        self.assertEqual(self.sweep(), 0)  # it may be getting linked right now
+        self.assertEqual(self.remote.state(issue["id"]), "In Progress")
+        self.fixture.fixture.clock.now = time.time() + 3600
+        self.assertEqual(self.bridge.sweep_unbound(force=True), 1)
+        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+
+    def test_another_apps_issue_is_not_listed(self):
+        issue = self.unbound("ABC-512", delegate="app-other")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(issue["id"]), "In Progress")
+
+    def test_sweep_is_bounded_and_pages(self):
+        issues = [self.unbound(f"ABC-{600 + n}") for n in range(53)]
+        self.bridge.UNBOUND_SWEEP_MOVES = 100
+        self.assertEqual(self.sweep(), 53)  # two pages of the listing
+        self.assertTrue(all(self.remote.state(issue["id"]) == "Todo" for issue in issues))
+        more = [self.unbound(f"ABC-{700 + n}") for n in range(3)]
+        self.bridge.UNBOUND_SWEEP_MOVES = 2
+        self.assertEqual(self.sweep(), 2)
+        self.assertEqual(self.sweep(), 1)
+        self.assertTrue(all(self.remote.state(issue["id"]) == "Todo" for issue in more))
+
+    def test_sweep_runs_at_most_hourly_from_the_recheck(self):
+        issue = self.unbound("ABC-513")
+        self.bridge.recheck(force=True)
+        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+        later = self.unbound("ABC-514")
+        self.bridge.recheck(force=True)
+        self.assertEqual(self.remote.state(later["id"]), "In Progress")  # next pass is an hour later
+        self.fixture.fixture.clock.now = time.time() + 3601
+        self.bridge.recheck(force=True)
+        self.assertEqual(self.remote.state(later["id"]), "Todo")
 
 
 if __name__ == "__main__":

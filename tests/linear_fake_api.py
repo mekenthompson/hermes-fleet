@@ -211,6 +211,15 @@ class FakeLinear:
                         (mutation == "agentActivityCreate" and self.activity_updates_issue)):
                     self.issues[fields["issueId"]]["updatedAt"] = self.clock.iso()
                 return 200, {"data": {mutation: {"success": True}}}
+        if "issues(" in query:
+            # Delegated-and-started listing in id order; the cursor is the last node, as in Linear.
+            matches = [json.loads(json.dumps(i)) for _, i in sorted(self.issues.items())
+                       if (i.get("delegate") or {}).get("id") == variables["delegate"] and i["state"]["type"] == "started"
+                       and (not variables.get("after") or i["id"] > variables["after"])]
+            count = int(re.search(r"issues\(first: (\d+)", query)[1])
+            page, more = matches[:count], len(matches) > count
+            return 200, {"data": {"issues": {"nodes": page, "pageInfo": {
+                "hasNextPage": more, "endCursor": page[-1]["id"] if page else None}}}}
         if "issue(" in query:
             issue = self.issues.get(variables["id"]) or next(
                 (i for i in self.issues.values() if i["identifier"] == variables["id"]), None)

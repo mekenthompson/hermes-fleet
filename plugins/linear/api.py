@@ -386,6 +386,19 @@ class LinearAPI:
         return issue, nodes, bool((history.get("pageInfo") or {}).get("hasNextPage"))
     def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
         return self.issue_with_thread(issue_id, limit)[1]
+    def delegated_started_issues(self, delegate_id: str, *, after: str | None = None,
+                                 limit: int = 50) -> tuple[list[dict[str, Any]], str | None]:
+        """One page of issues delegated to ``delegate_id`` in a started state; the next cursor or None."""
+        data = self.graphql("query DelegatedStarted($delegate: ID!, $after: String) { issues(first: %d, after: $after, "
+                            "filter: { delegate: { id: { eq: $delegate } }, state: { type: { eq: \"started\" } } }) "
+                            "{ nodes { %s } pageInfo { hasNextPage endCursor } } }" % (limit, ISSUE_FIELDS),
+                            {"delegate": delegate_id, "after": after})
+        issues = data.get("issues")
+        if not isinstance(issues, dict) or not isinstance(issues.get("nodes"), list):
+            raise LinearError("Linear delegated issue listing unavailable")
+        page = issues.get("pageInfo") or {}
+        cursor = page.get("endCursor") if page.get("hasNextPage") else None
+        return [node for node in issues["nodes"] if isinstance(node, dict)], cursor if isinstance(cursor, str) and cursor else None
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
                             "{ issueUpdate(id: $id, input: $input) { success issue { " + ISSUE_FIELDS + " } } }",

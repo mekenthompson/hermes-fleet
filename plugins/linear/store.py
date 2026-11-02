@@ -827,14 +827,16 @@ class Store:
                 "(state IN ('sent', 'pending') OR (state = 'failed' AND attempts > 0)))) GROUP BY 1, 2",
                 (issue_id, task_id, session_id)).fetchall()
         return Counter({(kind, body): count for kind, body, count in rows})
-    def terminal_captured(self, task_id: str, *, issue_id: str | None = None) -> bool:
+    def terminal_captured(self, task_id: str, *, issue_id: str | None = None, state: str | None = None) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             return bool(db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND "
                                    "json_extract(payload, '$.task_id')=? AND "
                                    "(? IS NULL OR json_extract(payload, '$.issue_id')=?) AND "
+                                   "(? IS NULL OR json_extract(payload, '$.state')=?) AND "
                                    "json_extract(payload, '$.terminal')=1 AND "
-                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1", (task_id, issue_id, issue_id)).fetchone())
+                                   "json_extract(payload, '$.admission_id') IS NULL LIMIT 1",
+                                   (task_id, issue_id, issue_id, state, state)).fetchone())
     def assessment_comment_id(self, issue_id: str, body: str, *, completion: dict | None = None) -> str | None:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
