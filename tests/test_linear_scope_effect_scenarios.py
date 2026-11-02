@@ -123,7 +123,8 @@ class ScopeEffectScenarios(unittest.TestCase):
         self.fixture.assign()
         notices = [row for row in self.store.pending() if row["payload"].get("reporting_notice_version") == 1]
         self.assertTrue(notices)
-        self.assertIn("held for inspection", notices[-1]["payload"]["content"]["body"])
+        self.assertIn("couldn't safely act on this", notices[-1]["payload"]["content"]["body"])
+        self.assertNotIn("native", notices[-1]["payload"]["content"]["body"].lower())
         self.assertNotIn("Existing work:", notices[-1]["payload"]["content"]["body"])
         self.assertEqual(self.store.native_binding(native.ISSUE), binding)
 

@@ -41,8 +41,8 @@ class AssessmentRepairScenarios(unittest.TestCase):
         self.cursor = self.f.store.get(native.ISSUE)['last_event_id']
 
     def human_edit(self, seconds):
-        self.f.authority.issues[native.ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            self.created + seconds, datetime.timezone.utc).isoformat()
+        self.f.authority.human_edit(native.ISSUE, datetime.datetime.fromtimestamp(
+            self.created + seconds, datetime.timezone.utc).isoformat())
 
     def reject_original_group(self):
         self.human_edit(100)
