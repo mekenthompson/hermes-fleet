@@ -338,6 +338,49 @@ class BridgeLoopTests(unittest.TestCase):
             self.assertLess(attempts[1] - attempts[0], 30)  # a transient refusal still retries soon
             self.assertGreater(clock() - start, 3000)
 
+    def blocked_task_with_uncertain_closeout(self, directory, clock):
+        bridge, authority, store, kanban = self.bridge(directory, clock)
+        issue = authority.issues[ISSUE]
+        # Every Linear-created task carries the issue marker, so its effects need a Linear read.
+        task = kanban.create(title="OPS-1", body=f"Linear issue {issue.get('identifier') or ISSUE}: {issue.get('url')}\n")
+        store.bind_native(ISSUE, task.id, "synthetic", "default", owner_ref=SESSION, at=0)
+        task.status = "blocked"
+        kanban.histories[task.id] = [SimpleNamespace(id=1, kind="blocked", created_at=0, payload={"reason": "x"})]
+        with store._tx() as db:
+            db.execute("UPDATE work SET last_event_id=1 WHERE issue_id=?", (ISSUE,))
+            db.execute("INSERT INTO outbox (id, kind, payload, next_at, state, attempts) VALUES ('t1', 'status', ?, ?, "
+                       "'failed', 1)", (json.dumps({"issue_id": ISSUE, "task_id": task.id, "state": "done",
+                                                    "terminal": True, "write_started": True, "enqueued_at": 0}), 1e12))
+        return bridge, authority, store, task
+
+    def test_held_status_reconcile_makes_no_linear_reads(self):
+        """An uncertain closeout held for an operator must not cost a read every 2 s tick (was ~1,800/h)."""
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, store, _ = self.blocked_task_with_uncertain_closeout(directory, clock)
+            self.assertFalse(store.effect_admitted(ISSUE))
+            before = len(authority.requests)
+            for _ in range(1800):  # one hour of 2 s ticks
+                bridge.pump_kanban()
+                clock.now += 2
+            self.assertEqual(len(authority.requests) - before, 0)
+
+    def test_refused_status_reconcile_backs_off_after_its_read(self):
+        """A store refusal after the issue read raises, so the persisted pump backoff applies."""
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, store, _ = self.blocked_task_with_uncertain_closeout(directory, clock)
+            with store._tx() as db:
+                db.execute("DELETE FROM outbox WHERE id='t1'")  # admitted now; the work row still binds
+            self.assertTrue(store.effect_admitted(ISSUE))
+            store.reconcile_status = lambda issue_id, payload, at: False  # e.g. the work row moved underneath us
+            before = len(authority.requests)
+            for _ in range(1800):
+                bridge.pump_kanban()
+                clock.now += 2
+            self.assertGreater(len(authority.requests) - before, 0)
+            self.assertLess(len(authority.requests) - before, 12)  # 15 s doubling to 1 h, not every tick
+
     def test_spent_budget_defers_reads_but_queued_writes_still_go_out(self):
         with tempfile.TemporaryDirectory() as directory:
             clock = Clock()

@@ -2203,9 +2203,13 @@ class Bridge:
                 if state is None or state == latest.get("state"):
                     return
                 payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
+        if not self.store.effect_admitted(row["issue_id"]):
+            return  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         self._native_effect_task(row["issue_id"])
-        self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
-                                                      **self._alert_route(row)}, at=self.clock())
+        queued = self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
+                                                               **self._alert_route(row)}, at=self.clock())
+        if not queued and payload["state"] != latest.get("state"):
+            raise LinearError("Status reconcile was not queued; retrying later")  # pump backs off
     def _native_state(self, task, adapter, last) -> str | None:
         """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
         status, payload = task.status, native_event_payload(last) if last else {}

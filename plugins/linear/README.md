@@ -701,8 +701,9 @@ The client keeps one pause and budget file per profile, `<state_database>.rate-l
 - A credential's actor/workspace proof is reused for reads for 10 minutes; a new token or a
   401 forces a new proof, and writes always prove it again.
 - Anything that fails or is held repeatedly backs off with jitter instead of retrying every
-  tick: outbox rows a guard keeps deferring (30 s doubling to 30 min), pump steps such as delegate
-  recovery (15 s doubling to 1 h, saved in the state database), unconfirmed Stops (doubling to about
-  15 min), startup identity checks (doubling to 5 min) and OAuth refresh failures (1 min doubling to 15 min).
+  tick: outbox rows a guard keeps deferring (30 s doubling to 30 min), pump steps such as status
+  reconcile and delegate recovery (15 s doubling to 1 h, saved in the state database; no Linear read
+  at all while an unresolved write holds the issue), unconfirmed Stops (doubling, then every
+  10 min), startup identity checks (doubling to 5 min) and OAuth refresh failures (1 min doubling to 15 min).
 - Issue webhooks for a tracked issue recheck only that issue, at most once per 30 s, and ignore
   echoes of this app's own writes. Finished or parked native work is not polled.
