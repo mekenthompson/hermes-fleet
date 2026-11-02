@@ -827,6 +827,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(fates)
             self.assertEqual(set(fates), {"instance_replaced"})
             self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # A reboot (another boot id) ended the old instance too.
+        rebooted = "00000000-0000-4000-8000-000000000001:1"
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=rebooted):
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         for table, rows in before.items():
             self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], rows)
         # The takeover then starts the remainder exactly once: the Stop anchor admits one resume,
@@ -848,7 +852,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(self.live_owner), self.owner_event))
         result = await inspected(restarted)
         self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "old_gateway_alive"))
-        self.assertIn("still running", result["needed"])
+        self.assertIn("may still be running", result["needed"])
         live_owner = dict(self.live_owner, pid=99999996)
         self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(live_owner), self.owner_event))
         # The recorded instance is not an earlier one: another running copy may own the attempt.
@@ -860,6 +864,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             with self.subTest(epoch=degraded):
                 result = await inspected(degraded)
                 self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "worker_identity_unreadable"))
+                self.assertIn("Check again", result["needed"])
         # A worker of the current instance is alive: the long-standing live-PID hold.
         self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
             (json.dumps({"pid": os.getpid(), "started_at": _process_fingerprint(os.getpid()),

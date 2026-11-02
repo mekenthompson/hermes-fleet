@@ -37,20 +37,23 @@ _SETTLED_ADMISSION_OUTCOMES = frozenset({
 HOLD_FACTS = {
     "old_worker_alive": "A process from the earlier attempt is still running here. "
                         "It has to stop before the work can be taken over.",
-    "old_gateway_alive": "The agent process that started the earlier attempt is still running here, "
-                         "so that attempt may still be running. It has to stop before the work can be taken over.",
+    "old_gateway_alive": "A process here may be the one that started the earlier attempt, so that attempt "
+                         "may still be running. Confirm the earlier attempt has stopped before the work is taken over.",
     "worker_instance_not_earlier": "The earlier attempt ran in another running copy of this agent, "
                                    "not one that has since restarted. That copy has to be confirmed stopped first.",
     "old_instance_unproven": "The earlier attempt ran before a restart, but its record does not yet show that "
-                             "everything it started has ended. The agent settles that record when it next starts.",
+                             "everything it started has ended. Confirm that before the work is taken over.",
+    "worker_identity_unreadable": "This agent cannot read its own process identity right now, so it cannot tell "
+                                  "whether the earlier attempt is still running. Check again shortly.",
     "restart_proof_unsupported": "This agent's version cannot yet confirm that work from before a restart has ended. "
                                  "Update the agent, then check again.",
 }
 
 # Optional host lifecycle evidence. Core's own restart proof (attempt_instance_replaced)
-# comes first; this host receipt is only needed where that proof cannot apply: an
-# older core without it, or a deployment where another live container may share this
-# home (core assumes one live instance per board/owner ledger). It shares the existing
+# comes first; this host receipt is read only when that proof does not hold, which in
+# practice means an older core without it. Like core, this check assumes one live
+# instance per home (each container its own volume): a home shared by two live
+# containers is unsupported, and a receipt does not make it safe. It shares the existing
 # protected per-profile ingress mount. These are immutable physical facts, never
 # execution or consent grants.
 NAMESPACE_DISPOSITION_DIRECTORY = "namespace-dispositions"

@@ -698,15 +698,16 @@ core's `attempt_instance_replaced` (hermes-agent #217) must accept every worker 
 recorded. Its fate is then `instance_replaced`; every admission, Stop, executor, scope and
 checkpoint check below still applies. A worker that may still be alive keeps the hold, with a
 plain `needed` sentence: `old_worker_alive` (a live worker of this instance),
-`old_gateway_alive` (the admitting gateway is still running), `worker_instance_not_earlier`
+`old_gateway_alive` (a live process here may be the admitting gateway), `worker_instance_not_earlier`
 (another running copy), `old_instance_unproven` (core cannot yet prove it),
 `restart_proof_unsupported` (a core without #217) or `worker_identity_unreadable` (this
 instance's identity cannot be read). Each hold is logged as `action=cleanup.inspect outcome=held`.
 
-The host receipt below is kept only for what core's proof cannot cover: an older core without
-it, or a deployment where another live container may share the same home (core assumes one
-live instance per board and owner ledger). A present receipt that fails its checks still holds
-with its own reason.
+The host receipt below is read only when core's proof does not hold, which in practice means an
+older core without it. Like core, this check assumes one live instance per home (each container
+its own volume, as in `compose.example.yaml`); a home shared by two live containers is
+unsupported, and a receipt does not make it safe. A present receipt that fails its checks still
+holds with its own reason.
 
 The optional host namespace-disposal transport is the existing protected ingress directory's
 `namespace-dispositions/<sha256(epoch UTF-8)>.json` sibling directory. Every ancestor must be
