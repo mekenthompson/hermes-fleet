@@ -305,6 +305,7 @@ class BridgeLoopTests(unittest.TestCase):
             status = {"value": "done"}
             bridge._task_gone = lambda row: False
             bridge._native_task = lambda issue_id: (store.get(issue_id), SimpleNamespace(status=status["value"]))
+            bridge._last_unbound_sweep = clock()  # the hourly unbound sweep is its own bounded pass, not per row
             counts = []
             for rows in (5, 50, 200):
                 for index in range(rows):
@@ -470,7 +471,7 @@ class SpecialistPumpTests(unittest.TestCase):
                 clock.now += 2
             self.assertLess(self.issue_reads(authority), 12)  # was 1,800
             authority.fail_issue = False
-            clock.now += 3600
+            clock.now += 3600 * 1.2 + 1  # past the longest jittered wait (1 h cap, +20%)
             bridge.pump_kanban()
             self.assertFalse(bridge.store.scope_fenced(ISSUE))  # a transient refusal never fences
             self.assertIn(ISSUE, bridge._pump_authorized)  # and it is admitted again once Linear answers

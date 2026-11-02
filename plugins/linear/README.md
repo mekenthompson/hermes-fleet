@@ -22,7 +22,7 @@ API is required. The plugin is disabled by default.
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
-| `create_issue` with UUIDv4 `id`, `title`, `team` | Create an undelegated issue; optional description/project/parent. |
+| `create_issue` with UUIDv4 `id`, `title`, `team` and `project` | Create an undelegated issue; optional description/parent. `project` is a project id or exact name; without it the parent's project is used. With neither, nothing is created and the reply lists the team's active projects so the agent can choose one itself; `project: "none"` is the explicit opt-out. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
 | `update_description` with `issue`, UUIDv4 `id`, `description`, `expected_description` | Queue a description replacement after checking the exact previous text. |
@@ -86,7 +86,9 @@ The agent finalizes the full native task scope before tracking and admitting cha
 work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
 (the default); use `progress` for preparation, a hold, or another internal stage. The agent
 manages this distinction without asking the user to maintain task IDs or activate reporting.
-Linear assignment creates and admits a fully populated outcome task automatically.
+An automatic (creator-null) Linear assignment creates and admits a fully populated outcome
+task automatically. A human delegation or @mention opens a native conversation instead (see
+Native Agent Session conversations below).
 Tracking an unfinished native task on an undelegated issue queues the current app as
 Linear delegate through the existing guarded outbox. The next reporting pass projects
 the native active state. A different current delegate or newer issue edit holds routing
@@ -297,16 +299,23 @@ Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states
 `completion_contracts` retain their existing meanings.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
-blocked or triage shows the team's Blocked state, and an internal stage that finished shows
-the next step (In Review with a PR, else Todo). Done comes only from verified completion.
-Work archived or cancelled without a verified outcome posts nothing; a started state this app
-set (In Progress, Blocked, In Review) becomes Todo, since no agent is working on it now.
+blocked or triage shows the team's Blocked state, and finished work whose outcome is not
+verified shows In Review (it awaits review, CI or merge; never Todo). Done comes only from
+verified completion. Work archived or cancelled without a verified outcome posts nothing; a
+started state this app set (In Progress, Blocked, In Review) becomes Todo, since no agent is
+working on it now, including after an older build's Blocked closeout.
 Backlog, Todo, Done and Canceled stay as they are. A team without a named state uses its first state of
 the same type (unstarted, started, completed); without Blocked or In Review the state stays
 and the plain blocker sentence still posts. A newer human state, assignee or delegate change
 in Linear's issue history wins. The reporting recheck retires records whose native task no
 longer exists (including pre-rebuild chat records): a started state this app set becomes
-Todo once, unless someone else changed it since.
+Todo once, unless someone else changed it since. Once an hour it also lists issues delegated
+to this app in a started state that have no link in this store and no native task (work from
+before native execution), at most 4 pages of 50 and 25 moves per pass, and moves each to Todo
+under the same rule once it has been untouched for an hour; delegate and assignee stay.
+Linked open work (queued, running, blocked, triage or in review) gets this app back as
+delegate when it has none, unless a person changed state, assignee or delegate since the
+current claim or, for work not running, since the task was created.
 `ingress_profile` selects the trusted inbox route only; it does not change caller authorization.
 When omitted, CLI routing uses Hermes' resolved native profile, including a multiplexed
 named profile. Set it explicitly when a fleet deployment's inbox has a different name.
@@ -374,6 +383,15 @@ and replies. It uses the existing profile inbox and scoped outbox. Current reque
 can inspect stopped, scheduled or completed work and decide the authorized next
 action; a status request creates no task. The model uses native Kanban controls and
 the work-tracking skill for durable work and handoff.
+
+A new human session gets one immediate `thought` activity before the model turn, so
+Linear shows a response within seconds. Its outbox id is derived from the session, so a
+redelivered webhook never posts it twice, and a failed post never holds the input. An
+@mention reaches the agent as the comment text itself, marked as a mention to answer
+rather than a work request; a delegation is framed as delegated work. Each conversation
+turn also carries the current linked native task and its status (or that none is
+linked), so continuing existing work with `linear followup` does not rely on the skill
+alone.
 
 Enable it through native platform configuration and the real permitted Linear user
 IDs, with an explicit per-profile toolset:

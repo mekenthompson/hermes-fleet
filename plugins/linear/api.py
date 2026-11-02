@@ -492,6 +492,19 @@ class LinearAPI:
         return issue, nodes, cursor
     def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
         return self.issue_with_thread(issue_id, limit)[1]
+    def delegated_started_issues(self, delegate_id: str, *, after: str | None = None,
+                                 limit: int = 50) -> tuple[list[dict[str, Any]], str | None]:
+        """One page of issues delegated to ``delegate_id`` in a started state; the next cursor or None."""
+        data = self.graphql("query DelegatedStarted($delegate: ID!, $after: String) { issues(first: %d, after: $after, "
+                            "filter: { delegate: { id: { eq: $delegate } }, state: { type: { eq: \"started\" } } }) "
+                            "{ nodes { %s } pageInfo { hasNextPage endCursor } } }" % (limit, ISSUE_FIELDS),
+                            {"delegate": delegate_id, "after": after})
+        issues = data.get("issues")
+        if not isinstance(issues, dict) or not isinstance(issues.get("nodes"), list):
+            raise LinearError("Linear delegated issue listing unavailable")
+        page = issues.get("pageInfo") or {}
+        cursor = page.get("endCursor") if page.get("hasNextPage") else None
+        return [node for node in issues["nodes"] if isinstance(node, dict)], cursor if isinstance(cursor, str) and cursor else None
     def update_issue(self, issue_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         data = self.graphql("mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) "
                             "{ issueUpdate(id: $id, input: $input) { success issue { " + ISSUE_FIELDS + " } } }",
@@ -568,6 +581,17 @@ class LinearAPI:
                 or (parent_id is not None and parent.get("id") != parent_id)):
             raise LinearError("Linear issue readback does not match the create", retryable=False)
         return issue
+    def team_projects(self, team_id: str) -> list[dict[str, str]]:
+        """Active (not completed, canceled or archived) projects of one team, as id and name."""
+        data = self.graphql("query TeamProjects($id: String!) { team(id: $id) { id projects(first: 100) "
+                            "{ nodes { id name completedAt canceledAt archivedAt } } } }", {"id": team_id})
+        nodes = (((data.get("team") or {}).get("projects") or {}).get("nodes")
+                 if isinstance(data.get("team"), dict) else None)
+        if not isinstance(nodes, list):
+            raise LinearError(f"Linear team {team_id} projects unavailable")
+        return [{"id": node["id"], "name": node["name"]} for node in nodes
+                if isinstance(node, dict) and isinstance(node.get("id"), str) and isinstance(node.get("name"), str)
+                and not (node.get("completedAt") or node.get("canceledAt") or node.get("archivedAt"))]
     def create_project(self, client_id: str, name: str, team_ids: list[str], *,
                        description: str | None = None) -> dict[str, Any]:
         """Create a project as the authenticated app. Never sets a lead."""
