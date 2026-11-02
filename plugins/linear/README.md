@@ -67,17 +67,23 @@ definition of done matches the project's, and then as progress: it never closes 
 itself. Delegated children return the request to their parent.
 
 When work starts, the delegate is queued inside the issue's lock, before admission, from the
-issue version read under that lock, so it is the issue's oldest pending write. The chat reply says only what
-is true: Linear shows the delegate, is being updated (a delegate write is still pending), or
-the update is pending and retried unless a person changes the issue's routing first.
+issue version read under that lock, so the status writes that follow from the work are queued
+after it. A chat admission that finds no delegate proceeds only when no person changed state,
+assignee or delegate since the chat request (a pending delegate of ours skips that history read
+only while Linear has not moved since it was queued). If admission is superseded, its queued
+delegate is dropped and recovery does not add one: parked work is not shown as worked on.
+The chat reply says only what is true: Linear shows the delegate, is being updated (a delegate
+write is still pending), the update will be retried (only when delegate recovery's own
+conditions hold), a person removed this agent as delegate or otherwise changed routing (not
+re-added), or it was not updated and nothing retries it now.
 Delegate recovery retries chat-started routing that was refused before any write, once per
 binding. For chat-started work every delegate recovery is fenced from the earlier of the
 chat request and the worker's claim: a person's later change of state, assignee or delegate
-wins. While Linear shows no delegate, a Linear
-Stop on chat-started work bound here is authorized by that binding and its chat origin (Stop
-is the safe direction); work delegated to anyone else still refuses it. Work adopted from the
-board through chat keeps the ordinary rules: its Stop and delegate recovery need this app as
-delegate or the plain binding recovery, since it was not created from the chat request.
+wins. Whenever Linear shows no delegate, a Linear Stop on chat-started work bound here is
+authorized by that binding and its chat origin (Stop is the safe direction); work delegated
+to anyone else still refuses it. Work adopted from the board through chat keeps the ordinary
+rules: its Stop and delegate recovery need this app as delegate or the plain binding
+recovery, since it was not created from the chat request.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not

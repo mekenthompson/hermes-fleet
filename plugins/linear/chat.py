@@ -330,10 +330,20 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
                 **({"recorded_done": True} if recorded_done else {}))
             # A retried request returns its earlier row: only a still-pending one is on its way.
             routing = ("queued" if (bridge.store.outbox_row(row_id) or {}).get("state") == "pending"
-                       else "held: an earlier delegate update for this work did not go through")
+                       else _held(bridge, issue_id, "an earlier delegate update for this work did not go through"))
         except (LinearError, ValueError) as exc:
-            routing = f"held: {exc}"
+            routing = _held(bridge, issue_id, str(exc))
     return routing
+
+
+HELD = {"retry": "held: will retry automatically", "removed": "held: a person removed this agent as delegate",
+        "changed": "held: a person changed who works on this issue", "closed": "held: the issue is closed"}
+
+
+def _held(bridge: Any, issue_id: str, detail: str) -> str:
+    """Held routing, with what the bridge knows will happen next; no promise it cannot keep."""
+    outlook = bridge.chat_route_outlook(issue_id) if hasattr(bridge, "chat_route_outlook") else "unknown"
+    return HELD.get(outlook, f"held: {detail}")
 
 
 def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any) -> dict:
@@ -356,8 +366,15 @@ def _delegate_sentence(routing: str) -> str:
         return "Linear shows this agent as delegate and follows the status"
     if routing == "queued":
         return "Linear is being updated to show this agent as delegate, and follows the status"
-    return ("the Linear delegate update is still pending: the agent retries it automatically unless someone "
-            "changes who works on this issue in Linear first, so Linear may not show this agent as delegate yet")
+    if routing == HELD["retry"]:
+        return ("the Linear delegate update is still pending and the agent retries it automatically, so Linear "
+                "may not show this agent as delegate yet")
+    if routing == HELD["removed"]:
+        return "a person removed this agent as delegate in Linear, so it was not re-added"
+    if routing == HELD["changed"]:
+        return ("a person changed who works on this issue in Linear after this request, so this agent was not "
+                "added as delegate")
+    return "Linear was not updated to show this agent as delegate, and nothing retries that now"
 
 
 def _entrust_message(result: dict) -> str:

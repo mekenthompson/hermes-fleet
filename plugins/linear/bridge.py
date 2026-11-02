@@ -1555,9 +1555,13 @@ class Bridge:
         delegate_id = (issue.get("delegate") or {}).get("id")
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
                 (delegate_id != self.api.viewer_id() and not (
-                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload))) or
+                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload, issue))) or
                 (issue.get("state") or {}).get("type") in CLOSED):
-            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
+            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission",
+                                                 **({"chat_superseded": True} if from_chat else {})})
+            if from_chat and self.store.drop_unsent_delegate(issue_id, row["task_id"], at=self.clock()):
+                # Parked chat work is not shown as worked on: its delegate, queued before admission, never goes out.
+                diag.evt("delegate.write", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
             if stop:
                 self._pending_assignment_stop(row)
             if row["owner_ref"]:
@@ -1583,19 +1587,59 @@ class Bridge:
                           f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
         return True
 
-    def _chat_admission_allowed(self, issue_id: str, payload: dict) -> bool:
+    def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict) -> bool:
         """May chat-started admission proceed while Linear shows no delegate yet?
 
-        Only while our own delegate write is still pending, or when no person changed state,
-        assignee or delegate since the chat request: someone undelegating it wins, however late
-        admission resumes (for example after a crash).
+        Only when no person changed state, assignee or delegate since the chat request: someone
+        reassigning or undelegating it wins, however late admission resumes (after a crash, or
+        while our delegate write is held). A pending delegate of ours short-cuts the history read
+        only when Linear has not moved since that delegate was queued.
         """
-        if self.store.delegate_pending(issue_id):
+        pending = self.store.pending_delegate(issue_id)
+        if pending and pending.get("expected_updated_at") == issue.get("updatedAt"):
             return True
         if self._human_routing_changed(issue_id, float(payload["source_ms"])):
             diag.evt("claim.decision", "skipped", "human_routing_change", iss=issue_id)
             return False
         return True
+
+    def chat_route_outlook(self, issue_id: str) -> str:
+        """After chat routing was not queued: what happens to the delegate of chat-started work.
+
+        "retry" only when delegate recovery will retry it (its own conditions: chat-started
+        binding, no recovery decision for this binding, no written or pending delegate, an open
+        undelegated issue and no person changing routing since the request); "removed" when a
+        person removed this app as delegate; "changed" for another human routing change;
+        "closed"; else "unknown" (no promise is made).
+        """
+        try:
+            row = self.store.get(issue_id)
+            if not self._chat_started(row) or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+                return "unknown"
+            issue = self._effect_issue(issue_id)
+            if (issue.get("state") or {}).get("type") in CLOSED:
+                return "closed"
+            if issue.get("delegate") is not None:
+                return "unknown"
+            created = self.store.native_intent(f"create:{issue_id}") or {}
+            since = float(created["payload"]["source_ms"])
+            viewer = self.api.viewer_id()
+            nodes, complete = self._routing_scan(issue_id, lambda page: any(
+                iso_ms(node.get("createdAt")) <= since for node in page))
+            human = [node for node in nodes if iso_ms(node.get("createdAt")) > since and self._routed(node)
+                     and node.get("actorId") != viewer]
+            if any((node.get("fromDelegate") or {}).get("id") == viewer and not node.get("toDelegate") for node in human):
+                return "removed"
+            if human or not complete:
+                return "changed"
+            revision = self.store.binding_revision(issue_id)
+            if self.store.native_intent(f"delegate-recovery:{issue_id}:{revision}"):
+                return "unknown"
+            if self.store.delegate_routed(issue_id, revision) and not self.store.delegate_unwritten(issue_id, revision):
+                return "unknown"
+            return "retry"
+        except LinearError:
+            return "unknown"
 
     def _chat_started(self, row: dict | None) -> bool:
         """This store's bound task was created here from a chat request (the create intent applied to it)."""
@@ -1697,8 +1741,8 @@ class Bridge:
         in chat is created parked and completed with its evidence; it is never runnable.
         route_delegate(issue, task_status) queues Linear routing inside this issue's lock, before
         admission, with the issue version read under that lock: no tick write can land between
-        that read and the queued delegate, which is then this issue's oldest pending write.
-        Its result is returned as "routing".
+        that read and the queued delegate, and the status writes that follow from the work are
+        queued after it. Its result is returned as "routing".
         """
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
@@ -2454,6 +2498,8 @@ class Bridge:
         binding = self.store.native_binding(issue_id, adapter.executor_profile)
         if not binding or binding.get("task_id") != row["task_id"]:
             return self._log_delegate(row, "binding_mismatch")
+        if (self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}).get("chat_superseded"):
+            return self._log_delegate(row, "admission_superseded", quiet=True)  # Parked chat work never started: no delegate.
         revision = self.store.binding_revision(issue_id)
         key = f"delegate-recovery:{issue_id}:{revision}"
         retry_chat = False
