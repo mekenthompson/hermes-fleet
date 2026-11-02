@@ -605,7 +605,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         done = [body for body in remote.bodies(ISSUE) if body.startswith("Done.")]
         self.assertEqual(len(done), 1)
         self.assertIn("CI/CD passed.\n\nNext: read/write split, and/or deploy.", done[0])
-        self.assertIn("**Remaining**\n\n- Nothing; logs in [local artifact]", done[0])
+        self.assertIn("**Remaining**\n\n- Nothing; logs in `out.log`", done[0])
         self.assertNotIn("/opt/data", done[0])
 
     def test_delayed_progress_and_completion_flush_reaches_done_once(self):

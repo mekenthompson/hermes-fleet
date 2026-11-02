@@ -647,8 +647,11 @@ class LinearAPI:
         self._create("agentActivityCreate", "AgentActivityCreateInput", fields)
     def create_project_update(self, client_id: str, project_id: str, body: str, *,
                               issue_ids: list[str] | None = None) -> None:
+        # Agent updates report finished issues: on track, and without Linear's automatic
+        # project-progress diff, which reads as "0% -> 100%" beside a project still in Backlog.
         self._create("projectUpdateCreate", "ProjectUpdateCreateInput",
-                     {"id": client_id, "projectId": project_id, "body": body})
+                     {"id": client_id, "projectId": project_id, "body": body,
+                      "health": "onTrack", "isDiffHidden": True})
     def create_issue(self, client_id: str, team_id: str, title: str, *, description: str | None = None,
                      project_id: str | None = None, parent_id: str | None = None) -> dict[str, Any]:
         """Create an issue as the authenticated app. Never assigns or delegates."""

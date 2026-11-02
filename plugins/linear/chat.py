@@ -554,6 +554,11 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         body = args.get("description") if action == "update_description" else args.get("body")
         if not isinstance(body, str) or not body.strip():
             raise ValueError(f"{action} needs nonempty content.")
+        if action == "add_comment":
+            from .bridge import INTERNAL_ONLY_REPLY, _readable
+            # Comments are read by people: task ids, board names, run numbers and fence vocabulary
+            # stay in native history. Deterministic, so a retry with the same id keeps identical content.
+            body = _readable(body) or INTERNAL_ONLY_REPLY
         writes = bridge.store.issue_reconciliation_blocked(issue_id, except_id=client_id) if action == "update_description" else []
         if writes:
             return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])

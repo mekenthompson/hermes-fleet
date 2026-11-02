@@ -32,10 +32,11 @@ class ReadableSummaryTests(unittest.TestCase):
         text = ("Logs: /opt/data/runs/42/out.log, ~/repo/notes.md and ./build/a.txt; "
                 "see ../shared/x and file:///tmp/report.html. Also C:\\Users\\ops\\x.txt.")
         out = _project_summary(text, 1500)
-        for path in ("/opt/data", "~/repo", "./build", "../shared", "file://", "C:\\Users"):
+        for path in ("/opt/data", "~/repo", "file://", "C:\\Users"):
             self.assertNotIn(path, out)
-        self.assertEqual(out.count("[local artifact]"), 6)
-        self.assertTrue(out.endswith("[local artifact]."))
+        # Names people can use, never a bracketed placeholder; relative paths stay as written.
+        self.assertEqual(out, "Logs: `out.log`, `notes.md` and `./build/a.txt`; see `../shared/x` and "
+                              "`report.html`. Also `x.txt`.")
 
     def test_secrets_are_still_redacted(self):
         out = _project_summary("Used token=abc123 and ghp_ABCDEF123 to push.")
@@ -69,10 +70,12 @@ class ReadableSummaryTests(unittest.TestCase):
         self.assertEqual(_project_summary(text, 1500), text)
 
     def test_filesystem_paths_are_still_masked(self):
-        for path in ("/opt/data/x", "/home/ken/repo/a.py", "/tmp/build/out", "/var/log/app.log",
-                     "/private/report.md", "/srv/app/config", "/reports/q3/summary.csv"):
+        for path, shown in (("/opt/data/x", "`x`"), ("/home/ken/repo/a.py", "`a.py`"), ("/tmp/build/out", "`out`"),
+                            ("/var/log/app.log", "`app.log`"), ("/private/report.md", "`report.md`"),
+                            ("/srv/app/config", "`config`"), ("/reports/q3/summary.csv", "`summary.csv`"),
+                            ("/home/ken", "a local folder"), ("/opt/data/workspace", "the workspace")):
             with self.subTest(path=path):
-                self.assertEqual(_project_summary(f"See {path} now.", 1500), "See [local artifact] now.")
+                self.assertEqual(_project_summary(f"See {path} now.", 1500), f"See {shown} now.")
 
     def test_trim_never_leaves_a_code_fence_open(self):
         text = "Summary first.\n\n```python\n" + "".join(f"line_{n} = {n}\n" for n in range(80)) + "```\n\nAfter."
@@ -172,7 +175,7 @@ class PlainBlockerTests(unittest.TestCase):
     def test_human_blocks_say_what_is_needed_from_whom(self):
         kind, body = _block_message({"kind": "needs_input", "reason": "Which region?\nUse /opt/data/x"}, "blocked")
         self.assertEqual(kind, "elicitation")
-        self.assertEqual(body, "Waiting on you: Which region? Use [local artifact]. Once this is answered, "
+        self.assertEqual(body, "Waiting on you: Which region? Use `x`. Once this is answered, "
                                "ask the agent to resume and it continues the same task.")
         _, body = _block_message({"kind": "dependency", "reason": ""}, "blocked")
         self.assertEqual(body, "Waiting for a dependency: earlier work must finish first. Work continues when it is done.")
