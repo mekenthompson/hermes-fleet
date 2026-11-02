@@ -187,7 +187,7 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         self.assertEqual(self.delegate_rows(), [])
         self.assertEqual(f.snapshot(), before)
 
-    def test_completed_internal_stage_is_not_routed_and_does_not_close_issue(self):
+    def test_completed_internal_stage_keeps_its_agent_and_does_not_close_issue(self):
         task, run, before = self.retained_running(delegate=None)
         f = self.fixture
         with f.board.conn() as db:
@@ -196,7 +196,9 @@ class ActiveRecoveryScenarios(unittest.TestCase):
         f.bridge.recover()
         f.bridge.flush()
         self.assertNotEqual(f.remote.state("issue-1"), "Done")
-        self.assertEqual(self.delegate_rows(), [])
+        # A finished stage awaits review: only background binding recovery routes the agent back.
+        self.assertTrue(all(row.get("recovered_binding") for row in self.delegate_rows()))
+        self.assertEqual((f.issue["delegate"] or {}).get("id"), f.bridge.api.viewer_id())
 
     def test_background_recovery_cannot_fabricate_session_delegate_routing(self):
         # Delegate routing is a caller-authorized content action. A session-owned

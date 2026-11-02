@@ -192,6 +192,10 @@ class BoundLinearAPI(LinearAPI):
             issue, nodes, cursor = super()._routing_history(issue_id, limit, after)
         self._scoped(issue, issue_id)
         return nodes, cursor
+    def delegated_started_issues(self, delegate_id, *, after=None, limit=50):
+        """Listing only; every issue is re-read through issue() (scoped) before any effect."""
+        with self._permit_specialist_operation():
+            return super().delegated_started_issues(delegate_id, after=after, limit=limit)
     def issue_thread(self, issue_id, limit=50):
         """Issue and comments in one read, scoped like any issue read. Under specialist_scope only allowed
         requesters and this app are passed on, so a refused requester's words never reach the worker."""
