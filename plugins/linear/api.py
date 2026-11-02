@@ -18,6 +18,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 from .oauth import ReauthorizationRequired
+from . import diag
 
 ENDPOINT = "https://api.linear.app/graphql"
 DEFAULT_RATE_LIMIT_PAUSE = 60.0
@@ -75,7 +76,6 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
 def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
     """Keep bounded, redacted GraphQL detail beside the stable error prefix."""
     parts: list[str] = []
-    log = logging.getLogger("linear")
     entries = errors if isinstance(errors, list) else []
     for error in entries[:3]:
         if not isinstance(error, dict):
@@ -86,7 +86,10 @@ def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
         code = extensions.get("code")
         text = _safe_diagnostic_text(message, 360)
         safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", code) else ""
-        log.error("linear: GraphQL error request_kind=%s message=%s code=%s", request_kind, text, safe_code)
+        if safe_code == "INPUT_ERROR" and isinstance(message, str) and message.startswith("conflict on insert of"):
+            diag.evt("api.result", "deduped", "duplicate_create", code=safe_code)  # idempotent create replay, not an error
+        else:
+            logging.getLogger(diag.LOGGER_NAME).error("linear: GraphQL error request_kind=%s message=%s code=%s", request_kind, text, safe_code)
         if text and safe_code:
             parts.append(f"{text} ({safe_code})")
         elif text or safe_code:
@@ -285,7 +288,7 @@ class LinearAPI:
         fraction, reset = self.budget_remaining()
         level = "essential-only" if fraction < ESSENTIAL_FLOOR else "optional-paused" if fraction < OPTIONAL_FLOOR else "ok"
         if level != self._budget_level:
-            log = logging.getLogger("linear")
+            log = logging.getLogger(diag.LOGGER_NAME)
             report = log.info if level == "ok" else log.warning
             report("linear: shared request budget %s (%.0f%% left until %.0f)", level, fraction * 100, reset)
             self._budget_level = level
@@ -374,7 +377,7 @@ class LinearAPI:
                 headers = {"Content-Type": "application/json",
                            "Authorization": "Bearer " + (credential if credential is not None else provider())}
             except Exception as exc:  # noqa: BLE001 - credential providers may include secrets in errors
-                logging.getLogger("linear").error("linear: credentials unavailable")
+                logging.getLogger(diag.LOGGER_NAME).error("linear: credentials unavailable")
                 if isinstance(exc, ReauthorizationRequired):
                     raise LinearError("Linear credentials unavailable") from exc
                 raise LinearError("Linear credentials unavailable") from None

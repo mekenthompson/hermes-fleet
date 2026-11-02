@@ -280,7 +280,7 @@ class NativeBridgeScenarios(unittest.TestCase):
             raise RuntimeError("before plugin durable commit")
         pending_before = self.store.pending()
         with patch.object(self.bridge.store, "capture_event", side_effect=crash):
-            with self.assertLogs("linear", level="WARNING") as held:
+            with self.assertLogs("hermes_plugins.linear", level="WARNING") as held:
                 self.bridge.pump_kanban()
         self.assertTrue(any("RuntimeError" in entry and task_id in entry for entry in held.output))
         self.assertFalse(any("before plugin durable commit" in entry for entry in held.output))

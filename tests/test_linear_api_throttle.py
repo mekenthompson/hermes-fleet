@@ -154,7 +154,7 @@ class SharedBudgetTests(unittest.TestCase):
         clock = Clock()
         wire = Wire(clock, lambda: budget_headers(clock, 4000, complexity=(300_000, 2_000_000)))
         api = LinearAPI(lambda: "t", transport=wire, clock=clock)
-        with self.assertLogs("linear", "WARNING") as logs:
+        with self.assertLogs("hermes_plugins.linear", "WARNING") as logs:
             api.issue("issue-1")
             api.issue("issue-1")  # 15% of complexity left: normal reads continue
         self.assertEqual(len([line for line in logs.output if "shared request budget" in line]), 1)

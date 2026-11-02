@@ -16,11 +16,12 @@ from .api import ENDPOINT, LinearAPI, LinearError, RateLimited, backoff_delay
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import ReauthorizationRequired, token_provider
 from .store import Store
+from . import diag
 
-log = logging.getLogger("linear")
+log = logging.getLogger(diag.LOGGER_NAME)
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
-            "specialist_scope")
+            "specialist_scope", "diagnostics")
 IDENTITY_TTL = 600.0  # seconds a verified credential->actor/workspace binding is reused for reads
 HISTORY_CURSOR_TTL = 600.0
 def rate_limit_path(state_database: Any, home: Path) -> Path:
@@ -117,7 +118,7 @@ class BoundLinearAPI(LinearAPI):
             try:
                 prefetched = provider()
             except Exception as exc:  # noqa: BLE001 - credential providers may include secrets in errors
-                logging.getLogger("linear").error("linear: credentials unavailable")
+                log.error("linear: credentials unavailable")
                 if isinstance(exc, ReauthorizationRequired):
                     raise LinearError("Linear credentials unavailable") from exc
                 raise LinearError("Linear credentials unavailable") from None
@@ -457,8 +458,8 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
             reauthorize = isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired)
             delay = backoff_delay(failures + (8 if reauthorize else 0),
                                   base=max(1.0, float(settings.get("tick_seconds", 2))), cap=300.0)
-            log.warning("linear: identity lookup unavailable%s; reporting startup retries in %.0fs",
-                        " (reauthorization required)" if reauthorize else "", delay)
+            diag.warn("service.start", "retry", "auth_unavailable" if reauthorize else "identity_unavailable",
+                      next_s=delay, attempt=failures)
             retry_until = time.monotonic() + delay
             while not stop_requested.is_set() and time.monotonic() < retry_until:
                 await asyncio.sleep(min(0.25, max(0.01, retry_until - time.monotonic())))
@@ -471,6 +472,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                                             profile_home=home), profile=profile_name,
                     settings=settings)
     bridge.profile_home = home
+    await asyncio.to_thread(diag.service_start, bridge.store, float(settings.get("tick_seconds", 2)), bridge.recheck_every)
     if running.get("native_requested"):
         from .native_input import route_delivery
         bridge.native_ingress = lambda delivery: route_delivery(running, delivery)
@@ -496,8 +498,8 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                     await asyncio.to_thread(bridge.recover, ingress)
                     recovered = True
                 await asyncio.to_thread(bridge.tick, ingress)  # tick ends with its own flush
-            except Exception:  # one bad remote delivery must not stop native execution
-                log.exception("linear: reporting tick failed")
+            except Exception as exc:  # one bad remote delivery must not stop native execution
+                diag.evt("service.tick", "failed", "tick_exception", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
             wake_wait = asyncio.create_task(running["wake"].wait())
             try:
                 await asyncio.wait({wake_wait}, timeout=float(settings.get("tick_seconds", 2)))
@@ -605,8 +607,13 @@ def register(ctx: Any) -> None:
             asyncio.run(_reporting_loop(ctx, home, stop_requested, running))
         except transport.Unavailable:
             log.info("linear: another profile reporting service already owns the socket")
-        except Exception:
-            log.exception("linear: reporting service stopped")
+        except Exception as exc:
+            if stop_requested.is_set() or (isinstance(exc, RuntimeError) and "after shutdown" in str(exc)):
+                diag.evt("service.stop", "stopped", "shutdown", exc=type(exc).__name__)  # normal gateway shutdown race
+            else:
+                diag.evt("service.stop", "failed", "crash", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
+        else:
+            diag.evt("service.stop", "stopped", "shutdown")
     thread = threading.Thread(target=lambda: scope.run(serve), name="linear-reporting", daemon=True)
     def close() -> None:
         stop_requested.set()

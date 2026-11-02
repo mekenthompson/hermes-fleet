@@ -69,7 +69,7 @@ class CredentialBindingTests(unittest.TestCase):
         def unavailable():
             raise RuntimeError("synthetic-secret-in-provider-error")
         client = BoundLinearAPI(unavailable, identity=IDENTITY, transport=SyntheticLinear())
-        with self.assertLogs("linear", level="ERROR") as captured:
+        with self.assertLogs("hermes_plugins.linear", level="ERROR") as captured:
             with self.assertRaises(LinearError) as refused:
                 client.issue("issue-1")
         self.assertNotIn("synthetic-secret-in-provider-error", " ".join(captured.output))
@@ -504,7 +504,7 @@ class CredentialBindingTests(unittest.TestCase):
         provider = Provider()
         transport = SyntheticLinear(lambda kind, credential, _: (401, {}, b"{}") if kind == "operation" else None)
         client = BoundLinearAPI(provider, identity=IDENTITY, transport=transport)
-        with self.assertLogs("linear", level="ERROR"), self.assertRaises(LinearError) as failed:
+        with self.assertLogs("hermes_plugins.linear", level="ERROR"), self.assertRaises(LinearError) as failed:
             client.update_issue("issue-1", {"stateId": "started"})
         self.assertTrue(failed.exception.retryable)
         self.assertEqual(transport.credentials(), [("identity", "synthetic-stale"), ("operation", "synthetic-stale")])

@@ -27,7 +27,7 @@ MARGIN = 60
 ROTATED = "rotated_refresh_token"
 ALIASES = {"client_id": ("client_id", "username"), "client_secret": ("client_secret", "credential", "password"),
            "refresh_token": ("refresh_token",)}
-log = logging.getLogger("linear.oauth")
+log = logging.getLogger("hermes_plugins.linear.oauth")
 
 class ReauthorizationRequired(RuntimeError):
     """Linear rejected the refresh token; an operator must reauthorize this profile's app."""
@@ -171,7 +171,7 @@ class ConnectOAuth:
             self.item.write_refresh_token(rotated)
         except Exception as exc:  # noqa: BLE001 - Connect outage must not block Linear calls
             self._retry_at = self.clock() + 300
-            log.warning("rotated Linear refresh token not yet stored in Connect: %s", exc)
+            log.warning("rotated Linear refresh token not yet stored in Connect: exc=%s", type(exc).__name__)
             return
         cache.pop(ROTATED, None)
         self._write(cache)
