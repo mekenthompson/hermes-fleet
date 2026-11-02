@@ -350,6 +350,9 @@ def _entrust_message(result: dict) -> str:
                 "once its evidence is verified. Nothing was started or re-run.")
     if native["status"] in ("done", "archived"):
         return "This issue's work has already finished, so nothing new was started."
+    if native.get("not_started_reason"):
+        return (f"Not started: {native['not_started_reason']}. The task is linked to the issue but parked, "
+                "and nothing is doing this work yet; an operator should check it before it is retried.")
     if not native.get("created_from_chat"):
         return ("This issue already has work on this agent's board, so nothing new was started; "
                 "its updates now also come back to this chat.")
@@ -378,7 +381,7 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
                           code="authorization_unavailable", issue=created)
         # The readback carries no issue version; routing needs the current one.
         result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
-        return _reply(True, "Created the issue. " + _entrust_message(result) + _stored_differently(created)
+        return _reply(not result["native"].get("not_started_reason"), "Created the issue. " + _entrust_message(result) + _stored_differently(created)
                       + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
@@ -454,7 +457,7 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         if action == "work_on":
             _, record = _entrust_request(args, action, context)
             result = _entrust(bridge, issue, record, context)
-            return _reply(True, _entrust_message(result), issue={"id": issue_id, "identifier": issue.get("identifier"),
+            return _reply(not result["native"].get("not_started_reason"), _entrust_message(result), issue={"id": issue_id, "identifier": issue.get("identifier"),
                                                                  "url": issue.get("url")}, **result)
         if action == "delegate_self":
             if context.delegated_child:

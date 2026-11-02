@@ -78,7 +78,7 @@ REASONS = frozenset({
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
     # chat entrust / record_done
-    "record_done_parked", "created_from_chat",
+    "record_done_parked", "not_started", "delegated_elsewhere",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",

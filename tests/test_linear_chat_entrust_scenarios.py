@@ -397,6 +397,59 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertNotIn("unblocked", self.history(task_id))
 
+    def test_work_on_an_issue_delegated_elsewhere_creates_nothing_and_says_so(self):
+        other = str(uuid.UUID(int=0x99, version=4))
+        self.authority.issues[ISSUE]["delegate"] = {"id": other}
+        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
+        for args in ({"action": "work_on", "issue": ISSUE},
+                     {"action": "work_on", "issue": ISSUE, "record_done": True, "summary": "Done in chat."}):
+            reply = self.ask(args)
+            self.assertFalse(reply["ok"], reply)
+            self.assertIn("delegated to another agent", reply["message"])
+            self.assertNotIn("carries out this work", reply["message"])
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertIsNone(self.bridge.store.native_intent(f"create:{ISSUE}"))
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": other})
+        # Nothing was parked, so a later delegation to this agent starts normally.
+        self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
+        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
+        self.echo(ISSUE, "later-session")
+        self.flush()
+        tasks = self.tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("unblocked", self.history(tasks[0]))
+        answers = [r["content"].get("body") or "" for r in self.authority.activity_records
+                   if r["agentSessionId"] == "later-session"]
+        self.assertFalse(any("waiting to start" in body for body in answers), answers)
+
+    def test_superseded_admission_reports_not_started_instead_of_started(self):
+        # A Stop newer than the chat request supersedes admission: the task is parked, not run.
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(reply["ok"], reply)
+        self.assertTrue(reply["native"]["created_from_chat"])
+        self.assertFalse(reply["native"]["admitted"])
+        self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
+        self.assertIn("stopped, closed or reassigned", reply["message"])
+        self.assertNotIn("Do not also do this work here", reply["message"])
+        task_id = reply["native"]["task_id"]
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(again["ok"], again)
+        self.assertTrue(again["message"].startswith("Not started:"), again["message"])
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_unavailable_guarded_controls_report_not_started(self):
+        with patch.object(Kanban, "guarded_controls", False, create=True):
+            reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(reply["ok"], reply)
+        self.assertFalse(reply["native"]["admitted"])
+        self.assertIn("can't start work safely", reply["message"])
+        self.assertNotIn("unblocked", self.history(reply["native"]["task_id"]))
+
     def test_another_session_on_assignment_work_gets_a_neutral_notice(self):
         self.assertIn("already working on this", _same_work_notice("running", False))
         for status in ("running", "blocked", "done"):

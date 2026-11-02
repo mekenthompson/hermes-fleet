@@ -322,6 +322,18 @@ def _existing_work_notice(status: str | None) -> str:
         return "Earlier work on this issue has already finished, so nothing new was started."
     return ("This issue already has paused work, so nothing new was started. Ask the agent to resume it "
             "when ready.")
+def _not_started_reason(activation: dict) -> str:
+    """Plain words for why a chat-created task was parked instead of admitted."""
+    reason = activation.get("reason") or ""
+    if not activation:
+        return "this agent's board can't start work safely right now"
+    if reason.startswith("Stop, closure or reassignment"):
+        return "the issue was stopped, closed or reassigned while the task was being set up"
+    if reason.startswith("Native work changed"):
+        return "the task changed right after it was created"
+    return "its start couldn't be confirmed"
+
+
 def _same_work_notice(status: str | None, from_chat: bool, recorded: bool = False) -> str:
     """Another Agent Session on already admitted work, such as our own chat delegation's echo."""
     if not from_chat:
@@ -1667,6 +1679,12 @@ class Bridge:
             if not getattr(self.kanban, "executor_profile", None):
                 raise LinearError("Native executor profile is unverified", retryable=False)
             issue = self._effect_issue(issue_id)
+            delegate_id = (issue.get("delegate") or {}).get("id")
+            if delegate_id is not None and delegate_id != self.api.viewer_id():
+                # Another agent is delegate: its assignment owns the work. Nothing is created or bound.
+                diag.evt("chat.entrust", "refused", "delegated_elsewhere", iss=issue_id)
+                raise LinearError("This issue is delegated to another agent, so nothing was started here; "
+                                  "it needs to be handed over first", retryable=False)
             row = self.store.get(issue_id)
             if row is not None:
                 if row.get("origin") != "native":
@@ -1777,11 +1795,15 @@ class Bridge:
             # After admission, so the chat hears checkpoints and the result, not our own unblock.
             adapter.subscribe_origin(task_id, route)
         activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
-        diag.evt("chat.entrust", "applied" if activation.get("accepted") else "skipped",
-                 "-" if activation.get("accepted") else ("created_from_chat" if ours else "existing_binding"),
+        admitted = bool(activation.get("accepted"))
+        result = {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
+                  "admitted": admitted, "chat_subscribed": subscribed}
+        if ours and not admitted and task.status not in ("done", "archived"):
+            result["not_started_reason"] = _not_started_reason(activation)
+        diag.evt("chat.entrust", "applied" if admitted else "skipped",
+                 "-" if admitted else ("not_started" if ours else "existing_binding"),
                  iss=issue_id, task=task_id)
-        return {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
-                "admitted": bool(activation.get("accepted")), "chat_subscribed": subscribed}
+        return result
 
     def _record_done(self, row: dict, adapter, record_done: dict) -> dict:
         issue_id, task = row["issue_id"], adapter.require_task(row["task_id"])
