@@ -841,7 +841,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
         event = self.event("unused-mention-activity", "", action="created")
         event.pop("agentActivity")
-        event["agentSession"]["comment"] = {"id": "mention-comment", "body": question}
+        event["agentSession"]["comment"] = {"id": "mention-comment", "body": question, "userId": self.USER}
         raw = await self.deliver_raw("human-mention", event)
         await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
         self.assertEqual(len(seen), 1)
@@ -868,6 +868,44 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1)
         with self.board.conn() as conn:
             self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], [task_id])
+
+    async def test_human_delegation_without_prompt_starts_one_tracked_task_before_the_model_turn(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        seen = []
+        async def answer(event):
+            # Admission already happened: the one task exists and this turn shows In Progress.
+            with self.board.conn() as conn:
+                tasks = [row[0] for row in conn.execute("SELECT id FROM tasks")]
+            seen.append((event.text, event.channel_context, tasks, self.bridge._session_turn_active(self.ISSUE)))
+            execution_result.get()["result"] = {"completed": True, "final_response": "Under way."}
+            return "Under way."
+        self.model = answer
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        event = self.event("unused-delegation-activity", "", action="created")
+        event.pop("agentActivity")
+        # Linear's own authorless thread root (HF-617): not a mention and not a request.
+        event["agentSession"]["comment"] = {"id": "thread-root", "body": "This thread is for an agent session with agent.",
+                                            "issueId": self.ISSUE}
+        raw = await self.deliver_raw("human-delegation", event)
+        await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
+        self.assertEqual(len(seen), 1)
+        text, context, tasks, in_turn = seen[0]
+        self.assertIn("was delegated to you", text)
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("Tracked work already started", context)
+        self.assertIn(tasks[0], context)
+        self.assertTrue(in_turn)
+        self.assertEqual(self.board.require_task(tasks[0]).status, "ready")
+        self.assertEqual(self.inbox_row("human-delegation"), ("default", raw, "imported", 1))
+        await self.until(lambda: not self.bridge._session_turn_active(self.ISSUE))  # the turn ended
+        # A redelivered delegation reuses the same task: no second create or admission.
+        await self.deliver_raw("human-delegation-redelivery", event)
+        await self.until(lambda: self.inbox_row("human-delegation-redelivery")[2] == "imported")
+        with self.board.conn() as conn:
+            self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], tasks)
+        self.assertEqual([e.kind for e in self.board.history(tasks[0], 0)].count("unblocked"), 1)
+        self.assertEqual(len(seen), 1)  # nor a second model turn
 
     async def test_distinct_provider_inputs_commit_own_ids_bodies_before_own_inbox_ack(self):
         a = await self.deliver("activity-a", "  First unchanged instruction.\n")

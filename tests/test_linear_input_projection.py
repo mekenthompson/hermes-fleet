@@ -110,7 +110,8 @@ class InputProjectionTests(unittest.TestCase):
 
     def mention(self, body="@agent is the rollout finished, or is anything still waiting?"):
         event = self.event("created")
-        event["agentSession"]["comment"] = {"id": "comment-1", "body": body}
+        # A person's comment carries its author; Linear's own session thread root does not.
+        event["agentSession"]["comment"] = {"id": "comment-1", "body": body, "userId": USER}
         return event
 
     def test_mention_question_reaches_the_agent_as_the_question_not_a_work_request(self):
@@ -131,6 +132,26 @@ class InputProjectionTests(unittest.TestCase):
         self.assertNotIn("@mention", projected.channel_context())
         later = project_input(self.bridge, self.event())
         self.assertIsNone(later.source)
+
+    def test_linear_session_thread_root_is_a_delegation_not_a_mention(self):
+        # Live payload shape (HF-617): Linear opens every delegated session on its own
+        # authorless thread-root comment. That text is never the person's request.
+        event = self.event("created")
+        event["agentSession"]["comment"] = {"id": "root", "body": "This thread is for an agent session with agent.",
+                                            "issueId": ISSUE}
+        projected = project_input(self.bridge, event)
+        self.assertEqual(projected.source, "delegation")
+        self.assertIn("was delegated to you", projected.text)
+        self.assertNotIn("@mention", projected.channel_context())
+        # A person's comment given with a nested author is still a mention.
+        event["agentSession"]["comment"] = {"id": "c2", "body": "@agent is it done?", "user": {"id": USER}}
+        self.assertEqual(project_input(self.bridge, event).source, "mention")
+        event["agentSession"]["comment"] = {"id": "root", "body": "This thread is for an agent session with agent.",
+                                            "issueId": ISSUE}
+        # This app's own comment is never a person's mention either.
+        event["agentSession"]["comment"]["userId"] = VIEWER
+        self.assertEqual(project_input(self.bridge, event).source, "delegation")
+        self.assertEqual(self.kanban.creates, [])
 
     def test_no_linked_work_is_stated_in_the_session_context(self):
         self.assertIn("none is linked", project_input(self.bridge, self.mention()).channel_context())
