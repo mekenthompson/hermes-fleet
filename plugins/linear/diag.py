@@ -82,7 +82,7 @@ REASONS = frozenset({
     "already_stopped", "block_failed", "unverified",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
-    "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
+    "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",

@@ -227,6 +227,14 @@ def _formatting_tip(content: Any) -> str:
     return ""
 
 
+def _stored_differently(created: dict) -> str:
+    fields = created.get("readback_differences")
+    if not fields:
+        return ""
+    return (f" It exists under this id; Linear stored {', '.join(fields)} differently from what was sent."
+            " Do not create it again. Read it and edit it only if the difference matters.")
+
+
 def _issue_project(bridge: Any, team: str, project: str, parent: str | None) -> tuple[str | None, str]:
     """Every new issue lands in a project: the one named, the parent's, or an explicit "none"."""
     if project.casefold() == "none":
@@ -363,20 +371,22 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
         created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
                                           project_id=project_id, parent_id=parent)
         if not entrust:
-            return _reply(True, "Created an undelegated issue." + _formatting_tip(args.get("description")), issue=created)
+            return _reply(True, "Created an undelegated issue." + _stored_differently(created)
+                          + _formatting_tip(args.get("description")), issue=created)
         if not bridge.authorize_specialist_effect(created["id"]):
             return _reply(False, "Created the issue, but specialist authorization is fenced, so no work was started.",
                           code="authorization_unavailable", issue=created)
         # The readback carries no issue version; routing needs the current one.
         result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
-        return _reply(True, "Created the issue. " + _entrust_message(result) + _formatting_tip(args.get("description")),
-                      issue=created, **result)
+        return _reply(True, "Created the issue. " + _entrust_message(result) + _stored_differently(created)
+                      + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
         if not name or not team:
             raise ValueError("create_project needs name and team.")
         created = bridge.api.create_project(client_id, name, [team], description=args.get("description"))
-        return _reply(True, "Created a project." + _formatting_tip(args.get("description")), project=created)
+        return _reply(True, "Created a project." + _stored_differently(created)
+                      + _formatting_tip(args.get("description")), project=created)
     issue, related, relation = (_text(args, key) for key in ("issue", "related", "relation"))
     if not issue or not related or relation not in {"blocks", "blocked_by", "related"}:
         raise ValueError("link_issue needs issue, related, and a supported relation.")

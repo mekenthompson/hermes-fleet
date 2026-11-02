@@ -173,13 +173,44 @@ def _bare_host_line_matches(actual: str, expected: str) -> bool:
     return re.fullmatch(''.join(parts), actual) is not None
 
 
+# Linear's editor stores Markdown through its own serializer: it backslash-escapes punctuation it
+# would otherwise read as syntax (``~1.5:1`` comes back as ``\~1.5:1``), writes ``*`` bullets for
+# ``-`` and drops trailing spaces and repeated blank lines. Seen live on a chat-created issue,
+# 2026-11-02. Outside code these spell the same text, so readback compares them as equal.
+# Escapes that change structure stay significant: code ticks, link brackets, HTML angle brackets,
+# and a block marker (heading, quote, bullet, ordered item) escaped at the start of a line.
+_ESCAPABLE = r'!-/:-@\[-`{-~'
+_TEXT_TOKEN = re.compile(r'\\[' + _ESCAPABLE + r']|`+|[^\\`]+|\\')
+_STRUCTURAL = frozenset('`[]<>')
+_BLOCK_ESCAPE = re.compile(r'^[ \t]*(?:(?:[-*+]|[0-9]+[.)]) +)?(?:\\[#>*+-]|[0-9]+\\[.)])')
+
+def _editor_text(line: str) -> str:
+    """Unescape text punctuation outside inline code, normalise the bullet marker, trim the end."""
+    out, run = [], None
+    block = _BLOCK_ESCAPE.match(line)
+    protected = block.end() if block else 0
+    offset = 0
+    for token in _TEXT_TOKEN.findall(line):
+        start, offset = offset, offset + len(token)
+        if token.startswith('`'):
+            run = len(token) if run is None else (None if len(token) == run else run)
+            out.append(token)
+        elif (run is None and len(token) == 2 and token[0] == '\\' and token[1] not in _STRUCTURAL
+              and start >= protected):
+            out.append(token[1])
+        else:
+            out.append(token)
+    text = re.sub(r'^([ \t]*)[*+] ', r'\1- ', ''.join(out))
+    # Two or more trailing spaces are a hard line break; any other trailing whitespace is noise.
+    return text.rstrip() + ("  " if re.search(r'\S {2,}$', text) else "")
+
 def markdown_matches(actual: object, expected: str) -> bool:
     """Accept narrow editor rewrites, including bare-host autolinks; preserve code/text."""
     if not isinstance(actual, str):
         return False
     def canonical(text: str) -> list[tuple[str, bool]]:
         lines, result, fence = text.splitlines(), [], None
-        after_heading = False
+        after_heading = indented = False
         inline_run, delimiters = None, 0
         for line in lines:
             marker = re.match(r'^\s*(`{3,}|~{3,})', line)
@@ -193,7 +224,10 @@ def markdown_matches(actual: object, expected: str) -> bool:
             if fence is not None:
                 result.append((line, False))
                 continue
-            if not line and after_heading:
+            if not line.strip():
+                if not indented and (after_heading or not result or not result[-1][0]):
+                    continue  # Linear keeps one blank line, none after a heading or at the start
+                result.append(("", False))
                 continue
             after_heading = bool(re.match(r'^#{1,6} +', line))
             # A bare-looking host on a later line may still be inside inline
@@ -207,17 +241,54 @@ def markdown_matches(actual: object, expected: str) -> bool:
                     elif len(token) == inline_run: inline_run = None
                 elif inline_run is None:
                     delimiters = max(0, delimiters + (1 if token in '[(<' else -1))
-            prose = prose and inline_run is None and delimiters == 0
-            if not prose or '`' in line or line.expandtabs(4).startswith('    '):
-                result.append((line, False))
+            indented = line.expandtabs(4).startswith('    ')
+            if indented:
+                result.append((line, False))  # indented code (or a deep list item) stays exact
                 continue
-            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)
-            result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)), prose))
+            if not (prose and inline_run is None and delimiters == 0) or '`' in line:
+                # Inline code, links or HTML: only the editor's text rewrites, and only when the
+                # line does not start inside a construct opened on an earlier line.
+                result.append((_editor_text(line) if prose else line, False))
+                continue
+            # Escaped text is never a bare-host autolink candidate.
+            prose = '\\' not in line
+            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', _editor_text(line))
+            result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', line), prose))
+        while fence is None and result and not result[-1][0]:
+            result.pop()  # trailing blank lines
         return result
     received, authored = canonical(actual), canonical(expected)
     return len(received) == len(authored) and all(
         line == wanted or ('<' not in expected and prose and expected_prose and _bare_host_line_matches(line, wanted))
         for (line, prose), (wanted, expected_prose) in zip(received, authored))
+
+# Fields Linear stores as sent. On a same-id replay a difference here means the id was already used
+# for something else, not that the editor rewrote it.
+_IDENTITY_FIELDS = frozenset({"title", "name", "team", "teams", "project", "parent"})
+
+def _created(entity: dict[str, Any], kind: str, replayed: bool, differs: dict[str, bool]) -> dict[str, Any]:
+    """A create Linear accepted under our id is created, even when it stores something differently.
+
+    Refusing it would make a good create look failed and invite a retry under a new id, which is
+    the one way to duplicate it. Remaining differences go back to the caller and to the log. The
+    exception is an id that already belonged to a different entity: that entity is not the one asked
+    for, so the caller is told which one it is and that a new id is needed."""
+    fields = sorted(name for name, changed in differs.items() if changed)
+    if not fields:
+        return entity
+    identifier = entity.get("identifier")
+    if replayed and _IDENTITY_FIELDS & set(fields):
+        diag.evt("content.write", "refused", "id_reused", level=logging.WARNING, kind=f"{kind}_create",
+                 iss=str(entity.get("id") or "")[:8] or None,
+                 issue=identifier if isinstance(identifier, str) else None)
+        named = f" {identifier}" if isinstance(identifier, str) else ""
+        raise LinearError(f"This id already belongs to an existing {kind}{named} whose {', '.join(fields)} "
+                          f"{'differs' if len(fields) == 1 else 'differ'}, so nothing new was created. If that {kind} is the one meant, use it; "
+                          "otherwise create with a new id.", retryable=False)
+    diag.evt("content.write", "applied", "readback_differs", level=logging.WARNING, kind=f"{kind}_create",
+             iss=str(entity.get("id") or "")[:8] or None,
+             issue=identifier if isinstance(identifier, str) else None)
+    return {**entity, "readback_differences": fields}
 
 class LinearAPI:
     """``token`` is the provider interface: a callable returning an access token, with an
@@ -536,7 +607,7 @@ class LinearAPI:
         return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
                     markdown_matches(comment.get("body"), body) and isinstance(comment.get("issue"), dict) and
                     comment["issue"].get("id") == issue_id)
-    def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
+    def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> bool:
         try:
             data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",
                                 {"input": fields})
@@ -544,6 +615,22 @@ class LinearAPI:
         except LinearError as exc:
             if not is_duplicate_create_error(exc.errors, fields["id"]):
                 raise
+            return True  # an entity with this id already existed
+        return False
+    def _read_created(self, query: str, key: str, client_id: str) -> dict[str, Any]:
+        """Read a create back by its id. Any failure here follows an accepted create, so it is retryable
+        under the same id (which cannot duplicate it) and never a reason to pick a new one."""
+        try:
+            entity = self.graphql(query, {"id": client_id}).get(key)
+        except RateLimited:
+            raise  # keeps its pause; the create itself already landed under this id
+        except LinearError as exc:
+            raise LinearError(f"Linear accepted the {key} but it could not be read back yet; "
+                              "retry with the same id and content") from exc
+        if not isinstance(entity, dict) or entity.get("id") != client_id:
+            raise LinearError(f"Linear accepted the {key} but it could not be read back yet; "
+                              "retry with the same id and content")
+        return entity
     def agent_session(self, session_id: str) -> dict[str, Any]:
         raise LinearError("Agent Session authorization requires a bound specialist client", retryable=False)
     def agent_activity(self, activity_id: str, session_id: str) -> dict[str, Any]:
@@ -568,22 +655,18 @@ class LinearAPI:
         fields = {"id": client_id, "teamId": team_id, "title": title, "assigneeId": None, "delegateId": None}
         fields.update({key: value for key, value in (
             ("description", description), ("projectId", project_id), ("parentId", parent_id)) if value is not None})
-        self._create("issueCreate", "IssueCreateInput", fields)
-        issue = self.graphql(
+        replayed = self._create("issueCreate", "IssueCreateInput", fields)
+        issue = self._read_created(
             "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
-            "team { id key } project { id } parent { id } assignee { id } delegate { id } } }",
-            {"id": client_id}).get("issue")
-        team = (issue or {}).get("team") or {}
-        project = (issue or {}).get("project") or {}
-        parent = (issue or {}).get("parent") or {}
-        if (not isinstance(issue, dict) or issue.get("id") != client_id or issue.get("title") != title
-                or team_id not in {team.get("id"), team.get("key")}
-                or (description is not None and not markdown_matches(issue.get("description"), description))
-                or issue.get("assignee") is not None or issue.get("delegate") is not None
-                or (project_id is not None and project.get("id") != project_id)
-                or (parent_id is not None and parent.get("id") != parent_id)):
-            raise LinearError("Linear issue readback does not match the create", retryable=False)
-        return issue
+            "team { id key } project { id } parent { id } assignee { id } delegate { id } } }", "issue", client_id)
+        team, project, parent = (issue.get(key) or {} for key in ("team", "project", "parent"))
+        return _created(issue, "issue", replayed, {
+            "title": issue.get("title") != title,
+            "team": team_id not in {team.get("id"), team.get("key")},
+            "description": description is not None and not markdown_matches(issue.get("description"), description),
+            "assignee": issue.get("assignee") is not None, "delegate": issue.get("delegate") is not None,
+            "project": project_id is not None and project.get("id") != project_id,
+            "parent": parent_id is not None and parent.get("id") != parent_id})
     def team_projects(self, team_id: str) -> list[dict[str, str]]:
         """Active (not completed, canceled or archived) projects of one team, as id and name."""
         data = self.graphql("query TeamProjects($id: String!) { team(id: $id) { id projects(first: 100) "
@@ -601,15 +684,14 @@ class LinearAPI:
         fields: dict[str, Any] = {"id": client_id, "name": name, "teamIds": list(team_ids), "leadId": None}
         if description is not None:
             fields["description"] = description
-        self._create("projectCreate", "ProjectCreateInput", fields)
-        project = self.graphql(
+        replayed = self._create("projectCreate", "ProjectCreateInput", fields)
+        project = self._read_created(
             "query CreatedProject($id: String!) { project(id: $id) { id name url lead { id } teams { nodes { id key } } } }",
-            {"id": client_id}).get("project")
-        teams = {node.get("id") for node in ((project or {}).get("teams") or {}).get("nodes") or []}
-        if (not isinstance(project, dict) or project.get("id") != client_id or project.get("name") != name
-                or project.get("lead") is not None or not set(team_ids) <= teams):
-            raise LinearError("Linear project readback does not match the create", retryable=False)
-        return project
+            "project", client_id)
+        teams = {node.get("id") for node in (project.get("teams") or {}).get("nodes") or []}
+        return _created(project, "project", replayed, {"name": project.get("name") != name,
+                                             "lead": project.get("lead") is not None,
+                                             "teams": not set(team_ids) <= teams})
     def link_issue(self, issue_id: str, related_issue_id: str, relation: str) -> dict[str, Any]:
         """Link two issues. ``blocked_by`` records the related issue as the blocker."""
         if relation not in {"blocks", "blocked_by", "related"}:
