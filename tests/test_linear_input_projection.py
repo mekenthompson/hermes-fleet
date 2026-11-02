@@ -16,7 +16,7 @@ load_plugin()
 from hermes_fleet_linear_plugin.api import LinearError
 from hermes_fleet_linear_plugin import chat
 from hermes_fleet_linear_plugin.bridge import Bridge
-from hermes_fleet_linear_plugin.native_input import InboxDelivery, project_input, queue_reply
+from hermes_fleet_linear_plugin.native_input import InboxDelivery, acknowledge, project_input, queue_reply
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
 
@@ -107,6 +107,100 @@ class InputProjectionTests(unittest.TestCase):
         event["agentActivity"]["content"] = ["not an object"]
         with self.assertRaises(LinearError):
             project_input(self.bridge, event)
+
+    def mention(self, body="@agent is the rollout finished, or is anything still waiting?"):
+        event = self.event("created")
+        event["agentSession"]["comment"] = {"id": "comment-1", "body": body}
+        return event
+
+    def test_mention_question_reaches_the_agent_as_the_question_not_a_work_request(self):
+        projected = project_input(self.bridge, self.mention())
+        self.assertEqual(projected.source, "mention")
+        self.assertEqual(projected.text, "@agent is the rollout finished, or is anything still waiting?")
+        self.assertNotIn("requests work", projected.text)
+        self.assertIn("@mention", projected.channel_context())
+        self.assertIn("answer it in this thread", projected.channel_context())
+        self.assertEqual(self.kanban.creates, [])
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_delegation_is_framed_as_delegated_work(self):
+        projected = project_input(self.bridge, self.event("created"))
+        self.assertEqual(projected.source, "delegation")
+        self.assertIn("was delegated to you", projected.text)
+        self.assertIn("delegated to you", projected.channel_context())
+        self.assertNotIn("@mention", projected.channel_context())
+        later = project_input(self.bridge, self.event())
+        self.assertIsNone(later.source)
+
+    def test_no_linked_work_is_stated_in_the_session_context(self):
+        self.assertIn("none is linked", project_input(self.bridge, self.mention()).channel_context())
+
+    def test_existing_native_work_facts_reach_the_session_context(self):
+        task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
+        task.status = "running"
+        self.bridge.track(ISSUE, task.id, requester_session=SESSION)
+        context = project_input(self.bridge, self.mention()).channel_context()
+        self.assertIn(f"task {task.id}", context)
+        self.assertIn("status running", context)
+        self.assertIn("`linear followup`", context)
+        self.assertIn("do not create another task", context)
+        self.assertEqual(len(self.kanban.creates), 1)
+
+    def test_redelivery_keeps_the_first_work_facts_so_native_admission_sees_identical_input(self):
+        first = project_input(self.bridge, self.mention())
+        task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
+        self.bridge.track(ISSUE, task.id, requester_session=SESSION)
+        second = project_input(self.bridge, self.mention())
+        self.assertEqual(first, second)
+        self.assertEqual(first.channel_context(), second.channel_context())
+        # A different provider input on the same session sees the current facts.
+        self.assertIn(f"task {task.id}", project_input(self.bridge, self.event()).channel_context())
+
+    def test_unreadable_task_state_degrades_to_the_link_and_still_says_no_second_worker(self):
+        task = self.kanban.create(title="Rollout", body=f"Linear issue {ISSUE}")
+        self.bridge.track(ISSUE, task.id, requester_session=SESSION)
+        def unavailable(_issue_id):
+            raise RuntimeError("board unavailable")
+        self.bridge._native_task = unavailable
+        context = project_input(self.bridge, self.mention()).channel_context()
+        self.assertIn(f"task {task.id} is linked", context)
+        self.assertIn("do not create another task", context)
+
+    def activity_creates(self):
+        return [query for query in self.authority.mutations if "agentActivityCreate" in query]
+
+    def test_new_session_gets_one_immediate_thought_before_any_model_turn(self):
+        for event, words in ((self.mention(), "Reading your comment"), (self.event("created"), "Checking the issue")):
+            with self.subTest(words=words):
+                self.authority.mutations.clear()
+                projected = project_input(self.bridge, event)
+                row_id = acknowledge(self.bridge, projected)
+                self.assertTrue(row_id)
+                row = self.bridge.store.outbox_row(row_id)
+                self.assertEqual(row["state"], "sent")
+                self.assertEqual(row["payload"]["content"]["type"], "thought")
+                self.assertIn(words, row["payload"]["content"]["body"])
+                self.assertEqual(len(self.activity_creates()), 1)
+                # Redelivery of the same session cannot post a second acknowledgment.
+                self.assertEqual(acknowledge(self.bridge, project_input(self.bridge, copy.deepcopy(event))), row_id)
+                self.assertEqual(len(self.activity_creates()), 1)
+                self.bridge.store = Store(self.bridge.store.path.with_name(f"fresh-{len(words)}.db"))
+        self.assertEqual(self.kanban.creates, [])
+
+    def test_later_prompts_and_stop_get_no_acknowledgment(self):
+        self.assertEqual(acknowledge(self.bridge, project_input(self.bridge, self.event())), "")
+        event = self.event()
+        event["agentActivity"]["signal"] = "stop"
+        self.assertEqual(acknowledge(self.bridge, project_input(self.bridge, event)), "")
+        self.assertEqual(self.authority.mutations, [])
+
+    def test_unposted_acknowledgment_never_holds_the_input(self):
+        projected = project_input(self.bridge, self.event("created"))
+        def outage(**_ignored):
+            raise LinearError("Linear unavailable")
+        self.bridge.flush = outage
+        self.assertEqual(acknowledge(self.bridge, projected), "")  # logged, never raised
+        self.assertEqual(self.authority.mutations, [])
 
     def test_reply_queues_once_and_does_not_claim_remote_delivery(self):
         first = queue_reply(self.bridge, ISSUE, SESSION, ACTIVITY, "The work is waiting for input.")

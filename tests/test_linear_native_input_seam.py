@@ -355,7 +355,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.provider.mutations), 1)
         self.assertEqual(self.rows(), [])
 
-    async def test_rejected_task_stop_remains_pending_and_old_retry_cannot_stop_new_run(self):
+    async def test_rejected_task_stop_is_retried_and_stops_work_claimed_after_the_click(self):
         from hermes_cli import kanban_db as kb
         task_id = self.fixture_task()
         with self.board.conn() as conn:
@@ -373,18 +373,20 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             conn.execute("DROP TRIGGER fixture_refuse_stop")
             newer = kb.claim_task(conn, task_id)
         self.assertIsNotNone(newer)
-        event_id = self.board.history(task_id, 0)[-1].id
         await self.deliver_raw("rejected-stop-redelivery", event)
         for _ in range(3):
             await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
             await asyncio.sleep(0.02)
         await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
-        self.assertEqual(self.board.get(task_id).status, "running")
-        self.assertEqual(self.board.get(task_id).current_run_id, newer.current_run_id)
-        self.assertEqual(self.board.history(task_id, 0)[-1].id, event_id)
+        # The dispatcher claiming the work after the click is not a newer human
+        # decision, and one refused attempt does not freeze the Stop: the retry
+        # stops the run that started in between, from the same Stop request.
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.board.history(task_id, 0)[-1].run_id, newer.current_run_id)
+        self.assertEqual(self.bridge.store.native_intent(key)["state"], "applied")
         self.assertEqual(self.bridge.store.native_intent(key)["payload"], original["payload"])
-        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "pending")
-        self.assertEqual(self.inbox_row("rejected-stop-redelivery")[2], "pending")
+        self.assertEqual(self.inbox_row("rejected-task-stop")[2], "imported")
+        self.assertEqual(self.inbox_row("rejected-stop-redelivery")[2], "imported")
 
     async def test_lost_task_stop_response_reconciles_original_receipt_without_stopping_resumed_run(self):
         from hermes_cli import kanban_db as kb
@@ -822,6 +824,50 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bridge.authorize_specialist_effect(self.ISSUE))
         self.assertFalse(self.bridge.store.scope_fenced(self.ISSUE))
         self.assertEqual(self.board.get(binding["task_id"]).status, "blocked")
+
+    async def test_human_mention_is_acknowledged_first_and_reaches_the_model_as_a_question_with_work_facts(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        task_id = self.fixture_task()
+        question = "@agent is the rollout finished, or is anything still waiting?"
+        seen = []
+        async def answer(event):
+            # The acknowledgment is already visible in Linear before any model turn.
+            seen.append((event.text, event.channel_context, [query for query in self.provider.mutations
+                                                              if "agentActivityCreate" in query]))
+            execution_result.get()["result"] = {"completed": True, "final_response": "Still running."}
+            return "Still running."
+        self.model = answer
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        event = self.event("unused-mention-activity", "", action="created")
+        event.pop("agentActivity")
+        event["agentSession"]["comment"] = {"id": "mention-comment", "body": question}
+        raw = await self.deliver_raw("human-mention", event)
+        await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
+        self.assertEqual(len(seen), 1)
+        text, context, acknowledged = seen[0]
+        self.assertEqual(text, question)
+        self.assertIn("@mention", context)
+        self.assertIn(f"task {task_id}", context)
+        self.assertIn("`linear followup`", context)
+        self.assertEqual(len(acknowledged), 1)
+        ack = self.bridge.store.outbox_row(self.native_input.stable_uuid4(
+            "native-session-ack", "default", self.ISSUE, self.SESSION))
+        self.assertEqual((ack["state"], ack["payload"]["content"]["type"]), ("sent", "thought"))
+        self.assertEqual(self.inbox_row("human-mention"), ("default", raw, "imported", 1))
+        def activity_creates():
+            return len([query for query in self.provider.mutations if "agentActivityCreate" in query])
+        # The acknowledgment and then the model's own reply; nothing else.
+        await self.until(lambda: activity_creates() == 2)
+        activities = activity_creates()
+        # A redelivered mention neither posts a second acknowledgment nor starts a second model turn.
+        await self.deliver_raw("human-mention-redelivery", event)
+        await self.until(lambda: self.inbox_row("human-mention-redelivery")[2] == "imported")
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(activity_creates(), activities)
+        self.assertEqual(len(seen), 1)
+        with self.board.conn() as conn:
+            self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], [task_id])
 
     async def test_distinct_provider_inputs_commit_own_ids_bodies_before_own_inbox_ack(self):
         a = await self.deliver("activity-a", "  First unchanged instruction.\n")

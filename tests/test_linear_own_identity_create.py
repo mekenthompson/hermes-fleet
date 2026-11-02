@@ -118,6 +118,30 @@ class OwnIdentityCreateTests(unittest.TestCase):
         self.assertTrue(any(query.lstrip().startswith("query Project") for query in calls))
         self.assertFalse(any(query.lstrip().startswith("mutation") for query in calls))
 
+    def test_bound_project_hint_lists_only_scoped_active_projects_of_a_scoped_team(self) -> None:
+        def transport(url, body, headers):
+            payload = json.loads(body)
+            query, variables = payload["query"], payload["variables"]
+            if "IdentityBinding" in query:
+                return _ok({"viewer": {"id": "app-a"}, "organization": {"id": "org-a"}})
+            if query.lstrip().startswith("query Team("):
+                return _ok({"team": {"id": "team-1" if variables["id"] == "OPS" else "team-other",
+                                     "key": variables["id"]}})
+            if "TeamProjects" in query:
+                self.assertEqual(variables["id"], "team-1")
+                return _ok({"team": {"id": "team-1", "projects": {"nodes": [
+                    {"id": "p-in", "name": "In scope", "completedAt": None, "canceledAt": None, "archivedAt": None},
+                    {"id": "p-out", "name": "Out of scope", "completedAt": None, "canceledAt": None, "archivedAt": None},
+                    {"id": "p-old", "name": "Finished", "completedAt": None, "canceledAt": "2026-10-01", "archivedAt": None}]}}})
+            raise AssertionError(query)
+
+        client = BoundLinearAPI(lambda: "synthetic", identity={
+            "viewer_id": "app-a", "organization_id": "org-a", "teams": ["OPS"], "projects": ["p-in", "p-old"]},
+            transport=transport)
+        self.assertEqual(client.team_projects("OPS"), [{"id": "p-in", "name": "In scope"}])
+        with self.assertRaises(LinearError):
+            client.team_projects("OTHER")
+
     def test_bound_create_refuses_foreign_parent_before_mutation(self) -> None:
         calls = []
 
@@ -194,7 +218,7 @@ class OwnIdentityCreateTests(unittest.TestCase):
             def status(self, *args, **kwargs):
                 raise AssertionError("create must not track")
 
-        reply = json.loads(chat.handle(Bridge(), {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "OPS"}, context))
+        reply = json.loads(chat.handle(Bridge(), {"action": "create_issue", "id": CLIENT, "title": "Reconcile", "team": "OPS", "project": "none"}, context))
         self.assertTrue(reply["ok"])
         self.assertIn("undelegated", reply["message"])
 
