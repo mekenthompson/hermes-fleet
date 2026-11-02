@@ -219,7 +219,10 @@ class FakeLinear:
                 # Linear connections are newest first.
                 nodes = list(reversed(self.history.get(issue["id"], [])))
                 count = int(re.search(r"history\(first: (\d+)", query)[1])
-                issue["history"] = {"nodes": nodes[:count], "pageInfo": {"hasNextPage": len(nodes) > count}}
+                start = int((variables or {}).get("after") or 0)
+                issue["history"] = {"nodes": nodes[start:start + count],
+                                    "pageInfo": {"hasNextPage": len(nodes) > start + count,
+                                                 "endCursor": str(start + count)}}
             if issue and "comments(" in query:
                 comments = [
                     {"id": c.get("id"), "url": c.get("url"),

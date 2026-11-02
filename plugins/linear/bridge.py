@@ -26,6 +26,7 @@ class ProjectUpdateDeferred(Exception):
 class NativeProgressSuperseded(Exception):
     """Native work entered a wait, halt or terminal state before transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
+HISTORY_PAGES = 10  # IssueHistory pages (50 entries each) read before a routing answer counts as unprovable
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
 STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
@@ -1722,16 +1723,27 @@ class Bridge:
 
         Comments, attachments, labels and our own writes move updatedAt but
         are not a human decision about who works on the issue or its status.
-        An unprovable answer (history longer than one page) counts as changed.
+        History is read page by page back to since_ms; an unprovable answer
+        (more than HISTORY_PAGES pages newer than since_ms) counts as changed.
         """
-        nodes, more = self.api.routing_history(issue_id)
         viewer = self.api.viewer_id()
-        for node in nodes:
-            if iso_ms(node.get("createdAt")) <= since_ms:
-                continue  # Precedes the fence; no reliance on Linear's ordering.
-            if self._routed(node) and node.get("actorId") != viewer:
-                return True
-        return more
+        def human(node):
+            return iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") != viewer
+        nodes, complete = self._routing_scan(issue_id, lambda page: any(human(node) for node in page) or any(
+            iso_ms(node.get("createdAt")) <= since_ms for node in page))
+        # Every node is checked against the fence; no reliance on Linear's ordering within what was read.
+        return any(human(node) for node in nodes) or not complete
+    def _routing_scan(self, issue_id: str, enough) -> tuple[list[dict], bool]:
+        """Newest-first IssueHistory, one page at a time until enough(page) or the end.
+
+        Bounded at HISTORY_PAGES pages; complete is False when that bound stopped the scan."""
+        nodes, cursor = [], None
+        for _ in range(HISTORY_PAGES):
+            page, cursor = self.api.routing_history(issue_id, after=cursor)
+            nodes += page
+            if cursor is None or enough(page):
+                return nodes, True
+        return nodes, False
     @staticmethod
     def _routed(node: dict) -> bool:
         """An IssueHistory entry that changed state, assignee or delegate."""
@@ -2368,7 +2380,7 @@ class Bridge:
         current = self.store.outbox_row(row["id"])
         self.store.rewrite(row["id"], {**current["payload"], "issue_write_receipt": receipt}, current["next_at"])
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
-                  source_ms: float | None = None, history_fence: bool = False) -> bool:
+                  source_ms: float | None = None, history_fence: bool = True) -> bool:
         if claim or (issue.get("state") or {}).get("type") in CLOSED:
             return False
         row = self.store.get(issue["id"])
@@ -2379,7 +2391,7 @@ class Bridge:
                 if ((not self._receipt_scope({"issue_id": issue["id"], "task_id": row["task_id"]}, receipt)
                         or receipt["issue"] != self._issue_version(issue))
                         and (not history_fence or self._human_routing_changed(issue["id"], fence))):
-                    return False  # Own acknowledged version, or (In Progress) no human routing change since the source event.
+                    return False  # Not our own acknowledged version, and a human changed routing since the source event.
         return self._report_delegate_allowed(issue)
     def recheck(self, force: bool = False) -> None:
         now = self.clock()
@@ -2435,7 +2447,9 @@ class Bridge:
         state, viewer = issue.get("state") or {}, self.api.viewer_id()
         if state.get("type") != "started":
             return False
-        nodes, more = self.api.routing_history(issue["id"])
+        # Newest first: everything newer than the newest state move is read once that move is.
+        nodes, _ = self._routing_scan(issue["id"], lambda page: any(
+            node.get("fromStateId") != node.get("toStateId") for node in page))
         routed = [node for node in nodes if self._routed(node)]
         moved = max((node for node in routed if node.get("fromStateId") != node.get("toStateId")),
                     key=lambda node: iso_ms(node.get("createdAt")), default=None)
@@ -2615,7 +2629,7 @@ class Bridge:
             if row and row["kind"] == "status":
                 current = self._effect_issue(payload["issue_id"])
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                      payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
+                                      payload.get("seen"), payload.get("source_ms")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             prior_started["value"] = payload.get("write_started")
             if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
@@ -2764,7 +2778,7 @@ class Bridge:
             if payload.get("admission_id"):
                 return False
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
-                                  payload.get("seen"), payload.get("source_ms"), not payload.get("terminal")):
+                                  payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
                         and row["attempts"] and (issue.get("state") or {}).get("type") == "completed"
                         and not payload.get("reported")):
