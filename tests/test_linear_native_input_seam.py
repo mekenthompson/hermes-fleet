@@ -825,6 +825,50 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bridge.store.scope_fenced(self.ISSUE))
         self.assertEqual(self.board.get(binding["task_id"]).status, "blocked")
 
+    async def test_human_mention_is_acknowledged_first_and_reaches_the_model_as_a_question_with_work_facts(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        task_id = self.fixture_task()
+        question = "@agent is the rollout finished, or is anything still waiting?"
+        seen = []
+        async def answer(event):
+            # The acknowledgment is already visible in Linear before any model turn.
+            seen.append((event.text, event.channel_context, [query for query in self.provider.mutations
+                                                              if "agentActivityCreate" in query]))
+            execution_result.get()["result"] = {"completed": True, "final_response": "Still running."}
+            return "Still running."
+        self.model = answer
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        event = self.event("unused-mention-activity", "", action="created")
+        event.pop("agentActivity")
+        event["agentSession"]["comment"] = {"id": "mention-comment", "body": question}
+        raw = await self.deliver_raw("human-mention", event)
+        await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
+        self.assertEqual(len(seen), 1)
+        text, context, acknowledged = seen[0]
+        self.assertEqual(text, question)
+        self.assertIn("@mention", context)
+        self.assertIn(f"task {task_id}", context)
+        self.assertIn("`linear followup`", context)
+        self.assertEqual(len(acknowledged), 1)
+        ack = self.bridge.store.outbox_row(self.native_input.stable_uuid4(
+            "native-session-ack", "default", self.ISSUE, self.SESSION))
+        self.assertEqual((ack["state"], ack["payload"]["content"]["type"]), ("sent", "thought"))
+        self.assertEqual(self.inbox_row("human-mention"), ("default", raw, "imported", 1))
+        def activity_creates():
+            return len([query for query in self.provider.mutations if "agentActivityCreate" in query])
+        # The acknowledgment and then the model's own reply; nothing else.
+        await self.until(lambda: activity_creates() == 2)
+        activities = activity_creates()
+        # A redelivered mention neither posts a second acknowledgment nor starts a second model turn.
+        await self.deliver_raw("human-mention-redelivery", event)
+        await self.until(lambda: self.inbox_row("human-mention-redelivery")[2] == "imported")
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(activity_creates(), activities)
+        self.assertEqual(len(seen), 1)
+        with self.board.conn() as conn:
+            self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], [task_id])
+
     async def test_distinct_provider_inputs_commit_own_ids_bodies_before_own_inbox_ack(self):
         a = await self.deliver("activity-a", "  First unchanged instruction.\n")
         b = await self.deliver("activity-b", "Second unchanged instruction\nwith detail.")

@@ -193,6 +193,10 @@ class BoundLinearAPI(LinearAPI):
             issue, nodes, cursor = super()._routing_history(issue_id, limit, after)
         self._scoped(issue, issue_id)
         return nodes, cursor
+    def delegated_started_issues(self, delegate_id, *, after=None, limit=50):
+        """Listing only; every issue is re-read through issue() (scoped) before any effect."""
+        with self._permit_specialist_operation():
+            return super().delegated_started_issues(delegate_id, after=after, limit=limit)
     def issue_thread(self, issue_id, limit=50):
         """Issue and comments in one read, scoped like any issue read. Under specialist_scope only allowed
         requesters and this app are passed on, so a refused requester's words never reach the worker."""
@@ -353,6 +357,13 @@ class BoundLinearAPI(LinearAPI):
             parent_id = self.issue(parent_id)["id"]
         return super().create_issue(client_id, team["id"], title, description=description,
                                     project_id=project_id, parent_id=parent_id)
+
+    def team_projects(self, team_id):
+        if self.specialist_scope is not None:
+            raise LinearError("Issue creation is outside specialist scope", retryable=False)
+        projects = super().team_projects(self._scoped_team(team_id)["id"])
+        allowed = self.identity.get("projects")
+        return [project for project in projects if not allowed or project["id"] in allowed]
 
     def create_project(self, client_id, name, team_ids, *, description=None):
         if self.specialist_scope is not None:

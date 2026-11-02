@@ -65,6 +65,7 @@ REASONS = frozenset({
     # delegate recovery / delegate write
     "session_owned", "agent_session_scope", "binding_mismatch", "already_decided", "not_running",
     "human_delegate", "human_edit", "moot_before_write", "binding_recovery", "already_delegate",
+    "task_finished", "claim_unconsumed", "no_human_fence",
     # outbox
     "rate_limited", "retryable_http", "non_retryable", "auth_unavailable", "scope_denied",
     "give_up_24h", "reconciliation_blocked", "uncertain_terminal", "uncertain_prior",

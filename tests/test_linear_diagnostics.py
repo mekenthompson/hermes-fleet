@@ -328,13 +328,13 @@ class BridgePathTests(DiagCase):
     def test_delegate_recovery_names_its_skip_once(self) -> None:
         bridge, store = self.make(Api())
         row = store.get(ISSUE)
-        adapter = Kanban()
+        adapter = Kanban("running")  # Running, but its claim is not readable yet.
         with patch.object(Bridge, "_current_claim", staticmethod(lambda adapter, task: None)):
             for _ in range(50):
                 bridge._recover_binding_delegate(row, adapter)
         lines = self.capture.lines()
         self.assertEqual(lines, [
-            "linear.evt action=delegate.write outcome=skipped reason=not_running agent=alpha profile=default "
+            "linear.evt action=delegate.write outcome=skipped reason=claim_unconsumed agent=alpha profile=default "
             f"iss=0a1b2c3d task={TASK}"])
 
 
