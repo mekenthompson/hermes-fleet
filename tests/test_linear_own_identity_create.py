@@ -41,7 +41,9 @@ class OwnIdentityCreateTests(unittest.TestCase):
         self.assertEqual(seen[0]["delegateId"], None)
         self.assertEqual(created["identifier"], "OPS-1")
 
-    def test_issue_readback_refuses_a_delegate(self) -> None:
+    def test_issue_readback_reports_a_delegate_it_did_not_set(self) -> None:
+        # The create sent delegateId null. A delegate on readback came from elsewhere (a Linear
+        # rule or a person); the issue exists, so it is reported rather than refused into a retry.
         def transport(url, body, headers):
             query = json.loads(body)["query"]
             if "issueCreate" in query:
@@ -53,8 +55,8 @@ class OwnIdentityCreateTests(unittest.TestCase):
                     "assignee": None, "delegate": {"id": "someone"}}})
             raise AssertionError(query)
 
-        with self.assertRaises(LinearError):
-            LinearAPI(lambda: "synthetic", transport=transport).create_issue(CLIENT, "team-1", "Reconcile")
+        created = LinearAPI(lambda: "synthetic", transport=transport).create_issue(CLIENT, "team-1", "Reconcile")
+        self.assertEqual((created["id"], created["readback_differences"]), (CLIENT, ["delegate"]))
 
     def test_project_create_nulls_lead_and_reads_it_back(self) -> None:
         seen = []
