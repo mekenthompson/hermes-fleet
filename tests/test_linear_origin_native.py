@@ -2069,13 +2069,14 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_desktop_work_reports_resolve_to_the_desktop_conversation(self):
         # Chat updates use native Kanban notify subscriptions. From an adopted Desktop turn the
-        # subscription targets the native local route for this conversation (notify+wake), and
-        # the owner's read-only delivery handle resolves that same live Desktop session.
+        # subscription targets the native local route for this conversation with a single 'wake'
+        # delivery (core #206: one delivery per completion, not notify+wake), and the owner's
+        # read-only delivery handle resolves that same live Desktop session.
         from tools.kanban_tools import _resolve_notify_target
         await self.desktop()
         target = _resolve_notify_target()
         self.assertEqual((target["platform"], target["chat_id"], target["delivery_mode"]),
-                         ("local", self.sid, "notify+wake"))
+                         ("local", self.sid, "wake"))
         handle = await self.conn.dispatch({"id": 901, "method": "session.delivery_handle",
                                            "params": {"session_id": target["chat_id"]}})
         self.assertEqual(handle.get("result", {}).get("session_id"), self.sid, handle)
