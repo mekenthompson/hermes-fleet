@@ -353,6 +353,13 @@ class BoundLinearAPI(LinearAPI):
         return super().create_issue(client_id, team["id"], title, description=description,
                                     project_id=project_id, parent_id=parent_id)
 
+    def team_projects(self, team_id):
+        if self.specialist_scope is not None:
+            raise LinearError("Issue creation is outside specialist scope", retryable=False)
+        projects = super().team_projects(self._scoped_team(team_id)["id"])
+        allowed = self.identity.get("projects")
+        return [project for project in projects if not allowed or project["id"] in allowed]
+
     def create_project(self, client_id, name, team_ids, *, description=None):
         if self.specialist_scope is not None:
             raise LinearError("Project creation is outside specialist scope", retryable=False)
