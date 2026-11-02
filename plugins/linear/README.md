@@ -71,14 +71,16 @@ issue version read under that lock, so the status writes that follow from the wo
 after it. A chat admission that finds no delegate proceeds only when no person changed state,
 assignee or delegate since the chat request (the history read is skipped only when Linear has
 not moved since the request). If admission is superseded, its queued delegate is dropped and
-recovery adds none while the parked task has not run: parked work is not shown as worked on.
-Once someone resumes it and a worker claims it, recovery routes the delegate as usual.
+recovery adds none while the parked task has never been claimed: parked work is not shown as
+worked on. Once someone resumes it and a worker claims it, recovery routes the delegate as
+usual, fenced from that claim (the change that parked it came before).
 The chat reply says only what is true: Linear shows the delegate, is being updated (a delegate
 write is still pending), the update will be retried (only when delegate recovery's own
 conditions hold), a person removed this agent as delegate or otherwise changed routing (not
 re-added; only when Linear history proves it), or it was not updated and nothing retries it now.
 Delegate recovery retries chat-started routing that was refused before any write, once per
-binding. For chat-started work every delegate recovery is fenced from the earlier of the
+binding revision (which changes as native work moves). Asking again from chat never re-adds a
+delegate after a person's proven routing change since the request. For chat-started work every delegate recovery is fenced from the earlier of the
 chat request and the worker's claim: a person's later change of state, assignee or delegate
 wins. Whenever Linear shows no delegate, a Linear Stop on chat-started work bound here is
 authorized by that binding and its chat origin (Stop is the safe direction); work delegated

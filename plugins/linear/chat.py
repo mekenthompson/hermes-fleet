@@ -322,6 +322,12 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
         revision = bridge.store.binding_revision(issue_id)
         route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
         prior = bridge.store.outbox_row(route_id)
+        if not prior and hasattr(bridge, "chat_route_outlook") and bridge._chat_started(bridge.store.get(issue_id)):
+            # A person's routing change since the chat request wins, however many ticks ran since:
+            # asking again never re-adds a delegate someone removed.
+            outlook = bridge.chat_route_outlook(issue_id)
+            if outlook in ("removed", "changed"):
+                return HELD[outlook]
         try:
             requester = _content_requester(bridge, issue_id, prior, *_linear_coordinates(context))
             row_id = bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,

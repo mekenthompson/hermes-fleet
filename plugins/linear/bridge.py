@@ -1613,7 +1613,8 @@ class Bridge:
         """
         try:
             row = self.store.get(issue_id)
-            if not self._chat_started(row) or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            if (not self._chat_started(row) or row.get("owner_ref") or
+                    (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
                 return "unknown"
             issue = self._effect_issue(issue_id)
             if (issue.get("state") or {}).get("type") in CLOSED:
@@ -2513,8 +2514,9 @@ class Bridge:
                 task.id, issue_id=issue_id, state="done")):
             return self._log_delegate(row, "task_finished", quiet=True)  # Archived, or verified finished: nothing waits on the agent any more.
         claim = self._current_claim(adapter, task)
-        if (claim is None and task.status != "running" and
-                (self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}).get("chat_superseded")):
+        superseded = bool((self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}).get("chat_superseded"))
+        if superseded and claim is None and task.status != "running" and not any(
+                event.kind == "claimed" for event in adapter.history(task.id, 0)):
             # Parked chat work that never ran gets no delegate; once someone resumes it and a worker claims it, it does.
             return self._log_delegate(row, "admission_superseded", quiet=True)
         if task.status == "running" and claim is None:
@@ -2526,9 +2528,10 @@ class Bridge:
             return self._log_delegate(row, "effect_unresolved", quiet=True)  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
-        if retry_chat or self._chat_started(row):
+        if (retry_chat or self._chat_started(row)) and not superseded:
             # Routing for chat-started work was requested by that chat: a person's change after
-            # the request wins too, even when the worker's claim came later.
+            # the request wins too, even when the worker's claim came later. Parked work that was
+            # resumed later counts from its claim: the change that parked it came before that.
             requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
             claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
         route = (issue.get("delegate") is None and "delegate" in issue
