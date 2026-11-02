@@ -35,7 +35,8 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          # GitHub accepts the numeric App ID as the JWT issuer wherever a client ID is expected.
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
           owner: mekenthompson
           repositories: hermes-fleet
@@ -48,17 +49,35 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          prs="$(gh pr list -R "$REPO" --state open --base main --limit 100 \
-            --json number,isCrossRepository,isDraft,autoMergeRequest,mergeStateStatus,mergeable,headRefOid \
-            --jq '.[] | select(.autoMergeRequest != null and (.isCrossRepository | not) and (.isDraft | not))
-                  | [.number, .mergeStateStatus, .mergeable, .headRefOid] | @tsv')"
+          list_prs() {
+            gh pr list -R "$REPO" --state open --base main --limit 100 \
+              --json number,isCrossRepository,isDraft,autoMergeRequest,mergeStateStatus,mergeable,headRefOid \
+              --jq '.[] | select(.autoMergeRequest != null and (.isCrossRepository | not) and (.isDraft | not))
+                    | [.number, .mergeStateStatus, .mergeable, .headRefOid] | @tsv'
+          }
+          # GitHub computes merge state lazily, so a sweep that starts right
+          # after a push to main often reads UNKNOWN. Re-read a few times
+          # (bounded) before acting, so the push trigger isn't wasted and the
+          # PR doesn't wait for the cron fallback.
+          prs="$(list_prs)"
+          for attempt in 1 2 3 4; do
+            if ! printf '%s\n' "$prs" | awk -F'\t' '$2 == "UNKNOWN" { found = 1 } END { exit !found }'; then
+              break
+            fi
+            echo "Merge state still UNKNOWN for some PRs; re-reading in 15s (attempt $attempt/4)."
+            sleep 15
+            prs="$(list_prs)"
+          done
           if [ -z "$prs" ]; then
             echo "No open same-repository auto-merge PRs."
             exit 0
           fi
+          updated=0; skipped=0; failed=0
           while IFS=$'\t' read -r number state mergeable head; do
             if [ "$mergeable" = "CONFLICTING" ] || [ "$state" = "DIRTY" ]; then
               echo "::warning title=PR auto-update skipped::#$number conflicts with main; resolve it by hand."
+              echo "- #$number: conflicts with main, skipped" >> "$GITHUB_STEP_SUMMARY"
+              skipped=$((skipped + 1))
               continue
             fi
             if [ "$state" != "BEHIND" ]; then
@@ -69,7 +88,12 @@ jobs:
             if gh api -X PUT "repos/$REPO/pulls/$number/update-branch" \
                 -f expected_head_sha="$head" >/dev/null; then
               echo "#$number updated with main."
+              echo "- #$number: updated with main" >> "$GITHUB_STEP_SUMMARY"
+              updated=$((updated + 1))
             else
               echo "::warning title=PR auto-update failed::#$number could not be updated (it may need the workflows permission, or its head moved); it will be retried on the next sweep."
+              echo "- #$number: update failed, will retry" >> "$GITHUB_STEP_SUMMARY"
+              failed=$((failed + 1))
             fi
           done <<< "$prs"
+          echo "Updated $updated, skipped $skipped conflicting, failed $failed."

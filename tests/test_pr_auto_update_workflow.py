@@ -50,7 +50,7 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
         mint = step(self.text, "Mint a release bot token scoped to hermes-fleet")
         self.assertIn("id: app-token", mint)
         self.assertRegex(mint, r"uses: actions/create-github-app-token@[0-9a-f]{40}")
-        self.assertIn("app-id: ${{ vars.RELEASE_BOT_APP_ID }}", mint)
+        self.assertIn("client-id: ${{ vars.RELEASE_BOT_APP_ID }}", mint)
         self.assertIn("private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}", mint)
         self.assertIn("owner: mekenthompson", mint)
         self.assertIn("repositories: hermes-fleet\n", mint)
