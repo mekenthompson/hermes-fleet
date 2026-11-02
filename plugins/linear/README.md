@@ -66,13 +66,18 @@ reported, never duplicated. An unlinked task already on the board is adopted onl
 definition of done matches the project's, and then as progress: it never closes the issue by
 itself. Delegated children return the request to their parent.
 
-The delegate is queued inside the issue's lock, before admission, from the issue version
-read under that lock, so it is the issue's oldest pending write. The chat reply says only what
-is true: Linear shows the delegate, is being updated, or the update is pending and retried.
+When work starts, the delegate is queued inside the issue's lock, before admission, from the
+issue version read under that lock, so it is the issue's oldest pending write. The chat reply says only what
+is true: Linear shows the delegate, is being updated (a delegate write is still pending), or
+the update is pending and retried unless a person changes the issue's routing first.
 Delegate recovery retries chat-started routing that was refused before any write, once per
-binding, under the same human-change fence. Until the delegate lands, a Linear Stop on
-chat-started work bound here is authorized by that binding and its chat origin; work
-delegated to anyone else still refuses it.
+binding. For chat-started work every delegate recovery is fenced from the earlier of the
+chat request and the worker's claim: a person's later change of state, assignee or delegate
+wins. While Linear shows no delegate, a Linear
+Stop on chat-started work bound here is authorized by that binding and its chat origin (Stop
+is the safe direction); work delegated to anyone else still refuses it. Work adopted from the
+board through chat keeps the ordinary rules: its Stop and delegate recovery need this app as
+delegate or the plain binding recovery, since it was not created from the chat request.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not

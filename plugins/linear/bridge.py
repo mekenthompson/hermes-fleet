@@ -1555,7 +1555,7 @@ class Bridge:
         delegate_id = (issue.get("delegate") or {}).get("id")
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
                 (delegate_id != self.api.viewer_id() and not (
-                    from_chat and delegate_id is None and self._chat_delegate_pending(issue_id, payload))) or
+                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload))) or
                 (issue.get("state") or {}).get("type") in CLOSED):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
             if stop:
@@ -1583,7 +1583,7 @@ class Bridge:
                           f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
         return True
 
-    def _chat_delegate_pending(self, issue_id: str, payload: dict) -> bool:
+    def _chat_admission_allowed(self, issue_id: str, payload: dict) -> bool:
         """May chat-started admission proceed while Linear shows no delegate yet?
 
         Only while our own delegate write is still pending, or when no person changed state,
@@ -2477,6 +2477,11 @@ class Bridge:
             return self._log_delegate(row, "effect_unresolved", quiet=True)  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
+        if retry_chat or self._chat_started(row):
+            # Routing for chat-started work was requested by that chat: a person's change after
+            # the request wins too, even when the worker's claim came later.
+            requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
+            claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
         route = (issue.get("delegate") is None and "delegate" in issue
                  and (issue.get("state") or {}).get("type") not in CLOSED
                  and (iso_ms(issue.get("updatedAt")) <= claim_ms

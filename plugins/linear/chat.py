@@ -324,11 +324,13 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
         prior = bridge.store.outbox_row(route_id)
         try:
             requester = _content_requester(bridge, issue_id, prior, *_linear_coordinates(context))
-            bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
+            row_id = bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
                 expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
                 expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester,
                 **({"recorded_done": True} if recorded_done else {}))
-            routing = "queued"
+            # A retried request returns its earlier row: only a still-pending one is on its way.
+            routing = ("queued" if (bridge.store.outbox_row(row_id) or {}).get("state") == "pending"
+                       else "held: an earlier delegate update for this work did not go through")
         except (LinearError, ValueError) as exc:
             routing = f"held: {exc}"
     return routing
@@ -354,8 +356,8 @@ def _delegate_sentence(routing: str) -> str:
         return "Linear shows this agent as delegate and follows the status"
     if routing == "queued":
         return "Linear is being updated to show this agent as delegate, and follows the status"
-    return ("the Linear delegate update is still pending and will be retried automatically, so Linear may not "
-            "show this agent as delegate yet")
+    return ("the Linear delegate update is still pending: the agent retries it automatically unless someone "
+            "changes who works on this issue in Linear first, so Linear may not show this agent as delegate yet")
 
 
 def _entrust_message(result: dict) -> str:

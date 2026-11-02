@@ -558,7 +558,7 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertTrue(reply["ok"], reply)
             self.assertTrue(reply["routing"].startswith("held"), reply["routing"])
             self.assertNotIn("Linear shows this agent as delegate", reply["message"])
-            self.assertIn("delegate update is still pending and will be retried", reply["message"])
+            self.assertIn("delegate update is still pending: the agent retries it automatically", reply["message"])
             for _ in range(3):
                 self.bridge.tick()  # binding recovery re-queues routing for chat-started work
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
@@ -590,6 +590,35 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
         self.assertEqual(self.delegate_rows(), ["failed", "failed", "sent"])
         self.assertEqual(self.authority.issues[ISSUE]["assignee"], issue_record()["assignee"])
+
+    def test_repeating_the_request_after_a_refused_delegate_write_does_not_claim_it_is_queued(self):
+        self.assertEqual(self.ask({"action": "work_on", "issue": ISSUE})["routing"], "queued")
+        self.authority.issues[ISSUE]["updatedAt"] = self.later_iso()
+        self.bridge.flush()  # refused at send; the binding has not moved
+        self.assertEqual(self.delegate_rows(), ["failed"])
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(again["routing"].startswith("held"), again["routing"])
+        self.assertNotIn("being updated", again["message"])
+        self.assertIn("delegate update is still pending", again["message"])
+
+    def test_chat_route_retry_yields_to_a_person_changing_routing_after_the_request(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = reply["native"]["task_id"]
+        # After the chat request a person assigns the issue; our delegate write is then refused.
+        changed = self.later_iso()
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}
+        self.authority.issues[ISSUE]["updatedAt"] = changed
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": changed, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
+        self.bridge.flush()
+        self.assertEqual(self.delegate_rows(), ["failed"])
+        time.sleep(1.1)  # the worker's claim comes clearly after the person's change
+        self.claim(task_id)
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # the person's newer change wins
+        self.assertEqual(self.authority.issues[ISSUE]["assignee"], {"id": USER})
 
     def test_linear_stop_reaches_chat_started_work_while_the_delegate_write_is_pending(self):
         reply = self.ask({"action": "work_on", "issue": ISSUE})
