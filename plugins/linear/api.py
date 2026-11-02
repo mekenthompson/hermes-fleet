@@ -370,20 +370,29 @@ class LinearAPI:
         # Linear's first page is newest first for the selected order. Only
         # ordinary worker threads need their existing oldest-first presentation.
         return data["issue"], comments if progress else sorted(comments, key=lambda comment: comment["at"])
-    def routing_history(self, issue_id: str, limit: int = 50) -> tuple[list[dict[str, Any]], bool]:
-        """Newest-first IssueHistory page: who changed state, assignee or delegate, and when."""
-        return self._routing_history(issue_id, limit)[1:]
-    def _routing_history(self, issue_id: str, limit: int) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
-        data = self.graphql("query IssueRoutingHistory($id: String!) { issue(id: $id) { %s history(first: %d) "
+    def routing_history(self, issue_id: str, limit: int = 50, after: str | None = None) -> tuple[list[dict[str, Any]], str | None]:
+        """One newest-first IssueHistory page: who changed state, assignee or delegate, and when.
+
+        Returns the page and the cursor of the next (older) page, or None at the end."""
+        return self._routing_history(issue_id, limit, after)[1:]
+    def _routing_history(self, issue_id: str, limit: int, after: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+        data = self.graphql("query IssueRoutingHistory($id: String!, $after: String) { issue(id: $id) { %s "
+                            "history(first: %d, after: $after) "
                             "{ nodes { createdAt actorId fromStateId toStateId fromAssigneeId toAssigneeId "
-                            "fromDelegate { id } toDelegate { id } } pageInfo { hasNextPage } } } }"
-                            % (ISSUE_FIELDS, limit), {"id": issue_id})
+                            "fromDelegate { id } toDelegate { id } } pageInfo { hasNextPage endCursor } } } }"
+                            % (ISSUE_FIELDS, limit), {"id": issue_id, "after": after})
         issue = data.get("issue")
         history = (issue or {}).get("history")
         if not isinstance(history, dict) or not isinstance(history.get("nodes"), list):
             raise LinearError(f"Linear issue {issue_id} history unavailable")
         nodes = [node for node in history["nodes"] if isinstance(node, dict)]
-        return issue, nodes, bool((history.get("pageInfo") or {}).get("hasNextPage"))
+        page = history.get("pageInfo") or {}
+        if not page.get("hasNextPage"):
+            return issue, nodes, None
+        cursor = page.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            raise LinearError(f"Linear issue {issue_id} history page has no cursor")
+        return issue, nodes, cursor
     def issue_thread(self, issue_id: str, limit: int = 50) -> list[dict[str, str]]:
         return self.issue_with_thread(issue_id, limit)[1]
     def delegated_started_issues(self, delegate_id: str, *, after: str | None = None,

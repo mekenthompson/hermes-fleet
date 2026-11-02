@@ -36,6 +36,9 @@ class CompletionScopeTests(unittest.TestCase):
         self.api = self.authority.api()
         self.bridge = Bridge(self.store, self.api, self.kanban, profile='synthetic', clock=lambda: 1800000000)
 
+    def human_edit(self, at):
+        self.authority.human_edit(ISSUE, datetime.datetime.fromtimestamp(at, datetime.timezone.utc).isoformat())
+
     def event(self, kind, payload=None):
         history = self.kanban.histories[self.task.id]
         event = SimpleNamespace(id=max(row.id for row in history) + 1, kind=kind,
@@ -274,8 +277,7 @@ class CompletionScopeTests(unittest.TestCase):
     def test_current_reporting_reconciliation_can_follow_an_issue_correction(self):
         self.track(completion_scope='progress')
         self.complete()
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000100, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000100)
         self.bridge.clock = lambda: 1800000300
         request = dict(replace=True, reconcile_complete=True,
                        expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
@@ -293,8 +295,7 @@ class CompletionScopeTests(unittest.TestCase):
         request = dict(replace=True, reconcile_complete=True,
                        expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
         self.track(**request)
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000400, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000400)
         self.bridge.clock = lambda: 1800000500
         self.track(**request)
         self.assertEqual(self.store.outbox_row(request['request_id'])['payload']['source_ms'], 1800000300000)
@@ -330,8 +331,7 @@ class CompletionScopeTests(unittest.TestCase):
         self.track()
         self.complete()
         original = next(row for row in self.store.pending() if row['kind'] == 'status')
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000100, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000100)
         self.bridge.clock = lambda: 1800000300
         self.bridge.flush()
         obsolete = self.store.outbox_row(original['id'])
@@ -385,16 +385,14 @@ class CompletionScopeTests(unittest.TestCase):
     def test_newer_human_edit_still_fences_fresh_repair_of_known_unapplied_done(self):
         self.track()
         self.complete()
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000100, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000100)
         self.bridge.clock = lambda: 1800000300
         self.bridge.flush()
         request = dict(replace=True, completion_scope='outcome', reconcile_complete=True,
                        expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
         self.track(**request)
         self.assertIsNotNone(self.store.outbox_row(request['request_id']))
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000400, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000400)
         self.bridge.clock = lambda: 1800000500
         self.track(**request)
         self.authority.mutations.clear()
@@ -410,8 +408,7 @@ class CompletionScopeTests(unittest.TestCase):
         request = dict(replace=True, completion_scope='outcome', reconcile_complete=True,
                        expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
         self.assertTrue(self.track(**request)['completion_reporting_reconciled'])
-        self.authority.issues[ISSUE]['updatedAt'] = datetime.datetime.fromtimestamp(
-            1800000400, datetime.timezone.utc).isoformat()
+        self.human_edit(1800000400)
         self.bridge.clock = lambda: 1800000500
         self.bridge.flush()
         obsolete = self.store.outbox_row(request['request_id'])

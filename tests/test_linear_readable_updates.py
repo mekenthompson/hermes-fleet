@@ -1,12 +1,22 @@
 """Linear text reads like a colleague's update: words, Markdown and line breaks survive."""
 from __future__ import annotations
 
+import ast
+import re
 import unittest
+from pathlib import Path
 
 from linear_fake_api import load_plugin
 
 plugin = load_plugin()
-from hermes_fleet_linear_plugin.bridge import TASK_BODY, _block_message, _project_summary
+from hermes_fleet_linear_plugin import bridge as bridge_module
+from hermes_fleet_linear_plugin.bridge import (HELD_NOTICE, TASK_BODY, _block_message, _done_body,
+                                               _followup_notice, _plain_notice, _project_summary,
+                                               acceptance_refusal)
+
+# Words that belong in native Kanban history and logs, never in a Linear comment.
+INTERNAL = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|executor|binding|completion contract|"
+                      r"inspect\w*|ordering|run-scoped|increment|authoritative|exact head|worker/effect|effects?)\b")
 
 
 class ReadableSummaryTests(unittest.TestCase):
@@ -52,6 +62,99 @@ class ReadableSummaryTests(unittest.TestCase):
     def test_one_line_for_project_update_lines(self):
         self.assertEqual(_project_summary("CI/CD passed.\n\nNext: deploy.", one_line=True),
                          "CI/CD passed. Next: deploy.")
+
+
+    def test_api_routes_and_url_paths_are_not_local_artifacts(self):
+        text = "Added /api/v1/x and GET /v2/users/42/orders; the /graphql/admin route now checks scopes."
+        self.assertEqual(_project_summary(text, 1500), text)
+
+    def test_filesystem_paths_are_still_masked(self):
+        for path in ("/opt/data/x", "/home/ken/repo/a.py", "/tmp/build/out", "/var/log/app.log",
+                     "/private/report.md", "/srv/app/config", "/reports/q3/summary.csv"):
+            with self.subTest(path=path):
+                self.assertEqual(_project_summary(f"See {path} now.", 1500), "See [local artifact] now.")
+
+    def test_trim_never_leaves_a_code_fence_open(self):
+        text = "Summary first.\n\n```python\n" + "".join(f"line_{n} = {n}\n" for n in range(80)) + "```\n\nAfter."
+        for limit in (60, 120, 300, 700):
+            with self.subTest(limit=limit):
+                out = _project_summary(text, limit)
+                self.assertLessEqual(len(out), limit)
+                fences = [line for line in out.splitlines() if line.lstrip().startswith("```")]
+                self.assertEqual(len(fences) % 2, 0, out)
+
+
+class DoneBodyTests(unittest.TestCase):
+    PR = "https://github.com/acme/app/pull/12"
+
+    def test_structured_summary_starts_on_its_own_paragraph(self):
+        body = _done_body("**Delivered**\n\nFixed the export.", [])
+        self.assertEqual(body, "Done.\n\n**Delivered**\n\nFixed the export.")
+        self.assertNotIn("Done. **", body)
+
+    def test_one_line_summary_stays_one_sentence_and_lists_evidence_once(self):
+        self.assertEqual(_done_body("Fixed the export.", [self.PR]), f"Done. Fixed the export.\n\nEvidence: {self.PR}")
+        self.assertEqual(_done_body("", [self.PR]), f"Done.\n\nEvidence: {self.PR}")
+        self.assertEqual(_done_body("", []), "Done.")
+
+    def test_worker_evidence_section_is_not_repeated(self):
+        summary = f"**Delivered**\n\nFixed it.\n\n**Evidence**\n\n- {self.PR} merged, CI green\n\n**Remaining**\n\nNothing"
+        body = _done_body(summary, [self.PR])
+        self.assertEqual(len(re.findall(r"(?i)evidence", body)), 1, body)
+        self.assertEqual(body.count(self.PR), 1)
+        other = "https://deploy.example/check/9"
+        body = _done_body(summary, [self.PR, other])
+        self.assertEqual(len(re.findall(r"(?i)evidence", body)), 1, body)
+        self.assertIn(other, body)
+        self.assertEqual(body.count(self.PR), 1)
+
+    def test_link_already_in_a_plain_summary_is_not_repeated(self):
+        body = _done_body(f"Merged {self.PR} after review.", [self.PR])
+        self.assertEqual(body, f"Done. Merged {self.PR} after review.")
+
+
+class PlainNoticeTests(unittest.TestCase):
+    def test_internal_text_is_replaced_by_a_plain_sentence(self):
+        raw = "Native task explicitly references a different or ambiguous issue; instruction or reporting link held for inspection"
+        self.assertEqual(_plain_notice(raw), HELD_NOTICE)
+        self.assertIsNone(INTERNAL.search(HELD_NOTICE))
+        plain = "Not starting: this issue is closed or assigned to someone else."
+        self.assertEqual(_plain_notice(plain), plain)
+
+    def test_every_literal_decline_reads_like_a_colleague(self):
+        """Every hard-coded reply to a Linear session (decline, Stop, existing work, keepalive) is plain."""
+        tree = ast.parse(Path(bridge_module.__file__).read_text())
+        texts = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in ("_decline", "_progress_activity"):
+                for arg in node.args[2:]:
+                    for part in ast.walk(arg):
+                        if isinstance(part, ast.Constant) and isinstance(part.value, str) and len(part.value) > 3:
+                            texts.append(part.value)
+        self.assertGreater(len(texts), 20)
+        leaked = [text for text in texts if INTERNAL.search(text)]
+        self.assertEqual(leaked, [])
+
+    def test_followup_outcomes_are_plain(self):
+        for result in ({"status": "running", "message": "Instruction saved on the existing native task."},
+                       {"status": "running", "message": "Instruction already saved on the existing native task."},
+                       {"status": "done", "message": "Work has ended. Review history or explicitly create a new native increment."},
+                       {"status": "blocked", "message": "Work is stopped or waiting. Use an authorized native task control to resume; no automatic resume was attempted."},
+                       {"status": "running", "message": "Follow-up ordering is stale or unverifiable. Inspect native task history and send a current native instruction."},
+                       {"status": "running", "message": "something new"}):
+            with self.subTest(result=result["message"]):
+                text = _followup_notice(result)
+                self.assertIsNone(INTERNAL.search(text), text)
+                self.assertTrue(text.endswith("."))
+        self.assertIn("passed", _followup_notice({"status": "running", "message": "Instruction saved on the existing native task."}))
+
+    def test_acceptance_refusal_on_linear_is_plain_and_keeps_the_cause(self):
+        for where in ("kanban", "chat"):
+            with self.subTest(where=where):
+                text = acceptance_refusal(["https://github.com/acme/app/pull/7: failure: required job build failed"], where=where)
+                self.assertIn("required job build failed", text)
+                self.assertIsNone(INTERNAL.search(text), text)
+                self.assertIn("open", text)
 
 
 class PlainBlockerTests(unittest.TestCase):

@@ -186,12 +186,12 @@ class BoundLinearAPI(LinearAPI):
             raise LinearError("Linear issue project is outside configured scope", retryable=False, authoritative_issue_id=issue.get("id"))
         self._check_issue(issue)
         return issue
-    def routing_history(self, issue_id, limit=50):
-        """Issue routing history, scoped like any issue read."""
+    def routing_history(self, issue_id, limit=50, after=None):
+        """Issue routing history page, scoped like any issue read."""
         with self._permit_specialist_operation():
-            issue, nodes, more = super()._routing_history(issue_id, limit)
+            issue, nodes, cursor = super()._routing_history(issue_id, limit, after)
         self._scoped(issue, issue_id)
-        return nodes, more
+        return nodes, cursor
     def delegated_started_issues(self, delegate_id, *, after=None, limit=50):
         """Listing only; every issue is re-read through issue() (scoped) before any effect."""
         with self._permit_specialist_operation():

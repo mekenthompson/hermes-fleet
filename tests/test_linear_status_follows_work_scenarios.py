@@ -282,6 +282,101 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.ticks()
         self.assertEqual(self.state(), "Blocked")
 
+    def pump_then_comment_then_send(self):
+        """The native closeout is queued, then someone comments, then the status is sent."""
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.bridge.pump_kanban()
+        self.fixture.fixture.clock.now += 2
+        self.remote.touch("issue-1")  # a comment moves updatedAt; nobody changed routing
+        for _ in range(3):
+            self.bridge.flush()
+            self.bridge.pump_kanban()
+
+    def test_a_comment_before_the_done_send_still_shows_done(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.assertTrue(self.native("complete_task", task, summary="Rotated the staging certificate and checked it live.",
+                                    expected_run_id=run))
+        self.pump_then_comment_then_send()
+        self.assertEqual(self.state(), "Done")
+
+    def test_a_comment_before_the_closeout_blocked_send_still_shows_blocked(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.assertTrue(self.native("complete_task", task, summary="ok", expected_run_id=run))  # no evidence
+        self.pump_then_comment_then_send()
+        self.assertEqual(self.state(), "Blocked")
+        self.assertTrue(any("without evidence" in body for body in self.remote.bodies("issue-1")))
+
+    def test_a_human_move_before_the_done_send_still_wins(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.assertTrue(self.native("complete_task", task, summary="Rotated the staging certificate and checked it live.",
+                                    expected_run_id=run))
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.bridge.pump_kanban()
+        self.fixture.fixture.clock.now += 2
+        self.set_state("Todo")  # Ken reopens it before Linear shows Done
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+
+    # -- IssueHistory longer than one page (50 entries) -------------------
+
+    def history_entries(self, count, actor):
+        """Label, title or estimate edits: IssueHistory grows, routing does not."""
+        for _ in range(count):
+            self.fixture.fixture.clock.now += 0.01
+            self.remote.record_history("issue-1", actor, self.fixture.issue, self.fixture.issue)
+
+    def test_long_agent_only_history_still_shows_done(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.history_entries(60, SELF)  # a long-lived issue the agent has edited many times
+        self.assertTrue(self.native("complete_task", task, summary="Rotated the staging certificate and checked it live.",
+                                    expected_run_id=run))
+        self.pump_then_comment_then_send()
+        self.assertEqual(self.state(), "Done")
+
+    def test_long_agent_only_history_still_moves_archived_work_to_todo(self):
+        task, _ = self.task(claim=True)
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.history_entries(60, SELF)  # the In Progress move is now on history page 2
+        self.native("archive_task", task)
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+
+    def test_a_human_move_on_history_page_two_still_wins(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.native("block_task", task, reason="Need the API key", kind="needs_input", expected_run_id=run)
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.set_state("Todo")  # Ken parks it himself after the block ...
+        self.history_entries(60, "human-1")  # ... then edits labels and the title many times
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+        self.assertEqual(len(self.mutations()), writes)
+
+    def test_a_human_move_on_history_page_two_leaves_archived_work_alone(self):
+        task, _ = self.task(claim=True)
+        self.ticks()
+        self.fixture.fixture.clock.now = time.time() + 2
+        self.set_state("Blocked")  # Ken moved it himself after the agent started ...
+        self.history_entries(60, SELF)  # ... and the agent's later edits push that to page 2
+        self.native("archive_task", task)
+        writes = len(self.mutations())
+        self.ticks()
+        self.assertEqual(self.state(), "Blocked")
+        self.assertEqual(len(self.mutations()), writes)
+
+    def test_history_paging_is_bounded_and_an_unproven_answer_counts_as_changed(self):
+        since = self.fixture.fixture.clock.now * 1000
+        self.history_entries(10 * 50 + 1, SELF)  # newer than the fence, beyond the page bound
+        self.assertTrue(self.bridge._human_routing_changed("issue-1", since))
+        self.assertFalse(self.bridge._human_routing_changed("issue-1", self.fixture.fixture.clock.now * 1000))
+
     def test_steady_state_is_idempotent_across_restarts(self):
         self.task(claim=True)
         self.ticks()
