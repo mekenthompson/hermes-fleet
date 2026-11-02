@@ -21,7 +21,7 @@ from hermes_fleet_linear_plugin.api import (  # noqa: E402
 from hermes_fleet_linear_plugin.oauth import ConnectOAuth, ReauthorizationRequired  # noqa: E402
 from hermes_fleet_linear_plugin.store import Store  # noqa: E402
 from test_linear_specialist_authorization import (  # noqa: E402
-    Authority, Bridge, FakeKanban, ISSUE, SESSION, VIEWER)
+    PROJECT, Authority, Bridge, FakeKanban, ISSUE, SESSION, VIEWER, issue_record)
 
 IDENTITY = {"viewer_id": "app-a", "organization_id": "org-a"}
 ISSUE_DATA = {"id": "issue-1", "identifier": "OPS-1", "team": {"id": "team-1", "key": "OPS"}, "project": None}
@@ -410,6 +410,70 @@ class BridgeLoopTests(unittest.TestCase):
             bridge._decline(ISSUE, SESSION, "Stop is not confirmed yet.", activity_id="activity-2")
             replies = [row for row in store.pending(ISSUE) if row["kind"] == "activity"]
             self.assertEqual(len(replies), 2)
+
+
+class SpecialistPumpTests(unittest.TestCase):
+    """A specialist-scope profile (aggie-private) proves scope per row, not per row per 2 s tick."""
+
+    def bridge(self, directory, clock, rows=3):
+        authority = Authority()
+        store, kanban = Store(Path(directory) / "state.db"), FakeKanban()
+        bridge = Bridge(store, authority.api(), kanban, profile="synthetic", clock=clock)
+        issues = [ISSUE] + [f"issue-{index}" for index in range(1, rows)]
+        for issue_id in issues:
+            if issue_id != ISSUE:
+                authority.issues[issue_id] = issue_record(id=issue_id)
+            authority.issues[issue_id]["delegate"] = {"id": VIEWER}
+            task_id = f"task-{issue_id}"
+            kanban.tasks[task_id] = SimpleNamespace(id=task_id, status="ready", completion_contract=None, result="",
+                                                    title="OPS-1: task", current_run_id=None, assignee="synthetic")
+            kanban.histories[task_id] = []
+            store.bind_native(issue_id, task_id, "synthetic", "default", owner_ref=SESSION, project_id=PROJECT, at=0)
+        return bridge, authority, issues
+
+    @staticmethod
+    def issue_reads(authority):
+        return sum(1 for query in authority.requests if "query Issue(" in query)
+
+    def test_idle_rows_cost_one_read_each_not_one_per_tick(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, issues = self.bridge(directory, clock)
+            for _ in range(140):  # 280 s of 2 s ticks, inside one proof lifetime
+                bridge.pump_kanban()
+                clock.now += 2
+            self.assertEqual(self.issue_reads(authority), len(issues))  # was 3 x 140 = 420
+            for _ in range(1800 - 140):  # the rest of the hour
+                bridge.pump_kanban()
+                clock.now += 2
+            # One re-proof per row every 5 minutes: about 12/h per row instead of 1,800/h.
+            self.assertLessEqual(self.issue_reads(authority), len(issues) * 13)
+
+    def test_issue_webhook_drops_the_cached_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, issues = self.bridge(directory, clock, rows=1)
+            bridge.pump_kanban()
+            clock.now += 2
+            bridge._mark_dirty(ISSUE)  # what a tracked Issue webhook from a person does
+            before = self.issue_reads(authority)
+            bridge.pump_kanban()
+            self.assertEqual(self.issue_reads(authority) - before, 1)
+
+    def test_refused_scope_backs_off_instead_of_reading_every_tick(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, issues = self.bridge(directory, clock, rows=1)
+            authority.fail_issue = True  # Linear keeps answering 503 for the issue
+            for _ in range(1800):  # one hour of 2 s ticks
+                bridge.pump_kanban()
+                clock.now += 2
+            self.assertLess(self.issue_reads(authority), 12)  # was 1,800
+            authority.fail_issue = False
+            clock.now += 3600
+            bridge.pump_kanban()
+            self.assertFalse(bridge.store.scope_fenced(ISSUE))  # a transient refusal never fences
+            self.assertIn(ISSUE, bridge._pump_authorized)  # and it is admitted again once Linear answers
 
 
 if __name__ == "__main__":

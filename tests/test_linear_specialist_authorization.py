@@ -1345,6 +1345,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
         self.assertEqual(self.store.pending(ISSUE), [])
         self.authority.fail_issue = False
+        self.bridge.pump_kanban()  # the refusal waits on its persisted backoff, not the next 2 s tick
+        self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
+        later = self.bridge.clock() + 60
+        self.bridge.clock = lambda: later
         self.bridge.pump_kanban()
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 1)
         # The blocker sentence is captured with the event; the state is reconciled after the batch

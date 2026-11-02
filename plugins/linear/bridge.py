@@ -31,6 +31,7 @@ HISTORY_PAGES = 5  # IssueHistory pages (50, then 100 entries each) read before 
 # 15 s for a day: about 150 tries before the 24 h park instead of about 5,800, still ahead of other work.
 STOP_RETRY_GAP = 600
 ISSUE_RECHECK_GAP = 30.0  # seconds: Issue webhooks for one tracked issue coalesce into at most one read per gap
+PUMP_AUTHORIZED_TTL = 300.0  # seconds: an idle native row re-proves specialist scope at most this often while pumping
 RECHECKED_STATUSES = ("running", "ready", "blocked")  # finished or parked native work is not polled
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
@@ -831,6 +832,7 @@ class Bridge:
         self._last_recheck = 0.0
         self._dirty: dict[str, float] = {}  # issue id -> earliest time its coalesced recheck may run
         self._rechecked_at: dict[str, float] = {}
+        self._pump_authorized: dict[str, float] = {}  # issue id -> when its cached specialist-scope proof expires
         self.native_ingress = None
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
@@ -1023,6 +1025,7 @@ class Bridge:
         return getattr(self.api, "specialist_scope", None) is not None
     def _fence_scope_denial(self, issue_id: str, exc: LinearError) -> None:
         if self._specialist_scope_active() and issue_id and exc.authoritative_issue_id == issue_id:
+            self._pump_authorized.pop(issue_id, None)
             self.store.fence_scope(issue_id, "permanent specialist authorization denial", at=self.clock())
             self._park_fenced(issue_id)
             log.warning("linear: specialist scope permanently fenced issue %s: %s", issue_id, exc)
@@ -1042,6 +1045,29 @@ class Bridge:
         except LinearError:
             return False
         return not self.store.scope_fenced(issue_id)
+    def _pump_authorize(self, issue_id: str) -> bool:
+        """Specialist-scope admission for the 2 s native pump, without a Linear read per row per tick.
+
+        A positive proof is reused for PUMP_AUTHORIZED_TTL (dropped on an Issue webhook or a fence); a refusal
+        waits on the persisted backoff (15 s doubling to 1 h). Outbound effects still authorize freshly at flush.
+        """
+        if not self._specialist_scope_active(): return True
+        if self.store.scope_fenced(issue_id):
+            self._pump_authorized.pop(issue_id, None)
+            return self.authorize_specialist_effect(issue_id)  # local: parks the fenced row, no read
+        now = self.clock()
+        if self._pump_authorized.get(issue_id, -math.inf) > now:
+            return True
+        backoff = f"pump_authorize:{issue_id}"
+        if not self.store.backoff_ready(backoff, now):
+            return False
+        if self.authorize_specialist_effect(issue_id):
+            self._pump_authorized[issue_id] = now + PUMP_AUTHORIZED_TTL
+            self.store.backoff_clear(backoff)
+            return True
+        self._pump_authorized.pop(issue_id, None)
+        self.store.backoff_fail(backoff, now)
+        return False
     def _require_effect(self, issue_id: str) -> bool:
         if self.authorize_specialist_effect(issue_id): return True
         if not self.store.scope_fenced(issue_id): raise LinearError("Linear authorization temporarily unavailable")
@@ -2061,7 +2087,7 @@ class Bridge:
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
-                if not self.authorize_specialist_effect(row["issue_id"]):
+                if not self._pump_authorize(row["issue_id"]):
                     continue
                 # Loading or iterating one task's native history can fail just
                 # like decoding its task row. Keep that entire read/capture path
@@ -2513,6 +2539,7 @@ class Bridge:
             log.info("linear: recheck deferred while the shared request budget is low (%s)", exc)
     def _mark_dirty(self, issue_id: str) -> None:
         """Recheck one issue on a later tick, at most once per ISSUE_RECHECK_GAP."""
+        self._pump_authorized.pop(issue_id, None)  # someone changed the issue: re-prove scope on the next pump
         if issue_id not in self._dirty:
             self._dirty[issue_id] = self._rechecked_at.get(issue_id, -math.inf) + ISSUE_RECHECK_GAP
     def _recheck_row(self, row: dict) -> None:
