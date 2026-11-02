@@ -42,6 +42,8 @@ jobs:
           repositories: hermes-fleet
           permission-contents: write
           permission-pull-requests: write
+          # Lets update-branch merge main into a PR when that brings in .github/workflows changes.
+          permission-workflows: write
 
       - name: Update behind auto-merge PRs
         env:
@@ -91,7 +93,7 @@ jobs:
               echo "- #$number: updated with main" >> "$GITHUB_STEP_SUMMARY"
               updated=$((updated + 1))
             else
-              echo "::warning title=PR auto-update failed::#$number could not be updated (it may need the workflows permission, or its head moved); it will be retried on the next sweep."
+              echo "::warning title=PR auto-update failed::#$number could not be updated (its head may have moved); it will be retried on the next sweep."
               echo "- #$number: update failed, will retry" >> "$GITHUB_STEP_SUMMARY"
               failed=$((failed + 1))
             fi
