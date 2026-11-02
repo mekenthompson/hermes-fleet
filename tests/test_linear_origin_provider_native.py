@@ -125,7 +125,9 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
         cases = [lambda: self.provider.activities[ACTIVITY].update(user={"id": VIEWER}),
                  lambda: self.provider.activities[ACTIVITY].update(agentSession={"id": "foreign"}),
                  lambda: self.provider.sessions[SESSION].update(appUser={"id": "foreign"}),
-                 lambda: setattr(self.provider, "organization", "foreign"),
+                 # A credential cannot change workspace; a different one is proved again.
+                 lambda: (setattr(self.provider, "organization", "foreign"),
+                          setattr(self.api, "token", lambda: "synthetic-other-workspace")),
                  lambda: self.provider.sessions[SESSION].update(issue={"id": "foreign"})]
         for change in cases:
             self.provider.activities[ACTIVITY] = json.loads(json.dumps(original))

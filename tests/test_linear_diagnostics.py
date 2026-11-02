@@ -325,6 +325,28 @@ class BridgePathTests(DiagCase):
         self.assertIn("kind=Issue.update", deliveries[0])
         self.assertNoContent()
 
+    def test_issue_webhook_echo_and_coalesced_recheck_are_named(self) -> None:
+        api = Api()
+        api.identity = {"viewer_id": "app-user"}
+        bridge, store = self.make(api)
+        echo = {"type": "Issue", "action": "update", "actor": {"id": "app-user"}, "data": {"id": ISSUE, "title": BODY}}
+        human = {"type": "Issue", "action": "update", "actor": {"id": "human-1"}, "data": {"id": ISSUE, "title": BODY}}
+        with tempfile.TemporaryDirectory() as directory:
+            inbox = Path(directory) / "ingress.db"
+            import sqlite3
+            with contextlib.closing(sqlite3.connect(inbox)) as db, db:
+                db.execute("CREATE TABLE deliveries (logical_agent TEXT, delivery_id TEXT, profile TEXT, payload TEXT, "
+                           "received_at REAL, attempts INTEGER DEFAULT 0, status TEXT DEFAULT 'pending')")
+                for index, payload in enumerate((echo, human, human)):
+                    db.execute("INSERT INTO deliveries (logical_agent, delivery_id, profile, payload, received_at) "
+                               "VALUES ('alpha', ?, 'alpha', ?, ?)", (f"dlv-{index}", json.dumps(payload), index))
+            bridge.drain_ingress(inbox, retry_now=True)
+        deliveries = [line for line in self.capture.lines() if "action=webhook.delivery" in line]
+        self.assertEqual([re.search(r"outcome=\S+ reason=\S+", line).group(0) for line in deliveries],
+                         ["outcome=ignored reason=own_echo", "outcome=routed reason=bound_issue_recheck",
+                          "outcome=deduped reason=recheck_coalesced"], self.capture.lines())
+        self.assertNoContent()
+
     def test_delegate_recovery_names_its_skip_once(self) -> None:
         bridge, store = self.make(Api())
         row = store.get(ISSUE)

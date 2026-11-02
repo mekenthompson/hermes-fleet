@@ -567,6 +567,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             general.agent_session(SESSION)
         self.authority.issues[ISSUE] = issue_record()
         self.authority.organization = "foreign-workspace"
+        # A credential cannot change workspace; a different one (or the proof's 10 min expiry) is re-proved.
+        general.token = lambda: "synthetic-other-workspace"
         with self.assertRaises(LinearError):
             general.agent_session(SESSION)
         self.assertEqual(self.authority.mutations, [])
@@ -749,9 +751,12 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 if calls == (2 if second_lookup else 1): return original(other)
             return original(ref)
         self.api.issue = redirect
+        now = [time.time()]
+        self.bridge.clock = lambda: now[0]
         for _ in range(2 if second_lookup else 1):
             self.bridge.handle_webhook({"type": "Issue", "updatedFrom": {"delegateId": "other"},
                                         "data": {"id": ISSUE}})
+            now[0] += 31  # Issue webhooks for one issue coalesce to one recheck per 30 s
         self.assertEqual(calls, 2 if second_lookup else 1)
         self.assertEqual(self.store.get(other), work)
         self.assertEqual(self.store.outbox_row(outbox_id), outbox)
@@ -1340,6 +1345,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
         self.assertEqual(self.store.pending(ISSUE), [])
         self.authority.fail_issue = False
+        self.bridge.pump_kanban()  # the refusal waits on its persisted backoff, not the next 2 s tick
+        self.assertEqual(self.store.get(ISSUE)["last_event_id"], 0)
+        later = self.bridge.clock() + 60
+        self.bridge.clock = lambda: later
         self.bridge.pump_kanban()
         self.assertEqual(self.store.get(ISSUE)["last_event_id"], 1)
         # The blocker sentence is captured with the event; the state is reconciled after the batch
