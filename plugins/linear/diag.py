@@ -47,6 +47,7 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
+    "session.admit",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -79,6 +80,10 @@ REASONS = frozenset({
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
     # chat entrust / record_done
     "record_done_parked", "not_started", "delegated_elsewhere", "contract_mismatch",
+    # delegation admission before the model turn (native_input.admit_delegation)
+    "delegation_started", "delegation_linked", "admission_declined", "admission_held", "admission_failed",
+    "mention_conversation", "delegated_awaiting_session", "session_turn", "same_session",
+    "finished_work_conversation",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",
