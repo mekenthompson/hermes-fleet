@@ -302,6 +302,8 @@ class DurableCloseoutTests(unittest.TestCase):
             bridge._keepalive(row)
             [alive] = [r for r in store.pending(ISSUE) if r['kind'] == 'activity']
             self.assertEqual((alive['payload']['content']['action'], alive['payload']['ephemeral']), ('Working', True))
+            self.assertEqual(alive['payload']['content']['parameter'], 'Still on this; nothing is needed from you')
+            self.assertNotIn('native', str(alive['payload']['content']).lower())
             now[0] += 60
             bridge._keepalive(row)  # recent activity: nothing more
             self.assertEqual(len([r for r in store.pending(ISSUE) if r['kind'] == 'activity']), 1)
