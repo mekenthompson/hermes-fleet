@@ -20,7 +20,8 @@ from .api import markdown_matches, LinearAPI, LinearError, RateLimited
 from .oauth import ReauthorizationRequired
 from .store import Store, advisory
 from . import transport
-log = logging.getLogger("linear")
+from . import diag
+log = logging.getLogger(diag.LOGGER_NAME)
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
 class NativeProgressSuperseded(Exception):
@@ -288,7 +289,7 @@ _INTERNAL_WORDS = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|ex
                              r"effects?|idempoten\w*|retry key|profile)\b")
 def _plain_notice(body: str) -> str:
     if _INTERNAL_WORDS.search(body or ""):
-        log.info("linear: session reply kept internal: %s", _public(body)[:300])
+        diag.detail("content.write", "skipped", "internal_wording")  # never the reply text
         return HELD_NOTICE
     return body
 def _followup_notice(result: dict) -> str:
@@ -784,6 +785,7 @@ class Bridge:
         self._guard = threading.Lock()
         self._last_recheck = 0.0
         self.native_ingress = None
+        diag.configure(settings.get("diagnostics"), agent=self.ingress_profile, profile=profile)
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
             api.requester_activity_for_issue = self._requester_activity_for_issue
@@ -838,7 +840,7 @@ class Bridge:
         found = found or min((n for n in nodes if n.get("type") == STATE_TYPES.get(key)),
                              key=lambda n: n.get("position") or 0, default=None)
         if not found:
-            log.info("linear: team %s has no '%s' state; status left unchanged", (issue.get("team") or {}).get("key"), name)
+            diag.evt("status.write", "skipped", "no_state_mapping", iss=issue.get("id"), state=key)
         return str(found["id"]) if found else None
     @staticmethod
     def closure_ms(issue: dict[str, Any]) -> float:
@@ -851,7 +853,7 @@ class Bridge:
         except RateLimited: raise
         except LinearError: return None
     def _alert_reauthorization(self) -> None:
-        log.error("linear: profile %s needs reauthorization; durable reporting is queued", self.profile)
+        diag.warn("auth.reauth_required", "held", "auth_unavailable")
     def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
                           heads: dict[str, str] | None = None, failures: list[str] | None = None) -> bool:
         prs = [url for url in links if PR_URL.fullmatch(url)]
@@ -968,7 +970,7 @@ class Bridge:
         if self._specialist_scope_active() and issue_id and exc.authoritative_issue_id == issue_id:
             self.store.fence_scope(issue_id, "permanent specialist authorization denial", at=self.clock())
             self._park_fenced(issue_id)
-            log.warning("linear: specialist scope permanently fenced issue %s: %s", issue_id, exc)
+            diag.warn("scope.fenced", "held", "scope_denied", iss=issue_id, exc=type(exc).__name__)
     def _park_fenced(self, issue_id: str) -> None:
         # Authorization revocation fences integration effects. Native execution remains native.
         return
@@ -1033,7 +1035,7 @@ class Bridge:
             issue = self.api.issue(issue_id)
             if not isinstance(issue, dict) or issue.get("id") != issue_id:
                 raise LinearError("Linear issue resolution changed its identity")
-            return issue
+            return diag.remember(issue)
         except LinearError as exc:
             if not exc.retryable: self._fence_scope_denial(issue_id, exc)
             raise
@@ -1068,7 +1070,7 @@ class Bridge:
         return issue, activity
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
-        log.warning("linear: specialist authorization refused: %s", exc)
+        diag.warn("scope.fenced", "refused", "scope_refused", exc=type(exc).__name__)
     def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
@@ -1082,31 +1084,32 @@ class Bridge:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
-                return stamp is not None  # Known older input never revives its native control.
+                return diag.because("activation_cutoff", stamp is not None)  # Known older input never revives its native control.
         if event.get("type") == "Issue":
             issue_id = (event.get("data") or {}).get("id")
             if issue_id and self.store.get(issue_id):
                 self.recheck(force=True)
-            return
+                return diag.because("bound_issue_recheck", None, "routed")
+            return diag.because("unbound_issue", None)
         session = event.get("agentSession") or {}
         issue_id, session_id = (session.get("issue") or {}).get("id"), session.get("id")
         if event.get("type") != "AgentSessionEvent" or not issue_id or not session_id:
-            return
+            return diag.because("not_session_event", None)
         try:
             issue, activity = self._specialist_session_event(event, issue_id, session_id)
         except LinearError as exc:
             self._reject_specialist_scope(exc)
-            return
+            return diag.because("scope_refused", None)
         if self.store.scope_fenced(issue_id):
-            return
+            return diag.because("scope_fenced", None)
         with self.lock(issue_id):
             row = self.store.get(issue_id)
             stamp = activation_event_ms(event)
             if stamp is None:
                 self._decline(issue_id, session_id, "This request couldn't be dated reliably, so the agent didn't act on it. Please send it again.")
-                return
+                return diag.because("stamp_missing", None)
             if row and stamp < float(row["last_updated_at"]):
-                return True  # A newer reporting/admission observation superseded this input.
+                return diag.because("superseded", True)  # A newer reporting/admission observation superseded this input.
             if event.get("action") == "created":
                 return self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
@@ -1120,9 +1123,9 @@ class Bridge:
                     if current and current.get("origin") == "native":
                         return self._pending_assignment_stop(current)
                     self._decline(issue_id, session_id, "Stop noted while the task was still being set up. The agent won't start it; an operator should confirm nothing is already running.")
-                    return True  # Durable unbound Stop fences subsequent native admission.
-                return self._stop(row, session_id, (activity.get("user") or {}).get("id") or "Linear user", stamp,
-                                  str(activity.get("id") or ""))
+                    return diag.decision("stop.decision", diag.because("unbound_recorded", True, "held"), iss=issue_id, sess=session_id)  # Durable unbound Stop fences subsequent native admission.
+                return diag.decision("stop.decision", self._stop(row, session_id, (activity.get("user") or {}).get("id") or "Linear user", stamp,
+                                  str(activity.get("id") or "")), iss=issue_id, sess=session_id, task=row.get("task_id"))
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
 
@@ -1130,14 +1133,14 @@ class Bridge:
                    *, assignment_prompt: str = "") -> bool:
         if row:
             if self._assignment_activation(row):
-                return True
+                return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
                 self._decline(issue["id"], session_id, task["message"])
-                return False
+                return diag.decision("session.start", diag.because("reconciliation_required"), iss=issue["id"], sess=session_id, task=row.get("task_id"))
             self._decline(issue["id"], session_id, _existing_work_notice(task.get("status")))
-            return True  # The original durable binding was verified; do not resume it.
-        return self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt)
+            return diag.decision("session.start", diag.because("existing_binding", True, "refused"), iss=issue["id"], sess=session_id, task=row.get("task_id"))  # The original durable binding was verified; do not resume it.
+        return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt), iss=issue["id"], sess=session_id)
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
@@ -1168,7 +1171,7 @@ class Bridge:
         except RateLimited:
             raise
         except LinearError as exc:
-            log.warning("linear: thread for %s unavailable: %s", issue_id, exc)
+            diag.warn("binding.held", "held", diag.exc_reason(exc), kind="thread", iss=issue_id, exc=type(exc).__name__)
             return ""
         lines, size = [], 0
         for comment in reversed([c for c in comments if since_ms < iso_ms(c["at"]) < until_ms]):
@@ -1389,6 +1392,7 @@ class Bridge:
             self.store.native_intent_prepare(key, request)
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native work changed after creation"})
             self._decline(issue_id, row["owner_ref"], "The task changed right after it was created, so the agent left it as it is and didn't start it.")
+            diag.evt("claim.decision", "skipped", "native_changed", iss=issue_id, task=row["task_id"])
             return True
         self.store.native_intent_prepare(key, request)
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
@@ -1400,6 +1404,7 @@ class Bridge:
             if stop:
                 self._pending_assignment_stop(row)
             self._decline(issue_id, row["owner_ref"], "The assignment changed or a Stop came in while the task was being set up, so it wasn't started. An operator should confirm nothing is already running.")
+            diag.evt("claim.decision", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
             return True
         require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
         accepted = adapter.activate(row["task_id"], token, issue=issue)
@@ -1412,6 +1417,7 @@ class Bridge:
             owned_activation = accepted
         self.store.native_intent_settle(key, {"state": "applied" if accepted else "reconcile",
                                              "accepted": accepted, "owned_activation": owned_activation})
+        diag.evt("claim.decision", "routed" if accepted else "skipped", "-" if accepted else "activation_unverified", iss=issue_id, task=row["task_id"])
         self._pending_assignment_stop(row)
         task = adapter.require_task(row["task_id"])
         self.activity(issue_id, row["owner_ref"], "thought",
@@ -1479,9 +1485,11 @@ class Bridge:
                 project_id=(issue.get("project") or {}).get("id"),
                 completion_scope=accepted_scope, reconcile_complete=reconcile_complete, at=self.clock() * 1000)
             if not binding:
+                diag.evt("handoff.decision", "refused", "revision_mismatch", iss=issue_id, task=task.id)
                 raise LinearError("Reporting link changed or its scope was refused; inspect current issue and native work before retrying", retryable=False)
             result = {"issue_id": issue_id, "task_id": task.id, "status": task.status,
                       "reporting_only": True, "history_preserved": True}
+            diag.evt("handoff.decision", "applied", "reconcile_complete" if reconcile_complete else "-", iss=issue_id, task=task.id)
             if reconcile_complete:
                 result["completion_reporting_reconciled"] = bool(self._finished(
                     self.store.get(issue_id), event_id=max(event.id for event in completed),
@@ -1582,7 +1590,7 @@ class Bridge:
         except RateLimited:
             raise
         except LinearError as exc:
-            log.warning("linear: native event capture held for %s: %s", issue_id, exc)
+            diag.warn("binding.held", "held", diag.exc_reason(exc), kind="capture", iss=issue_id, evt=event_id, exc=type(exc).__name__)
             return False
         return self.store.capture_event(issue_id, event_id, writes, at=at, forget=forget)
 
@@ -1762,7 +1770,7 @@ class Bridge:
         current = self._effect_issue(payload["issue_id"])
         if (current.get("delegate") or {}).get("id") == payload["target_delegate_id"]:
             # Desired-state readback settles a lost response without another mutation.
-            return True
+            return diag.skip("already_delegate")
         if payload.get("write_started") is not False:
             self._hold_terminal(row, "Prior delegate change is uncertain; inspect Linear before another mutation")
         try:
@@ -1770,7 +1778,7 @@ class Bridge:
         except LinearError as exc:
             if exc.retryable or not payload.get("recovered_binding"):
                 raise
-            return False  # Background recovery went moot before any write (work ended, or a human moved it).
+            return diag.because("moot_before_write")  # Background recovery went moot before any write (work ended, or a human moved it).
         response = {}
         try:
             self._mutate_outbox(row["id"], lambda: response.update(
@@ -1845,19 +1853,19 @@ class Bridge:
             return {"task_id": task.id, "status": task.status, "message": "Instruction saved on the existing native task."}
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> bool:
         if not row or row.get("origin") != "native" or not activity_id:
-            return False
+            return diag.because("not_native")
         row, task = self._native_task(row["issue_id"])
         adapter = self._binding_adapter(row["issue_id"])
         issue = self._effect_issue(row["issue_id"])
         if (issue.get("delegate") or {}).get("id") != self.api.viewer_id():
-            return False
+            return diag.because("not_delegate")
         if stamp < float(row["last_updated_at"]):
-            return True
+            return diag.because("superseded", True)
         try:
             require_task_issue_scope(task, issue)
         except LinearError as exc:
             self._decline(row["issue_id"], session_id, str(exc))
-            return False
+            return diag.because("scope_refused")
         if getattr(adapter, "guarded_controls", False):
             return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
         key = f"stop:{row['issue_id']}:{activity_id}"
@@ -1871,49 +1879,49 @@ class Bridge:
                         if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")]
             if any(stamp // 1000 <= event.created_at for event in controls):
                 self._decline(row["issue_id"], session_id, STALE_STOP)
-                return any(stamp / 1000 < event.created_at for event in controls)
+                return diag.because("stale_order", any(stamp / 1000 < event.created_at for event in controls))
         saved, first = self.store.native_intent_prepare(key, payload)
         if not first:
             if saved.get("state") != "applied":
                 self._decline(row["issue_id"], session_id, UNCONFIRMED_STOP)
-            return saved.get("state") == "applied"
+            return diag.because("already_stopped" if saved.get("state") == "applied" else "unverified", saved.get("state") == "applied")
         if task.status in ("blocked", "triage", "done", "archived"):
             self.store.native_intent_settle(key, {"state": "applied", "status": task.status})
-            return True
+            return diag.because("already_stopped", True)
         if task.status != "running" or task.current_run_id is None:
             self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
             self._decline(row["issue_id"], session_id, "Nothing was running to stop, so nothing changed. If this work should not start later, an operator needs to pause it on the agent's board.")
-            return False
+            return diag.because("no_current_run")
         try:
             adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id, issue=issue)
         except LinearError as exc:
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
             self._decline(row["issue_id"], session_id, str(exc))
-            return False
+            return diag.because("block_failed")
         latest = adapter.require_task(task.id)
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
         self._decline(row["issue_id"], session_id, STOPPED_NOTICE if stopped else UNCONFIRMED_STOP)
-        return stopped
+        return diag.because("-" if stopped else "unverified", stopped)
 
     def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> bool:
         issue_id = row["issue_id"]
         key = f"stop:{issue_id}:{activity_id}"
         prior = self.store.native_intent(key)
         if prior and prior.get("state") == "applied":
-            return True
+            return diag.because("already_stopped", True)
         reason = f"{OWN} stopped by {who} [{activity_id}]"
         if prior:
             if prior.get("superseded") is True:
-                return True
+                return diag.because("stale_order", True)
             if (prior["payload"].get("task_id") == task.id and
                     prior["payload"].get("profile") == adapter.executor_profile and
                     prior["payload"].get("board") == (adapter.board or "default")) and any(
                     event.kind in ("blocked", "block_loop_detected") and
                     (event.payload or {}).get("reason") == reason for event in adapter.history(task.id, 0)):
                 self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
-                return True  # Exact native response-loss receipt, never a repeated Stop.
-            return False
+                return diag.because("already_stopped", True)  # Exact native response-loss receipt, never a repeated Stop.
+            return diag.because("unverified")
         events = adapter.history(task.id, 0)
         task = adapter.require_task(task.id)
         payload = {"kind": "stop", "issue_id": issue_id, "task_id": task.id, "stamp": stamp,
@@ -1922,7 +1930,7 @@ class Bridge:
                    "run_id": task.current_run_id}
         _, first = self.store.native_intent_prepare(key, payload)
         if not first:
-            return False  # Another observer prepared this exact request; never capture a new generation.
+            return diag.because("unverified")  # Another observer prepared this exact request; never capture a new generation.
         stopped = False
         for _ in range(4):
             events = adapter.history(task.id, 0)
@@ -1932,7 +1940,7 @@ class Bridge:
                 # This request's native record is also its response-loss receipt.
                 # A later explicit resume stays authoritative; do not repeat Stop.
                 self.store.native_intent_settle(key, {"state": "applied", "stopped": True})
-                return True
+                return diag.because("already_stopped", True)
             try:
                 require_task_issue_scope(task, self._effect_issue(issue_id))
             except RateLimited:
@@ -1940,7 +1948,7 @@ class Bridge:
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
                 self._decline(issue_id, session_id, str(exc))
-                return False
+                return diag.because("scope_refused")
             if task.status in ("done", "archived", "triage"):
                 stopped = True
                 break
@@ -1956,7 +1964,7 @@ class Bridge:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable",
                                                      "superseded": superseded})
                 self._decline(issue_id, session_id, STALE_STOP)
-                return superseded
+                return diag.because("stale_order", superseded)
             if not events:
                 break
             try:
@@ -1967,7 +1975,7 @@ class Bridge:
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
                 self._decline(issue_id, session_id, UNCONFIRMED_STOP)
-                return False
+                return diag.because("block_failed")
             except Exception as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
                 self._decline(issue_id, session_id, UNCONFIRMED_STOP)
@@ -1977,7 +1985,7 @@ class Bridge:
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "stopped": stopped})
         self._decline(issue_id, session_id, STOPPED_NOTICE if stopped else
                       "The work changed while it was being stopped, so the Stop couldn't be confirmed. An operator needs to check the task on the agent's board.")
-        return stopped
+        return diag.because("-" if stopped else "unverified", stopped)
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
@@ -2003,13 +2011,13 @@ class Bridge:
                         row = self.store.get(row["issue_id"])
                         if not row or row["last_event_id"] < event.id:
                             break  # Retry this event before consuming any later one.
+                        diag.native_event(event.kind, iss=issue_id, task=task_id, evt=event.id)
                     else:
                         caught_up = True
                 except RateLimited:
                     raise
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
-                    log.warning("linear: native reporting held for issue %s task %s event %s (%s)",
-                                issue_id, task_id, event_id, type(exc).__name__)
+                    diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
                 for step in (self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
                     try:
@@ -2017,7 +2025,7 @@ class Bridge:
                     except RateLimited:
                         raise
                     except Exception as exc:
-                        log.warning("linear: %s held for issue %s (%s)", step.__name__, issue_id, type(exc).__name__)
+                        diag.warn("binding.held", "held", diag.exc_reason(exc), kind=step.__name__.strip("_"), iss=issue_id, task=task_id, exc=type(exc).__name__)
     def _recover_binding_delegate(self, row: dict | None, adapter) -> None:
         """Route this app as delegate for an already linked, undelegated issue.
 
@@ -2030,21 +2038,21 @@ class Bridge:
         (issue, binding revision), durable across reopen.
         """
         if not row or row.get("origin") != "native" or row.get("owner_ref"):
-            return  # Linear-session-owned links route only through their caller.
+            return self._log_delegate(row, "session_owned", quiet=True)  # Linear-session-owned links route only through their caller.
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
-            return  # Scope requires a bound requester session; hold, do not route.
+            return self._log_delegate(row, "agent_session_scope", quiet=True)  # Scope requires a bound requester session; hold, do not route.
         issue_id = row["issue_id"]
         binding = self.store.native_binding(issue_id, adapter.executor_profile)
         if not binding or binding.get("task_id") != row["task_id"]:
-            return
+            return self._log_delegate(row, "binding_mismatch")
         revision = self.store.binding_revision(issue_id)
         key = f"delegate-recovery:{issue_id}:{revision}"
         if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
-            return  # Cheap local check first: decided for this revision, or a delegate write is pending.
+            return self._log_delegate(row, "already_decided", quiet=True)  # Cheap local check first: decided for this revision, or a delegate write is pending.
         task = adapter.require_task(row["task_id"])
         claim = self._current_claim(adapter, task)
         if claim is None:
-            return  # Not running now; decide when it is.
+            return self._log_delegate(row, "not_running")  # Not running now; decide when it is.
         issue = self._effect_issue(issue_id)
         claim_ms = claim.created_at * 1000
         route = (issue.get("delegate") is None and "delegate" in issue
@@ -2061,12 +2069,21 @@ class Bridge:
             # A refusal is logged by pump and retried; the atomic outbox row is the marker.
             self._delegate_preflight(payload)
             self.store.recover_binding_delegate(issue_id, payload, at=self.clock())
-            return
+            return self._log_delegate(row, "binding_recovery", outcome="queued")
         # A human-chosen delegate, later human edit or closed issue wins for this revision: record once.
+        reason = ("human_delegate" if issue.get("delegate") is not None else
+                  "issue_closed" if (issue.get("state") or {}).get("type") in CLOSED else "human_edit")
+        self._log_delegate(row, reason)
         _, first = self.store.native_intent_prepare(key, {"issue_id": issue_id, "task_id": task.id,
                                                           "binding_revision": revision, "route": False})
         if first:
-            self.store.native_intent_settle(key, {"state": "applied", "routed": False})
+            self.store.native_intent_settle(key, {"state": "applied", "routed": False, "reason": reason})
+    @staticmethod
+    def _log_delegate(row: dict | None, reason: str, *, outcome: str = "skipped", quiet: bool = False) -> None:
+        """One line per change of this binding's delegate-recovery decision; routine ones are detail only."""
+        issue_id = (row or {}).get("issue_id")
+        if outcome == "queued": diag.count("delegate_q")
+        diag.transition("delegate.write", outcome, reason, key=issue_id, quiet=quiet, iss=issue_id, task=(row or {}).get("task_id"))
     def _reconcile_status(self, row: dict | None, adapter) -> None:
         """Show in Linear what native execution is doing now; queue a write only when that changes.
 
@@ -2109,6 +2126,7 @@ class Bridge:
                     return
                 payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000}
         self._native_effect_task(row["issue_id"])
+        diag.count("status_q"); diag.detail("status.write", "queued", "-", iss=row["issue_id"], task=row["task_id"], state=payload["state"])
         self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
                                                       **self._alert_route(row)}, at=self.clock())
     def _native_state(self, task, adapter, last) -> str | None:
@@ -2382,7 +2400,7 @@ class Bridge:
     def may_write(self, issue: dict[str, Any], claim: bool, queued_at: float = 0.0, seen: str | None = None,
                   source_ms: float | None = None, history_fence: bool = True) -> bool:
         if claim or (issue.get("state") or {}).get("type") in CLOSED:
-            return False
+            return diag.because("claim_retained" if claim else "issue_closed")
         row = self.store.get(issue["id"])
         if row and row.get("origin") == "native":
             fence = source_ms if source_ms is not None else queued_at * 1000
@@ -2391,8 +2409,8 @@ class Bridge:
                 if ((not self._receipt_scope({"issue_id": issue["id"], "task_id": row["task_id"]}, receipt)
                         or receipt["issue"] != self._issue_version(issue))
                         and (not history_fence or self._human_routing_changed(issue["id"], fence))):
-                    return False  # Not our own acknowledged version, and a human changed routing since the source event.
-        return self._report_delegate_allowed(issue)
+                    return diag.because("human_routing_change" if history_fence else "updated_after_source")  # Not our own acknowledged version, and a human changed routing since the source event.
+        return self._report_delegate_allowed(issue) or diag.because("delegate_not_ours")
     def recheck(self, force: bool = False) -> None:
         now = self.clock()
         if not force and now - self._last_recheck < self.recheck_every:
@@ -2416,7 +2434,7 @@ class Bridge:
                             self._alert_reauthorization()
                         if not exc.retryable:
                             self._fence_scope_denial(row["issue_id"], exc)
-                    log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
+                    diag.warn("binding.held", "held", diag.exc_reason(exc), kind="recheck", iss=row["issue_id"], task=row.get("task_id"), exc=type(exc).__name__)
     def _task_gone(self, row: dict) -> bool:
         """The bound task was deleted from a board that still has tasks (a wiped board proves nothing)."""
         if not self.store.native_binding(row["issue_id"], self.kanban.executor_profile):
@@ -2473,8 +2491,7 @@ class Bridge:
                 except RateLimited:
                     raise
                 except Exception as exc:
-                    log.warning("linear: admission recovery held for %s (%s); inspect retained task/history",
-                                row["issue_id"], type(exc).__name__)
+                    diag.warn("binding.held", "held", diag.exc_reason(exc), kind="admission", iss=row["issue_id"], task=row.get("task_id"), exc=type(exc).__name__)
 
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
@@ -2500,7 +2517,7 @@ class Bridge:
                         if missing:
                             self.store.mark(row["id"], "failed")
                             progress = ((self.store.outbox_row(row["id"]) or {}).get("state") == "failed") or progress
-                        log.warning("linear: outbox %s held: %s", row["id"], reason)
+                        diag.count("held"); diag.warn("outbox.retry", "held", "requester_session_missing" if missing else "auth_unavailable", **diag.outbox_fields(row))
                         continue
                     if row["kind"] != "project_update" and not (
                             self.store.independent_message(row["kind"], row["payload"]) or
@@ -2508,10 +2525,11 @@ class Bridge:
                             self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
                             for issue_id in self._outbox_scope_issue_ids(row)):
                         continue
+                    diag.clear(); started = time.monotonic()
                     try:
                         applied = self._send(row)
                     except NativeProgressSuperseded:
-                        applied = False
+                        applied = diag.because("obsolete_progress")
                     except ProjectUpdateDeferred:
                         current = self.store.outbox_row(row["id"])
                         if current is None:
@@ -2535,15 +2553,19 @@ class Bridge:
                                 self._fence_scope_denial(targets[0], exc)
                             continue
                         if advisory(row):
-                            log.warning("linear: dropped %s activity %s: %s", row["payload"]["content"]["type"], row["id"], exc)
+                            diag.outbox_failure(row, exc, advisory=True)
                             progress = True
                         elif not exc.retryable:
                             self.store.mark(row["id"], "failed", _public(str(exc))[:300])
+                            self.store.note_reason(row["id"], "failure_reason", diag.outbox_failure(row, exc))
                             if row["payload"].get("reconcile_required"): progress = True
                         else:
-                            self.store.retry(row, self.clock(), _public(str(exc))[:300])
+                            gave_up = self.store.retry(row, self.clock(), _public(str(exc))[:300])
+                            failure = diag.outbox_failure(row, exc, gave_up=gave_up)
+                            if gave_up: self.store.note_reason(row["id"], "failure_reason", failure)
                         continue
                     if self.store.mark_sent(row["id"], applied):
+                        self.store.note_reason(row["id"], "outcome_reason", diag.outbox_result(row, applied, started))
                         sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 if only_id is not None and row["id"] != only_id: continue
@@ -2706,7 +2728,7 @@ class Bridge:
                 raise LinearError("Prior description write is uncertain; remote description differs, reconcile manually", retryable=False)
             return True  # read-only settlement, even if the human changed ownership since send
         release_status = self.store.outbox_row(payload.get("requires_status_id", ""))
-        if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return False
+        if release_status and release_status["payload"].get("release") and self.store.superseded(release_status): return diag.because("release_superseded")
         if kind == "status" and payload.get("issue_write_receipt"):
             if not self._receipt_scope(payload, payload["issue_write_receipt"]):
                 self._hold_terminal(row, "Persisted status receipt no longer matches its reporting scope")
@@ -2714,7 +2736,7 @@ class Bridge:
         if kind != "project_update":
             self._require_outbox_native_scope(row)
         if self._obsolete_native_progress(row):
-            return False
+            return diag.because("obsolete_progress")
         if kind == "status":
             if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                 self.store.hold_terminal(row["id"])
@@ -2733,10 +2755,10 @@ class Bridge:
             if any(PR_URL.fullmatch(url) for url in links):
                 self._hold_terminal(row, "Legacy PR closeout has no recorded accepted head; reconcile before retrying")
         if kind == "status" and not payload.get("terminal") and payload.get("work_owner") and self.store.superseded(row):
-            return False  # an old chat's queued blocker/progress cannot overwrite its successor
+            return diag.because("superseded_owner")  # an old chat's queued blocker/progress cannot overwrite its successor
         if kind == "status" and payload.get("terminal") and self.store.superseded(row):
             self.store.rewrite(row["id"], {**payload, "superseded": True}, row["next_at"])
-            return False
+            return diag.because("superseded_terminal")
         if kind != "project_update" and payload.get("requires_status_id") and \
                 not self.store.terminal_status_applied(payload["requires_status_id"]):
             status = self.store.outbox_row(payload["requires_status_id"])
@@ -2744,7 +2766,7 @@ class Bridge:
             if (payload.get("native_history") is True or payload.get("native_progress") is True) and not history_released:
                 raise ProjectUpdateDeferred  # Unknown/legacy status is not an unapplied prerequisite.
             if not history_released and (not status or not status["payload"].get("superseded") or kind not in ("activity", "comment")):
-                return False
+                return diag.because("prereq_status_unapplied")
             if not history_released:
                 content = payload["content"] if kind == "activity" else payload
                 if not payload.get("superseded_receipt"):
@@ -2759,7 +2781,7 @@ class Bridge:
             released = (delegate is None and self.store.verified_release(payload.get("requires_status_id", "")))
             if ((not self._report_delegate_allowed(issue, payload) and not released)
                     or (issue.get("state") or {}).get("type") == "canceled"):
-                return False  # no completion message or update after a human takeover/cancel
+                return diag.because("takeover_or_canceled")  # no completion message or update after a human takeover/cancel
         elif kind in ("comment", "activity", "description") and not payload.get("takeover") and \
                 (payload.get("session_key") or payload.get("task_id")):
             issue = self._effect_issue(payload["issue_id"])
@@ -2772,11 +2794,11 @@ class Bridge:
                     or ((issue.get("state") or {}).get("type") in CLOSED and not history_receipt)):
                 if attempted_progress:
                     raise LinearError("Prior native progress delivery requires reconciliation after ownership or state changed", retryable=False)
-                return False
+                return diag.because("content_owner_changed")
         if kind == "status":
             issue = self._effect_issue(payload["issue_id"])  # exact target on every re-read
             if payload.get("admission_id"):
-                return False
+                return diag.because("admission_retained")
             if not self.may_write(issue, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                   payload.get("seen"), payload.get("source_ms")):
                 if (payload.get("terminal") and payload.get("state") == "done"
@@ -2808,6 +2830,7 @@ class Bridge:
                 fields["delegateId"] = self.api.viewer_id()
             if payload.get("release"):
                 fields["delegateId"] = None
+            if not fields: diag.skip("same_state" if target else "human_started_state" if payload["state"] == "in_progress" and current.get("type") == "started" else "app_not_last_mover" if payload.get("archived") else "no_state_mapping")
             if fields:
                 def update():
                     result = self.api.update_issue(payload["issue_id"], fields)
@@ -2826,7 +2849,7 @@ class Bridge:
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or
                         work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
                         work.get("stop_requested_at")):
-                    return False
+                    return diag.because("content_owner_changed")
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
             verify = getattr(self.api, "verify_comment", None)
@@ -2836,7 +2859,7 @@ class Bridge:
         elif kind == "description":
             current = self._effect_issue(payload["issue_id"])
             if not payload.get("unlinked_content"):
-                return False  # Retained execution-bound content must be reconciled.
+                return diag.because("unlinked_content_required")  # Retained execution-bound content must be reconciled.
             if current.get("description") != payload["expected_description"]:
                 raise LinearError("Description changed since the request; reconcile before editing", retryable=False)
             self._mutate_outbox(row["id"], lambda: self.api.replace_description(
@@ -2951,11 +2974,10 @@ class Bridge:
         raise LinearError("project update changed repeatedly during send preflight")
     def _loud(self, row: dict[str, Any], exc: Exception) -> bool:
         # Reporting failures remain visible in the outbox/CLI without waking a worker.
-        log.error("linear: reporting %s for %s needs inspection: %s", row["id"], row["payload"].get("issue_id"), exc)
+        diag.warn("outbox.retry", "failed", row["payload"].get("failure_reason") or diag.exc_reason(exc), **diag.outbox_fields(row))
         return True
     def _alert_uncertain_terminal(self, row: dict[str, Any]) -> None:
-        log.error("linear: uncertain remote status %s for %s; reconcile through linear status/resolve",
-                  row["id"], row["payload"]["issue_id"])
+        diag.warn("status.write", "held", "uncertain_terminal", **diag.outbox_fields(row))  # reconcile via linear status/resolve
     def _hold_terminal(self, row: dict[str, Any], message: str) -> None:
         self.store.hold_terminal(row["id"])
         row["payload"]["reconcile_required"] = True
@@ -2989,16 +3011,20 @@ class Bridge:
                         routed = self.native_ingress(InboxDelivery(
                             Path(database), self.ingress_profile, agent, delivery, payload))
                         if routed:
+                            diag.webhook(event, delivery, reason="native_routed")
                             continue  # Only the native committed-input hook may ACK it.
-                    self.handle_webhook(event)
+                    diag.clear()
+                    diag.webhook(event, delivery, self.handle_webhook(event), bound=self.store.get)
                 except (ValueError, TypeError):
                     status = "invalid"
+                    diag.warn("webhook.delivery", "refused", "invalid_payload", evt=delivery)
                 except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly
                     status = "failed" if self.clock() - float(received) > 86_400 else "pending"
                     if attempts and status == "pending":
-                        log.warning("linear: delivery %s failed again (attempt %d): %s", delivery, attempts + 1, exc)
+                        diag.warn("webhook.delivery", "retry", "delivery_failed", evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
                     else:
-                        log.exception("linear: delivery %s failed", delivery)
+                        diag.evt("webhook.delivery", "failed", "delivery_failed", level=logging.ERROR, evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
+                        log.debug("linear: delivery failed", exc_info=True)  # message and traceback only at DEBUG
                     if status == "failed":
                         try:
                             event = json.loads(payload)
@@ -3010,16 +3036,19 @@ class Bridge:
                                     "body": "An update to this issue could not be processed for 24 hours, so the agent set it "
                                             "aside. An operator needs to check the agent's Linear inbox and retry it.",
                                     **self._alert_route(work)}, f"{agent}:{delivery}", at=self.clock())
+                                diag.warn("ingress.parked", "failed", "delivery_failed", iss=issue_id, evt=delivery)
                             else:
-                                log.error("linear: parked delivery %s has no issue destination", delivery)
+                                diag.evt("ingress.parked", "failed", "no_issue_destination", level=logging.ERROR, evt=delivery)
                         except (ValueError, TypeError, AttributeError):
-                            log.error("linear: parked delivery %s has no usable issue destination", delivery)
+                            diag.evt("ingress.parked", "failed", "invalid_payload", level=logging.ERROR, evt=delivery)
                 db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
                            "AND delivery_id = ?", (status, agent, delivery))
     def tick(self, ingress: Path | None = None) -> None:
+        started = time.monotonic()
         if ingress is not None:
             self.drain_ingress(ingress)
         self._recover_admissions()
         self.pump_kanban()
         self.recheck()
         self.flush()
+        diag.tick_done(started, lambda: self.store.diag_counts(self.clock()))

@@ -2,11 +2,13 @@
 from __future__ import annotations
 import json
 import re
+import time
 import uuid
 from typing import Any
 from .api import LinearError, RateLimited
 from .ops import held
 from . import transport
+from . import diag
 
 SCHEMA = {
     "name": "linear",
@@ -232,6 +234,11 @@ def _plan(bridge: Any, args: dict, action: str) -> str:
     return _reply(True, "Linked issues.", relation=bridge.api.link_issue(issue, related, relation))
 
 def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
+    started = time.monotonic()
+    return diag.tool_result(args, _scoped_handle(bridge, args, context), started)
+
+
+def _scoped_handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     if (getattr(context, "platform", None) != "linear" or bridge is None
             or context.profile != bridge.profile or str(context.home) != str(bridge.profile_home)):
         return _handle(bridge, args, context)

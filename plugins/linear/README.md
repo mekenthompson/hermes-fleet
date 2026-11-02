@@ -326,6 +326,40 @@ supplies missing authority to old writes. Creation and issue linking remain disa
 specialist mode. General-mode Agent Sessions are also resolved through Linear and checked
 against the configured app and issue scope; payload identity alone is insufficient.
 
+## Diagnostics
+
+The plugin logs decisions, not work, to the `hermes_plugins.linear` logger. Core rotation and
+redaction apply, and the lines also land in `gateway.log`. Each line is one `linear.evt` record
+with a fixed field set: `action outcome reason agent profile issue iss task sess evt row attempt ms`,
+plus `kind`, `state`, `exc` (exception class only) or counters where they apply. Values are
+whitelisted per field; comment and description text, titles, emails, tokens and URLs never reach
+a line. `reason` comes from a closed set (`diag.REASONS`), and each code names one code branch.
+For example, a refused status write says `reason=updated_after_source` or `reason=issue_closed`.
+The same code is also kept on the outbox row as `outcome_reason` or `failure_reason`, so it
+outlives log rotation.
+
+Volume: at idle the plugin writes nothing. With linked work it writes one `service.health` line
+per hour. Under load it writes one `reconcile.summary` line per minute, and only when something
+happened. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
+carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Per-issue
+INFO stops for the rest of the hour at the cap (200 lines per hour in total), and a single
+`diag.throttled` WARNING records that it happened. `service.start` records the plugin `ver`, its
+source `sha` and, when visible, the git `commit`.
+
+For a short, time-boxed investigation, add the optional `diagnostics` setting to that agent's
+`settings` block. `until` is required, so the setting expires on its own. It is read when the
+gateway restarts:
+
+```yaml
+        diagnostics:
+          detail: true
+          issues: [ABC-123]          # optional; empty means every linked issue
+          until: 2026-11-03T00:00Z
+```
+
+While it is active, extra `lvl=detail` lines are written at INFO, still metadata only: applied
+comments, queued status writes, and read-only tool calls.
+
 ## Migration and delivery limits
 
 Existing chat/manual/old Kanban bindings, stopped work and uncertain deliveries remain visible
