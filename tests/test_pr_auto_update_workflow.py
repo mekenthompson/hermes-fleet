@@ -57,7 +57,7 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertNotIn("hermes-fleet-private", mint)
         self.assertIn("permission-contents: write", mint)
         self.assertIn("permission-pull-requests: write", mint)
-        self.assertNotIn("permission-workflows", mint)
+        self.assertIn("permission-workflows: write", mint)
         self.assertNotIn("skip-token-revoke", self.text)
         # The token flows to one sink: gh's environment in the update step.
         self.assertEqual(self.text.count(APP_TOKEN), 1)
