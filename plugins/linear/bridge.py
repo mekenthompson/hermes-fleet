@@ -322,6 +322,13 @@ def _existing_work_notice(status: str | None) -> str:
         return "Earlier work on this issue has already finished, so nothing new was started."
     return ("This issue already has paused work, so nothing new was started. Ask the agent to resume it "
             "when ready.")
+def _same_work_notice(status: str | None) -> str:
+    """The Agent Session our own chat-started delegation opens: acknowledged as the same work."""
+    if status in ("done", "archived"):
+        return "This work was already finished from the chat that asked, so nothing new was started."
+    if status in ("running", "ready", "review"):
+        return "This is the work already started from chat, so nothing new was started. Updates continue here."
+    return "This work was set up from chat and is waiting to start, so nothing new was started."
 STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
 UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
                     "board.")
@@ -545,6 +552,17 @@ class Kanban:
             if issue is not None:
                 require_task_issue_scope(self.require_task(task_id), issue)
             self.kn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=issue_id)
+    def subscribe_origin(self, task_id: str, route: dict) -> None:
+        """Native notify subscription for the chat that asked; core's notifier delivers to it."""
+        with self.conn() as conn:
+            self.kn.add_notify_sub(conn, task_id=task_id, **route)
+    def complete_recorded(self, task_id: str, expected_event_id: int, *, summary: str, evidence: list[str]) -> bool:
+        """Close work already finished in chat: only the pristine parked task, never a runnable one."""
+        if self.initial_activation_event(task_id) != expected_event_id:
+            return False
+        with self.conn() as conn:
+            return self.kb.complete_task(conn, task_id, summary=summary,
+                result="\n".join([summary, *evidence]), metadata={"recorded_from_chat": True, "evidence": evidence})
     def subscribe_parent(self, task_id: str, profile: str, route: dict) -> None:
         with self.conn() as conn:
             self.kn.add_notify_sub(conn, task_id=task_id, platform=route["platform"], chat_id=route["chat_id"],
@@ -1229,6 +1247,10 @@ class Bridge:
                    *, assignment_prompt: str = "") -> bool:
         if row:
             if self._assignment_activation(row):
+                if row.get("owner_ref") != session_id:
+                    # Our own chat-started work (or a re-delegation): the same work, never a second session.
+                    task = self.native_status(issue["id"])
+                    self._decline(issue["id"], session_id, _same_work_notice(task.get("status")), activity_id=session_id)
                 return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
@@ -1472,6 +1494,8 @@ class Bridge:
                                                       {"state": "applied", "task_id": row["task_id"]})
         if created.get("state") != "applied" or created.get("task_id") != row["task_id"]:
             return False
+        # The chat request authorized this creation; Linear routing to this app follows it.
+        from_chat = payload.get("origin") == "chat"
         key = f"activate:{issue_id}:{row['task_id']}"
         prior = self.store.native_intent(key)
         if prior and prior.get("state") in ("applied", "reconcile"):
@@ -1491,19 +1515,21 @@ class Bridge:
         if token is None:
             self.store.native_intent_prepare(key, request)
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native work changed after creation"})
-            self._decline(issue_id, row["owner_ref"], "The task changed right after it was created, so the agent left it as it is and didn't start it.")
+            if row["owner_ref"]:
+                self._decline(issue_id, row["owner_ref"], "The task changed right after it was created, so the agent left it as it is and didn't start it.")
             diag.evt("claim.decision", "skipped", "native_changed", iss=issue_id, task=row["task_id"])
             return True
         self.store.native_intent_prepare(key, request)
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         issue = self._effect_issue(issue_id)
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
-                (issue.get("delegate") or {}).get("id") != self.api.viewer_id() or
+                (not from_chat and (issue.get("delegate") or {}).get("id") != self.api.viewer_id()) or
                 (issue.get("state") or {}).get("type") in CLOSED):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
             if stop:
                 self._pending_assignment_stop(row)
-            self._decline(issue_id, row["owner_ref"], "The assignment changed or a Stop came in while the task was being set up, so it wasn't started. An operator should confirm nothing is already running.")
+            if row["owner_ref"]:
+                self._decline(issue_id, row["owner_ref"], "The assignment changed or a Stop came in while the task was being set up, so it wasn't started. An operator should confirm nothing is already running.")
             diag.evt("claim.decision", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
             return True
         require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
@@ -1520,8 +1546,9 @@ class Bridge:
         diag.evt("claim.decision", "routed" if accepted else "skipped", "-" if accepted else "activation_unverified", iss=issue_id, task=row["task_id"])
         self._pending_assignment_stop(row)
         task = adapter.require_task(row["task_id"])
-        self.activity(issue_id, row["owner_ref"], "thought",
-                      f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
+        if row["owner_ref"]:  # A chat-started task answers in its chat; Linear hears from native events.
+            self.activity(issue_id, row["owner_ref"], "thought",
+                          f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
         return True
 
     def _pending_assignment_stop(self, row: dict) -> bool | None:
@@ -1602,6 +1629,154 @@ class Bridge:
                 at=self.clock() * 1000):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
+
+    def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None) -> dict:
+        """Chat-requested work through the same guarded native admission a Linear assignment uses.
+
+        The chat request is the authority, as a delegation is for _start. One native task per
+        issue: a bound or linked task is reused, never duplicated; the create intent and retry
+        key are shared with assignment, so our own delegation echo finds the same work. The
+        asking chat gets a native notify subscription. With record_done, work already finished
+        in chat is created parked and completed with its evidence; it is never runnable.
+        """
+        if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
+            raise LinearError("This agent starts work from a Linear assignment, not from chat", retryable=False)
+        with self.lock(issue_id):
+            if not self._require_effect(issue_id):
+                raise LinearError("Issue authorization refused", retryable=False)
+            if not getattr(self.kanban, "executor_profile", None):
+                raise LinearError("Native executor profile is unverified", retryable=False)
+            issue = self._effect_issue(issue_id)
+            row = self.store.get(issue_id)
+            if row is not None:
+                if row.get("origin") != "native":
+                    raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
+                return self._entrust_bound(row, route, record_done)
+            if (issue.get("state") or {}).get("type") in CLOSED:
+                raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
+            if self.store.native_intent(f"create:{issue_id}") is None:
+                existing = self.kanban.discover(issue)
+                if existing:
+                    return self._entrust_existing(issue, existing, route, record_done)
+            return self._entrust_create(issue, route, record_done)
+
+    def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None) -> dict:
+        """Link the one native task already pointing at this issue; its execution state is unchanged."""
+        if record_done:
+            raise LinearError("A native task already points at this issue; read status instead of recording it as done", retryable=False)
+        if len(existing) != 1:
+            raise LinearError("More than one task already points at this issue, so no new one was started; decide which one continues", retryable=False)
+        adapter, task = existing[0]
+        require_task_issue_scope(task, issue)
+        if not task_issue_link(task, issue):
+            raise LinearError("A task's retry key matches this issue without a verified issue link; inspect it before starting work", retryable=False)
+        if task.assignee != adapter.executor_profile:
+            raise LinearError("Another agent already has work on this issue; that work needs to finish or be handed over first", retryable=False)
+        if getattr(adapter, "history_only", False) or task.status == "archived":
+            raise LinearError("Earlier work on this issue has ended; start a separately requested increment as a new issue", retryable=False)
+        task = adapter.require_task(task.id)
+        if not self.store.bind_native(issue["id"], task.id, adapter.executor_profile, adapter.board or "default",
+                                     project_id=(issue.get("project") or {}).get("id"),
+                                     completion_scope=self._completion_scope(adapter, task), at=self.clock() * 1000):
+            raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
+        adapter.subscribe(task.id, issue["id"], issue=issue)
+        return self._entrust_bound(self.store.get(issue["id"]), route, None)
+
+    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None) -> dict:
+        issue_id, key = issue["id"], f"linear:{issue['id']}"
+        project = (issue.get("project") or {}).get("id")
+        payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
+                   "board": self.kanban.board or "default", "external_key": key,
+                   "title": f"{issue.get('identifier') or issue_id}: {issue.get('title') or 'Linear issue'}",
+                   "body": TASK_BODY.format(ident=issue.get("identifier") or issue_id, url=issue.get("url") or "",
+                                            context=issue.get("description") or ""),
+                   "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
+                   "initial_status": "blocked", "activation": "native-event-guard-v1",
+                   "source_ms": self.clock() * 1000, "origin": "chat", "record_done": bool(record_done)}
+        intent_key = f"create:{issue_id}"
+        prior = self.store.native_intent(intent_key)
+        if prior:
+            original = prior["payload"]
+            if original.get("initial_status") != "blocked" or any(original.get(field) != payload[field] for field in ("kind", "issue_id", "profile", "board", "external_key")):
+                raise LinearError("Native creation request scope changed; reconcile it", retryable=False)
+            payload = original  # A retry reconciles the original request.
+        _, first = self.store.native_intent_prepare(intent_key, payload)
+        if first:
+            # A lost reply keeps the intent; the retry inspects the retry key, never creates again.
+            task = self.kanban.create(title=payload["title"], created_by=payload["created_by"], body=payload["body"],
+                idempotency_key=key, completion_contract=payload["completion_contract"], initial_status="blocked")
+        else:
+            tasks = self.kanban.find_created(key)
+            if len(tasks) != 1:
+                self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native create outcome is ambiguous"})
+                raise LinearError("It isn't clear whether the task was created, so it won't be created again; check the agent's board", retryable=False)
+            task = tasks[0]
+        task = self.kanban.require_task(task.id)
+        if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
+            self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
+            raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
+        require_task_issue_scope(task, issue)
+        if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
+                                     project_id=project, completion_scope=self._completion_scope(self.kanban, task),
+                                     at=payload["source_ms"]):
+            self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
+            raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
+        self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
+        self.kanban.subscribe(task.id, issue_id, issue=issue)
+        return self._entrust_bound(self.store.get(issue_id), route, record_done)
+
+    def _recorded_done(self, issue_id: str, task_id: str) -> bool:
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        payload = created.get("payload") or {}
+        return (created.get("state") == "applied" and created.get("task_id") == task_id
+                and payload.get("origin") == "chat" and payload.get("record_done") is True)
+
+    def _entrust_bound(self, row: dict, route: dict | None, record_done: dict | None) -> dict:
+        """Continue the one bound task: admit our own parked creation, or report what exists."""
+        issue_id, task_id = row["issue_id"], row["task_id"]
+        adapter = self._binding_adapter(issue_id)
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        ours = (created.get("state") == "applied" and created.get("task_id") == task_id
+                and created["payload"].get("origin") == "chat")
+        if record_done:
+            if not self._recorded_done(issue_id, task_id):
+                raise LinearError("This issue already has native work; read status instead of recording it as done", retryable=False)
+            return self._record_done(row, adapter, record_done)
+        if ours:
+            self._assignment_activation(row)  # Idempotent: an applied admission is never repeated.
+        task = adapter.require_task(task_id)
+        subscribed = bool(route) and task.status not in ("done", "archived")
+        if subscribed:
+            # After admission, so the chat hears checkpoints and the result, not our own unblock.
+            adapter.subscribe_origin(task_id, route)
+        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
+        return {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
+                "admitted": bool(activation.get("accepted")), "chat_subscribed": subscribed}
+
+    def _record_done(self, row: dict, adapter, record_done: dict) -> dict:
+        issue_id, task = row["issue_id"], adapter.require_task(row["task_id"])
+        if task.status != "done":
+            token = adapter.initial_activation_event(task.id)
+            if task.status != "blocked" or token is None:
+                raise LinearError("The task changed after it was created, so it was not recorded as done; inspect it", retryable=False)
+            created = self.store.native_intent(f"create:{issue_id}")
+            key = f"activate:{issue_id}:{task.id}"
+            # Settle admission first: no recovery or assignment echo may ever activate this task.
+            self.store.native_intent_prepare(key, {"kind": "activate", "issue_id": issue_id, "task_id": task.id,
+                "profile": adapter.executor_profile, "board": adapter.board or "default",
+                "expected_event_id": token, "source_ms": created["payload"]["source_ms"], "record_done": True})
+            self.store.native_intent_settle(key, {"state": "applied", "accepted": False,
+                                                 "owned_activation": False, "record_done": True})
+            if row["last_event_id"] < token:
+                # The parked creation pair is not news; skip its Queued note.
+                self._capture_native_event(issue_id, token, [], at=self.clock())
+            if not adapter.complete_recorded(task.id, token, summary=record_done["summary"],
+                                             evidence=record_done.get("evidence") or []):
+                raise LinearError("The task changed before it could be recorded as done; inspect it", retryable=False)
+            task = adapter.require_task(task.id)
+        return {"issue_id": issue_id, "task_id": task.id, "status": task.status, "recorded_done": True,
+                "worker_started": False}
 
     @staticmethod
     def _completion_scope(adapter, task, mode: str = "outcome") -> dict:
@@ -1787,7 +1962,7 @@ class Bridge:
                 "binding_revision": revision, "completion_scope": binding.get("completion_scope")}
     def queue_delegate_self(self, issue_id: str, request_id: str, *, expected_delegate_id: str | None,
                             expected_updated_at: str, expected_binding_revision: str,
-                            caller_context: dict, requester: dict) -> str:
+                            caller_context: dict, requester: dict, recorded_done: bool = False) -> str:
         """Change only Linear routing, after the caller has inspected native work."""
         with self.lock(issue_id):
             prior = self.store.outbox_row(request_id)
@@ -1799,7 +1974,8 @@ class Bridge:
                        "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": expected_delegate_id,
                        "expected_updated_at": expected_updated_at, "expected_binding_revision": expected_binding_revision,
                        "native_binding": binding, "task_id": (binding or {}).get("task_id"),
-                       "caller_context": caller_context, **requester}
+                       "caller_context": caller_context, **requester,
+                       **({"recorded_done": True} if recorded_done else {})}
             if not prior:
                 self._delegate_preflight(payload)
             row_id = self.store.enqueue("delegate", payload, at=self.clock())
@@ -1816,7 +1992,8 @@ class Bridge:
         issue = self._effect_issue(issue_id)
         task = self._native_effect_task(issue_id, issue)
         # Finished work awaiting review keeps its agent (background recovery only); verified or archived work does not.
-        ended = task.status == "archived" or (task.status == "done" and (
+        recorded = bool(payload.get("recorded_done")) and self._recorded_done(issue_id, task.id)
+        ended = task.status == "archived" or (task.status == "done" and not recorded and (
             not payload.get("recovered_binding") or self.store.terminal_captured(task.id, issue_id=issue_id, state="done")))
         if task.id != payload.get("task_id") or ended:
             raise LinearError("Native work has ended or changed; inspect its history", retryable=False)

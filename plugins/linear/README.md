@@ -23,10 +23,29 @@ API is required. The plugin is disabled by default.
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
 | `create_issue` with UUIDv4 `id`, `title`, `team` and `project` | Create an undelegated issue; optional description/parent. `project` is a project id or exact name; without it the parent's project is used. With neither, nothing is created and the reply lists the team's active projects so the agent can choose one itself; `project: "none"` is the explicit opt-out. |
+| `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
+| `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
+| `create_issue` or `work_on` with `record_done: true`, `summary`, optional `evidence` links | Link work already finished in chat and close it: the native task is created parked and completed with that evidence in one call, never runnable; verified completion sets Done with the closing summary. Refused when the issue already has native work. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
 | `update_description` with `issue`, UUIDv4 `id`, `description`, `expected_description` | Queue a description replacement after checking the exact previous text. |
 | `add_comment` with `issue`, UUIDv4 `id`, `body` | Queue a Linear comment. |
+
+### Entrust from chat
+
+Questions, status checks and short commands stay in the conversation and create nothing.
+A longer outcome gets an issue with `start_work` (or `work_on` for an existing one). The chat
+request is the authority, as a delegation is for an assignment: the plugin creates the task
+parked under the shared `create:<issue>` intent and `linear:<issue>` retry key, links it,
+and admits it against its creation event token. The webhook from this app's own delegation
+finds that admission and is answered as the same work in its Agent Session; it starts no
+session or worker. Linear status comes from native execution (In Progress once a worker
+claims it). The asking chat is a native notify subscriber built like core `kanban_create`
+auto-subscribe from host-captured context (messaging chats are woken in their thread,
+Desktop targets its native local conversation, TUI its session key), added after admission so
+it hears checkpoints and the result, not the admission itself. `record_done` never runs a
+worker or re-runs work. Existing linked work, another agent's task or ambiguous links are
+reported, never duplicated. Delegated children return the request to their parent.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not

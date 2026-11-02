@@ -1,0 +1,371 @@
+"""Entrust from chat: real upstream Kanban, the registered chat handler and a synthetic Linear.
+
+A longer outcome asked for in chat gets one native task through the same guarded admission a
+Linear assignment uses, this app as delegate, Linear status that follows the work, and native
+notifications back to the asking chat. Work already finished in chat is recorded as done with
+its evidence and never runs. These backend scenarios do not claim a deployed chat round-trip.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+from linear_fake_api import load_plugin
+
+SOURCE = os.environ.get("HERMES_AGENT_SRC", "")
+CORE = None
+try:
+    if not SOURCE:
+        raise ImportError("HERMES_AGENT_SRC is not set")
+    sys.path.insert(0, SOURCE)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_notify as kbn
+except Exception as exc:
+    CORE = str(exc)
+
+plugin = load_plugin()
+from hermes_fleet_linear_plugin import chat
+from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
+from hermes_fleet_linear_plugin.store import Store
+from hermes_fleet_linear_plugin.transport import NativeContext
+from test_linear_specialist_authorization import Authority, ISSUE, TEAM, PROJECT, USER, VIEWER, issue_record
+
+NEW_ISSUE = str(uuid.UUID(int=0x1234, version=4))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class ChatAuthority(Authority):
+    """Adds issue creation, team projects, delegate writes and recorded effects to the fixture."""
+
+    def __init__(self):
+        super().__init__()
+        self.activity_records: list[dict] = []
+        self.comment_bodies: list[tuple[str, str]] = []
+        self.issues[ISSUE]["updatedAt"] = now_iso()
+
+    def transport(self, url, body, headers):
+        payload = json.loads(body)
+        query, variables = payload["query"], payload.get("variables") or {}
+        reply = lambda data: (200, {}, json.dumps({"data": data}).encode())
+        if "query TeamProjects(" in query:
+            self.requests.append(query)
+            return reply({"team": {"id": variables["id"], "projects": {"nodes": [
+                {"id": PROJECT, "name": "Fleet Rollout", "completedAt": None, "canceledAt": None, "archivedAt": None}]}}})
+        if "query Team(" in query:
+            self.requests.append(query)
+            return reply({"team": {"id": TEAM, "key": "OPS"}})
+        if "query Project(" in query:
+            self.requests.append(query)
+            return reply({"project": {"id": variables["id"], "archivedAt": None,
+                                      "teams": {"nodes": [{"id": TEAM}], "pageInfo": {"hasNextPage": False}}}})
+        if "query CreatedIssue(" in query:
+            self.requests.append(query)
+            return reply({"issue": self.issues.get(variables["id"])})
+        if "issueCreate" in query:
+            self.requests.append(query)
+            self.mutations.append(query)
+            fields = variables["input"]
+            if fields["id"] not in self.issues:
+                self.issues[fields["id"]] = issue_record(
+                    id=fields["id"], identifier="OPS-2", title=fields["title"], url="https://linear.example/issue/OPS-2",
+                    description=fields.get("description"), project={"id": fields.get("projectId")},
+                    updatedAt=now_iso(), parent=None)
+            return reply({"issueCreate": {"success": True}})
+        if "agentActivityCreate" in query:
+            self.activity_records.append(dict(variables["input"]))
+        if "commentCreate" in query:
+            self.comment_bodies.append((variables["input"]["issueId"], variables["input"]["body"]))
+        if "issueUpdate" in query and "delegateId" in (variables.get("input") or {}):
+            issue = self.issues[variables["id"]]
+            before = (issue.get("delegate") or {}).get("id")
+            issue["delegate"] = {"id": variables["input"]["delegateId"]}
+            issue["updatedAt"] = now_iso()
+            self.history.setdefault(issue["id"], []).append({
+                "createdAt": issue["updatedAt"], "actorId": VIEWER, "fromStateId": issue["state"]["id"],
+                "toStateId": issue["state"]["id"], "fromAssigneeId": None, "toAssigneeId": None,
+                "fromDelegate": before and {"id": before}, "toDelegate": {"id": variables["input"]["delegateId"]}})
+        if "issueUpdate" in query and "stateId" in (variables.get("input") or {}):
+            self.issues[variables["id"]]["updatedAt"] = now_iso()
+        return super().transport(url, body, headers)
+
+    def state(self, issue_id: str) -> str:
+        return self.issues[issue_id]["state"]["name"]
+
+
+@unittest.skipIf(CORE is not None, f"native upstream source unavailable ({CORE})")
+class ChatEntrustScenarios(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="linear-chat-entrust-")
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name).resolve()
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("HERMES_KANBAN_") and key != "HERMES_DELEGATED_CHILD_CONTEXT"}
+        environment.update(HERMES_HOME=str(self.home), HERMES_KANBAN_HOME=str(self.home / "board"), HERMES_PROFILE="default")
+        self.env = patch.dict(os.environ, environment, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.authority = ChatAuthority()
+        self.board = Kanban(profile="default", profile_home=self.home)
+        if not self.board.guarded_controls:
+            self.skipTest("native host predates guarded admission")
+        self.bridge = Bridge(Store(self.home / "linear.db"), self.authority.api(scope=None), self.board, profile="default")
+        self.bridge.profile_home = self.home
+        self.context = NativeContext(home=str(self.home), profile="default", platform="telegram", source="telegram",
+                                     session_key="telegram:chat-1:thread-1", session_id="chat-session", user_id="human-1",
+                                     chat_id="chat-1", chat_type="group", thread_id="thread-1", scope_id="workspace-1")
+
+    # -- helpers ---------------------------------------------------------
+    def ask(self, args, context=None):
+        return json.loads(chat.handle(self.bridge, args, context or self.context))
+
+    def create(self, **extra):
+        return self.ask({"action": "create_issue", "id": NEW_ISSUE, "title": "Roll out the new proxy",
+                         "team": TEAM, "project": "Fleet Rollout", "description": "Ship it and check it live.", **extra})
+
+    def tasks(self):
+        with self.board.conn() as conn:
+            return [row["id"] for row in conn.execute("SELECT id FROM tasks")]
+
+    def subs(self, task_id):
+        with self.board.conn() as conn:
+            return [dict(sub) for sub in kbn.list_notify_subs(conn, task_id)]
+
+    def chat_events(self, task_id):
+        from gateway.kanban_watchers_notifier import TERMINAL_KINDS
+        with self.board.conn() as conn:
+            _, events = kbn.unseen_events_for_sub(conn, task_id=task_id, platform="telegram", chat_id="chat-1",
+                                                 thread_id="thread-1", kinds=TERMINAL_KINDS)
+        return [event.kind for event in events]
+
+    def history(self, task_id):
+        return [event.kind for event in self.board.history(task_id, 0)]
+
+    def flush(self):
+        self.bridge.pump_kanban()
+        self.bridge.flush()
+
+    def echo(self, issue_id, session_id="echo-session"):
+        """Linear opens an Agent Session for this app's own delegation."""
+        self.authority.sessions[session_id] = {"id": session_id, "issue": {"id": issue_id},
+                                               "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+        stamp = time.time()
+        return self.bridge.handle_webhook({
+            "type": "AgentSessionEvent", "action": "created",
+            "createdAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+            "webhookTimestamp": int(stamp * 1000),
+            "agentSession": {"id": session_id, "issue": {"id": issue_id}, "creatorId": USER}})
+
+    # -- scenarios -------------------------------------------------------
+    def test_chat_create_with_start_work_runs_one_task_as_delegate_and_reports_to_the_chat(self):
+        reply = self.create(start_work=True)
+        self.assertTrue(reply["ok"], reply)
+        self.assertIn("Do not also do this work here", reply["message"])
+        native = reply["native"]
+        self.assertTrue(native["created_from_chat"])
+        self.assertTrue(native["admitted"])
+        self.assertTrue(native["chat_subscribed"])
+        self.assertEqual(native["status"], "ready")  # admitted; the dispatcher claims it
+        self.assertEqual(reply["routing"], "queued")
+        self.assertEqual(self.tasks(), [native["task_id"]])
+        task_id = native["task_id"]
+
+        # The asking chat is a native notify subscriber (wake: one reply per update), as is the issue.
+        subs = {(sub["platform"], sub["chat_id"]): sub for sub in self.subs(task_id)}
+        self.assertEqual(subs[("telegram", "chat-1")]["thread_id"], "thread-1")
+        self.assertEqual(subs[("telegram", "chat-1")]["delivery_mode"], "wake")
+        self.assertIn(("linear", NEW_ISSUE), subs)
+        self.assertEqual(self.chat_events(task_id), [])  # our own admission is not news for the chat
+
+        # Delegate: this app, the human assignee untouched.
+        self.flush()
+        issue = self.authority.issues[NEW_ISSUE]
+        self.assertEqual(issue["delegate"], {"id": VIEWER})
+        self.assertIsNone(issue["assignee"])
+
+        # A worker claims it: Linear shows In Progress.
+        with self.board.conn() as conn:
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-test-worker"))
+        self.flush()
+        self.assertEqual(self.authority.state(NEW_ISSUE), "In Progress")
+
+        # A checkpoint reaches the asking chat through the native notifier.
+        with self.board.conn() as conn:
+            if "human_checkpoint" in __import__("inspect").signature(kb.add_comment).parameters:
+                kb.add_comment(conn, task_id, "worker", "Proxy deployed to staging.",
+                               human_checkpoint=True, request_id=str(uuid.uuid4()))
+            else:
+                with kb.write_txn(conn):
+                    comment = kb.add_comment(conn, task_id, "worker", "Proxy deployed to staging.")
+                    kb._append_event(conn, task_id, "checkpoint", {"author": "worker", "body": "Proxy deployed to staging.",
+                                                                 "comment_id": comment, "request_id": str(uuid.uuid4())})
+        self.assertIn("checkpoint", self.chat_events(task_id))
+
+        # The webhook from our own delegation is the same work: acknowledged, no second task or run.
+        before = self.board.get(task_id)
+        self.echo(NEW_ISSUE)
+        self.flush()
+        after = self.board.get(task_id)
+        self.assertEqual(self.tasks(), [task_id])
+        self.assertEqual((before.status, before.current_run_id), (after.status, after.current_run_id))
+        answers = [record for record in self.authority.activity_records if record["agentSessionId"] == "echo-session"]
+        self.assertEqual(len(answers), 1)
+        self.assertIn("already started from chat", answers[0]["content"]["body"])
+
+    def test_duplicate_request_and_repeated_echo_never_start_a_second_task(self):
+        first = self.create(start_work=True)
+        again = self.create(start_work=True)  # a lost reply retried with the same client id
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(again["native"]["task_id"], first["native"]["task_id"])
+        reuse = self.ask({"action": "work_on", "issue": NEW_ISSUE})
+        self.assertTrue(reuse["ok"], reuse)
+        self.assertEqual(reuse["native"]["task_id"], first["native"]["task_id"])
+        task_id = first["native"]["task_id"]
+        events = self.history(task_id)
+        self.assertEqual(events.count("unblocked"), 1)  # one admission
+        self.flush()
+        self.echo(NEW_ISSUE)
+        self.echo(NEW_ISSUE)
+        self.bridge.tick()
+        self.assertEqual(self.tasks(), [task_id])
+        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        delegates = [query for query in self.authority.mutations if "issueUpdate" in query]
+        self.assertTrue(delegates)
+        self.assertEqual(len([r for r in self.authority.activity_records if r["agentSessionId"] == "echo-session"]), 1)
+
+    def test_work_on_an_existing_issue_binds_and_starts_it(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["ok"], reply)
+        native = reply["native"]
+        self.assertTrue(native["created_from_chat"])
+        self.assertTrue(native["admitted"])
+        self.assertEqual(self.bridge.store.native_binding(ISSUE)["task_id"], native["task_id"])
+        self.assertEqual(self.tasks(), [native["task_id"]])
+        self.flush()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        status = self.ask({"action": "status", "issue": ISSUE})
+        self.assertTrue(status["native"]["linked"])
+
+    def test_work_on_reuses_an_unlinked_task_already_on_the_board(self):
+        issue = self.authority.issues[ISSUE]
+        existing = self.board.create(title="OPS-1: earlier chat task", created_by="chat",
+                                     body=f"Linear issue OPS-1: {issue['url']}\nContinue the rollout.")
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["native"]["task_id"], existing.id)
+        self.assertFalse(reply["native"]["created_from_chat"])
+        self.assertEqual(self.tasks(), [existing.id])
+        self.assertIn(("telegram", "chat-1"), {(s["platform"], s["chat_id"]) for s in self.subs(existing.id)})
+
+    def test_record_done_closes_with_evidence_without_running_anything(self):
+        reply = self.create(record_done=True, summary="Proxy rolled out and checked live.",
+                            evidence=["https://ci.example/run/42"])
+        self.assertTrue(reply["ok"], reply)
+        native = reply["native"]
+        self.assertTrue(native["recorded_done"])
+        self.assertFalse(native["worker_started"])
+        self.assertEqual(native["status"], "done")
+        task_id = native["task_id"]
+        # Created parked and completed: never unblocked, claimed, spawned or run.
+        events = self.history(task_id)
+        self.assertEqual(events[:2], ["created", "blocked"])
+        self.assertNotIn("unblocked", events)
+        self.assertNotIn("claimed", events)
+        self.assertNotIn("spawned", events)
+        self.assertIsNone(self.board.get(task_id).current_run_id)
+        self.assertEqual(reply["routing"], "queued")
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.authority.state(NEW_ISSUE), "Done")
+        self.assertEqual(self.authority.issues[NEW_ISSUE]["delegate"], {"id": VIEWER})
+        closing = [body for issue_id, body in self.authority.comment_bodies if issue_id == NEW_ISSUE]
+        self.assertTrue(any("Proxy rolled out and checked live." in body and "https://ci.example/run/42" in body
+                            for body in closing), closing)
+        self.assertFalse(any("Queued" in body for body in closing), closing)
+        # Repeating it, or asking to start it, re-runs nothing; the echo is the same work.
+        again = self.ask({"action": "work_on", "issue": NEW_ISSUE, "record_done": True,
+                          "summary": "Proxy rolled out and checked live.", "evidence": ["https://ci.example/run/42"]})
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(again["native"]["task_id"], task_id)
+        self.assertEqual(self.ask({"action": "work_on", "issue": NEW_ISSUE})["native"]["status"], "done")
+        self.echo(NEW_ISSUE)
+        self.bridge.tick()
+        self.assertEqual(self.tasks(), [task_id])
+        self.assertNotIn("unblocked", self.history(task_id))
+
+    def test_record_done_refuses_an_issue_with_existing_work(self):
+        self.ask({"action": "work_on", "issue": ISSUE})
+        refused = self.ask({"action": "work_on", "issue": ISSUE, "record_done": True, "summary": "Done."})
+        self.assertFalse(refused["ok"])
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(self.board.get(self.tasks()[0]).status, "ready")
+
+    def test_plain_issue_and_questions_start_nothing(self):
+        reply = self.create()
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["message"], "Created an undelegated issue.")
+        status = self.ask({"action": "status", "issue": ISSUE})
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(NEW_ISSUE))
+        self.assertIsNone(self.authority.issues[NEW_ISSUE]["delegate"])
+
+    def test_invalid_requests_write_nothing(self):
+        for extra in ({"start_work": "yes"}, {"record_done": True}, {"record_done": True, "summary": "x", "start_work": True},
+                      {"record_done": True, "summary": "x", "evidence": "https://ci.example"}):
+            with self.subTest(extra=extra):
+                reply = self.create(**extra)
+                self.assertFalse(reply["ok"])
+                self.assertNotIn(NEW_ISSUE, self.authority.issues)
+        child = NativeContext(**{**self.context.to_wire(), "delegated_child": True})
+        self.assertFalse(self.ask({"action": "work_on", "issue": ISSUE}, child)["ok"])
+        self.assertEqual(self.tasks(), [])
+
+    def test_crash_after_create_resumes_admission_without_a_second_task(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None)
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.bridge.tick()  # the existing recovery path finishes the chat admission
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        self.assertEqual(self.tasks(), [task_id])
+
+
+class OriginRouteTests(unittest.TestCase):
+    """The asking chat's subscription mirrors core kanban_create auto-subscribe, from host context only."""
+
+    def context(self, **fields):
+        base = dict(home="/h", profile="default", platform="telegram", source="telegram", session_key="k",
+                    session_id="s", chat_id="chat-1", chat_type="group", thread_id="t-1", user_id="u-1")
+        return NativeContext(**{**base, **fields})
+
+    def test_messaging_chat_is_woken_in_its_thread(self):
+        route = chat._origin_route(self.context())
+        self.assertEqual((route["platform"], route["chat_id"], route["thread_id"], route["delivery_mode"],
+                          route["notifier_profile"]), ("telegram", "chat-1", "t-1", "wake", "default"))
+
+    def test_desktop_conversation_targets_its_own_local_session(self):
+        # An owner-adopted Desktop turn binds the native local route for that conversation (#258).
+        route = chat._origin_route(self.context(platform="local", source="desktop", chat_id="sess-1", thread_id="",
+                                                chat_type=""))
+        self.assertEqual((route["platform"], route["chat_id"], route["delivery_mode"]), ("local", "sess-1", "wake"))
+
+    def test_tui_falls_back_to_the_session_key_and_linear_reports_on_its_issue(self):
+        route = chat._origin_route(self.context(platform="", chat_id="", session_key="tui-key"))
+        self.assertEqual((route["platform"], route["chat_id"], route["delivery_mode"]), ("tui", "tui-key", None))
+        self.assertIsNone(chat._origin_route(self.context(platform="linear")))
+
+
+if __name__ == "__main__":
+    unittest.main()
