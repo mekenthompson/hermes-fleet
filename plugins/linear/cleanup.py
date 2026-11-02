@@ -11,7 +11,7 @@ from pathlib import Path
 import sqlite3
 import uuid
 
-from . import origin
+from . import diag, origin
 from .transport import Unavailable, native_json_object
 
 
@@ -33,8 +33,26 @@ _SETTLED_ADMISSION_OUTCOMES = frozenset({
     "completed", "interrupted", "rejected", "failed", "cancelled", "steered",
 })
 
-# Host lifecycle evidence shares the existing protected per-profile ingress
-# mount. These are immutable physical facts, never execution or consent grants.
+# Plain statement of the fact a worker-fate hold needs, for the agent to pass on.
+HOLD_FACTS = {
+    "old_worker_alive": "A process from the earlier attempt is still running here. "
+                        "It has to stop before the work can be taken over.",
+    "old_gateway_alive": "The agent process that started the earlier attempt is still running here, "
+                         "so that attempt may still be running. It has to stop before the work can be taken over.",
+    "worker_instance_not_earlier": "The earlier attempt ran in another running copy of this agent, "
+                                   "not one that has since restarted. That copy has to be confirmed stopped first.",
+    "old_instance_unproven": "The earlier attempt ran before a restart, but its record does not yet show that "
+                             "everything it started has ended. The agent settles that record when it next starts.",
+    "restart_proof_unsupported": "This agent's version cannot yet confirm that work from before a restart has ended. "
+                                 "Update the agent, then check again.",
+}
+
+# Optional host lifecycle evidence. Core's own restart proof (attempt_instance_replaced)
+# comes first; this host receipt is only needed where that proof cannot apply: an
+# older core without it, or a deployment where another live container may share this
+# home (core assumes one live instance per board/owner ledger). It shares the existing
+# protected per-profile ingress mount. These are immutable physical facts, never
+# execution or consent grants.
 NAMESPACE_DISPOSITION_DIRECTORY = "namespace-dispositions"
 NAMESPACE_DISPOSITION_VERSION = 1
 NAMESPACE_DISPOSITION_MAX_BYTES = 16384
@@ -54,12 +72,16 @@ def _require(value, reason):
         raise Unknown(reason)
 
 
+def _namespace_disposition_path(ingress, epoch):
+    directory = Path(ingress).parent / NAMESPACE_DISPOSITION_DIRECTORY
+    return directory / (hashlib.sha256(epoch.encode("utf-8")).hexdigest() + ".json")
+
+
 def _namespace_disposition(ingress, home, deployment_profile, native_profile, epoch):
     """Read only the host-owned receipt in this profile's protected inbox."""
     _require(all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")),
              "namespace_disposition_unsupported")
-    directory = Path(ingress).parent / NAMESPACE_DISPOSITION_DIRECTORY
-    path = directory / (hashlib.sha256(epoch.encode("utf-8")).hexdigest() + ".json")
+    path = _namespace_disposition_path(ingress, epoch)
     _require(path.is_absolute() and ".." not in path.parts, "namespace_disposition_unavailable")
     descriptors = []
     try:
@@ -226,7 +248,66 @@ def _discover(home, issue, profile, native_profile, metadata, bound=None):
     return bound, reader.for_board(bound["board"])
 
 
-def _pid_gone(pid, fingerprint, owner=None, *, disposition=None):
+def _epoch_parts(epoch):
+    """Native ``<boot_id>:<pid1 start ticks>``; None for anything degraded or malformed."""
+    boot, separator, start = epoch.rpartition(":")
+    try:
+        valid = separator == ":" and str(uuid.UUID(boot)) == boot and start.isdigit() and int(start) > 0
+    except ValueError:
+        valid = False
+    return (boot, int(start)) if valid else None
+
+
+def _native_restart_reason(recorded_epoch, epoch, owner, replaced):
+    """None when core proves this attempt ended with an earlier instance of this host; else why not.
+
+    A container restart or reboot changes the native instantiation epoch, and a PID
+    namespace ends with its PID 1, so no process with the recorded identity can be
+    alive here. That holds only for an EARLIER, well-formed instance: the same boot
+    orders by PID 1's start, and another boot_id is a reboot. The gateway that admitted
+    the attempt must be gone, and core's ``attempt_instance_replaced`` must accept every
+    worker the run recorded. Missing or unreadable evidence is never proof.
+    """
+    old, now = _epoch_parts(recorded_epoch), _epoch_parts(epoch)
+    if old is None:
+        return "worker_identity_missing"
+    if now is None:
+        return "worker_identity_unreadable"  # e.g. boot_id unreadable right now: never a restart
+    if old[0] == now[0] and old[1] >= now[1]:
+        return "worker_instance_not_earlier"
+    try:
+        from hermes_cli.kanban_owner_recovery import _owner_process_gone
+    except ImportError:
+        return "restart_proof_unsupported"
+    if not (isinstance(owner, dict) and _owner_process_gone(owner)):
+        return "old_gateway_alive"
+    return "old_instance_unproven" if replaced is None else replaced()
+
+
+def _attempt_replaced(board, task_id, run_id, session_id):
+    """Core's restart proof for one run (hermes-agent #217), read in the cleanup snapshot."""
+    try:
+        from hermes_cli.kanban_owner_recovery import attempt_instance_replaced
+    except ImportError:
+        return "restart_proof_unsupported"
+    return None if attempt_instance_replaced(board, task_id, run_id, session_id) else "old_instance_unproven"
+
+
+def _other_instance_fate(recorded_epoch, epoch, owner, replaced, disposition):
+    reason = _native_restart_reason(recorded_epoch, epoch, owner, replaced)
+    if reason is None:
+        return "instance_replaced"
+    if disposition is not None:
+        try:
+            if disposition(recorded_epoch):
+                return "namespace_disposed"
+        except Unknown as exc:
+            if str(exc) != "namespace_disposition_unavailable":
+                raise  # A receipt is present but not trustworthy: say so.
+    raise Unknown(reason)
+
+
+def _pid_gone(pid, fingerprint, owner=None, *, replaced=None, disposition=None):
     """Compose native epoch and birth validation; never infer identity from junk."""
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
     from hermes_cli.kanban_db import _pid_alive
@@ -248,8 +329,7 @@ def _pid_gone(pid, fingerprint, owner=None, *, disposition=None):
     recorded = birth(fingerprint, "worker_identity_missing", same_epoch=False)
     recorded_epoch = fingerprint.partition("|")[0]
     if recorded_epoch != epoch:
-        _require(disposition is not None and disposition(recorded_epoch), "worker_identity_missing")
-        return "namespace_disposed"
+        return _other_instance_fate(recorded_epoch, epoch, owner, replaced, disposition)
     if not _pid_alive(pid):
         return "gone"
     current = birth(_process_fingerprint(pid), "worker_identity_unreadable")
@@ -457,6 +537,9 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
     receipts, owners, worker_evidence, native_lineages = [], [], [], []
     namespace_evidence = {}
     def disposed(epoch):
+        # No receipt at all: core's own evidence decides and names the hold. A present
+        # receipt is always read strictly, so an untrusted one holds with its own reason.
+        _require(os.path.lexists(_namespace_disposition_path(ingress, epoch)), "namespace_disposition_unavailable")
         if epoch not in namespace_evidence:
             namespace_evidence[epoch] = _namespace_disposition(ingress, home, binding_profile, native_profile, epoch)
         return True
@@ -584,8 +667,13 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             _require(admission and admission["status"] == "terminal" and admission["outcome"] in {"completed", "interrupted", "failed", "rejected"}
                      and admission["payload"].get("kanban_card_v1") == {"board": bound["board"], "task_id": task["id"], "run_id": run_id},
                      "native_admission_not_settled")
+            proof = {}
+            def replaced(run_id=run_id, sid=sid, proof=proof):
+                if "reason" not in proof:
+                    proof["reason"] = _attempt_replaced(board, task["id"], run_id, sid)
+                return proof["reason"]
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
-                _pid_gone(run["worker_pid"], run["worker_started_at"], marker, disposition=disposition)
+                _pid_gone(run["worker_pid"], run["worker_started_at"], marker, replaced=replaced, disposition=disposition)
             with db._read_ctx() as native:
                 lineage, native_workers, children, lineage_inputs = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
                 epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
@@ -626,7 +714,7 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 if worker["kind"] == "worker_bound":
                     _require(data.get("claim_lock") == frozen.get("claim_lock"), "worker_claim_mismatch")
                 observed.append({"kind": worker["kind"], "fate": _pid_gone(data.get("pid"), data.get("started_at"), marker,
-                                                                         disposition=disposition)})
+                                                                         replaced=replaced, disposition=disposition)})
             worker_evidence.append({"run_id": run_id, "workers": observed,
                 "scope": {key: frozen.get(key) for key in ("profile", "workspace", "branch", "tenant", "skills")}})
             owners.append(({saved["route"], *lineage}, {*lineage, *(child["session_id"] for child in children)}))
@@ -681,8 +769,14 @@ def inspect(state: Path, issue: str, binding_profile: str, stop_id: int, setting
             pass
         else:
             raise Unknown("synchronous_owner_cli_required")
-        return asyncio.run(_inspect(home, state, issue, binding_profile, get_active_profile_name(), stop_id, origin.scope(settings), metadata, ingress))
+        result = asyncio.run(_inspect(home, state, issue, binding_profile, get_active_profile_name(), stop_id, origin.scope(settings), metadata, ingress))
     except (Unknown, Unavailable, OSError, RuntimeError, ValueError, KeyError, IndexError, TypeError, ImportError, sqlite3.DatabaseError) as exc:
         reason = str(exc) if isinstance(exc, Unknown) else "cleanup_evidence_unavailable"
-        return {"issue_id": issue, "stop_event_id": stop_id, "quiescence_proven": False,
-                "state": "unknown", "reason": reason, "permission_granted": False}
+        diag.evt("cleanup.inspect", "held", reason, evt=stop_id)
+        result = {"issue_id": issue, "stop_event_id": stop_id, "quiescence_proven": False,
+                  "state": "unknown", "reason": reason, "permission_granted": False}
+        if reason in HOLD_FACTS:
+            result["needed"] = HOLD_FACTS[reason]
+        return result
+    diag.evt("cleanup.inspect", "applied", task=result.get("task_id"), evt=stop_id)
+    return result

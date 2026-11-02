@@ -47,6 +47,7 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
+    "cleanup.inspect",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -82,6 +83,23 @@ REASONS = frozenset({
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",
+    # takeover cleanup holds (cleanup.py; native_* codes pass through the open pattern)
+    "admission_after_stop_or_missing", "attempt_event_run_unknown", "attempt_event_task_mismatch",
+    "attempt_native_admission_missing_or_ambiguous", "checkpoint_duplicate_key",
+    "checkpoint_ownership_ambiguous", "checkpoint_unreadable", "cleanup_evidence_changed",
+    "cleanup_evidence_unavailable", "foreign_native_owner", "invalid_cleanup_selector",
+    "invalid_issue_discovery_metadata", "issue_scope_fenced", "late_worker_binding_after_stop",
+    "namespace_disposition_custody_unproven", "namespace_disposition_invalid",
+    "namespace_disposition_scope_mismatch", "namespace_disposition_unavailable",
+    "namespace_disposition_unsupported", "native_history_match_foreign_or_archived",
+    "native_history_match_missing_or_ambiguous", "owner_cli_required", "run_not_settled",
+    "scoped_process_cleanup_unknown", "stop_event_changed", "submitter_run_identity_missing",
+    "synchronous_owner_cli_required", "task_not_currently_stopped", "worker_binding_evidence_missing",
+    "worker_claim_mismatch", "worker_identity_missing", "worker_identity_unproven",
+    "worker_identity_unreadable",
+    # takeover cleanup: a worker from another instance of this host (restart/reboot)
+    "old_worker_alive", "old_gateway_alive", "worker_instance_not_earlier", "old_instance_unproven",
+    "restart_proof_unsupported",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",

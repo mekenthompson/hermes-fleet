@@ -690,6 +690,24 @@ BLOB alias is unknown rather than an omitted attempt. The checks preserve raw SQ
 equality/order and unrelated readable foreign records, without repairing any keys.
 No filtered-out opaque key or conflicting event/run ownership is positive foreign evidence.
 
+A worker recorded in an earlier instance of this host (after a container restart or a reboot)
+is proven gone by core's own evidence first, with no host receipt: the worker's recorded
+instance must be well-formed and earlier than this one (same boot: an earlier PID 1 start;
+another boot id: a reboot), the gateway process that admitted the attempt must be gone, and
+core's `attempt_instance_replaced` (hermes-agent #217) must accept every worker the run
+recorded. Its fate is then `instance_replaced`; every admission, Stop, executor, scope and
+checkpoint check below still applies. A worker that may still be alive keeps the hold, with a
+plain `needed` sentence: `old_worker_alive` (a live worker of this instance),
+`old_gateway_alive` (the admitting gateway is still running), `worker_instance_not_earlier`
+(another running copy), `old_instance_unproven` (core cannot yet prove it),
+`restart_proof_unsupported` (a core without #217) or `worker_identity_unreadable` (this
+instance's identity cannot be read). Each hold is logged as `action=cleanup.inspect outcome=held`.
+
+The host receipt below is kept only for what core's proof cannot cover: an older core without
+it, or a deployment where another live container may share the same home (core assumes one
+live instance per board and owner ledger). A present receipt that fails its checks still holds
+with its own reason.
+
 The optional host namespace-disposal transport is the existing protected ingress directory's
 `namespace-dispositions/<sha256(epoch UTF-8)>.json` sibling directory. Every ancestor must be
 root-owned, nonwritable by group/others and nonsymlink. The receipt directory is `root:1000`
