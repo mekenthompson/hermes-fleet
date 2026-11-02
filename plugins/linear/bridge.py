@@ -129,7 +129,8 @@ How to work this task:
 4. Keep the people following this issue informed without noise. At each meaningful milestone or blocker, call
    kanban_comment on this task with human_checkpoint=true and a new stable request_id (reuse it on
    retry). Write it for a person: a few complete sentences in Linear Markdown saying what changed,
-   what is next and any blocker. Never post reasoning, tool output, logs, process IDs or raw errors.
+   what is next and any blocker. Never post reasoning, tool output, logs, process IDs or raw errors,
+   and keep task ids, board names, run numbers and internal states (fences, quiescence) out of Linear.
 5. Your kanban_complete summary is the closing note people read in Linear. Write it in Linear Markdown
    with three short sections: **Delivered** (what changed, in plain words), **Evidence** (PR, CI,
    deploy and live check links or results) and **Remaining** (what is left, or "Nothing").
@@ -237,14 +238,186 @@ _LOCAL_PATH = re.compile(r"(?<![\w.~/:-])(?:file://[^\s)\]>`\"']+|~/[^\s)\]>`\"'
                          r"|[A-Za-z]:\\[^\s)\]>`\"',;]+|/[\w.@+-]+(?:/[\w.@+-]+)+/?)")
 _FS_ROOTS = frozenset("app bin boot data dev etc home lib lib64 media mnt nix opt private proc root run sbin snap "
                       "srv sys tmp usr var workspace Applications Library System Users Volumes".split())
-def _mask_path(match: re.Match) -> str:
-    path = match.group(0)
+_FILE_NAME = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,7}$")
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Character ranges inside fenced code blocks or inline code spans."""
+    spans, offset, fence = [], 0, None
+    for line in text.split("\n"):
+        end = offset + len(line)
+        marker = re.match(r" {0,3}(```+|~~~+)", line)
+        if fence is not None:
+            spans.append((offset, end))
+            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+                fence = None
+        elif marker:
+            fence = marker.group(1)
+            spans.append((offset, end))
+        else:
+            spans.extend((offset + m.start(), offset + m.end()) for m in re.finditer(r"(`+)[^`\n]+?\1", line))
+        offset = end + 1
+    return spans
+def _machine_path(path: str) -> bool:
+    """A file on the agent's machine, not an API route or URL path such as /api/v1/x."""
     if path.startswith("/") and not path.startswith("//"):
         segments = path.rstrip(".:!?/").split("/")
-        if segments[1] not in _FS_ROOTS and not re.search(r"\.[A-Za-z][A-Za-z0-9]{0,7}$", segments[-1]):
-            return path  # An API route or URL path, not a file on the agent's machine.
-    tail = len(path) - len(path.rstrip(".:!?"))
-    return "[local artifact]" + (path[-tail:] if tail else "")
+        return segments[1] in _FS_ROOTS or bool(_FILE_NAME.search(segments[-1]))
+    return True
+def _local_path_words(path: str) -> tuple[str, bool]:
+    """How a person should see a local path: (replacement, is_code). Never a bracketed placeholder.
+
+    The workspace root reads as "the workspace", files under it keep their workspace-relative
+    path, ./ and ../ paths stay as written, and any other path keeps only its file or folder name."""
+    if path.startswith("file://"):
+        path = path[len("file://"):]
+    if path.startswith(("./", "../")):
+        return path, True
+    segments = [part for part in re.split(r"[\\/]", path.rstrip("/\\")) if part]
+    if "workspace" in segments:
+        rest = segments[segments.index("workspace") + 1:]
+        return ("/".join(rest), True) if rest else ("the workspace", False)
+    if not segments or (len(segments) <= 2 and segments[0] in _FS_ROOTS | {"~"}
+                        and not _FILE_NAME.search(segments[-1])):
+        return "a local folder", False  # /home/sam or ~/x: the name would only say whose machine it is.
+    return segments[-1], True
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\(([^()\s]+)\)")
+def _local_link(match: re.Match) -> str:
+    """A link to a file on the agent's machine cannot open for the reader: keep its words and the name."""
+    target = match.group(2)
+    if not (_LOCAL_PATH.fullmatch(target) and _machine_path(target)):
+        return match.group(0)
+    words, is_code = _local_path_words(target)
+    return f"{match.group(1)} (`{words}`)" if is_code else match.group(1)
+def _mask_local_paths(text: str) -> str:
+    """Replace local paths with plain words or names in code, keeping the sentence readable."""
+    text = _MD_LINK.sub(_local_link, text)
+    spans = _code_spans(text)
+    out, last = [], 0
+    for match in _LOCAL_PATH.finditer(text):
+        path, start, end = match.group(0), match.start(), match.end()
+        if not _machine_path(path):
+            continue
+        tail = len(path) - len(path.rstrip(".:!?"))
+        path, end = path[:len(path) - tail], end - tail
+        words, is_code = _local_path_words(path)
+        in_code = any(lo <= start < hi for lo, hi in spans)
+        whole_span = in_code and text[start - 1:start] == "`" and text[end:end + 1] == "`" \
+            and not text[start - 2:start - 1] == "`"
+        if whole_span:
+            start, end = start - 1, end + 1  # `path` alone is prose about the path.
+        elif in_code:
+            # Inside code people asked for: keep it code, show only the readable part of the path.
+            out += [text[last:start], words if is_code else ("workspace" if words == "the workspace" else "…")]
+            last = end
+            continue
+        before, after = text[last:start], text[end:]
+        if not is_code and after.startswith(")") and re.search(r"(?i)\b(?:workspace|folder|directory) ?\($", before):
+            # "files in Atlas workspace (/opt/data/workspace)": the aside says nothing to a reader.
+            out.append(re.sub(r" ?\($", "", before))
+            last = end + 1
+            continue
+        out += [before, f"`{words}`" if is_code else words]
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+# Internal execution vocabulary that belongs in native Kanban history and logs, never in Linear.
+# Deliberately narrow: whole internal phrases and exact identifiers, never a single everyday word
+# (board, task, fence, admission, restart) and never a file or symbol name such as native_input.py.
+_TASK_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
+_TASK_SUBJECT = re.compile(r"^(?P<lead>[*_]*)(?:(?P<owner>[A-Z][\w-]*'s|[Tt]he|[Ii]ts|[Tt]his|[Tt]hat|[Oo]ur|[Mm]y|[Yy]our)\s+)?"
+                           r"(?:[Nn]ative\s+|[Kk]anban\s+)?(?:[Tt]ask\s+)?[*_`]*t_[0-9a-f]{8}[*_`]*(?![\w-])")
+_RUN_NUMBER = re.compile(r"\b[Rr]un #?\d+(?=\)|[,.;:]|'s\b|\s+(?:is|was|lost|failed|crashed|refused|ended|exited|"
+                         r"started|state)\b)")
+_RUN_CONTEXT = re.compile(r"(?i)\b(?:gateway|refused|respawn\w*|worker|admission|fence[sd]?|settle\w*|native)\b")
+_INTERNAL_PHRASE = re.compile(
+    r"(?i)\bquiescence (?:is |was )?(?:not )?prov\w*|\bquiescence_proven\b|\bprevious[- ]execution\b|"
+    r"\b(?:execution|admission|claim|ordering|run)[- ]fence[sd]?\b|\b(?:refused|held|blocked) by the (?:[\w-]+ )?fence\b|"
+    r"\bsettle (?:the |its )?admission\b|\badmission (?:is |was )?(?:still )?(?:not )?(?:unknown|unsettled|settled)\b|"
+    r"\b(?:native_)?admission_not_settled\b|\binspect-cleanup\b|\b(?:native )?[Ss]top event \d+\b")
+_BOARD_PHRASE = re.compile(r"(?i)\s+(?:on|in|from)\s+(?:the\s+)?(?:[*`]*[a-z0-9]+(?:[-_][a-z0-9]+)+[*`]*\s+board\b|"
+                           r"(?:native\s+|kanban\s+)?board\s+[*`]*[a-z0-9]+(?:[-_][a-z0-9]+)+[*`]*)")
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]*_]*\s+")
+# Quote and list markers and a leading label ("**Minute 2:**") belong to the line, not to its first sentence.
+_LINE_LEAD = re.compile(r"^(\s*(?:>\s*)*(?:(?:[-*+]|\d{1,3}[.)])\s+)?(?:([*_]{1,2})[^*_\n]{1,40}:\2\s+)?)")
+def _internal_sentence(sentence: str) -> bool:
+    words = sentence.replace("`", "")  # Inline code counts only through exact identifiers above.
+    return bool(_TASK_ID.search(words) or _INTERNAL_PHRASE.search(words)
+                or (_RUN_NUMBER.search(words) and _RUN_CONTEXT.search(words)))
+def _outside_code(text: str, change) -> str:
+    """Apply ``change`` to prose only; inline code keeps every character."""
+    out, last = [], 0
+    for lo, hi in _code_spans(text):
+        out += [change(text[last:lo]), text[lo:hi]]
+        last = hi
+    return "".join(out + [change(text[last:])])
+def _internal_parenthetical(match: re.Match) -> str:
+    inner = match.group(0)
+    return "" if (_TASK_ID.search(inner) or _INTERNAL_PHRASE.search(inner)
+                  or re.fullmatch(r"\s*\(\s*[Rr]un #?\d+\s*\)", inner)) else inner
+def _readable_sentence(sentence: str) -> str:
+    """One sentence with task ids, board names and run numbers taken out, or "" when only internals remain."""
+    subject = _TASK_SUBJECT.match(sentence)
+    if subject:
+        owner = subject.group("owner")
+        sentence = subject.group("lead") + (f"{owner} task" if owner else "The task") + sentence[subject.end():]
+    sentence = re.sub(r"\s*\([^()\n]*\)", _internal_parenthetical, sentence)
+    sentence = _BOARD_PHRASE.sub("", sentence)
+    sentence = _outside_code(sentence, lambda prose: re.sub(r"(?<=\S)[ \t]+([,.;:!?])(?=\s|$)", r"\1",
+                                                            re.sub(r"(?<=\S)[ \t]{2,}", " ", prose)))
+    return "" if _internal_sentence(sentence) else sentence
+_ABBREVIATION = re.compile(r"(?:^|\s)(?:\d{1,3}|e\.g|i\.e|vs|etc|Mr|Mrs|Ms|Dr|St|[A-Z])\.$")
+def _split_sentences(text: str) -> list[str]:
+    """Sentences of one line, never split inside code or a link."""
+    protected = _code_spans(text) + [(m.start(), m.start() + len(m.group(0).rstrip(".,;:!?")))
+                                     for m in URL.finditer(text)]
+    parts, last = [], 0
+    for match in _SENTENCE_END.finditer(text):
+        if match.start() <= last or any(lo <= match.start() - 1 < hi for lo, hi in protected):
+            continue
+        if _ABBREVIATION.search(text[last:match.start()]):
+            continue  # A list number, abbreviation or initial, not the end of a sentence.
+        parts.append(text[last:match.end()])
+        last = match.end()
+    parts.append(text[last:])
+    return [part for part in parts if part]
+def _readable(text: str) -> str:
+    """Conservative reader filter for agent-written Linear text.
+
+    Only a line that mentions a native task id, a run number next to execution words, or a whole
+    internal phrase (previous-execution fence, quiescence proven, admission not settled) changes;
+    every other line, every fenced code block and every inline code span keeps each character. In
+    a changed line a sentence about the task keeps its meaning ("Task t_1a2b3c4d is blocked"
+    becomes "The task is blocked"), board names and internal asides are dropped, and a sentence
+    that is only internal state goes. Returns "" when nothing readable is left."""
+    if not text or not any(_internal_sentence(line) for line in text.split("\n")):
+        return text
+    out, fence, removed = [], None, False
+    for line in text.split("\n"):
+        marker = re.match(r" {0,3}(```+|~~~+)", line)
+        if fence is not None or marker:
+            out.append(line)
+            if fence is None:
+                fence = marker.group(1)
+            elif marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+                fence = None
+            continue
+        if not line.strip() and removed and (not out or not out[-1].strip()):
+            continue  # The blank line around a removed line.
+        removed = False
+        if not _internal_sentence(line):
+            out.append(line)
+            continue
+        lead = _LINE_LEAD.match(line).group(1)
+        kept = [part for part in (_readable_sentence(sentence.strip()) for sentence in _split_sentences(line[len(lead):]))
+                if part]
+        if re.sub(r"[\W_]+", "", " ".join(kept)):
+            out.append(lead + " ".join(kept))
+        else:
+            removed = True  # Nothing readable is left, so its marker or label ("**Next:**") goes too.
+    while out and not out[-1].strip():
+        out.pop()
+    while out and not out[0].strip():
+        out.pop(0)
+    return "\n".join(out)
 def _open_fence(text: str) -> bool:
     return sum(1 for line in text.split("\n") if re.match(r" {0,3}```", line)) % 2 == 1
 def _trim_readable(text: str, limit: int) -> str:
@@ -260,17 +433,22 @@ def _trim_readable(text: str, limit: int) -> str:
         if _open_fence(cut):
             cut = cut.rstrip() + "\n```"
     return cut
+_LIST_NUMBER_END = re.compile(r"(?:^|\s)\d{1,3}[.)]$")
 def _trim_at_boundary(text: str, limit: int) -> str:
+    """Paragraph, then the end of a list item or sentence-ending line, then a sentence, then any line."""
     window = text[:limit + 1]
-    for boundary in (r"\n[ \t]*\n", r"(?<=[.!?])[\"')\]*_`]*\s", r"\n"):
-        cut = max((m.start() for m in re.finditer(boundary, window) if m.start() >= limit // 3), default=0)
+    for boundary in (r"\n[ \t]*\n", r"(?<=[.!?:])\n|\n(?=[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t])",
+                     r"(?<=[.!?])[\"')\]*_`]*\s", r"\n"):
+        cut = max((m.start() for m in re.finditer(boundary, window) if m.start() >= limit // 3
+                   # "3." opening a list item is not the end of a sentence.
+                   and not _LIST_NUMBER_END.search(window[:m.start()].rstrip("\"')]*_`"))), default=0)
         if cut:
             return text[:cut].rstrip()
     cut = window.rstrip().rfind(" ")
     return (text[:cut] if cut > 0 else text[:limit]).rstrip() + "\u2026"
 def _project_summary(text: str, limit: int = 300, *, one_line: bool = False) -> str:
-    """Human-readable result text: secrets redacted, local paths masked, Markdown and line breaks kept."""
-    masked = _LOCAL_PATH.sub(_mask_path, _public(text))
+    """Human-readable result text: secrets redacted, local paths in words, internal ids out, Markdown kept."""
+    masked = _readable(_mask_local_paths(_public(text)))
     if one_line:
         masked = " ".join(masked.split())
     else:
@@ -279,7 +457,8 @@ def _project_summary(text: str, limit: int = 300, *, one_line: bool = False) -> 
     return _trim_readable(masked, limit).strip()
 def _sentence(text: str) -> str:
     text = text.rstrip()
-    return text if text.endswith((".", "!", "?", "`", ")")) else text + "."
+    # A closing code fence ends the text; an inline `name` still needs its full stop.
+    return text if text.endswith((".", "!", "?", "```", ")")) else text + "."
 _EVIDENCE_HEADING = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]*|[*_]{1,2})?evidence\b")
 def _done_body(summary: str, evidence: list[str]) -> str:
     """The closing note: "Done." then the worker's summary, then any proof links it did not already show."""
@@ -290,7 +469,20 @@ def _done_body(summary: str, evidence: list[str]) -> str:
     if missing:
         body += ("\n\nAlso: " if _EVIDENCE_HEADING.search(summary) else "\n\nEvidence: ") + " ".join(missing)
     return body
+PROJECT_LINE_LIMIT = 1200
+def _project_line(summary: str, evidence: list[str]) -> str:
+    """A finished issue's line in a project update: the closing note, trimmed at a readable boundary."""
+    short = _project_summary(summary, PROJECT_LINE_LIMIT)
+    if short != summary.strip():
+        short += "\n\nThe full summary is on the issue."
+    return _done_body(short, evidence)
+def _update_line(ident: str, line: str) -> str:
+    """One bullet per issue; a multi-line note stays nested under it, so lists and breaks survive."""
+    first, _, rest = line.partition("\n")
+    nested = "\n".join(f"  {part}" if part.strip() else "" for part in rest.split("\n")) if rest else ""
+    return f"- {ident}: {first}" + (f"\n{nested}" if rest else "")
 # Replies to a Linear session are read by people; internal mechanics stay in logs and Kanban history.
+INTERNAL_ONLY_REPLY = "The agent's update here was only technical detail, which stays in its own logs."
 HELD_NOTICE = ("The agent couldn't safely act on this, so nothing changed. An operator needs to check the "
                "task on the agent's board.")
 _INTERNAL_WORDS = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|executor|binding|completion contract|"
@@ -355,6 +547,21 @@ UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check 
                     "board.")
 STALE_STOP = ("This Stop arrived after newer changes to the work, so it wasn't applied. Send Stop again "
               "if the work should still stop.")
+# A person stopped or handed off the work, not "Stopped at the login page; I need ...".
+_STOP_REASON = re.compile(r"(?i)^(?:stopped|halted|paused|cancell?ed) (?:by|from)\b|^handed (?:off|over)\b|"
+                          r"\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b")
+def _stopped_sentence(reason: str) -> str:
+    """"Stopped by Sam. Do not resume unless Sam asks." reads as a note to the agent; say it to people."""
+    kept, until = [], ""
+    for sentence in _split_sentences(reason):
+        sentence = sentence.strip()
+        asked = re.fullmatch(r"(?i)(?:do not|don't) resume(?: this| the task| the work)? unless (.+?) asks?(?: to)?[.!]?",
+                             sentence)
+        if asked:
+            until = f"It stays stopped until {asked.group(1)} asks the agent to resume."
+        elif not re.search(r"(?i)\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b", sentence):
+            kept.append(_sentence(sentence))
+    return " ".join(kept + [until or "It stays stopped until someone asks the agent to resume."]).strip()
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
     kind = payload.get("kind")
@@ -366,6 +573,9 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
         return "error", ("Paused by a technical problem on the agent's side. Nothing is needed from you; "
                          "the same task continues once the problem is cleared.")
     reason = _project_summary(payload.get("reason") or "", 400, one_line=True)
+    if kind != "dependency" and _STOP_REASON.search(reason) and "?" not in reason:
+        # A person stopped or handed off this work: nothing is being asked of the reader.
+        return "response", _stopped_sentence(reason)
     if kind == "dependency":
         return "thought", _sentence(f"Waiting for a dependency: {reason or 'earlier work must finish first'}") + \
             " Work continues when it is done."
@@ -2763,8 +2973,8 @@ class Bridge:
                 writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
         elif event.kind == "checkpoint":
             if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
-                    and payload["request_id"]):
-                writes = [message("thought", payload["body"])]
+                    and payload["request_id"] and (body := _readable(payload["body"]))):
+                writes = [message("thought", body)]
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
         if activity and event.kind != "checkpoint" and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
@@ -2824,7 +3034,8 @@ class Bridge:
                 self._capture_native_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
-        summary = _project_summary(adapter.completion_summary(task), 4000)
+        raw_summary = adapter.completion_summary(task)
+        summary = _project_summary(raw_summary, 4000)
         if not self._completion_scope_matches(row["issue_id"], task, adapter):
             body = ("This stage is finished, but the issue's agreed outcome is not done yet. No new work was "
                     "started; the agent checks what remains before the next step.")
@@ -2840,7 +3051,9 @@ class Bridge:
         issue_id = row["issue_id"]
         heads, failures = {}, []
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
-        residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", summary, flags=re.IGNORECASE)).casefold()
+        # Paths, secrets and task ids are not a result, however they are shown to people.
+        residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", _TASK_ID.sub("", _LOCAL_PATH.sub(
+            "", _public(raw_summary or ""))), flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
             body = ("The run ended without evidence (a PR, merge, deploy check or findings link), so this "
                     "issue stays unfinished. A new attempt needs to deliver and show that evidence.") if not evidence else acceptance_refusal(failures, where="kanban")
@@ -2870,7 +3083,6 @@ class Bridge:
                                                            "terminal": True, "owner_issue_id": issue_id,
                                                            "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id)
                 return
-        links = " ".join(dict.fromkeys(evidence))
         binding = self.store.native_binding(issue_id)
         completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
                         key=lambda event: event.id)
@@ -2885,7 +3097,7 @@ class Bridge:
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
-                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else f"Done: {links or _project_summary(summary, one_line=True)}"},
+                                      "lines": {task.title.split(":")[0]: "Assessment completed." if assessment else _project_line(summary, evidence)},
                                       "line_issues": {task.title.split(":")[0]: issue_id}})]
         if assessment:
             prior_id = self.store.assessment_comment_id(issue_id, assessment,
@@ -3597,7 +3809,7 @@ class Bridge:
                         (issue.get("state") or {}).get("type") == "canceled" or
                         ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
                     continue
-                lines_to_send.append(f"- {ident}: {line}")
+                lines_to_send.append(_update_line(ident, line))
                 issue_ids_to_send.append(issue["id"])
             if waiting_lines:
                 if payload.get("frozen"):

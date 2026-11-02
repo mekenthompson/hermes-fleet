@@ -558,6 +558,12 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         if writes:
             return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])
         prior = bridge.store.outbox_row(client_id)
+        if action == "add_comment" and not (prior and prior["payload"].get("body") == body):
+            from .bridge import INTERNAL_ONLY_REPLY, _readable
+            # Comments are read by people: task ids, board names, run numbers and fence phrases stay
+            # in native history. Deterministic, so a same-id retry keeps identical content; a row
+            # queued before this filter shipped keeps its original body.
+            body = _readable(body) or INTERNAL_ONLY_REPLY
         payload = {"issue_id": issue_id, "body": body, "id": client_id, "content_action": True,
                    "unlinked_content": True, "write_started": False, "caller_context": context.to_wire(),
                    **_content_requester(bridge, issue_id, prior,
