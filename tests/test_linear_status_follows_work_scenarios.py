@@ -505,14 +505,25 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.assertIsNone(self.fixture.issue["delegate"])
         self.assertEqual(len(self.delegate_writes()), writes)
 
-    def test_finished_work_does_not_get_a_delegate_back(self):
+    def test_finished_work_awaiting_review_gets_its_agent_back_as_delegate(self):
+        # Live HF-576, HF-585: a finished stage shows In Review and the agent stays visible on it.
+        self.undelegated()
         task, run = self.task(scope="progress", claim=True)
         self.ticks()
         self.assertTrue(self.native("complete_task", task, summary="Drafted the plan.", expected_run_id=run))
         self.ticks()
-        self.fixture.fixture.clock.now = time.time() + 2
-        self.remote.set_delegate("issue-1", None, actor=SELF)
+        self.assertEqual(self.board.get(task).status, "done")
+        self.assertEqual(self.state(), "In Review")
+        self.assertEqual((self.fixture.issue["delegate"] or {}).get("id"), SELF)
+        self.assertEqual(self.fixture.issue["assignee"], {"id": "human-assignee"})
+
+    def test_verified_finished_work_does_not_get_a_delegate_back(self):
+        self.undelegated()
+        task, run = self.task(claim=True)
+        self.native("complete_task", task, summary="Rotated the staging certificate and checked it live.",
+                    expected_run_id=run)
         self.ticks()
+        self.assertEqual(self.state(), "Done")
         self.assertIsNone(self.fixture.issue["delegate"])
 
     # -- legacy In Progress with no link and no native task (unbound) -----
@@ -522,6 +533,7 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         clock = self.fixture.fixture.clock
         clock.now = time.time() - age
         issue = self.remote.add_issue(f"id-{ident}", ident)
+        issue["team"] = {**issue["team"], "states": {"nodes": self.states}}
         issue["assignee"] = {"id": "human-assignee"}
         self.remote.set_delegate(issue["id"], delegate and {"id": delegate, "name": "This Agent"}, actor=SELF)
         self.remote.set_state(issue["id"], state, actor=SELF)
@@ -562,10 +574,14 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.assertEqual(self.sweep(), 0)
         self.assertEqual(self.remote.state(issue["id"]), "In Progress")
 
-    def test_unbound_blocked_this_app_set_goes_to_todo(self):
-        issue = self.unbound("ABC-507", state="Blocked")
-        self.sweep()
-        self.assertEqual(self.remote.state(issue["id"]), "Todo")
+    def test_unbound_blocked_and_in_review_are_left(self):
+        # Only In Progress claims active work; Blocked and In Review already say what is true.
+        blocked = self.unbound("ABC-507", state="Blocked")
+        review = self.unbound("ABC-517", state="In Review")
+        self.assertEqual(self.sweep(), 0)
+        self.assertEqual(self.remote.state(blocked["id"]), "Blocked")
+        self.assertEqual(self.remote.state(review["id"]), "In Review")
+        self.assertEqual(self.mutations(), [])
 
     def test_unbound_issue_a_human_moved_is_left(self):
         issue = self.unbound("ABC-508")

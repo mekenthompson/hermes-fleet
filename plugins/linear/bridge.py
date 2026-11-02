@@ -1708,7 +1708,10 @@ class Bridge:
             raise LinearError("Native reporting link or app identity changed; inspect current work", retryable=False)
         issue = self._effect_issue(issue_id)
         task = self._native_effect_task(issue_id, issue)
-        if task.id != payload.get("task_id") or task.status in ("done", "archived"):
+        # Finished work awaiting review keeps its agent (background recovery only); verified or archived work does not.
+        ended = task.status == "archived" or (task.status == "done" and (
+            not payload.get("recovered_binding") or self.store.terminal_captured(task.id, issue_id=issue_id, state="done")))
+        if task.id != payload.get("task_id") or ended:
             raise LinearError("Native work has ended or changed; inspect its history", retryable=False)
         if (issue.get("state") or {}).get("type") in CLOSED:
             raise LinearError("Issue is closed; no routing change was made", retryable=False)
@@ -2025,7 +2028,8 @@ class Bridge:
         authority is the existing session-less reporting link (the same one
         _report_delegate_allowed uses for undelegated reporting). Open work is
         routed (running, queued, blocked, triage or in review: the delegate
-        persists while work waits), never ended work, and only when no human
+        persists while work waits or finished work awaits review), never archived or
+        verified-finished work, and only when no human
         changed state, assignee or delegate since the current claim, else since
         the task was created (Linear issue history, not updatedAt).
         _delegate_preflight and delivery guards still apply. One decision per
@@ -2044,8 +2048,9 @@ class Bridge:
         if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
             return  # Cheap local check first: decided for this revision, or a delegate write is pending.
         task = adapter.require_task(row["task_id"])
-        if task.status in ("done", "archived"):
-            return  # Ended work is not waiting on anyone; the assignee and state tell the rest.
+        if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(
+                task.id, issue_id=issue_id, state="done")):
+            return  # Archived, or verified finished: nothing waits on the agent any more.
         claim = self._current_claim(adapter, task)
         if task.status == "running" and claim is None:
             return  # Running without a readable claim yet; decide once it is consumed.
@@ -2492,8 +2497,11 @@ class Bridge:
         else:
             issue = self.api.issue(issue_id)  # Fresh and scoped; never the listing's copy.
             target = self.state_id(issue, "todo")
+            in_progress = self.state_id(issue, "in_progress")
             if (issue.get("id") != issue_id or (issue.get("delegate") or {}).get("id") != viewer or not target
-                    or not self._app_set_started_state(issue)):
+                    or not in_progress or (issue.get("state") or {}).get("id") != in_progress):
+                target = None  # Only In Progress claims active work; Blocked and In Review already say what is true.
+            elif not self._app_set_started_state(issue):
                 target = None  # A human's state, assignee or delegate choice wins.
             elif self.store.get(issue_id):
                 return 0  # Linked while we looked: its task decides.

@@ -138,7 +138,8 @@ class FakeLinear:
 
     def set_state(self, issue_id: str, name: str, *, actor: str | None = "human-1") -> None:
         before = dict(self.issues[issue_id])
-        self.issues[issue_id]["state"] = dict(next(s for s in STATES if s["name"] == name))
+        team = ((self.issues[issue_id].get("team") or {}).get("states") or {}).get("nodes") or []
+        self.issues[issue_id]["state"] = dict(next(s for s in [*team, *STATES] if s["name"] == name))
         self.issues[issue_id]["updatedAt"] = self.clock.iso()
         self.record_history(issue_id, actor, before, self.issues[issue_id])
 

@@ -1466,10 +1466,10 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock, remote, reporter, task_id = self.reporting_fixture("receipt-restart")
         self.complete_reported_task(clock, task_id)
         clock.now += 10
-        # Progress, and the delegate recovery queued while the work waited; the work finished
-        # before delivery, so that recovery settles without a write.
+        # Progress, and the delegate recovery queued while the work waited. The finish is not
+        # verified yet when it is delivered, so the agent that did the work is visible again.
         self.assertEqual(reporter.flush(), 2)
-        self.assertIsNone(remote.issues[ISSUE]["delegate"])
+        self.assertEqual((remote.issues[ISSUE]["delegate"] or {}).get("id"), reporter.api.viewer_id())
         progress = next(row for row in reporter.store.active() if row["issue_id"] == ISSUE)
         reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
                           self.board, profile="default", clock=clock)
