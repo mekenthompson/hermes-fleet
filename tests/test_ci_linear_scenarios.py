@@ -136,6 +136,35 @@ class LinearScenarioLaneTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Ran 1 test", result.stderr)
 
+    def test_shards_are_disjoint_and_cover_every_test(self):
+        body = "import unittest\nclass Scenario(unittest.TestCase):\n" + "".join(
+            f"    def test_{i}(self): print('ran-{i}')\n" for i in range(7))
+        (self.tests / "test_linear_a_scenarios.py").write_text(body, encoding="utf-8")
+        (self.tests / "test_linear_b_scenarios.py").write_text(body, encoding="utf-8")
+        ran = []
+        for index in (1, 2, 3):
+            result = subprocess.run(
+                [sys.executable, str(RUNNER), "--manifest", str(self.manifest), "--agent-source",
+                 str(self.source), "--tests-dir", str(self.tests), "--shard", f"{index}/3"],
+                cwd=ROOT, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"Shard {index}/3:", result.stderr)
+            ran += [line for line in result.stderr.splitlines() if line.endswith("... ok")]
+        self.assertEqual(len(ran), 14)
+        self.assertEqual(len(set(ran)), 14)
+
+    def test_invalid_shard_is_refused(self):
+        for spec in ("0/3", "4/3", "1", "a/b"):
+            with self.subTest(spec=spec):
+                result = subprocess.run(
+                    [sys.executable, str(RUNNER), "--manifest", str(self.manifest), "--agent-source",
+                     str(self.source), "--tests-dir", str(self.tests), "--shard", spec],
+                    cwd=ROOT, capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("shard", result.stderr)
+
     def test_ci_provisions_manifest_revision_and_runs_separately(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         source_job = workflow.split("  runtime:\n", 1)[1].split("\n  candidate-hf578:", 1)[0]
