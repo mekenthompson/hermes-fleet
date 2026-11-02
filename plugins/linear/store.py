@@ -995,6 +995,23 @@ class Store:
             db.execute("UPDATE outbox SET state = 'sent', payload = json_set(payload, '$.applied', ?) WHERE id = ?",
                        (int(applied), row_id))
             return True
+    def note_reason(self, row_id: str, key: str, reason: str | None) -> None:
+        """Keep a decision's closed reason code on the row, so it outlives log rotation."""
+        if reason and key in ("outcome_reason", "failure_reason"):
+            with self._tx() as db:
+                db.execute(f"UPDATE outbox SET payload=json_set(payload, '$.{key}', ?) WHERE id=?", (reason, row_id))
+    def diag_counts(self, now: float) -> dict[str, int]:
+        """Gauges for the hourly health line: counts only, never content."""
+        with self._tx() as db:
+            bindings = db.execute("SELECT COUNT(*) FROM work").fetchone()[0]
+            pending, oldest = db.execute("SELECT COUNT(*), MIN(json_extract(payload, '$.enqueued_at')) FROM outbox "
+                                         "WHERE state='pending'").fetchone()
+            held = db.execute("SELECT COUNT(*) FROM outbox WHERE state='pending' AND (hold_reason IS NOT NULL OR "
+                              "json_extract(payload, '$.reconcile_required')=1)").fetchone()[0]
+            failed = db.execute("SELECT COUNT(*) FROM outbox WHERE state='failed' AND hold_reason IS NULL AND "
+                                "COALESCE(json_extract(payload, '$.reported'), 0)=0").fetchone()[0]
+        return {"n_bindings": bindings, "n_pending": pending, "n_held": held, "n_failed_unreported": failed,
+                "oldest_pending_s": max(0, int(now - float(oldest))) if oldest is not None else None}
     def native_status_receipt(self, issue_id: str, task_id: str) -> dict | None:
         """Read the latest acknowledged issue write for this native binding."""
         with self._tx() as db:

@@ -15,11 +15,12 @@ from .api import ENDPOINT, LinearAPI, LinearError, RateLimited
 from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import token_provider
 from .store import Store
+from . import diag
 
-log = logging.getLogger("linear")
+log = logging.getLogger(diag.LOGGER_NAME)
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
-            "specialist_scope")
+            "specialist_scope", "diagnostics")
 class BoundLinearAPI(LinearAPI):
     """Bind credentials to an actor/workspace and, optionally, a bounded specialist scope."""
 
@@ -406,7 +407,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
         except LinearError as exc:
             if not exc.retryable:
                 raise
-            log.warning("linear: identity lookup unavailable; reporting startup will retry")
+            diag.warn("service.start", "retry", "identity_unavailable")
             retry_until = time.monotonic() + max(1.0, float(settings.get("tick_seconds", 2)))
             while not stop_requested.is_set() and time.monotonic() < retry_until:
                 await asyncio.sleep(min(0.25, max(0.01, retry_until - time.monotonic())))
@@ -419,6 +420,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                                             profile_home=home), profile=profile_name,
                     settings=settings)
     bridge.profile_home = home
+    await asyncio.to_thread(diag.service_start, bridge.store, float(settings.get("tick_seconds", 2)), bridge.recheck_every)
     if running.get("native_requested"):
         from .native_input import route_delivery
         bridge.native_ingress = lambda delivery: route_delivery(running, delivery)
@@ -445,8 +447,8 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
                     recovered = True
                 await asyncio.to_thread(bridge.tick, ingress)
                 await asyncio.to_thread(bridge.flush)
-            except Exception:  # one bad remote delivery must not stop native execution
-                log.exception("linear: reporting tick failed")
+            except Exception as exc:  # one bad remote delivery must not stop native execution
+                diag.evt("service.tick", "failed", "tick_exception", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
             wake_wait = asyncio.create_task(running["wake"].wait())
             try:
                 await asyncio.wait({wake_wait}, timeout=float(settings.get("tick_seconds", 2)))
@@ -554,8 +556,13 @@ def register(ctx: Any) -> None:
             asyncio.run(_reporting_loop(ctx, home, stop_requested, running))
         except transport.Unavailable:
             log.info("linear: another profile reporting service already owns the socket")
-        except Exception:
-            log.exception("linear: reporting service stopped")
+        except Exception as exc:
+            if stop_requested.is_set() or (isinstance(exc, RuntimeError) and "after shutdown" in str(exc)):
+                diag.evt("service.stop", "stopped", "shutdown", exc=type(exc).__name__)  # normal gateway shutdown race
+            else:
+                diag.evt("service.stop", "failed", "crash", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
+        else:
+            diag.evt("service.stop", "stopped", "shutdown")
     thread = threading.Thread(target=lambda: scope.run(serve), name="linear-reporting", daemon=True)
     def close() -> None:
         stop_requested.set()
