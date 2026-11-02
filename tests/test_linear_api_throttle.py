@@ -413,7 +413,7 @@ class BridgeLoopTests(unittest.TestCase):
 
 
 class SpecialistPumpTests(unittest.TestCase):
-    """A specialist-scope profile (aggie-private) proves scope per row, not per row per 2 s tick."""
+    """A specialist-scope profile proves scope per row, not per row per 2 s tick."""
 
     def bridge(self, directory, clock, rows=3):
         authority = Authority()
