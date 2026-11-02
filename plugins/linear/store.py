@@ -13,7 +13,12 @@ from collections import Counter
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from .api import backoff_delay
 MIN_BACKOFF, MAX_BACKOFF, GIVE_UP_AFTER = 60.0, 3600.0, 86_400.0
+# A guard-deferred outbox row keeps two quick retries (the native state it waits for is usually
+# captured within a tick), then waits 30 s doubling to 30 min instead of re-reading Linear every tick.
+GUARD_FREE_DEFERS, GUARD_MIN_BACKOFF, GUARD_MAX_BACKOFF = 2, 30.0, 1800.0
+REVIVE_LIMIT, REVIVE_EVERY = 3, 3600.0  # timed-out rows: at most 3 revivals, at most one an hour
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work (
   issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, owner_ref TEXT NOT NULL,
@@ -980,8 +985,11 @@ class Store:
     def mark(self, row_id: str, state: str, error: str | None = None) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
-            db.execute("UPDATE outbox SET state = ?, payload = CASE WHEN ? IS NULL THEN payload ELSE "
-                       "json_set(payload, '$.last_error', ?) END WHERE id = ?", (state, error, error, row_id))
+            # A row marked failed here was refused (or held for an operator), not timed out: never revived.
+            db.execute("UPDATE outbox SET state = ?, payload = CASE WHEN ? = 'failed' THEN json_set(payload, "
+                       "'$.failure_kind', 'rejected') ELSE payload END WHERE id = ?", (state, state, row_id))
+            db.execute("UPDATE outbox SET payload = CASE WHEN ? IS NULL THEN payload ELSE "
+                       "json_set(payload, '$.last_error', ?) END WHERE id = ?", (error, error, row_id))
     def mark_sent(self, row_id: str, applied: bool) -> bool:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return False
@@ -1101,14 +1109,64 @@ class Store:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return
             db.execute("UPDATE outbox SET next_at = ? WHERE id = ?", (until, row_id))
+    def defer_guarded(self, row_id: str, now: float) -> float | None:
+        """A send guard held this row and left it due: back off so it is not re-read every tick.
+
+        Only a still-pending row whose next_at is not already in the future is touched (a quiet
+        period or a sender that moved it wins). The payload is unchanged; the count lives in
+        metadata. Returns the row's next_at afterwards, or None when untouched."""
+        with self._tx() as db:
+            row = db.execute("SELECT next_at FROM outbox WHERE id=? AND state='pending'", (row_id,)).fetchone()
+            if row is None or float(row["next_at"]) > now:
+                return None
+            name = self._backoff_key("outbox-guard:" + row_id)
+            saved = db.execute("SELECT value FROM metadata WHERE key=?", (name,)).fetchone()
+            defers = int(json.loads(saved[0]).get("failures", 0)) + 1 if saved else 1
+            until = float(row["next_at"])
+            if defers > GUARD_FREE_DEFERS:
+                until = now + backoff_delay(defers - GUARD_FREE_DEFERS, base=GUARD_MIN_BACKOFF, cap=GUARD_MAX_BACKOFF)
+                # Bumping next_at only delays a write; no admission is needed to make a row wait.
+                db.execute("UPDATE outbox SET next_at=? WHERE id=?", (until, row_id))
+            db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                       (name, json.dumps({"failures": defers, "next_at": until})))
+            return until
+    # Per-key failure backoff for optional Linear reads made outside the outbox (pump_kanban
+    # steps, recovery). Kept in metadata so a restart does not reset it into a tight loop.
+    @staticmethod
+    def _backoff_key(key: str) -> str:
+        return json.dumps(["linear-backoff", key])
+    def backoff_ready(self, key: str, now: float) -> bool:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (self._backoff_key(key),)).fetchone()
+        return row is None or float(json.loads(row[0]).get("next_at", 0)) <= now
+    def backoff_fail(self, key: str, now: float, *, base: float = 15.0, cap: float = 3600.0) -> float:
+        """Record one more failure for key; returns when it may be tried again (jittered, capped)."""
+        with self._tx() as db:
+            name = self._backoff_key(key)
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (name,)).fetchone()
+            failures = int(json.loads(row[0]).get("failures", 0)) + 1 if row else 1
+            next_at = now + backoff_delay(failures, base=base, cap=cap)
+            db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                       (name, json.dumps({"failures": failures, "next_at": next_at})))
+            return next_at
+    def backoff_clear(self, key: str) -> None:
+        name = self._backoff_key(key)
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM metadata WHERE key=?", (name,)).fetchone():
+                db.execute("DELETE FROM metadata WHERE key=?", (name,))
+    def effect_admitted(self, issue_id: str) -> bool:
+        """Local check (no Linear read): may an issue effect be queued now?"""
+        with self._tx() as db:
+            return self._effect_admitted(db, issue_id)
     def retry(self, row: dict[str, Any], now: float, error: str | None = None) -> bool:
         """Back off 1 min doubling to 1 h. Returns True when the row is given up (24 h old)."""
         attempts = int(row["attempts"]) + 1
         if now - float(row["payload"].get("enqueued_at", now)) >= GIVE_UP_AFTER:
             with self._tx() as db:
                 if not self._row_admitted(db, row["id"]): return False
-                db.execute("UPDATE outbox SET state = 'failed', attempts = ?, payload = CASE WHEN ? IS NULL THEN payload "
-                           "ELSE json_set(payload, '$.last_error', ?) END WHERE id = ?", (attempts, error, error, row["id"]))
+                db.execute("UPDATE outbox SET state = 'failed', attempts = ?, payload = json_set(CASE WHEN ? IS NULL THEN payload "
+                           "ELSE json_set(payload, '$.last_error', ?) END, '$.failure_kind', 'timeout') WHERE id = ?",
+                           (attempts, error, error, row["id"]))
             return True
         delay = min(MIN_BACKOFF * 2 ** (attempts - 1), MAX_BACKOFF)
         with self._tx() as db:
@@ -1117,19 +1175,26 @@ class Store:
         return False
     def revive_failed(self, now: float) -> int:
         """After any successful write, give timed-out rows one more try (same client id). A status
-        write superseded by a later one for the same issue stays failed, so it cannot land stale."""
+        write superseded by a later one for the same issue stays failed, so it cannot land stale.
+        Rows Linear refused are never revived; a timed-out row is revived at most REVIVE_LIMIT
+        times and at most once per REVIVE_EVERY, so steady traffic cannot resend it forever."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             rows = db.execute(
                 "SELECT id, payload FROM outbox WHERE state = 'failed' AND hold_reason IS NULL AND attempts > 0 AND "
+                "COALESCE(json_extract(payload, '$.failure_kind'), 'timeout') != 'rejected' AND "
+                "COALESCE(json_extract(payload, '$.revivals'), 0) < ? AND "
+                "(json_extract(payload, '$.revived_at') IS NULL OR json_extract(payload, '$.revived_at') <= ?) AND "
                 "COALESCE(json_extract(payload, '$.reconcile_required'), 0)=0 AND NOT " + ADVISORY + " AND NOT ("
                 " kind = 'status' AND EXISTS (SELECT 1 FROM outbox l WHERE l.kind = 'status' AND l.rowid > outbox.rowid"
                 " AND json_extract(l.payload, '$.issue_id') = json_extract(outbox.payload, '$.issue_id')))",
-                ).fetchall()
+                (REVIVE_LIMIT, now - REVIVE_EVERY)).fetchall()
             revived = 0
             for row in rows:
                 if self._admitted(db, *self._targets(json.loads(row["payload"]))):
-                    db.execute("UPDATE outbox SET state='pending', next_at=? WHERE id=?", (now, row["id"]))
+                    db.execute("UPDATE outbox SET state='pending', next_at=?, payload=json_set(json_set(payload, "
+                               "'$.revivals', COALESCE(json_extract(payload, '$.revivals'), 0) + 1), '$.revived_at', ?) "
+                               "WHERE id=?", (now, now, row["id"]))
                     revived += 1
             return revived
     @staticmethod

@@ -115,6 +115,9 @@ class ConnectOAuth:
         self._post = post or self._post_refresh
         self._lock = threading.Lock()
         self._retry_at = 0.0
+        # A failed refresh is not repeated on every Linear call: wait 60 s, doubling to 15 min.
+        self._refresh_failures, self._refresh_blocked_until = 0, 0.0
+        self._refresh_reauthorize = False
 
     def _read(self) -> dict[str, Any]:
         if not self.cache.exists():
@@ -174,6 +177,21 @@ class ConnectOAuth:
         self._write(cache)
 
     def _refresh(self, cache: dict[str, Any]) -> str:
+        if self.clock() < self._refresh_blocked_until:
+            if self._refresh_reauthorize:
+                raise ReauthorizationRequired("Linear rejected the refresh token; reauthorize this profile's app")
+            raise RuntimeError("Linear token refresh failed recently; waiting before the next attempt")
+        try:
+            token = self._refresh_once(cache)
+        except Exception as exc:
+            self._refresh_failures += 1
+            self._refresh_reauthorize = isinstance(exc, ReauthorizationRequired)
+            self._refresh_blocked_until = self.clock() + min(900.0, 60.0 * 2 ** min(self._refresh_failures - 1, 10))
+            raise
+        self._refresh_failures, self._refresh_blocked_until, self._refresh_reauthorize = 0, 0.0, False
+        return token
+
+    def _refresh_once(self, cache: dict[str, Any]) -> str:
         creds = self.item.credentials()
         refresh = cache.get(ROTATED) or creds["refresh_token"]
         result = self._post({"grant_type": "refresh_token", "refresh_token": refresh,

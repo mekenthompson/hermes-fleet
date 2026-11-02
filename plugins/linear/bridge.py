@@ -12,11 +12,11 @@ import threading
 import uuid
 import time
 from collections import defaultdict
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from .api import markdown_matches, LinearAPI, LinearError, RateLimited
+from .api import markdown_matches, LinearAPI, LinearError, RateLimited, Throttled
 from .oauth import ReauthorizationRequired
 from .store import Store, advisory
 from . import transport
@@ -26,7 +26,12 @@ class ProjectUpdateDeferred(Exception):
 class NativeProgressSuperseded(Exception):
     """Native work entered a wait, halt or terminal state before transient progress reached Linear."""
 CLOSED = ("completed", "canceled")
-HISTORY_PAGES = 10  # IssueHistory pages (50 entries each) read before a routing answer counts as unprovable
+HISTORY_PAGES = 5  # IssueHistory pages (50, then 100 entries each) read before a routing answer counts as unprovable
+# Unconfirmed Stops retry on a doubling schedule (5 s, 10 s, 20 s ... then every 10 min), not every
+# 15 s for a day: about 150 tries before the 24 h park instead of about 5,800, still ahead of other work.
+STOP_RETRY_GAP = 600
+ISSUE_RECHECK_GAP = 30.0  # seconds: Issue webhooks for one tracked issue coalesce into at most one read per gap
+RECHECKED_STATUSES = ("running", "ready", "blocked")  # finished or parked native work is not polled
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
 STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
@@ -39,11 +44,12 @@ URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
                   "/merge_requests/", "/merge-requests/")
-def ingress_due(gap: int) -> str:
-    """A failing delivery is retried 5 s after receipt, then at doubling gaps of at most `gap` s, and once
-    more after a day so it parks loudly. One bad event cannot flood logs and quota or hold newer ones back."""
+def ingress_due(gap: int, step: int = 900) -> str:
+    """A failing delivery is retried 5 s after receipt, then at doubling gaps of at most `gap` s (then every
+    `step` s), and once more after a day so it parks loudly. One bad event cannot flood logs and quota or hold
+    newer ones back."""
     return ("(attempts <= 0 OR received_at + MIN(86401, %d * attempts, CASE WHEN attempts > 7 THEN 635 + "
-            "(attempts - 7) * 900 ELSE 5 * ((1 << attempts) - 1) END) <= ?)" % gap)
+            "(attempts - 7) * %d ELSE 5 * ((1 << attempts) - 1) END) <= ?)" % (gap, step))
 OWN = "linear:"  # reason prefix on blocks this plugin makes, so their events are not echoed back
 def stable_uuid4(*parts: str) -> str:
     """A repeatable client ID in the UUIDv4 form Linear requires (it rejects v5)."""
@@ -783,6 +789,8 @@ class Bridge:
         self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._guard = threading.Lock()
         self._last_recheck = 0.0
+        self._dirty: dict[str, float] = {}  # issue id -> earliest time its coalesced recheck may run
+        self._rechecked_at: dict[str, float] = {}
         self.native_ingress = None
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
@@ -846,6 +854,15 @@ class Bridge:
         if state not in CLOSED: return 0
         field = "completedAt" if state == "completed" else "canceledAt"
         return iso_ms(issue.get(field)) or iso_ms(issue.get("updatedAt")) or math.inf
+    def _priority(self, level: str):
+        """Tag Linear reads so optional work yields first when the shared hourly budget runs low."""
+        return self.api.priority(level) if isinstance(self.api, LinearAPI) else nullcontext()
+    def _own_viewer(self) -> str | None:
+        """This app's configured viewer id, without a Linear request."""
+        identity = getattr(self.api, "identity", None)
+        if isinstance(identity, dict) and isinstance(identity.get("viewer_id"), str):
+            return identity["viewer_id"]
+        return getattr(self.api, "_viewer", None) if isinstance(self.api, LinearAPI) else None
     def me(self) -> str | None:
         try: return self.api.viewer_id()
         except RateLimited: raise
@@ -1070,6 +1087,10 @@ class Bridge:
         if exc.retryable: raise exc
         log.warning("linear: specialist authorization refused: %s", exc)
     def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+        # A person is waiting on Agent Session events (a Stop, a question, a delegation): never deferred for budget.
+        with self._priority("essential" if event.get("type") == "AgentSessionEvent" else "normal"):
+            return self._route_webhook(event, assignment_prompt=assignment_prompt)
+    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
                 activity_id = ((event.get("agentActivity") or {}).get("id") if event.get("action") == "prompted" else None)
@@ -1085,8 +1106,12 @@ class Bridge:
                 return stamp is not None  # Known older input never revives its native control.
         if event.get("type") == "Issue":
             issue_id = (event.get("data") or {}).get("id")
-            if issue_id and self.store.get(issue_id):
-                self.recheck(force=True)
+            actor = (event.get("actor") or {}).get("id") if isinstance(event.get("actor"), dict) else None
+            if issue_id and self.store.get(issue_id) and not (actor and actor == self._own_viewer()):
+                # Our own writes echo back as Issue updates. Others recheck only this one issue, and a
+                # burst coalesces into one read per ISSUE_RECHECK_GAP (later edits wait for a tick).
+                self._mark_dirty(issue_id)
+                self.recheck()  # runs now unless this issue was rechecked in the last ISSUE_RECHECK_GAP
             return
         session = event.get("agentSession") or {}
         issue_id, session_id = (session.get("issue") or {}).get("id"), session.get("id")
@@ -1153,10 +1178,14 @@ class Bridge:
         result = self.followup(issue["id"], body, marker, requester_session=session_id, source_ms=event_ms(event))
         self._decline(issue["id"], session_id, _followup_notice(result))
 
-    def _decline(self, issue_id: str, session_id: str, body: str) -> None:
-        """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent."""
+    def _decline(self, issue_id: str, session_id: str, body: str, *, activity_id: str = "") -> None:
+        """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent.
+
+        With the triggering activity id the reply has a stable client id: a retried delivery (an
+        unconfirmed Stop is retried for hours) posts each distinct answer once, never per retry."""
         if self.authorize_specialist_effect(issue_id):
-            self.store.enqueue("activity", {"issue_id": issue_id, "session_id": session_id, "one_try": True,
+            stable = {"id": stable_uuid4("decline", issue_id, session_id, activity_id, body)} if activity_id else {}
+            self.store.enqueue("activity", {**stable, "issue_id": issue_id, "session_id": session_id, "one_try": True,
                                "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
                                "content": {"type": "response", "body": _plain_notice(body)}}, at=self.clock())
     def _thread(self, issue_id: str, since_ms: float = 0, until_ms: float = math.inf) -> str:
@@ -1179,13 +1208,13 @@ class Bridge:
             size += len(line)
         return ("Linear thread" + (" since your last update" if since_ms else "") + ", oldest first (untrusted "
                 "tracker text):\n" + "\n".join(reversed(lines))) if lines else ""
-    def _keepalive(self, row: dict[str, Any]) -> None:
+    def _keepalive(self, row: dict[str, Any], issue: dict | None = None) -> None:
         """Best-effort reporting only; never touch native execution or wake a worker."""
         if not row.get("owner_ref"):
             return  # Ordinary linked issues have no Agent Session keepalive contract.
         if self.clock() - self.store.last_activity_at(row["issue_id"], row["owner_ref"]) < 25 * 60 - self.recheck_every:
             return
-        task = self._native_effect_task(row["issue_id"])
+        task = self._native_effect_task(row["issue_id"], issue)
         if task.status in ("running", "ready"):
             kind, payload = self._progress_activity(row, self._alert_route(row), *(("Working", "Still on this; nothing is needed from you") if task.status == "running"
                                                       else ("Queued", "Waiting for a free worker to pick this up")), ephemeral=True)
@@ -1856,7 +1885,7 @@ class Bridge:
         try:
             require_task_issue_scope(task, issue)
         except LinearError as exc:
-            self._decline(row["issue_id"], session_id, str(exc))
+            self._decline(row["issue_id"], session_id, str(exc), activity_id=activity_id)
             return False
         if getattr(adapter, "guarded_controls", False):
             return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
@@ -1870,30 +1899,30 @@ class Bridge:
             controls = [event for event in adapter.history(task.id, 0)
                         if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")]
             if any(stamp // 1000 <= event.created_at for event in controls):
-                self._decline(row["issue_id"], session_id, STALE_STOP)
+                self._decline(row["issue_id"], session_id, STALE_STOP, activity_id=activity_id)
                 return any(stamp / 1000 < event.created_at for event in controls)
         saved, first = self.store.native_intent_prepare(key, payload)
         if not first:
             if saved.get("state") != "applied":
-                self._decline(row["issue_id"], session_id, UNCONFIRMED_STOP)
+                self._decline(row["issue_id"], session_id, UNCONFIRMED_STOP, activity_id=activity_id)
             return saved.get("state") == "applied"
         if task.status in ("blocked", "triage", "done", "archived"):
             self.store.native_intent_settle(key, {"state": "applied", "status": task.status})
             return True
         if task.status != "running" or task.current_run_id is None:
             self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
-            self._decline(row["issue_id"], session_id, "Nothing was running to stop, so nothing changed. If this work should not start later, an operator needs to pause it on the agent's board.")
+            self._decline(row["issue_id"], session_id, "Nothing was running to stop, so nothing changed. If this work should not start later, an operator needs to pause it on the agent's board.", activity_id=activity_id)
             return False
         try:
             adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id, issue=issue)
         except LinearError as exc:
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
-            self._decline(row["issue_id"], session_id, str(exc))
+            self._decline(row["issue_id"], session_id, str(exc), activity_id=activity_id)
             return False
         latest = adapter.require_task(task.id)
         stopped = latest.status in ("blocked", "triage", "done", "archived")
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
-        self._decline(row["issue_id"], session_id, STOPPED_NOTICE if stopped else UNCONFIRMED_STOP)
+        self._decline(row["issue_id"], session_id, STOPPED_NOTICE if stopped else UNCONFIRMED_STOP, activity_id=activity_id)
         return stopped
 
     def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> bool:
@@ -1939,7 +1968,7 @@ class Bridge:
                 raise
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
-                self._decline(issue_id, session_id, str(exc))
+                self._decline(issue_id, session_id, str(exc), activity_id=activity_id)
                 return False
             if task.status in ("done", "archived", "triage"):
                 stopped = True
@@ -1955,7 +1984,7 @@ class Bridge:
                 superseded = any(stamp / 1000 < event.created_at for event in controls)
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable",
                                                      "superseded": superseded})
-                self._decline(issue_id, session_id, STALE_STOP)
+                self._decline(issue_id, session_id, STALE_STOP, activity_id=activity_id)
                 return superseded
             if not events:
                 break
@@ -1966,17 +1995,17 @@ class Bridge:
                 raise
             except LinearError as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
-                self._decline(issue_id, session_id, UNCONFIRMED_STOP)
+                self._decline(issue_id, session_id, UNCONFIRMED_STOP, activity_id=activity_id)
                 return False
             except Exception as exc:
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": type(exc).__name__})
-                self._decline(issue_id, session_id, UNCONFIRMED_STOP)
+                self._decline(issue_id, session_id, UNCONFIRMED_STOP, activity_id=activity_id)
                 raise
             if stopped:
                 break
         self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "stopped": stopped})
         self._decline(issue_id, session_id, STOPPED_NOTICE if stopped else
-                      "The work changed while it was being stopped, so the Stop couldn't be confirmed. An operator needs to check the task on the agent's board.")
+                      "The work changed while it was being stopped, so the Stop couldn't be confirmed. An operator needs to check the task on the agent's board.", activity_id=activity_id)
         return stopped
     def pump_kanban(self) -> None:
         for row in self.store.active("native"):
@@ -2012,12 +2041,24 @@ class Bridge:
                                 issue_id, task_id, event_id, type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
                 for step in (self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
+                    # These steps read Linear; a refusal or error waits (15 s doubling to 1 h, persisted)
+                    # instead of repeating the same reads every tick.
+                    backoff = f"{step.__name__}:{issue_id}"
+                    if not self.store.backoff_ready(backoff, self.clock()):
+                        continue
                     try:
-                        step(row, adapter)
+                        with self._priority("optional"):
+                            step(row, adapter)
+                    except Throttled:
+                        continue
                     except RateLimited:
                         raise
                     except Exception as exc:
-                        log.warning("linear: %s held for issue %s (%s)", step.__name__, issue_id, type(exc).__name__)
+                        until = self.store.backoff_fail(backoff, self.clock())
+                        log.warning("linear: %s held for issue %s (%s); next try in %.0fs", step.__name__, issue_id,
+                                    type(exc).__name__, until - self.clock())
+                    else:
+                        self.store.backoff_clear(backoff)
     def _recover_binding_delegate(self, row: dict | None, adapter) -> None:
         """Route this app as delegate for an already linked, undelegated issue.
 
@@ -2045,6 +2086,8 @@ class Bridge:
         claim = self._current_claim(adapter, task)
         if claim is None:
             return  # Not running now; decide when it is.
+        if not self.store.effect_admitted(issue_id):
+            return  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         issue = self._effect_issue(issue_id)
         claim_ms = claim.created_at * 1000
         route = (issue.get("delegate") is None and "delegate" in issue
@@ -2060,7 +2103,8 @@ class Bridge:
         if route:
             # A refusal is logged by pump and retried; the atomic outbox row is the marker.
             self._delegate_preflight(payload)
-            self.store.recover_binding_delegate(issue_id, payload, at=self.clock())
+            if not self.store.recover_binding_delegate(issue_id, payload, at=self.clock()):
+                raise LinearError("Delegate recovery was not queued; retrying later")  # pump backs off
             return
         # A human-chosen delegate, later human edit or closed issue wins for this revision: record once.
         _, first = self.store.native_intent_prepare(key, {"issue_id": issue_id, "task_id": task.id,
@@ -2394,29 +2438,49 @@ class Bridge:
                     return False  # Not our own acknowledged version, and a human changed routing since the source event.
         return self._report_delegate_allowed(issue)
     def recheck(self, force: bool = False) -> None:
+        """Full pass every recheck_minutes; Issue webhooks recheck only their issue, coalesced per ISSUE_RECHECK_GAP."""
         now = self.clock()
-        if not force and now - self._last_recheck < self.recheck_every:
-            return
-        self._last_recheck = now
-        for row in self.store.active():
-            with self.lock(row["issue_id"]):
-                try:
-                    if row["origin"] != "native" or self._task_gone(row):
-                        self._retire_untracked(row)
-                        continue
-                    self._native_task(row["issue_id"])
-                    issue = self._effect_issue(row["issue_id"])
-                    if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
-                        self._keepalive(row)
-                except RateLimited:
-                    raise
-                except Exception as exc:
-                    if isinstance(exc, LinearError):
-                        if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
-                            self._alert_reauthorization()
-                        if not exc.retryable:
-                            self._fence_scope_denial(row["issue_id"], exc)
-                    log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
+        if force or now - self._last_recheck >= self.recheck_every:
+            self._last_recheck = now
+            rows = self.store.active()
+            self._dirty.clear()
+        else:
+            due = [issue_id for issue_id, at in self._dirty.items() if at <= now]
+            for issue_id in due:
+                self._dirty.pop(issue_id)
+            rows = [row for row in map(self.store.get, due) if row]
+        try:
+            with self._priority("optional"):
+                for row in rows:
+                    self._rechecked_at[row["issue_id"]] = now
+                    self._recheck_row(row)
+        except Throttled as exc:
+            log.info("linear: recheck deferred while the shared request budget is low (%s)", exc)
+    def _mark_dirty(self, issue_id: str) -> None:
+        """Recheck one issue on a later tick, at most once per ISSUE_RECHECK_GAP."""
+        if issue_id not in self._dirty:
+            self._dirty[issue_id] = self._rechecked_at.get(issue_id, -math.inf) + ISSUE_RECHECK_GAP
+    def _recheck_row(self, row: dict) -> None:
+        with self.lock(row["issue_id"]):
+            try:
+                if row["origin"] != "native" or self._task_gone(row):
+                    self._retire_untracked(row)
+                    return
+                _, task = self._native_task(row["issue_id"])
+                if task.status not in RECHECKED_STATUSES:
+                    return  # Finished or parked work: no Linear polling while nothing can change our report.
+                issue = self._effect_issue(row["issue_id"])
+                if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
+                    self._keepalive(row, issue)
+            except RateLimited:
+                raise
+            except Exception as exc:
+                if isinstance(exc, LinearError):
+                    if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
+                        self._alert_reauthorization()
+                    if not exc.retryable:
+                        self._fence_scope_denial(row["issue_id"], exc)
+                log.warning("linear: native reporting recheck held for %s (%s)", row["issue_id"], type(exc).__name__)
     def _task_gone(self, row: dict) -> bool:
         """The bound task was deleted from a board that still has tasks (a wiped board proves nothing)."""
         if not self.store.native_binding(row["issue_id"], self.kanban.executor_profile):
@@ -2478,6 +2542,9 @@ class Bridge:
 
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
+        with self._priority("essential"):
+            return self._flush(only_id=only_id)
+    def _flush(self, *, only_id: str | None = None) -> int:
         sent, progress = 0, True
         while progress:
             progress = False
@@ -2516,9 +2583,13 @@ class Bridge:
                         current = self.store.outbox_row(row["id"])
                         if current is None:
                             progress = True
-                        elif (current["payload"].get("native_history") is True and
-                              current["payload"].get("write_started") is False):
-                            row["_unattempted_history_deferred"] = True
+                        else:
+                            if (current["payload"].get("native_history") is True and
+                                    current["payload"].get("write_started") is False):
+                                row["_unattempted_history_deferred"] = True
+                            if not advisory(row):  # advisory rows get one try and retire instead
+                                # A guard that keeps holding a due row must not re-read Linear every tick.
+                                self.store.defer_guarded(row["id"], self.clock())
                         continue
                     except RateLimited as exc:
                         self.store.defer(row["id"], exc.until)
@@ -2965,7 +3036,7 @@ class Bridge:
                           "json_extract(payload, '$.agentSession.issue.id') FROM deliveries WHERE profile=? "
                           "AND status='pending' AND CASE WHEN json_valid(payload) THEN "
                           "json_extract(payload, '$.agentActivity.signal') END='stop' "
-                          f"AND (? IS NULL OR {ingress_due(15)}) ORDER BY received_at, delivery_id",
+                          f"AND (? IS NULL OR {ingress_due(STOP_RETRY_GAP, STOP_RETRY_GAP)}) ORDER BY received_at, delivery_id",
                           (self.ingress_profile, due_at, due_at)).fetchall()
     def drain_ingress(self, database: Path, limit: int = 50, *, retry_now: bool = False) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
@@ -3017,9 +3088,13 @@ class Bridge:
                 db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
                            "AND delivery_id = ?", (status, agent, delivery))
     def tick(self, ingress: Path | None = None) -> None:
-        if ingress is not None:
-            self.drain_ingress(ingress)
-        self._recover_admissions()
-        self.pump_kanban()
-        self.recheck()
+        try:
+            if ingress is not None:
+                self.drain_ingress(ingress)
+            self._recover_admissions()
+            self.pump_kanban()
+            self.recheck()
+        except Throttled as exc:
+            # Budget nearly spent: reads wait for the reset, but queued writes still go out.
+            log.info("linear: reporting reads deferred (%s)", exc)
         self.flush()

@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import math
+import random
 import re
 import threading
 import time
@@ -20,6 +21,16 @@ from .oauth import ReauthorizationRequired
 
 ENDPOINT = "https://api.linear.app/graphql"
 DEFAULT_RATE_LIMIT_PAUSE = 60.0
+# Linear (developers/rate-limiting, checked 2026-11): an OAuth app user gets 5,000 requests and
+# 2,000,000 complexity points per hour; one query may cost at most 10,000 points. Every client of
+# one app user (bridge, chat tools, skills, cron) shares that budget, so the observed headers are
+# saved beside the pause. Below OPTIONAL_FLOOR, optional reads (rechecks, sweeps, recovery, history
+# paging) wait for the reset; below ESSENTIAL_FLOOR only mutations and essential work (outbox
+# delivery, Stop) still go out, so a busy hour never starves the writes people are waiting for.
+OPTIONAL_FLOOR, ESSENTIAL_FLOOR = 0.20, 0.05
+BUDGETS = ("requests", "complexity")
+PRIORITIES = ("optional", "normal", "essential")
+LEAN_HISTORY_PAGE = 100  # entries per later IssueHistory page; those pages carry no issue fields
 ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id } assignee { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type position } } }"""
@@ -38,6 +49,19 @@ class RateLimited(LinearError):
     def __init__(self, until: float) -> None:
         super().__init__(f"Linear rate limit; paused until {until:.0f}")
         self.until = until
+
+class Throttled(RateLimited):
+    """This client chose not to spend scarce budget on a lower-priority request; nothing was sent."""
+    def __init__(self, until: float, priority: str) -> None:
+        RateLimited.__init__(self, until)
+        self.args = (f"Linear budget low; {priority} request deferred until {until:.0f}",)
+        self.priority = priority
+
+def backoff_delay(failures: int, *, base: float, cap: float, jitter: float = 0.2,
+                  rand: Callable[[], float] = random.random) -> float:
+    """Capped exponential delay with +/- jitter, so restarted or parallel callers do not retry in step."""
+    delay = min(cap, base * 2 ** max(0, min(failures - 1, 30)))
+    return max(0.0, delay * (1 + jitter * (2 * rand() - 1)))
 
 def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
     result = data.get(mutation)
@@ -208,15 +232,73 @@ class LinearAPI:
         self._request_lock = threading.RLock()
         self._viewer: str | None = None
         self._mutation_guard = threading.local()
+        self._priority = threading.local()
+        self.budget: dict[str, dict[str, float]] = {}
+        self._budget_level = "ok"
+    @contextmanager
+    def priority(self, level: str):
+        """Mark requests made in this block: optional work yields first when the shared budget runs low."""
+        if level not in PRIORITIES: raise ValueError(f"unknown Linear request priority {level!r}")
+        previous = getattr(self._priority, "level", None)
+        # Nested work keeps the most important caller's priority (a Stop inside a recheck stays essential).
+        self._priority.level = level if previous is None else max(previous, level, key=PRIORITIES.index)
+        try: yield
+        finally: self._priority.level = previous
+    def budget_remaining(self) -> tuple[float, float]:
+        """(lowest remaining fraction across Linear's hourly budgets, when that budget resets)."""
+        now, fraction, reset = self.clock(), 1.0, 0.0
+        for observed in self.budget.values():
+            limit, remaining, until = observed.get("limit", 0), observed.get("remaining", 0), observed.get("reset", 0)
+            if limit > 0 and until > now and remaining / limit < fraction:
+                fraction, reset = remaining / limit, until
+        return fraction, reset
+    def _admit(self, query: str) -> None:
+        level = getattr(self._priority, "level", None) or "normal"
+        fraction, reset = self.budget_remaining()
+        mutation = query.lstrip().startswith("mutation")
+        if (level == "optional" and fraction < OPTIONAL_FLOOR) or (
+                fraction < ESSENTIAL_FLOOR and level != "essential" and not mutation):
+            raise Throttled(reset, level)
+    def _observe_budget(self, headers: dict[str, str]) -> dict[str, dict[str, float]]:
+        now, seen = self.clock(), {}
+        for name in BUDGETS:
+            try:
+                remaining = float(headers["x-ratelimit-%s-remaining" % name])
+                limit = float(headers["x-ratelimit-%s-limit" % name])
+                reset = float(headers["x-ratelimit-%s-reset" % name]) / 1000.0
+            except (KeyError, ValueError, TypeError):
+                continue
+            if all(math.isfinite(value) for value in (remaining, limit, reset)) and limit > 0:
+                seen[name] = {"remaining": max(0.0, remaining), "limit": limit, "reset": reset, "at": now}
+        return seen
+    def _merge_budget(self, saved: Any) -> None:
+        for name in BUDGETS:
+            entry = saved.get(name) if isinstance(saved, dict) else None
+            try:
+                entry = {key: float(entry[key]) for key in ("remaining", "limit", "reset", "at")}
+            except (KeyError, ValueError, TypeError):
+                continue
+            if all(math.isfinite(value) for value in entry.values()) and \
+                    entry["at"] >= self.budget.get(name, {}).get("at", -math.inf):
+                self.budget[name] = entry
+    def _report_budget(self) -> None:
+        fraction, reset = self.budget_remaining()
+        level = "essential-only" if fraction < ESSENTIAL_FLOOR else "optional-paused" if fraction < OPTIONAL_FLOOR else "ok"
+        if level != self._budget_level:
+            log = logging.getLogger("linear")
+            report = log.info if level == "ok" else log.warning
+            report("linear: shared request budget %s (%.0f%% left until %.0f)", level, fraction * 100, reset)
+            self._budget_level = level
     @contextmanager
     def guarded_mutation(self, guard):
         previous = getattr(self._mutation_guard, "callback", None)
         self._mutation_guard.callback = guard
         try: yield
         finally: self._mutation_guard.callback = previous
-    def _pause_state(self, until: float = 0.0) -> float:
-        """Retain the longest cooldown in this profile across client/service restarts."""
+    def _pause_state(self, until: float = 0.0, budget: dict[str, dict[str, float]] | None = None) -> float:
+        """Retain the longest cooldown and the newest budget headers in this profile across clients and restarts."""
         self.paused_until = max(self.paused_until, until)
+        if budget: self._merge_budget(budget)
         if self.rate_limit_path is None: return self.paused_until
         try:
             self.rate_limit_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -225,14 +307,16 @@ class LinearAPI:
                 handle.seek(0)
                 raw = handle.read()
                 try:
-                    saved = float(json.loads(raw)["paused_until"]) if raw else 0.0
+                    state = json.loads(raw) if raw else {}
+                    saved = float(state["paused_until"]) if raw else 0.0
                     if not math.isfinite(saved): raise ValueError("invalid cooldown")
                 except (ValueError, TypeError, KeyError):
-                    saved = self.clock() + DEFAULT_RATE_LIMIT_PAUSE
+                    state, saved = {}, self.clock() + DEFAULT_RATE_LIMIT_PAUSE
                 self.paused_until = max(self.paused_until, saved)
+                self._merge_budget(state.get("budget") if isinstance(state, dict) else None)
                 handle.seek(0)
                 handle.truncate()
-                json.dump({"paused_until": self.paused_until}, handle)
+                json.dump({"paused_until": self.paused_until, **({"budget": self.budget} if self.budget else {})}, handle)
         except OSError:
             raise LinearError("Linear rate-limit state unavailable") from None
         return self.paused_until
@@ -244,7 +328,12 @@ class LinearAPI:
             try: empty = float(headers.get(prefix + "-remaining", "nan")) <= 0
             except (ValueError, TypeError): empty = False
             if empty: exhausted.append(prefix)
-        if not limited and not exhausted: return self.paused_until
+        budget = self._observe_budget(headers)
+        if not limited and not exhausted:
+            if budget:
+                self._pause_state(budget=budget)
+                self._report_budget()
+            return self.paused_until
         for prefix in exhausted or ("x-ratelimit-requests", "x-ratelimit-complexity", "x-ratelimit-endpoint-requests"):
             value = headers.get(prefix + "-reset")
             if value is not None:
@@ -260,7 +349,7 @@ class LinearAPI:
                 except ValueError: retry = parsedate_to_datetime(value).timestamp()
                 if math.isfinite(retry) and retry > now: resets.append(retry)
             except (ValueError, TypeError, OverflowError): pass
-        return self._pause_state(max(resets) if resets else now + DEFAULT_RATE_LIMIT_PAUSE)
+        return self._pause_state(max(resets) if resets else now + DEFAULT_RATE_LIMIT_PAUSE, budget)
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._graphql(query, variables)
     def _graphql(self, query: str, variables: dict[str, Any] | None = None, *,
@@ -271,6 +360,7 @@ class LinearAPI:
     def _request(self, query, variables, *, token_provider, verify_credential):
         if self.clock() < self._pause_state():
             raise RateLimited(self.paused_until)
+        self._admit(query)
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
         guard = getattr(self._mutation_guard, "callback", None) if query.lstrip().startswith("mutation") else None
         for attempt in (1, 2):
@@ -304,6 +394,8 @@ class LinearAPI:
             if status == 429 or "RATELIMITED" in codes:
                 raise RateLimited(self._pause(response_headers))
             self._pause(response_headers, limited=False)
+            if status == 401:
+                self._credential_rejected()
             rejected = getattr(guard, "rejected", None) if guard is not None else None
             if status == 401 and callable(rejected):
                 # False means this project-update create was already started or is a
@@ -328,6 +420,8 @@ class LinearAPI:
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
         return payload["data"]
+    def _credential_rejected(self) -> None:
+        """Linear refused the credential (HTTP 401); subclasses drop anything cached for it."""
     def viewer_id(self) -> str:
         if self._viewer is not None:
             return self._viewer
@@ -374,13 +468,16 @@ class LinearAPI:
         """One newest-first IssueHistory page: who changed state, assignee or delegate, and when.
 
         Returns the page and the cursor of the next (older) page, or None at the end."""
-        return self._routing_history(issue_id, limit, after)[1:]
-    def _routing_history(self, issue_id: str, limit: int, after: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+        lean = after is not None
+        return self._routing_history(issue_id, max(limit, LEAN_HISTORY_PAGE) if lean else limit, after, lean=lean)[1:]
+    def _routing_history(self, issue_id: str, limit: int, after: str | None = None, *,
+                         lean: bool = False) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
+        """``lean`` pages (a later page of a scan whose first page was read in full) ask only for history."""
         data = self.graphql("query IssueRoutingHistory($id: String!, $after: String) { issue(id: $id) { %s "
                             "history(first: %d, after: $after) "
                             "{ nodes { createdAt actorId fromStateId toStateId fromAssigneeId toAssigneeId "
                             "fromDelegate { id } toDelegate { id } } pageInfo { hasNextPage endCursor } } } }"
-                            % (ISSUE_FIELDS, limit), {"id": issue_id, "after": after})
+                            % ("id" if lean else ISSUE_FIELDS, limit), {"id": issue_id, "after": after})
         issue = data.get("issue")
         history = (issue or {}).get("history")
         if not isinstance(history, dict) or not isinstance(history.get("nodes"), list):

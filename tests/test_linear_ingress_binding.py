@@ -99,7 +99,7 @@ class IngressBindingTests(unittest.TestCase):
             bridge.drain_ingress(self.inbox)
         self.assertEqual(self.statuses()["stuck"], "failed")
 
-    def test_failing_stop_retries_within_fifteen_seconds(self):
+    def test_failing_stop_retries_sooner_than_ordinary_work(self):
         from unittest.mock import patch
         self.store.put("i", "chat", "owner")
         stop = {"agentActivity": {"signal": "stop"}, "agentSession": {"issue": {"id": "i"}}}
@@ -108,7 +108,7 @@ class IngressBindingTests(unittest.TestCase):
         with closing(sqlite3.connect(self.inbox)) as db, db:
             db.execute("UPDATE deliveries SET received_at = 1000, attempts = 8")
         bridge = Bridge(self.store, SimpleNamespace(), SimpleNamespace(executor_profile="default"),
-                        profile="default", clock=lambda: 1000 + 120)
+                        profile="default", clock=lambda: 1000 + 1300)  # Stop due at +1235, other work at +1535
         with patch.object(bridge, "handle_webhook") as handle:
             bridge.drain_ingress(self.inbox)
         self.assertEqual(handle.call_count, 1)  # the Stop is due; ordinary work waits its longer gap

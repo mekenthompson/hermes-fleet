@@ -685,3 +685,24 @@ The isolated source proof is `python scripts/run-linear-origin-scenarios.py --ag
 rejects credential/model activation, external processes/network, real-user config access and
 writes outside its temporary root. This source proof does not establish deployed client or
 handoff readiness.
+
+## Linear API budget
+
+Linear allows each OAuth app user 5,000 requests and 2,000,000 complexity points an hour, and
+every client of that app user shares them: the reporting service, chat tools, skills and cron.
+The client keeps one pause and budget file per profile, `<state_database>.rate-limit.json`
+(`rate_limit_path()` in this package); any other client of the same profile should pass it as
+`rate_limit_path` so all of them see the same pause and the same remaining budget.
+
+- A `RATELIMITED` answer (HTTP 429 or 400) pauses every client until the reset Linear gives.
+- Below 20% of either hourly budget, optional reads (the periodic recheck, recovery steps,
+  sweeps) wait for the reset; below 5% only writes, Agent Session events (Stop, questions,
+  delegations) and outbox delivery still go out. Crossing a level logs one line.
+- A credential's actor/workspace proof is reused for reads for 10 minutes; a new token or a
+  401 forces a new proof, and writes always prove it again.
+- Anything that fails or is held repeatedly backs off with jitter instead of retrying every
+  tick: outbox rows a guard keeps deferring (30 s doubling to 30 min), pump steps such as delegate
+  recovery (15 s doubling to 1 h, saved in the state database), unconfirmed Stops (doubling to about
+  15 min), startup identity checks (doubling to 5 min) and OAuth refresh failures (1 min doubling to 15 min).
+- Issue webhooks for a tracked issue recheck only that issue, at most once per 30 s, and ignore
+  echoes of this app's own writes. Finished or parked native work is not polled.
