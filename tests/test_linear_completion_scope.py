@@ -62,7 +62,7 @@ class CompletionScopeTests(unittest.TestCase):
                              for row in pending), pending)
         for row in self.store.pending():
             if row['kind'] == 'project_update':
-                self.assertFalse(any(str(line).startswith('Done:')
+                self.assertFalse(any(str(line).startswith('Done')
                                      for line in row['payload'].get('lines', {}).values()), row)
         self.assertNotEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
         self.assertEqual(self.authority.issues[ISSUE]['assignee'], {'id': USER})
