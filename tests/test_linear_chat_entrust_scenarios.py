@@ -741,6 +741,27 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task_id).status, "running")
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
 
+    def test_reask_after_resume_keeps_recovery_delegate(self):
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        for _ in range(2):
+            self.bridge.tick()
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)
+        self.claim(task_id)
+        with patch.object(type(self.bridge), "flush", lambda self, **kw: 0):
+            for _ in range(4):
+                self.bridge.tick()
+        with self.bridge.store._tx() as db:
+            rows = db.execute("SELECT id,state,json_extract(payload,'$.recovered_binding') FROM outbox WHERE kind='delegate'").fetchall()
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        for _ in range(6):
+            self.bridge.tick()
+        with self.bridge.store._tx() as db:
+            rows = db.execute("SELECT id,state,json_extract(payload,'$.admission_superseded') FROM outbox WHERE kind='delegate'").fetchall()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+
     def test_work_parked_by_a_person_and_resumed_later_gets_its_delegate(self):
         with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):

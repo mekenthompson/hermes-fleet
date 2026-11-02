@@ -1895,7 +1895,9 @@ class Bridge:
         if route_delegate is not None:
             if ours and not activation.get("accepted"):
                 # Parked chat work, never admitted, is not shown as worked on: no delegate is queued.
-                self.store.drop_unsent_delegate(issue_id, task_id, at=self.clock())
+                # Once resumed and claimed, recovery owns the delegate; never drop its pending row.
+                if task.status != "running" and not any(e.kind == "claimed" for e in adapter.history(task_id, 0)):
+                    self.store.drop_unsent_delegate(issue_id, task_id, at=self.clock())
                 routing = "held: not started"
             else:
                 routing = route_delegate(issue, task.status)
