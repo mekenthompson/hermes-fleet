@@ -18,7 +18,7 @@ import sqlite3
 import threading
 
 from .api import LinearError, RateLimited
-from .bridge import activation_event_ms, stable_uuid4
+from .bridge import _existing_work_notice, activation_event_ms, stable_uuid4
 from . import diag
 
 log = logging.getLogger(__name__)
@@ -81,6 +81,8 @@ class NativeInput:
     # What the bridge's own delegation admission did before this turn. When set it
     # replaces work_facts, which were read before the admission. Context only.
     admission: str = field(default="", compare=False)
+    # This turn runs on work the bridge just started: queued work shows In Progress meanwhile.
+    turn_in_progress: bool = field(default=False, compare=False)
 
     def channel_context(self):
         lines = [f"Linear issue: {self.issue_id}", f"Agent Session: {self.session_id}"]
@@ -180,7 +182,8 @@ def _mention_comment(supplied, viewer_id):
     Only a comment a person wrote (its userId, never this app) is a mention.
     """
     comment = supplied.get("comment") if isinstance(supplied.get("comment"), dict) else {}
-    body, author = comment.get("body"), comment.get("userId")
+    user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    body, author = comment.get("body"), comment.get("userId") or user.get("id")
     if (isinstance(body, str) and body.strip() and isinstance(author, str) and author.strip()
             and author != viewer_id):
         return body
@@ -247,7 +250,7 @@ def _admission_note(row, task, started: bool) -> str:
             "`linear followup`.")
 
 
-def admit_delegation(bridge, original, projected) -> str:
+def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
     """Start a delegated issue as one tracked native task before any model turn.
 
     Uses the same guarded assignment admission as a creator-null delegation (the
@@ -255,23 +258,37 @@ def admit_delegation(bridge, original, projected) -> str:
     use), so a redelivery or echo finds the same task and never starts a second one.
     With no prompt, the issue title and description are the request.
 
-    Returns the admission note for the model turn, or "" when the bridge already
-    answered the session (existing work elsewhere, closed, Stop, ambiguous) and no
-    turn should run. Raises when nothing could be started yet, after posting one
-    plain wait notice, so the provider delivery stays pending and is retried.
+    Returns (run_turn, admission_note, started). A turn runs with the note when this
+    session now carries the work, or with the plain work facts when the issue's work
+    already finished (a re-delegation is answered by the agent, not a dead end). No
+    turn runs when the bridge answered the session itself (the same work elsewhere,
+    closed, Stop, an operator decision). Raises when nothing could start yet, after
+    one plain wait notice, so the provider delivery stays pending and is retried.
     """
     issue_id, session_id = projected.issue_id, projected.session_id
     fields = {"iss": issue_id, "sess": session_id}
-    bridge.session_notices[(issue_id, session_id)] = False
+    key = (issue_id, session_id)
+    bridge.session_notices[key] = False
     try:
+        row = bridge.store.get(issue_id)
+        if row and row.get("origin") == "native" and row.get("owner_ref") != session_id:
+            status = bridge.native_status(issue_id).get("status")
+            if status in ("done", "archived"):
+                bridge.session_notices.pop(key, None)
+                diag.evt("session.admit", "skipped", "finished_work_conversation", task=row.get("task_id"), **fields)
+                return True, "", False
         accepted = bridge.handle_webhook(original)
     except Exception as error:
-        bridge.session_notices.pop((issue_id, session_id), None)
-        _wait_notice(bridge, projected, isinstance(error, RateLimited))
+        if not bridge.session_notices.pop(key, False):  # a decline already said what is needed
+            _wait_notice(bridge, projected, isinstance(error, RateLimited))
         diag.warn("session.admit", "held", "admission_failed", exc=type(error).__name__, **fields)
         raise LinearError("Delegated work has not started yet; provider delivery remains pending") from error
-    notified = bridge.session_notices.pop((issue_id, session_id), False)
+    notified = bridge.session_notices.pop(key, False)
     row = bridge.store.get(issue_id)
+    if notified:
+        # The bridge answered this session itself: same work elsewhere, closed, Stop, a decision needed.
+        diag.evt("session.admit", "skipped", "admission_declined", task=(row or {}).get("task_id"), **fields)
+        return False, "", False
     if row and row.get("origin") == "native" and row.get("owner_ref") == session_id:
         activation = bridge.store.native_intent(f"activate:{issue_id}:{row['task_id']}")
         created = bridge.store.native_intent(f"create:{issue_id}") or {}
@@ -287,12 +304,23 @@ def admit_delegation(bridge, original, projected) -> str:
             started = not linked
             diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
                      task=task.id, state=task.status, **fields)
-            return _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
-                                   task, started)
-    if notified or accepted is True:
-        # The bridge answered this session itself: same work elsewhere, closed, Stop, a decision needed.
+            return True, _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
+                                         task, started), started
+    if bridge.store.scope_fenced(issue_id):
+        # Held for an operator; no effect (not even a notice) may reach this issue meanwhile.
+        diag.evt("session.admit", "skipped", "scope_fenced", **fields)
+        return False, "", False
+    if accepted is True and row and row.get("owner_ref") == session_id:
+        # Linked to this session but not started: the bridge's own thought on this session says so.
+        diag.evt("session.admit", "skipped", "admission_declined", task=row.get("task_id"), **fields)
+        return False, "", False
+    if accepted is True:
+        # Answered quietly (a superseded delivery for work linked elsewhere): still say what is happening.
+        status = bridge.native_status(issue_id).get("status") if row else None
+        bridge._decline(issue_id, session_id, _existing_work_notice(status) if row else
+                        "This request was already handled, so nothing new was started.", activity_id=session_id)
         diag.evt("session.admit", "skipped", "admission_declined", task=(row or {}).get("task_id"), **fields)
-        return ""
+        return False, "", False
     _wait_notice(bridge, projected, False)
     diag.warn("session.admit", "held", "admission_held", **fields)
     raise LinearError("Delegated work admission is held; provider delivery remains pending")
@@ -535,13 +563,13 @@ def create_adapter(config, running):
             await asyncio.to_thread(acknowledge, bridge, projected)
             if projected.source == "delegation":
                 # The bridge starts delegated work itself, before the model turn: one tracked task.
-                note = await asyncio.to_thread(admit_delegation, bridge, original, projected)
-                if not note:
+                run_turn, note, started = await asyncio.to_thread(admit_delegation, bridge, original, projected)
+                if not run_turn:
                     await asyncio.to_thread(delivery.acknowledge)
                     with self._relay_lock:
                         self._submitted.pop(self._delivery_key(delivery), None)
                     return
-                projected = replace(projected, admission=note)
+                projected = replace(projected, admission=note, turn_in_progress=started)
                 event = projected.message(self)
             key = self._event_key(event)
             with self._relay_lock:
@@ -549,9 +577,9 @@ def create_adapter(config, running):
                 if current and current[0][1] != projected:
                     raise LinearError("Linear Activity was redelivered with conflicting input", retryable=False)
                 current.append((delivery, projected, original))
-                if projected.admission:
+                if projected.turn_in_progress:
                     self._turns[key] = projected.issue_id
-            if projected.admission:
+            if projected.turn_in_progress:
                 # In Progress while this session's turn runs on the admitted work.
                 bridge.session_turn(projected.issue_id, True)
             try:

@@ -504,7 +504,12 @@ the plugin runs the assignment admission (`session.admit` in the diagnostics), t
   then review or Done).
 - Answered by the plugin (`admission_declined`): the same work already runs from chat or
   another session, the issue is closed or delegated elsewhere, a Stop came first, or an
-  operator decision is needed. The session gets that one plain answer and no model turn.
+  operator decision is needed. The session gets that one plain answer and no model turn. A
+  redelivery of the same session is answered once (`same_session`); an issue held for an
+  operator (`scope_fenced`) gets no effect at all until it is resolved.
+- Already finished (`finished_work_conversation`): a new delegation of an issue whose work is
+  done reaches the model turn with that history, so the agent explains the result or takes a
+  separately requested increment; nothing restarts on its own.
 - Not started yet (`admission_failed`, `admission_held`): one plain wait notice is posted
   within seconds (once per session), no model turn runs, and the delivery stays pending so
   the inbox retries the same admission. A retry never creates a second task.

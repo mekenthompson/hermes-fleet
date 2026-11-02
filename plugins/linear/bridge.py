@@ -1287,9 +1287,12 @@ class Bridge:
                 return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
-                self._decline(issue["id"], session_id, task["message"])
+                self._decline(issue["id"], session_id, task["message"], activity_id=session_id)
                 return diag.decision("session.start", diag.because("reconciliation_required"), iss=issue["id"], sess=session_id, task=row.get("task_id"))
-            self._decline(issue["id"], session_id, _existing_work_notice(task.get("status")))
+            if row.get("owner_ref") == session_id:
+                # A redelivery of the session this work is already linked to: it was answered the first time.
+                return diag.evt("session.reuse", "applied", "same_session", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
+            self._decline(issue["id"], session_id, _existing_work_notice(task.get("status")), activity_id=session_id)
             return diag.decision("session.start", diag.because("existing_binding", True, "refused"), iss=issue["id"], sess=session_id, task=row.get("task_id"))  # The original durable binding was verified; do not resume it.
         return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt), iss=issue["id"], sess=session_id)
     def _prompted(self, event, issue, session_id, row, activity) -> None:

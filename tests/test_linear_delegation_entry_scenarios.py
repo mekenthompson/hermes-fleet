@@ -36,6 +36,7 @@ except Exception as exc:
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat, diag, native_input
+from hermes_fleet_linear_plugin.api import RateLimited
 from hermes_fleet_linear_plugin.bridge import Bridge, Kanban, stable_uuid4
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
@@ -273,6 +274,51 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(body.startswith("Got it.") for body in said), 1)
         wait = self.bridge.store.outbox_row(stable_uuid4("native-delegation-wait", "default", ISSUE, "session-1"))
         self.assertEqual(wait["state"], "sent")
+
+    async def test_redelegation_after_finished_work_reaches_the_agent_instead_of_a_dead_end(self):
+        await self.ingest(self.delegation())
+        task_id = self.tasks()[0]
+        with self.board.conn() as conn:
+            claim = kb.claim_task(conn, task_id, claimer="native-test-worker")
+            self.assertTrue(kb.complete_task(conn, task_id, expected_run_id=claim.current_run_id,
+                                             result="Counted every directory."))
+        self.reconcile()
+        delivery = await self.ingest(self.delegation("session-2"), "redelegated")
+        # The person is answered by the agent with the finished work in context; nothing restarts on its own.
+        self.assertEqual(len(self.turns), 2)
+        context = self.turns[-1].channel_context
+        self.assertNotIn("Tracked work already started", context)
+        self.assertIn("It is history now", context)
+        self.assertEqual(self.tasks(), [task_id])
+        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.inbox_status(delivery), "pending")  # the committed-input hook acknowledges it
+
+    async def test_retried_session_linked_to_existing_board_work_answers_once(self):
+        issue = self.authority.issues[ISSUE]
+        existing = self.board.create(title="OPS-1: earlier task", created_by="chat",
+                                     body=f"Linear issue OPS-1: {issue['url']}\nCount the directories.")
+        event = self.delegation()
+        for delivery in ("first", "retry-1", "retry-2"):
+            await self.ingest(event, delivery)
+        self.assertEqual(self.tasks(), [existing.id])
+        self.assertIn("Existing native work", self.turns[0].channel_context)
+        said = self.said("session-1")
+        self.assertEqual(sum(body.startswith("Linked to the agent's existing task") for body in said), 1, said)
+        self.assertFalse(any("nothing new was started." in body and not body.startswith("Linked") for body in said), said)
+
+    async def test_rate_limit_wait_says_so_in_plain_words(self):
+        # Linear answers the session reads, then rate-limits the admission's own reads.
+        with patch.object(self.bridge, "_start", side_effect=RateLimited(time.time() + 60)):
+            with self.assertRaises(native_input.LinearError):
+                await self.ingest(self.delegation(), "limited")
+        self.assertEqual(self.tasks(), [])
+        self.assertEqual(self.turns, [])
+        wait = self.bridge.store.outbox_row(stable_uuid4("native-delegation-wait", "default", ISSUE, "session-1"))
+        self.assertEqual(wait["payload"]["content"]["body"],
+                         "Linear is limiting requests right now, so this work hasn't started yet. The agent retries on "
+                         "its own and updates appear here; nothing is running yet.")
+        # Once Linear answers again the queued wait is published with the rest of the outbox.
+        self.assertIn(wait["payload"]["content"]["body"], self.said("session-1"))
 
     async def test_closed_or_reassigned_delegation_is_answered_without_a_model_turn(self):
         self.authority.issues[ISSUE]["delegate"] = {"id": "another-agent"}

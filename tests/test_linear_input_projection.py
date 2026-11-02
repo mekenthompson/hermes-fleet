@@ -143,6 +143,11 @@ class InputProjectionTests(unittest.TestCase):
         self.assertEqual(projected.source, "delegation")
         self.assertIn("was delegated to you", projected.text)
         self.assertNotIn("@mention", projected.channel_context())
+        # A person's comment given with a nested author is still a mention.
+        event["agentSession"]["comment"] = {"id": "c2", "body": "@agent is it done?", "user": {"id": USER}}
+        self.assertEqual(project_input(self.bridge, event).source, "mention")
+        event["agentSession"]["comment"] = {"id": "root", "body": "This thread is for an agent session with agent.",
+                                            "issueId": ISSUE}
         # This app's own comment is never a person's mention either.
         event["agentSession"]["comment"]["userId"] = VIEWER
         self.assertEqual(project_input(self.bridge, event).source, "delegation")
