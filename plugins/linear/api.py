@@ -173,6 +173,26 @@ def _bare_host_line_matches(actual: str, expected: str) -> bool:
     return re.fullmatch(''.join(parts), actual) is not None
 
 
+# Linear's editor stores Markdown through its own serializer: it backslash-escapes punctuation it
+# would otherwise read as syntax (``~1.5:1`` comes back as ``\~1.5:1``), writes ``*`` bullets for
+# ``-`` and drops trailing spaces and repeated blank lines. Seen live on a chat-created issue,
+# 2026-11-02. Outside code these spell the same text, so readback compares them as equal.
+_ESCAPABLE = r'!-/:-@\[-`{-~'
+_TEXT_TOKEN = re.compile(r'\\[' + _ESCAPABLE + r']|`+|[^\\`]+|\\')
+
+def _editor_text(line: str) -> str:
+    """Unescape Markdown punctuation outside inline code, normalise the bullet marker, trim the end."""
+    out, run = [], None
+    for token in _TEXT_TOKEN.findall(line):
+        if token.startswith('`'):
+            run = len(token) if run is None else (None if len(token) == run else run)
+            out.append(token)
+        elif run is None and len(token) == 2 and token[0] == '\\':
+            out.append(token[1])
+        else:
+            out.append(token)
+    return re.sub(r'^([ \t]*)[*+] ', r'\1- ', ''.join(out)).rstrip()
+
 def markdown_matches(actual: object, expected: str) -> bool:
     """Accept narrow editor rewrites, including bare-host autolinks; preserve code/text."""
     if not isinstance(actual, str):
@@ -193,8 +213,10 @@ def markdown_matches(actual: object, expected: str) -> bool:
             if fence is not None:
                 result.append((line, False))
                 continue
-            if not line and after_heading:
-                continue
+            if not line.strip():
+                if after_heading or not result or not result[-1][0]:
+                    continue  # Linear keeps one blank line, none after a heading or at the start
+                line = ""
             after_heading = bool(re.match(r'^#{1,6} +', line))
             # A bare-looking host on a later line may still be inside inline
             # code, a link label/destination, or an HTML tag opened earlier.
@@ -207,17 +229,39 @@ def markdown_matches(actual: object, expected: str) -> bool:
                     elif len(token) == inline_run: inline_run = None
                 elif inline_run is None:
                     delimiters = max(0, delimiters + (1 if token in '[(<' else -1))
-            prose = prose and inline_run is None and delimiters == 0
-            if not prose or '`' in line or line.expandtabs(4).startswith('    '):
-                result.append((line, False))
+            if line.expandtabs(4).startswith('    '):
+                result.append((line, False))  # indented code (or a deep list item) stays exact
                 continue
-            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', line)
-            result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', re.sub(r'^([ \t]*)[*+] ', r'\1- ', line)), prose))
+            if not (prose and inline_run is None and delimiters == 0) or '`' in line:
+                # Inline code, links or HTML: only the editor's text rewrites, and only when the
+                # line does not start inside a construct opened on an earlier line.
+                result.append((_editor_text(line) if prose else line, False))
+                continue
+            # Escaped text is never a bare-host autolink candidate.
+            prose = '\\' not in line
+            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', _editor_text(line))
+            result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', line), prose))
+        while fence is None and result and not result[-1][0]:
+            result.pop()  # trailing blank lines
         return result
     received, authored = canonical(actual), canonical(expected)
     return len(received) == len(authored) and all(
         line == wanted or ('<' not in expected and prose and expected_prose and _bare_host_line_matches(line, wanted))
         for (line, prose), (wanted, expected_prose) in zip(received, authored))
+
+def _created(entity: dict[str, Any], kind: str, differs: dict[str, bool]) -> dict[str, Any]:
+    """A create Linear accepted under our id is created, even when it stores something differently.
+
+    Refusing it would make a good create look failed and invite a retry under a new id, which is
+    the one way to duplicate it. Remaining differences go back to the caller and to the log."""
+    fields = sorted(name for name, changed in differs.items() if changed)
+    if not fields:
+        return entity
+    identifier = entity.get("identifier")
+    diag.evt("content.write", "applied", "readback_differs", level=logging.WARNING, kind=f"{kind}_create",
+             iss=str(entity.get("id") or "")[:8] or None,
+             issue=identifier if isinstance(identifier, str) else None)
+    return {**entity, "readback_differences": fields}
 
 class LinearAPI:
     """``token`` is the provider interface: a callable returning an access token, with an
@@ -573,17 +617,18 @@ class LinearAPI:
             "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
             "team { id key } project { id } parent { id } assignee { id } delegate { id } } }",
             {"id": client_id}).get("issue")
-        team = (issue or {}).get("team") or {}
-        project = (issue or {}).get("project") or {}
-        parent = (issue or {}).get("parent") or {}
-        if (not isinstance(issue, dict) or issue.get("id") != client_id or issue.get("title") != title
-                or team_id not in {team.get("id"), team.get("key")}
-                or (description is not None and not markdown_matches(issue.get("description"), description))
-                or issue.get("assignee") is not None or issue.get("delegate") is not None
-                or (project_id is not None and project.get("id") != project_id)
-                or (parent_id is not None and parent.get("id") != parent_id)):
-            raise LinearError("Linear issue readback does not match the create", retryable=False)
-        return issue
+        if not isinstance(issue, dict) or issue.get("id") != client_id:
+            # The create was accepted; only the readback is missing. The same id cannot duplicate it.
+            raise LinearError("Linear accepted the issue but it could not be read back yet; "
+                              "retry with the same id and content")
+        team, project, parent = (issue.get(key) or {} for key in ("team", "project", "parent"))
+        return _created(issue, "issue", {
+            "title": issue.get("title") != title,
+            "team": team_id not in {team.get("id"), team.get("key")},
+            "description": description is not None and not markdown_matches(issue.get("description"), description),
+            "assignee": issue.get("assignee") is not None, "delegate": issue.get("delegate") is not None,
+            "project": project_id is not None and project.get("id") != project_id,
+            "parent": parent_id is not None and parent.get("id") != parent_id})
     def team_projects(self, team_id: str) -> list[dict[str, str]]:
         """Active (not completed, canceled or archived) projects of one team, as id and name."""
         data = self.graphql("query TeamProjects($id: String!) { team(id: $id) { id projects(first: 100) "
@@ -605,11 +650,13 @@ class LinearAPI:
         project = self.graphql(
             "query CreatedProject($id: String!) { project(id: $id) { id name url lead { id } teams { nodes { id key } } } }",
             {"id": client_id}).get("project")
-        teams = {node.get("id") for node in ((project or {}).get("teams") or {}).get("nodes") or []}
-        if (not isinstance(project, dict) or project.get("id") != client_id or project.get("name") != name
-                or project.get("lead") is not None or not set(team_ids) <= teams):
-            raise LinearError("Linear project readback does not match the create", retryable=False)
-        return project
+        if not isinstance(project, dict) or project.get("id") != client_id:
+            raise LinearError("Linear accepted the project but it could not be read back yet; "
+                              "retry with the same id and content")
+        teams = {node.get("id") for node in (project.get("teams") or {}).get("nodes") or []}
+        return _created(project, "project", {"name": project.get("name") != name,
+                                             "lead": project.get("lead") is not None,
+                                             "teams": not set(team_ids) <= teams})
     def link_issue(self, issue_id: str, related_issue_id: str, relation: str) -> dict[str, Any]:
         """Link two issues. ``blocked_by`` records the related issue as the blocker."""
         if relation not in {"blocks", "blocked_by", "related"}:

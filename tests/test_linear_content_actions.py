@@ -19,6 +19,26 @@ from hermes_fleet_linear_plugin.store import Store
 
 BODY = '### Current status\n\n- Setup verified.\n\n### Remaining\n\n- [ ] Await replies.\n\n```sh\nprintf "a  b"\n```\n[Evidence](https://example.test/proof)'
 
+# LIFE-584 as Finn sent it and as Linear stored it (2026-11-02): an escaped tilde, and * bullets on
+# plain lists (including lines with inline code) while task-list items keep -.
+LIFE_584_AUTHORED = """## Plan
+
+- **PR A — backend:** `kept_hero.window_totals` for earned / spent / loan_interest / kept / invested / cash_kept; invariants `earned − spent − loan_interest == kept` and `invested + cash_kept == kept`, per month and window.
+- **PR B — Kept card 50a:** frontend per README §1–§4, Playwright height test, 1280/390 screenshots beside the reference.
+
+## Acceptance (handoff §6)
+
+- [ ] Chart in shared frame, empty gutter; `.home-sel` centre x within 1px of the other cards
+- [ ] Merged, deployed via Coolify pin, live bundle verified
+
+## Deliberate deviations (flagged to Ken)
+
+- Selected-month Cash bar keeps the tested `--home-cash-bar` (#5a9f8c) rather than #2f7a66: #2f7a66 is ~1.5:1 against Invested and fails the audit #8 ≥2:1 gate.
+- Avg label keeps decision #9 (no background box).
+"""
+LIFE_584_STORED = LIFE_584_AUTHORED.rstrip('\n').replace('\n- **', '\n* **').replace(
+    '\n- Selected', '\n* Selected').replace('\n- Avg', '\n* Avg').replace('~1.5:1', '\\~1.5:1')
+
 class ContentRemote(FakeLinear):
     def _apply(self, query, variables):
         if 'CommentReadback' in query:
@@ -190,8 +210,9 @@ class ContentActionTests(unittest.TestCase):
         self.assertEqual(seen, [self.request_id, self.request_id])
         self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
         self.remote.issues[self.request_id]['description'] = 'Visit other.com'
-        with self.assertRaises(LinearError):
-            self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+        replay = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+        self.assertEqual((replay['id'], replay['readback_differences']), (self.request_id, ['description']))
+        self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
 
     def test_autolink_description_response_loss_restart_settles_without_resend(self):
         body = '### Outcome\n\nVisit example.com'
@@ -231,7 +252,7 @@ class ContentActionTests(unittest.TestCase):
         self.remote.comments[0]['body'] = '### Progress\n\nVisit other.com'
         self.assertFalse(self.api.verify_comment(self.request_id, 'issue-1', body))
 
-    def test_create_wrong_description_is_refused(self):
+    def test_create_with_a_genuine_difference_is_created_with_a_warning(self):
         original = self.remote._apply
         def changed(query, variables):
             status, payload = original(query, variables)
@@ -239,8 +260,91 @@ class ContentActionTests(unittest.TestCase):
                 payload['data']['issue']['description'] = 'lost all formatting'
             return status, payload
         self.remote._apply = changed
-        with self.assertRaises(LinearError):
-            self.api.create_issue(str(uuid.uuid4()), 'team-1', 'Outcome', description=BODY)
+        client_id = str(uuid.uuid4())
+        with self.assertLogs('hermes_plugins.linear', 'WARNING') as logs:
+            created = self.api.create_issue(client_id, 'team-1', 'Outcome', description=BODY)
+        self.assertEqual((created['id'], created['readback_differences']), (client_id, ['description']))
+        self.assertIn('action=content.write outcome=applied reason=readback_differs', logs.output[0])
+        self.assertIn(f'iss={client_id[:8]} kind=issue_create', logs.output[0])
+        self.assertNotIn('formatting', '\n'.join(logs.output))
+
+    def test_create_readback_missing_is_retryable_under_the_same_id(self):
+        original = self.remote._apply
+        def missing(query, variables):
+            if 'CreatedIssue' in query:
+                return 200, {'data': {'issue': None}}
+            return original(query, variables)
+        self.remote._apply = missing
+        with self.assertRaises(LinearError) as caught:
+            self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=BODY)
+        self.assertTrue(caught.exception.retryable)
+        self.assertIn('same id', str(caught.exception))
+
+    def test_life_584_editor_rewrite_is_a_successful_create(self):
+        """Linear escaped a tilde and rewrote - bullets to * (LIFE-584, 2026-11-02)."""
+        authored = LIFE_584_AUTHORED
+        stored = LIFE_584_STORED
+        original = self.remote._apply
+        def editor(query, variables):
+            status, payload = original(query, variables)
+            if 'issueCreate' in query:
+                self.remote.issues[variables['input']['id']]['description'] = stored
+            return status, payload
+        self.remote._apply = editor
+        args = {'action': 'create_issue', 'id': self.request_id, 'title': 'Home Kept card 50a',
+                'team': 'team-1', 'project': 'none', 'description': authored}
+        reply = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(reply['message'], 'Created an undelegated issue.')
+        self.assertNotIn('readback_differences', reply['issue'])
+        self.assertEqual(reply['issue']['description'], stored)
+        self.assertEqual(self.remote.requests.count('mutation Create'), 1)
+
+    def test_chat_create_with_a_remaining_difference_says_it_exists(self):
+        original = self.remote._apply
+        def editor(query, variables):
+            status, payload = original(query, variables)
+            if 'issueCreate' in query:
+                self.remote.issues[variables['input']['id']]['description'] = 'rewritten'
+            return status, payload
+        self.remote._apply = editor
+        args = {'action': 'create_issue', 'id': self.request_id, 'title': 'Outcome',
+                'team': 'team-1', 'project': 'none', 'description': BODY}
+        reply = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(reply['issue']['id'], self.request_id)
+        self.assertEqual(reply['issue']['readback_differences'], ['description'])
+        self.assertIn('It exists under this id', reply['message'])
+        self.assertIn('Do not create it again', reply['message'])
+        again = json.loads(chat.handle(self.bridge, args, self.context))
+        self.assertTrue(again['ok'])
+        self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
+
+    def test_editor_escapes_bullets_and_whitespace_match_outside_code(self):
+        from hermes_fleet_linear_plugin.api import markdown_matches
+        for expected, actual in (
+            ('Ratio ~1.5:1', 'Ratio \\~1.5:1'),
+            ('- Keeps `--home-cash-bar` at ~1.5:1', '* Keeps `--home-cash-bar` at \\~1.5:1'),
+            ('- a\n- b', '* a\n* b'),
+            ('loan_interest and 5 * 3 > 2 | # [x]', 'loan\\_interest and 5 \\* 3 \\> 2 \\| \\# \\[x\\]'),
+            ('Line  \nNext', 'Line\nNext'),
+            ('Para\n\n\n\nNext\n\n', 'Para\n\nNext'),
+            ('\n\nLead', 'Lead'),
+            ('- [ ] Check `a`', '- [ ] Check `a`'),
+        ):
+            with self.subTest(expected=expected):
+                self.assertTrue(markdown_matches(actual, expected))
+        for expected, actual in (
+            ('`a~b`', '`a\\~b`'),                     # escapes inside inline code are literal
+            ('```\n~1\n```', '```\n\\~1\n```'),      # and inside fenced code
+            ('    ~1', '    \\~1'),                     # and indented code
+            ('```\na\n\n\nb\n```', '```\na\n\nb\n```'),  # code keeps its blank lines
+            ('Ratio ~1.5:1', 'Ratio \\~1.6:1'),          # a real text change still differs
+            ('- [ ] Done', '- [x] Done'),
+            ('Visit example.com', 'Visit \\[example.com](<http://example.com>)'),
+        ):
+            with self.subTest(expected=expected):
+                self.assertFalse(markdown_matches(actual, expected))
 
     def test_readback_wrong_or_missing_comment_target_and_body_is_refused(self):
         for changed in (None, {'id': self.request_id, 'body': BODY, 'issue': {'id': 'other'}},

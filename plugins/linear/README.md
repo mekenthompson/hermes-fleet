@@ -28,6 +28,14 @@ API is required. The plugin is disabled by default.
 | `update_description` with `issue`, UUIDv4 `id`, `description`, `expected_description` | Queue a description replacement after checking the exact previous text. |
 | `add_comment` with `issue`, UUIDv4 `id`, `body` | Queue a Linear comment. |
 
+Creates read the new issue or project back under its UUID. Linear's editor rewrites Markdown as
+it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` bullets and drops
+trailing spaces and repeated blank lines. Outside code those count as the same text. A create
+whose readback still differs is reported as created, with `readback_differences` naming the
+fields and a `content.write` `readback_differs` warning; it is never refused, because a refusal
+invites a retry under a new id, which is how duplicates happen. Only an issue that cannot be read
+back yet is refused, and the same id and content can be retried safely.
+
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not
 remote delivery. Use readable Linear Markdown. Description preflight is best effort; Linear
