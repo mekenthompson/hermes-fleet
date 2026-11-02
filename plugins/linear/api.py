@@ -283,7 +283,7 @@ def _created(entity: dict[str, Any], kind: str, replayed: bool, differs: dict[st
                  issue=identifier if isinstance(identifier, str) else None)
         named = f" {identifier}" if isinstance(identifier, str) else ""
         raise LinearError(f"This id already belongs to an existing {kind}{named} whose {', '.join(fields)} "
-                          f"differ, so nothing new was created. If that {kind} is the one meant, use it; "
+                          f"{'differs' if len(fields) == 1 else 'differ'}, so nothing new was created. If that {kind} is the one meant, use it; "
                           "otherwise create with a new id.", retryable=False)
     diag.evt("content.write", "applied", "readback_differs", level=logging.WARNING, kind=f"{kind}_create",
              iss=str(entity.get("id") or "")[:8] or None,
@@ -607,7 +607,7 @@ class LinearAPI:
         return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
                     markdown_matches(comment.get("body"), body) and isinstance(comment.get("issue"), dict) and
                     comment["issue"].get("id") == issue_id)
-    def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> None:
+    def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> bool:
         try:
             data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",
                                 {"input": fields})
@@ -622,6 +622,8 @@ class LinearAPI:
         under the same id (which cannot duplicate it) and never a reason to pick a new one."""
         try:
             entity = self.graphql(query, {"id": client_id}).get(key)
+        except RateLimited:
+            raise  # keeps its pause; the create itself already landed under this id
         except LinearError as exc:
             raise LinearError(f"Linear accepted the {key} but it could not be read back yet; "
                               "retry with the same id and content") from exc
