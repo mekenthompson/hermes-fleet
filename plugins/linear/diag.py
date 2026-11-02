@@ -65,7 +65,7 @@ REASONS = frozenset({
     # delegate recovery / delegate write
     "session_owned", "agent_session_scope", "binding_mismatch", "already_decided", "not_running",
     "human_delegate", "human_edit", "moot_before_write", "binding_recovery", "already_delegate",
-    "task_finished", "claim_unconsumed", "no_human_fence", "effect_unresolved",
+    "task_finished", "claim_unconsumed", "no_human_fence", "effect_unresolved", "chat_route_retry",
     # outbox
     "rate_limited", "retryable_http", "non_retryable", "auth_unavailable", "scope_denied",
     "give_up_24h", "reconciliation_blocked", "uncertain_terminal", "uncertain_prior",
@@ -78,7 +78,7 @@ REASONS = frozenset({
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
     # chat entrust / record_done
-    "record_done_parked", "not_started", "delegated_elsewhere",
+    "record_done_parked", "not_started", "delegated_elsewhere", "contract_mismatch",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",

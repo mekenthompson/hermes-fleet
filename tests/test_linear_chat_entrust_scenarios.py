@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,7 +32,8 @@ except Exception as exc:
     CORE = str(exc)
 
 plugin = load_plugin()
-from hermes_fleet_linear_plugin import chat
+from hermes_fleet_linear_plugin import chat, native_input
+from hermes_fleet_linear_plugin.api import LinearError
 from hermes_fleet_linear_plugin.bridge import Bridge, Kanban, _same_work_notice
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
@@ -155,16 +156,61 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.pump_kanban()
         self.bridge.flush()
 
+    def session_event(self, issue_id, session_id, creator):
+        self.authority.sessions[session_id] = {"id": session_id, "issue": {"id": issue_id},
+                                               "creator": creator and {"id": creator}, "appUser": {"id": VIEWER}}
+        stamp = time.time()
+        session = {"id": session_id, "issue": {"id": issue_id}}
+        if creator:
+            session["creatorId"] = creator
+        return {"type": "AgentSessionEvent", "action": "created",
+                "createdAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+                "webhookTimestamp": int(stamp * 1000), "agentSession": session}
+
     def echo(self, issue_id, session_id="echo-session"):
-        """Linear opens an Agent Session for this app's own delegation."""
+        """Linear opens an Agent Session for this app's own delegation: no human creator.
+
+        Native-input mode, as native_input's receiver does it: a creator-null session projects to
+        no conversation input and keeps the dispatcher path, which must accept it (True), or the
+        provider delivery stays pending.
+        """
+        event = self.session_event(issue_id, session_id, None)
+        self.assertIsNone(native_input.project_input(self.bridge, event))
+        accepted = self.bridge.handle_webhook(event, assignment_prompt=native_input.ACTORLESS_COORDINATION)
+        self.assertIs(accepted, True)
+        return accepted
+
+    def human_delegation(self, issue_id, session_id):
+        """A person delegates the issue in Linear (legacy dispatcher path)."""
+        return self.bridge.handle_webhook(self.session_event(issue_id, session_id, USER))
+
+    def stop(self, issue_id, session_id="stop-session", activity_id="stop-activity"):
+        """A person presses Stop in a Linear Agent Session on this issue."""
         self.authority.sessions[session_id] = {"id": session_id, "issue": {"id": issue_id},
                                                "creator": {"id": USER}, "appUser": {"id": VIEWER}}
-        stamp = time.time()
+        self.authority.activities[activity_id] = {"id": activity_id, "user": {"id": USER},
+                                                  "agentSession": {"id": session_id}}
+        stamp = time.time() + 1
         return self.bridge.handle_webhook({
-            "type": "AgentSessionEvent", "action": "created",
+            "type": "AgentSessionEvent", "action": "prompted",
             "createdAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
             "webhookTimestamp": int(stamp * 1000),
-            "agentSession": {"id": session_id, "issue": {"id": issue_id}, "creatorId": USER}})
+            "agentSession": {"id": session_id, "issue": {"id": issue_id}, "creatorId": USER},
+            "agentActivity": {"id": activity_id, "signal": "stop", "user": {"id": USER}}})
+
+    @staticmethod
+    def later_iso():
+        """A Linear updatedAt newer than any earlier one, as a non-routing edit (a comment) moves it."""
+        time.sleep(0.002)
+        return now_iso()
+
+    def delegate_rows(self):
+        with self.bridge.store._tx() as db:
+            return [row[0] for row in db.execute("SELECT state FROM outbox WHERE kind='delegate' ORDER BY rowid")]
+
+    def claim(self, task_id):
+        with self.board.conn() as conn:
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-test-worker"))
 
     # -- scenarios -------------------------------------------------------
     def test_chat_create_with_start_work_runs_one_task_as_delegate_and_reports_to_the_chat(self):
@@ -414,7 +460,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         # Nothing was parked, so a later delegation to this agent starts normally.
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
         self.authority.issues[ISSUE]["updatedAt"] = now_iso()
-        self.echo(ISSUE, "later-session")
+        self.assertTrue(self.human_delegation(ISSUE, "later-session"))
         self.flush()
         tasks = self.tasks()
         self.assertEqual(len(tasks), 1)
@@ -449,6 +495,362 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertFalse(reply["native"]["admitted"])
         self.assertIn("can't start work safely", reply["message"])
         self.assertNotIn("unblocked", self.history(reply["native"]["task_id"]))
+
+    # -- reviewer follow-ups ------------------------------------------------
+    def test_adopted_board_task_with_a_different_definition_of_done_is_declined(self):
+        issue = self.authority.issues[ISSUE]
+        self.bridge.contracts = {PROJECT: "https://github.com/example/fleet"}
+        existing = self.board.create(title="OPS-1: earlier chat task", created_by="chat",
+                                     body=f"Linear issue OPS-1: {issue['url']}\nContinue the rollout.")
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("different definition of done", reply["message"])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+        self.assertEqual(self.tasks(), [existing.id])
+        self.assertEqual(self.board.get(existing.id).status, existing.status)  # nothing stopped or started
+
+    def test_adopted_board_task_binds_as_progress_and_never_closes_the_issue(self):
+        issue = self.authority.issues[ISSUE]
+        existing = self.board.create(title="OPS-1: earlier chat task", created_by="chat",
+                                     body=f"Linear issue OPS-1: {issue['url']}\nContinue the rollout.")
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.bridge.store.native_binding(ISSUE)["completion_scope"]["mode"], "progress")
+        with self.board.conn() as conn:
+            kb.complete_task(conn, existing.id, summary="Stage finished.", result="Stage finished.")
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertNotEqual(self.authority.state(ISSUE), "Done")
+
+    def test_delegate_routing_is_queued_under_the_issue_lock_with_the_version_read_there(self):
+        original_entrust, original_queue = self.bridge.entrust, self.bridge.queue_delegate_self
+        held = []
+
+        def entrust_after_a_flush(issue_id, **kwargs):
+            # A tick flush lands between the chat's issue read and the bridge taking the lock.
+            self.authority.issues[issue_id]["updatedAt"] = self.later_iso()
+            return original_entrust(issue_id, **kwargs)
+
+        def queue(issue_id, *args, **kwargs):
+            held.append(self.bridge.lock(issue_id)._is_owned())
+            return original_queue(issue_id, *args, **kwargs)
+        with patch.object(self.bridge, "entrust", side_effect=entrust_after_a_flush), \
+                patch.object(self.bridge, "queue_delegate_self", side_effect=queue):
+            reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["routing"], "queued")
+        self.assertEqual(held, [True])
+        self.bridge.flush()  # no tick: the chat's own queued routing must land by itself
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.assertEqual(self.delegate_rows(), ["sent"])
+
+    def test_held_delegate_routing_is_reported_honestly_and_retried(self):
+        original = self.bridge._delegate_preflight
+        calls = []
+
+        def refuse_once(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise LinearError("Linear changed; read current status before routing work", retryable=False)
+            return original(payload)
+        with patch.object(self.bridge, "_delegate_preflight", side_effect=refuse_once):
+            reply = self.ask({"action": "work_on", "issue": ISSUE})
+            self.assertTrue(reply["ok"], reply)
+            self.assertTrue(reply["routing"].startswith("held"), reply["routing"])
+            self.assertNotIn("Linear shows this agent as delegate", reply["message"])
+            self.assertIn("delegate update is still pending and the agent retries it automatically", reply["message"])
+            for _ in range(3):
+                self.bridge.tick()  # binding recovery re-queues routing for chat-started work
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.assertEqual(self.delegate_rows(), ["sent"])
+
+    def test_queued_routing_does_not_claim_linear_already_shows_the_delegate(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(reply["routing"], "queued")
+        self.assertNotIn("Linear shows this agent", reply["message"])
+        self.assertIn("being updated to show this agent as delegate", reply["message"])
+
+    def test_chat_route_refused_at_send_is_requeued_by_delegate_recovery(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(reply["routing"], "queued")
+        # Linear moves for a non-routing reason (a comment) before the queued delegate goes out.
+        self.authority.issues[ISSUE]["updatedAt"] = self.later_iso()
+        self.bridge.tick()  # captures the admission; the chat's delegate write is refused at send
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        # Asked again from chat: routing for the current binding is queued and refused the same way.
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(again["routing"], "queued")
+        self.authority.issues[ISSUE]["updatedAt"] = self.later_iso()
+        self.bridge.flush()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        self.assertEqual(self.delegate_rows(), ["failed", "failed"])
+        # No write was ever attempted, so recovery retries once for this binding, under its human fence.
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.assertEqual(self.delegate_rows(), ["failed", "failed", "sent"])
+        self.assertEqual(self.authority.issues[ISSUE]["assignee"], issue_record()["assignee"])
+
+    def test_repeating_the_request_after_a_refused_delegate_write_does_not_claim_it_is_queued(self):
+        self.assertEqual(self.ask({"action": "work_on", "issue": ISSUE})["routing"], "queued")
+        self.authority.issues[ISSUE]["updatedAt"] = self.later_iso()
+        self.bridge.flush()  # refused at send; the binding has not moved
+        self.assertEqual(self.delegate_rows(), ["failed"])
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(again["routing"].startswith("held"), again["routing"])
+        self.assertNotIn("being updated", again["message"])
+        self.assertIn("delegate update is still pending", again["message"])
+
+    def test_chat_route_retry_yields_to_a_person_changing_routing_after_the_request(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = reply["native"]["task_id"]
+        # After the chat request a person assigns the issue; our delegate write is then refused.
+        changed = self.later_iso()
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}
+        self.authority.issues[ISSUE]["updatedAt"] = changed
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": changed, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
+        self.bridge.flush()
+        self.assertEqual(self.delegate_rows(), ["failed"])
+        time.sleep(1.1)  # the worker's claim comes clearly after the person's change
+        self.claim(task_id)
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # the person's newer change wins
+        self.assertEqual(self.authority.issues[ISSUE]["assignee"], {"id": USER})
+
+    def undelegate_by_person(self, issue_id):
+        changed = self.later_iso()
+        self.authority.issues[issue_id]["delegate"] = None
+        self.authority.issues[issue_id]["updatedAt"] = changed
+        self.authority.history.setdefault(issue_id, []).append({
+            "createdAt": changed, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": {"id": VIEWER}, "toDelegate": None})
+
+    def test_asking_again_after_a_person_removed_the_delegate_says_so_and_does_not_re_add_it(self):
+        self.ask({"action": "work_on", "issue": ISSUE})
+        self.bridge.flush()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.undelegate_by_person(ISSUE)
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertIn("a person removed this agent as delegate in Linear, so it was not re-added", again["message"])
+        self.assertNotIn("retries", again["message"])
+        for _ in range(4):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_recovered_admission_still_yields_to_a_later_reassignment(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(self.delegate_rows(), [])  # routing follows admission
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+        self.authority.issues[ISSUE]["updatedAt"] = later
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
+        self.bridge._recover_admissions()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
+        # The parked task is not shown as worked on: no delegate is queued.
+        self.assertEqual(self.delegate_rows(), [])
+        for _ in range(4):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_superseded_chat_admission_queues_no_delegate_even_when_asked_again(self):
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
+        self.assertEqual(reply["routing"], "held: not started")
+        for _ in range(3):
+            self.bridge.tick()
+        again = self.ask({"action": "work_on", "issue": ISSUE})  # after ticks moved the binding revision
+        self.assertEqual(again["routing"], "held: not started")
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.delegate_rows(), [])
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        self.assertEqual(self.board.get(reply["native"]["task_id"]).status, "blocked")
+
+    def test_work_that_cannot_start_safely_gets_no_delegate(self):
+        with patch.object(Kanban, "guarded_controls", False, create=True):
+            reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(reply["native"]["admitted"])
+        self.bridge.flush()
+        self.assertEqual(self.delegate_rows(), [])
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_a_status_only_change_is_not_described_as_reassignment(self):
+        self.ask({"action": "work_on", "issue": ISSUE})
+        self.bridge.flush()
+        self.undelegate_by_person(ISSUE)
+        node = self.authority.history[ISSUE][-1]
+        node.update(fromDelegate=None, toDelegate=None, fromStateId="state-todo", toStateId="state-progress")
+        self.authority.issues[ISSUE]["delegate"] = None
+        for _ in range(2):
+            self.bridge.tick()
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertIn("changed this issue's status, assignee or delegate", again["message"])
+        self.assertNotIn("who works on", again["message"])
+
+    def test_first_chat_route_costs_no_extra_linear_reads(self):
+        before = len(self.authority.requests)
+        self.ask({"action": "work_on", "issue": ISSUE})
+        reads = self.authority.requests[before:]
+        self.assertFalse(any("IssueRoutingHistory" in query for query in reads), reads)
+
+    def test_asking_again_after_a_crash_and_a_reassignment_does_not_start_the_work(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None)  # crash before routing was queued
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+        self.authority.issues[ISSUE]["updatedAt"] = later
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(again["native"]["admitted"], again)
+        self.assertTrue(again["message"].startswith("Not started:"), again["message"])
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(again["routing"], "held: not started")
+        self.assertEqual(self.delegate_rows(), [])  # no delegate is queued over the person's change
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_parked_chat_work_resumed_later_gets_its_delegate(self):
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        for _ in range(2):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # parked: not shown as worked on
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)  # someone resumes it on the board
+        self.claim(task_id)
+        for _ in range(4):
+            self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "running")
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+
+    def test_reask_after_resume_keeps_recovery_delegate(self):
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        for _ in range(2):
+            self.bridge.tick()
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)
+        self.claim(task_id)
+        with patch.object(type(self.bridge), "flush", lambda self, **kw: 0):
+            for _ in range(4):
+                self.bridge.tick()
+        with self.bridge.store._tx() as db:
+            rows = db.execute("SELECT id,state,json_extract(payload,'$.recovered_binding') FROM outbox WHERE kind='delegate'").fetchall()
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        for _ in range(6):
+            self.bridge.tick()
+        with self.bridge.store._tx() as db:
+            rows = db.execute("SELECT id,state,json_extract(payload,'$.admission_superseded') FROM outbox WHERE kind='delegate'").fetchall()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+
+    def test_work_parked_by_a_person_and_resumed_later_gets_its_delegate(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        later = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+        self.authority.issues[ISSUE]["updatedAt"] = later
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-progress",
+            "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": None, "toDelegate": None})
+        self.bridge._recover_admissions()
+        self.assertEqual(self.board.get(task_id).status, "blocked")  # the person's change parked it
+        time.sleep(2.1)
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)  # later someone resumes it
+        self.claim(task_id)
+        for _ in range(4):
+            self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "running")
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+
+    def test_asking_again_after_ticks_never_re_adds_a_delegate_a_person_removed(self):
+        task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        self.bridge.flush()
+        self.claim(task_id)
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.undelegate_by_person(ISSUE)
+        for _ in range(3):
+            self.bridge.tick()
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertIn("a person removed this agent as delegate in Linear, so it was not re-added", again["message"])
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_native_input_stop_control_reaches_chat_started_work_before_the_delegate_lands(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = reply["native"]["task_id"]
+        self.claim(task_id)
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+        session, activity = "native-stop-session", "native-stop-activity"
+        self.authority.sessions[session] = {"id": session, "issue": {"id": ISSUE},
+                                            "creator": {"id": USER}, "appUser": {"id": VIEWER}}
+        self.authority.activities[activity] = {"id": activity, "user": {"id": USER}, "agentSession": {"id": session}}
+        stamp = time.time() + 1
+        event = {"type": "AgentSessionEvent", "action": "prompted",
+                 "createdAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(),
+                 "webhookTimestamp": int(stamp * 1000),
+                 "agentSession": {"id": session, "issue": {"id": ISSUE}, "creatorId": USER},
+                 "agentActivity": {"id": activity, "signal": "stop", "user": {"id": USER}}}
+        projected = native_input.project_input(self.bridge, event)
+        self.assertEqual(projected.signal, "stop")
+        native_input._handle_control(self.bridge, event, projected)  # raises when the Stop is held
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    def test_linear_stop_reaches_chat_started_work_while_the_delegate_write_is_pending(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = reply["native"]["task_id"]
+        self.claim(task_id)
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # the delegate write has not gone out
+        self.assertTrue(self.stop(ISSUE))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        for _ in range(2):
+            self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "blocked")  # stopped work stays stopped
+
+    def test_linear_stop_on_work_delegated_elsewhere_is_still_refused(self):
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        task_id = reply["native"]["task_id"]
+        self.claim(task_id)
+        self.authority.issues[ISSUE]["delegate"] = {"id": str(uuid.UUID(int=0x99, version=4))}
+        self.assertFalse(self.stop(ISSUE))
+        self.assertEqual(self.board.get(task_id).status, "running")
+
+    def test_recovered_chat_admission_yields_to_a_person_undelegating_it(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None)
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+        self.authority.issues[ISSUE]["updatedAt"] = later
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": {"id": VIEWER}, "toDelegate": None})
+        self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
 
     def test_another_session_on_assignment_work_gets_a_neutral_notice(self):
         self.assertIn("already working on this", _same_work_notice("running", False))

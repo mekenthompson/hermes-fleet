@@ -60,8 +60,36 @@ it hears checkpoints and the result, not the admission itself. `record_done` nev
 worker or re-runs work, even after a crash part-way through: recovery and the assignment
 echo never admit a record_done task, `work_on` is refused, and repeating the same
 `record_done` finishes it. A chat admission recovered after a crash is held if the issue
-has since been delegated to someone else. Existing linked work, another agent's task or ambiguous links are
-reported, never duplicated. Delegated children return the request to their parent.
+has since been delegated to someone else, or if a person changed its state, assignee or
+delegate after the chat request while no delegate write of ours is pending. Existing linked work, another agent's task or ambiguous links are
+reported, never duplicated. An unlinked task already on the board is adopted only when its
+definition of done matches the project's, and then as progress: it never closes the issue by
+itself. Delegated children return the request to their parent.
+
+When work starts, the delegate is queued inside the issue's lock right after admission (which
+writes nothing to Linear), from the issue version read under that lock, so the status writes
+that follow from the work are queued after it. Chat work that was not admitted (parked by a
+Stop, a person's change, or unsafe controls) gets no delegate, however often chat asks again.
+A chat admission that finds no delegate proceeds only when no person changed state, assignee
+or delegate since the chat request (the history read is skipped only when Linear has not moved
+since the request). Recovery adds no delegate to parked chat work that was never claimed; once
+someone resumes it and a worker claims it, recovery routes the delegate as usual, fenced from
+its latest claim (the change that parked it came before).
+The chat reply says only what is true: Linear shows the delegate, is being updated (a delegate
+write is still pending), the update will be retried (only when delegate recovery's own
+conditions hold), a person removed this agent as delegate or changed the issue's status,
+assignee or delegate (not re-added; only when Linear history proves it), Linear's history
+couldn't be checked (nothing is changed over it), or it was not updated and the agent can't
+confirm a retry.
+Delegate recovery retries chat-started routing that was refused before any write, once per
+binding revision (which changes as native work moves). Asking again from chat never re-adds a
+delegate after a person's proven routing change since the request. For chat-started work every delegate recovery is fenced from the earlier of the
+chat request and the worker's claim: a person's later change of state, assignee or delegate
+wins. Whenever Linear shows no delegate, a Linear Stop on chat-started work bound here is
+authorized by that binding and its chat origin (Stop is the safe direction); work delegated
+to anyone else still refuses it. Work adopted from the board through chat keeps the ordinary
+rules: its Stop and delegate recovery need this app as delegate or the plain binding
+recovery, since it was not created from the chat request.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not

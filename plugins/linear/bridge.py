@@ -1554,9 +1554,14 @@ class Bridge:
         issue = self._effect_issue(issue_id)
         delegate_id = (issue.get("delegate") or {}).get("id")
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
-                (delegate_id != self.api.viewer_id() and (not from_chat or delegate_id is not None)) or
+                (delegate_id != self.api.viewer_id() and not (
+                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload, issue))) or
                 (issue.get("state") or {}).get("type") in CLOSED):
-            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
+            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission",
+                                                 **({"chat_superseded": True} if from_chat else {})})
+            if from_chat and self.store.drop_unsent_delegate(issue_id, row["task_id"], at=self.clock()):
+                # Parked chat work is not shown as worked on: its delegate, queued before admission, never goes out.
+                diag.evt("delegate.write", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
             if stop:
                 self._pending_assignment_stop(row)
             if row["owner_ref"]:
@@ -1581,6 +1586,80 @@ class Bridge:
             self.activity(issue_id, row["owner_ref"], "thought",
                           f"Linked to the agent's task, which is currently {task.status}. The agent's board schedules the work.")
         return True
+
+    def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict) -> bool:
+        """May chat-started admission proceed while Linear shows no delegate yet?
+
+        Only when no person changed state, assignee or delegate since the chat request: someone
+        reassigning or undelegating it wins, however late admission resumes (after a crash, or
+        while our delegate write is pending or held). The history read is skipped only when
+        Linear has not moved since the request.
+        """
+        if iso_ms(issue.get("updatedAt")) <= float(payload["source_ms"]):
+            return True
+        if self._human_routing_changed(issue_id, float(payload["source_ms"])):
+            diag.evt("claim.decision", "skipped", "human_routing_change", iss=issue_id)
+            return False
+        return True
+
+    def chat_route_outlook(self, issue_id: str, issue: dict | None = None) -> str:
+        """After chat routing was not queued: what happens to the delegate of chat-started work.
+
+        "retry" only when delegate recovery will retry it (its own conditions: chat-started
+        binding, no recovery decision for this binding, no written or pending delegate, an open
+        undelegated issue and no person changing routing since the request); "removed" when a
+        person removed this app as delegate; "changed" for another human change of state,
+        assignee or delegate; "unprovable" when Linear history could not be read or checked to
+        the request; "closed"; else "unknown" (not chat-started work, or no promise is made).
+        issue: the version just read under the issue lock, saving a read.
+        """
+        try:
+            row = self.store.get(issue_id)
+            if (not self._chat_started(row) or row.get("owner_ref") or
+                    (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
+                return "unknown"
+            issue = issue or self._effect_issue(issue_id)
+            if (issue.get("state") or {}).get("type") in CLOSED:
+                return "closed"
+            if issue.get("delegate") is not None:
+                return "unknown"
+            created = self.store.native_intent(f"create:{issue_id}") or {}
+            since = float(created["payload"]["source_ms"])
+            viewer = self.api.viewer_id()
+            if iso_ms(issue.get("updatedAt")) <= since:
+                nodes, complete = [], True  # Nothing moved since the request: no history read.
+            else:
+                try:
+                    nodes, complete = self._routing_scan(issue_id, lambda page: any(
+                        iso_ms(node.get("createdAt")) <= since for node in page))
+                except LinearError:
+                    return "unprovable"
+            human = [node for node in nodes if iso_ms(node.get("createdAt")) > since and self._routed(node)
+                     and node.get("actorId") != viewer]
+            if any((node.get("fromDelegate") or {}).get("id") == viewer and not node.get("toDelegate") for node in human):
+                return "removed"
+            if not complete:
+                return "unprovable"  # Blame nobody, and change nothing over it.
+            if human:
+                return "changed"
+            revision = self.store.binding_revision(issue_id)
+            if self.store.native_intent(f"delegate-recovery:{issue_id}:{revision}"):
+                return "unknown"
+            if self.store.delegate_routed(issue_id, revision) and not self.store.delegate_unwritten(issue_id, revision):
+                return "unknown"
+            return "retry"
+        except LinearError:
+            return "unknown"
+
+    def _chat_started(self, row: dict | None) -> bool:
+        """This store's bound task was created here from a chat request (the create intent applied to it)."""
+        if not row or row.get("origin") != "native":
+            return False
+        created = self.store.native_intent(f"create:{row['issue_id']}") or {}
+        binding = self.store.native_binding(row["issue_id"]) or {}
+        return (created.get("state") == "applied" and created.get("task_id") == row.get("task_id")
+                and (created.get("payload") or {}).get("origin") == "chat"
+                and binding.get("task_id") == row.get("task_id"))
 
     def _pending_assignment_stop(self, row: dict) -> bool | None:
         stop = self.store.native_intent(f"unbound-stop:{row['issue_id']}")
@@ -1661,7 +1740,8 @@ class Bridge:
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
 
-    def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None) -> dict:
+    def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None,
+                route_delegate: Callable[[dict, str], str] | None = None) -> dict:
         """Chat-requested work through the same guarded native admission a Linear assignment uses.
 
         The chat request is the authority, as a delegation is for _start. One native task per
@@ -1669,6 +1749,11 @@ class Bridge:
         key are shared with assignment, so our own delegation echo finds the same work. The
         asking chat gets a native notify subscription. With record_done, work already finished
         in chat is created parked and completed with its evidence; it is never runnable.
+        route_delegate(issue, task_status) queues Linear routing inside this issue's lock, right
+        after admission (admission writes nothing to Linear), with the issue version read under
+        that lock: no tick write can land between that read and the queued delegate, and the
+        status writes that follow from the work are queued after it. Work that was not admitted
+        gets no delegate. Its result is returned as "routing".
         """
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
@@ -1689,16 +1774,17 @@ class Bridge:
             if row is not None:
                 if row.get("origin") != "native":
                     raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
-                return self._entrust_bound(row, route, record_done)
+                return self._entrust_bound(row, route, record_done, route_delegate, issue)
             if (issue.get("state") or {}).get("type") in CLOSED:
                 raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
             if self.store.native_intent(f"create:{issue_id}") is None:
                 existing = self.kanban.discover(issue)
                 if existing:
-                    return self._entrust_existing(issue, existing, route, record_done)
-            return self._entrust_create(issue, route, record_done)
+                    return self._entrust_existing(issue, existing, route, record_done, route_delegate)
+            return self._entrust_create(issue, route, record_done, route_delegate)
 
-    def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None) -> dict:
+    def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None,
+                          route_delegate=None) -> dict:
         """Link the one native task already pointing at this issue; its execution state is unchanged."""
         if record_done:
             raise LinearError("A native task already points at this issue; read status instead of recording it as done", retryable=False)
@@ -1713,14 +1799,24 @@ class Bridge:
         if getattr(adapter, "history_only", False) or task.status == "archived":
             raise LinearError("Earlier work on this issue has ended; start a separately requested increment as a new issue", retryable=False)
         task = adapter.require_task(task.id)
+        # As for _start: adopted work keeps its own definition of done. A different project
+        # requirement is declined; a matching one binds as progress, so the adopted task never
+        # closes the issue by itself. Only work created for this issue carries the outcome.
+        contract = self.contracts.get((issue.get("project") or {}).get("id"))
+        if contract and (task.completion_contract or "local-only") != contract:
+            diag.evt("chat.entrust", "refused", "contract_mismatch", iss=issue["id"], task=task.id)
+            raise LinearError("Existing work on this issue was set up with a different definition of done, so "
+                              "nothing new was started and nothing was stopped; the two need lining up first",
+                              retryable=False)
         if not self.store.bind_native(issue["id"], task.id, adapter.executor_profile, adapter.board or "default",
                                      project_id=(issue.get("project") or {}).get("id"),
-                                     completion_scope=self._completion_scope(adapter, task), at=self.clock() * 1000):
+                                     completion_scope=self._completion_scope(adapter, task, "progress"),
+                                     at=self.clock() * 1000):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         adapter.subscribe(task.id, issue["id"], issue=issue)
-        return self._entrust_bound(self.store.get(issue["id"]), route, None)
+        return self._entrust_bound(self.store.get(issue["id"]), route, None, route_delegate, issue)
 
-    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None) -> dict:
+    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None) -> dict:
         issue_id, key = issue["id"], f"linear:{issue['id']}"
         project = (issue.get("project") or {}).get("id")
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
@@ -1761,7 +1857,7 @@ class Bridge:
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
         self.kanban.subscribe(task.id, issue_id, issue=issue)
-        return self._entrust_bound(self.store.get(issue_id), route, record_done)
+        return self._entrust_bound(self.store.get(issue_id), route, record_done, route_delegate, issue)
 
     def _recorded_done(self, issue_id: str, task_id: str) -> bool:
         created = self.store.native_intent(f"create:{issue_id}") or {}
@@ -1769,7 +1865,8 @@ class Bridge:
         return (created.get("state") == "applied" and created.get("task_id") == task_id
                 and payload.get("origin") == "chat" and payload.get("record_done") is True)
 
-    def _entrust_bound(self, row: dict, route: dict | None, record_done: dict | None) -> dict:
+    def _entrust_bound(self, row: dict, route: dict | None, record_done: dict | None,
+                       route_delegate=None, issue: dict | None = None) -> dict:
         """Continue the one bound task: admit our own parked creation, or report what exists."""
         issue_id, task_id = row["issue_id"], row["task_id"]
         adapter = self._binding_adapter(issue_id)
@@ -1780,7 +1877,10 @@ class Bridge:
             if not self._recorded_done(issue_id, task_id):
                 diag.evt("chat.record_done", "refused", "existing_binding", iss=issue_id, task=task_id)
                 raise LinearError("This issue already has native work; read status instead of recording it as done", retryable=False)
-            return self._record_done(row, adapter, record_done)
+            result = self._record_done(row, adapter, record_done)
+            if route_delegate is not None:
+                result["routing"] = route_delegate(issue, result["status"])
+            return result
         task = adapter.require_task(task_id)
         if self._recorded_done(issue_id, task_id) and task.status not in ("done", "archived"):
             # An interrupted record_done never becomes runnable; only repeating it finishes it.
@@ -1790,16 +1890,28 @@ class Bridge:
         if ours:
             self._assignment_activation(row)  # Idempotent: an applied admission is never repeated.
         task = adapter.require_task(task_id)
+        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
+        routing = None
+        if route_delegate is not None:
+            if ours and not activation.get("accepted"):
+                # Parked chat work, never admitted, is not shown as worked on: no delegate is queued.
+                # Once resumed and claimed, recovery owns the delegate; never drop its pending row.
+                if task.status != "running" and not any(e.kind == "claimed" for e in adapter.history(task_id, 0)):
+                    self.store.drop_unsent_delegate(issue_id, task_id, at=self.clock())
+                routing = "held: not started"
+            else:
+                routing = route_delegate(issue, task.status)
         subscribed = bool(route) and task.status not in ("done", "archived")
         if subscribed:
             # After admission, so the chat hears checkpoints and the result, not our own unblock.
             adapter.subscribe_origin(task_id, route)
-        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
         admitted = bool(activation.get("accepted"))
         result = {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
                   "admitted": admitted, "chat_subscribed": subscribed}
         if ours and not admitted and task.status not in ("done", "archived"):
             result["not_started_reason"] = _not_started_reason(activation)
+        if routing is not None:
+            result["routing"] = routing
         diag.evt("chat.entrust", "applied" if admitted else "skipped",
                  "-" if admitted else ("not_started" if ours else "existing_binding"),
                  iss=issue_id, task=task_id)
@@ -2189,7 +2301,10 @@ class Bridge:
         row, task = self._native_task(row["issue_id"])
         adapter = self._binding_adapter(row["issue_id"])
         issue = self._effect_issue(row["issue_id"])
-        if (issue.get("delegate") or {}).get("id") != self.api.viewer_id():
+        delegate_id = (issue.get("delegate") or {}).get("id")
+        # Chat-started work bound here is ours by its binding and origin, even before Linear
+        # shows the delegate: a Stop must reach it. Work delegated to someone else is not.
+        if delegate_id != self.api.viewer_id() and not (delegate_id is None and self._chat_started(row)):
             return diag.because("not_delegate")
         if stamp < float(row["last_updated_at"]):
             return diag.because("superseded", True)
@@ -2405,22 +2520,42 @@ class Bridge:
             return self._log_delegate(row, "binding_mismatch")
         revision = self.store.binding_revision(issue_id)
         key = f"delegate-recovery:{issue_id}:{revision}"
+        retry_chat = False
         if self.store.native_intent(key) or self.store.delegate_routed(issue_id, revision):
-            return self._log_delegate(row, "already_decided", quiet=True)  # Cheap local check first: decided for this revision, or a delegate write is pending.
+            # A chat-started task's own routing refused before any write (say Linear moved
+            # between its read and send) is retried once by recovery, under the human fence.
+            retry_chat = self._chat_started(row) and self.store.delegate_unwritten(issue_id, revision)
+            if not retry_chat or self.store.native_intent(key):
+                return self._log_delegate(row, "already_decided", quiet=True)  # Cheap local check first: decided for this revision, or a delegate write is pending.
         task = adapter.require_task(row["task_id"])
         if task.status == "archived" or (task.status == "done" and self.store.terminal_captured(
                 task.id, issue_id=issue_id, state="done")):
             return self._log_delegate(row, "task_finished", quiet=True)  # Archived, or verified finished: nothing waits on the agent any more.
         claim = self._current_claim(adapter, task)
+        superseded = bool((self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}).get("chat_superseded"))
+        if superseded and claim is None and task.status != "running" and not any(
+                event.kind == "claimed" for event in adapter.history(task.id, 0)):
+            # Parked chat work that never ran gets no delegate; once someone resumes it and a worker claims it, it does.
+            return self._log_delegate(row, "admission_superseded", quiet=True)
         if task.status == "running" and claim is None:
             return self._log_delegate(row, "claim_unconsumed")  # Running without a readable claim yet; decide once it is consumed.
-        source = claim.created_at if claim is not None else getattr(task, "created_at", None)
+        if claim is None and superseded:
+            claims = [event.created_at for event in adapter.history(task.id, 0) if event.kind == "claimed"]
+            source = max(claims) if claims else getattr(task, "created_at", None)  # Resumed parked work: its latest claim.
+        else:
+            source = claim.created_at if claim is not None else getattr(task, "created_at", None)
         if source is None:
             return self._log_delegate(row, "no_human_fence")  # No provable fence for a human change: leave routing alone.
         if not self.store.effect_admitted(issue_id):
             return self._log_delegate(row, "effect_unresolved", quiet=True)  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
+        if (retry_chat or self._chat_started(row)) and not superseded:
+            # Routing for chat-started work was requested by that chat: a person's change after
+            # the request wins too, even when the worker's claim came later. Parked work that was
+            # resumed later counts from its claim: the change that parked it came before that.
+            requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
+            claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
         route = (issue.get("delegate") is None and "delegate" in issue
                  and (issue.get("state") or {}).get("type") not in CLOSED
                  and (iso_ms(issue.get("updatedAt")) <= claim_ms
@@ -2434,9 +2569,9 @@ class Bridge:
         if route:
             # A refusal is logged by pump and retried; the atomic outbox row is the marker.
             self._delegate_preflight(payload)
-            if not self.store.recover_binding_delegate(issue_id, payload, at=self.clock()):
+            if not self.store.recover_binding_delegate(issue_id, payload, at=self.clock(), supersede_unwritten=retry_chat):
                 raise LinearError("Delegate recovery was not queued; retrying later")  # pump backs off
-            return self._log_delegate(row, "binding_recovery", outcome="queued")
+            return self._log_delegate(row, "chat_route_retry" if retry_chat else "binding_recovery", outcome="queued")
         # A human-chosen delegate, later human edit or closed issue wins for this revision: record once.
         reason = ("human_delegate" if issue.get("delegate") is not None else
                   "issue_closed" if (issue.get("state") or {}).get("type") in CLOSED else "human_edit")
