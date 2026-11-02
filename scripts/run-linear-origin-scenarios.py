@@ -17,7 +17,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent-source", type=Path, required=True)
     parser.add_argument("--expected-revision", help="Explicit immutable candidate Core revision; default is the release manifest pin")
+    parser.add_argument("--shard", help="K/N: run only the K-th of N round-robin test slices (CI parallelism)")
     args = parser.parse_args()
+    shard = None
+    if args.shard:
+        index, _, total = args.shard.partition("/")
+        if not (index.isdigit() and total.isdigit() and 1 <= int(index) <= int(total)):
+            parser.error("invalid --shard; expected K/N with 1 <= K <= N")
+        shard = int(index), int(total)
     source = args.agent_source.resolve(strict=True)
     manifest = json.loads((ROOT / "release/agent-image-manifest.json").read_text())
     actual = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
@@ -56,6 +63,20 @@ def main():
         from hermes_cli import version_info
         version_info._cached_version_info = version_info.VersionInfo("fixture", "fixture", 0, actual, None, "ci")
         suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_origin*_native.py")
+        if shard is not None:
+            # Round-robin individual tests in discovery order: every test lands in exactly one slice.
+            def flatten(items):
+                for item in items:
+                    if isinstance(item, unittest.TestSuite):
+                        yield from flatten(item)
+                    else:
+                        yield item
+            tests = list(flatten(suite))
+            suite = unittest.TestSuite(t for i, t in enumerate(tests) if i % shard[1] == shard[0] - 1)
+            print(f"Shard {shard[0]}/{shard[1]}: {suite.countTestCases()} of {len(tests)} tests", file=sys.stderr, flush=True)
+            if not suite.countTestCases():
+                print("Origin proof shard selected zero tests", file=sys.stderr)
+                return 1
         result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
         # A caught guard refusal is still a failed proof: it must never become green by fallback.
         if guard.violations:

@@ -27,7 +27,40 @@ def expected_revision(manifest: Path) -> str:
     return module.load_manifest(manifest)["revision"]
 
 
-def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "test_linear_*scenarios.py") -> int:
+def parse_shard(spec: str | None) -> tuple[int, int] | None:
+    """`K/N` selects the K-th of N disjoint, jointly exhaustive slices; None runs everything."""
+    if not spec:
+        return None
+    index, _, total = spec.partition("/")
+    if not (index.isdigit() and total.isdigit() and 1 <= int(index) <= int(total)):
+        raise ValueError(f"invalid shard {spec!r}; expected K/N with 1 <= K <= N")
+    return int(index), int(total)
+
+
+def flatten(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from flatten(item)
+        else:
+            yield item
+
+
+def select_shard(suite, shard: tuple[int, int] | None):
+    """Round-robin individual tests in discovery order so slices stay balanced across modules.
+
+    Every discovered test (including import-failure placeholders) lands in exactly one slice.
+    """
+    if shard is None:
+        return suite
+    index, total = shard
+    tests = list(flatten(suite))
+    picked = unittest.TestSuite(t for i, t in enumerate(tests) if i % total == index - 1)
+    print(f"Shard {index}/{total}: {picked.countTestCases()} of {len(tests)} tests", file=sys.stderr, flush=True)
+    return picked
+
+
+def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "test_linear_*scenarios.py",
+        shard: tuple[int, int] | None = None) -> int:
     if not agent_source.is_dir():
         print(f"Agent source missing: {agent_source}", file=sys.stderr)
         return 1
@@ -63,16 +96,17 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "tes
         try:
             os.environ.clear()
             os.environ.update(isolated)
-            return run_suite(tests_dir, pattern)
+            return run_suite(tests_dir, pattern, shard)
         finally:
             os.environ.clear()
             os.environ.update(inherited)
 
 
-def run_suite(tests_dir: Path, pattern: str = "test_linear_*scenarios.py") -> int:
-    suite = unittest.defaultTestLoader.discover(
+def run_suite(tests_dir: Path, pattern: str = "test_linear_*scenarios.py",
+              shard: tuple[int, int] | None = None) -> int:
+    suite = select_shard(unittest.defaultTestLoader.discover(
         start_dir=str(tests_dir), pattern=pattern,
-    )
+    ), shard)
     if suite.countTestCases() == 0:
         print("Linear scenario suite has zero tests", file=sys.stderr)
         return 1
@@ -89,8 +123,13 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=ROOT / "release/agent-image-manifest.json")
     parser.add_argument("--tests-dir", type=Path, default=ROOT / "tests")
     parser.add_argument("--pattern", default="test_linear_*scenarios.py")
+    parser.add_argument("--shard", help="K/N: run only the K-th of N round-robin test slices (CI parallelism)")
     args = parser.parse_args()
-    return run(args.agent_source, args.manifest, args.tests_dir, args.pattern)
+    try:
+        shard = parse_shard(args.shard)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return run(args.agent_source, args.manifest, args.tests_dir, args.pattern, shard)
 
 
 if __name__ == "__main__":
