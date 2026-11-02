@@ -554,15 +554,16 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         body = args.get("description") if action == "update_description" else args.get("body")
         if not isinstance(body, str) or not body.strip():
             raise ValueError(f"{action} needs nonempty content.")
-        if action == "add_comment":
-            from .bridge import INTERNAL_ONLY_REPLY, _readable
-            # Comments are read by people: task ids, board names, run numbers and fence vocabulary
-            # stay in native history. Deterministic, so a retry with the same id keeps identical content.
-            body = _readable(body) or INTERNAL_ONLY_REPLY
         writes = bridge.store.issue_reconciliation_blocked(issue_id, except_id=client_id) if action == "update_description" else []
         if writes:
             return _reply(False, held(writes[0]), code="reconciliation_required", held_writes=[w["id"] for w in writes])
         prior = bridge.store.outbox_row(client_id)
+        if action == "add_comment" and not (prior and prior["payload"].get("body") == body):
+            from .bridge import INTERNAL_ONLY_REPLY, _readable
+            # Comments are read by people: task ids, board names, run numbers and fence phrases stay
+            # in native history. Deterministic, so a same-id retry keeps identical content; a row
+            # queued before this filter shipped keeps its original body.
+            body = _readable(body) or INTERNAL_ONLY_REPLY
         payload = {"issue_id": issue_id, "body": body, "id": client_id, "content_action": True,
                    "unlinked_content": True, "write_started": False, "caller_context": context.to_wire(),
                    **_content_requester(bridge, issue_id, prior,

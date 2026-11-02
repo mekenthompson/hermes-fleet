@@ -283,8 +283,9 @@ def queue_reply(bridge, issue_id, session_id, message_id, body):
     message_id = _identifier(message_id, "reply source Activity")
     if not isinstance(body, str) or not body:
         raise LinearError("Linear reply needs text", retryable=False)
+    raw = body  # The create identity stays the provider's reply, before and after this filter shipped.
     # Model-written replies keep their words; only task ids, board names, run numbers and
-    # fence/quiescence vocabulary are taken out. Deterministic, so a retry keeps the same row id.
+    # fence/quiescence phrases are taken out.
     body = _readable(body) or INTERNAL_ONLY_REPLY
     activity_id = message_id if message_id != session_id else None
     with bridge.api.requester_session(session_id, activity_id=activity_id):
@@ -292,7 +293,7 @@ def queue_reply(bridge, issue_id, session_id, message_id, body):
         bridge._effect_issue(issue_id)
     if session["issue"]["id"] != issue_id:
         raise LinearError("Linear reply session changed its issue", retryable=False)
-    digest = hashlib.sha256(body.encode()).hexdigest()
+    digest = hashlib.sha256(raw.encode()).hexdigest()
     row_id = stable_uuid4("native-reply", bridge.profile, issue_id, session_id, message_id, digest)
     payload = {
         "id": row_id, "issue_id": issue_id, "session_id": session_id,

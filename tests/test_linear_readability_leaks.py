@@ -1,4 +1,4 @@
-"""Readability leaks from Ken's guided acceptance run (3 Nov 2026), as exact strings.
+"""Readability leaks from the guided acceptance run (3 Nov 2026), as exact strings.
 
 HF-612's closing note and Fleet QA project update, the HF-616/HF-617 session replies and
 comments: no bracketed placeholders, task ids, board names, run numbers or fence vocabulary,
@@ -49,14 +49,14 @@ HF_616_STOP = ("I've stopped HF-616. Task t_d8c47a32 is now **blocked**: the wor
 HF_617_START = ("HF-617 is running. Native task **t_bd03a4f7** (run 34) is live on the `atlas-linear-v1` board, "
                 "and the issue has moved from Backlog to In Progress.\n\nI checked first: nothing else on the "
                 "board was running, ready or queued, so this is the only task for the issue.")
-HF_617_TAKEOVER = ("**Takeover by Finn pending.** Ken asked Finn to take over HF-617 on 2026-11-03.\n\n"
+HF_617_TAKEOVER = ("**Takeover by Rowan pending.** Sam asked Rowan to take over HF-617 on 2026-11-03.\n\n"
                    "- Atlas's task t_bd03a4f7 is stopped (native Stop event 340). No worker is live.\n"
                    "- The replacement is **held**: `inspect-cleanup` returns `quiescence_proven: false` "
                    "(`native_admission_not_settled`). Run 34's admission is still `unknown` because the gateway "
                    "restarted at 21:15:57Z, during the run.\n"
                    "- Only the minute-0 checkpoint landed.\n\n"
                    "**Next:** Atlas is looking for a supported way to settle the admission. Once quiescence is "
-                   "proven, Finn starts a fresh 10-minute run under its own task and becomes the delegate.")
+                   "proven, Rowan starts a fresh 10-minute run under its own task and becomes the delegate.")
 LEAKS = ("t_d8c47a32", "t_bd03a4f7", "atlas-linear-v1", "run 34", "Run 34", "fence", "quiescence",
          "admission", "[local artifact]", "/opt/data", "Stop event")
 
@@ -75,6 +75,15 @@ class WorkspacePathTests(unittest.TestCase):
         self.assertEqual(_project_summary("Ran `find /opt/data/workspace -type f | sort`.", 4000),
                          "Ran `find workspace -type f | sort`.")
         self.assertEqual(_project_summary("```\ncat /var/log/app.log\n```", 4000), "```\ncat app.log\n```")
+
+    def test_asides_and_links_stay_readable(self):
+        self.assertEqual(_project_summary("Results are in the workspace (/opt/data/workspace).", 4000),
+                         "Results are in the workspace.")
+        self.assertEqual(_project_summary("See (/opt/data/workspace).", 4000), "See (the workspace).")
+        self.assertEqual(_project_summary("Open [the report](/opt/data/out/report.md) for details.", 4000),
+                         "Open the report (`report.md`) for details.")
+        self.assertEqual(_project_summary("Open [the PR](https://github.com/acme/app/pull/12).", 4000),
+                         "Open [the PR](https://github.com/acme/app/pull/12).")
 
     def test_a_file_in_parentheses_keeps_its_name(self):
         self.assertEqual(_project_summary("Saved the report (/opt/data/out/report.md).", 4000),
@@ -102,13 +111,13 @@ class ProjectUpdateTests(unittest.TestCase):
         self.assertEqual(_update_line("HF-1", _project_line("Fixed the export.", [pr])),
                          f"- HF-1: Done. Fixed the export.\n\n  Evidence: {pr}")
 
-    def test_project_update_is_on_track_without_linears_progress_diff(self):
+    def test_project_update_hides_linears_progress_diff_and_keeps_health(self):
         sent = []
         api = LinearAPI(lambda: "synthetic")
         api.graphql = lambda query, variables=None: sent.append(variables) or {"projectUpdateCreate": {"success": True}}
         api.create_project_update(str(uuid.uuid4()), "project-1", "Agent update\n\n- HF-612: Done.")
-        self.assertEqual(sent[0]["input"]["health"], "onTrack")
         self.assertIs(sent[0]["input"]["isDiffHidden"], True)
+        self.assertNotIn("health", sent[0]["input"])  # A person's "at risk" is never overridden.
         self.assertEqual(sent[0]["input"]["body"], "Agent update\n\n- HF-612: Done.")
 
 
@@ -155,8 +164,18 @@ class FinishedThroughTheBridgeTests(unittest.TestCase):
         update = self.sent()["projectUpdateCreate"]
         self.assertEqual(update["body"], "Agent update\n\n" + _update_line("OPS-1", "Done.\n\n" + HF_612_READABLE))
         self.assertIn("\n  2. 1330.1 MiB", update["body"])
-        self.assertEqual((update["health"], update["isDiffHidden"]), ("onTrack", True))
+        self.assertIs(update["isDiffHidden"], True)
+        self.assertNotIn("health", update)
         self.assertEqual(self.sent()["agentActivityCreate"]["content"]["body"], "Done.\n\n" + HF_612_READABLE)
+
+    def test_a_genuine_summary_about_internal_files_still_completes(self):
+        summary = "Renamed `native_input.py` to `native_relay.py`; tests pass."
+        self.task.status, self.task.result = "done", summary
+        self.kanban.histories[self.task.id].append(SimpleNamespace(id=2, kind="completed", created_at=1800000001,
+                                                                   run_id=1, payload={"summary": summary}))
+        self.bridge._finished(self.store.get(ISSUE), event_id=2)
+        self.assertTrue(any(row["kind"] == "status" and row["payload"].get("state") == "done"
+                            for row in self.store.pending()))
 
     def test_worker_checkpoint_is_cleaned(self):
         body = ("**Minute 0:** The run has started on task t_bd03a4f7 (run 34). I'll post a checkpoint every "
@@ -189,7 +208,7 @@ class SessionReplyTests(unittest.TestCase):
 
     def test_hf_617_takeover_comment(self):
         self.assertEqual(_readable(HF_617_TAKEOVER),
-                         "**Takeover by Finn pending.** Ken asked Finn to take over HF-617 on 2026-11-03.\n\n"
+                         "**Takeover by Rowan pending.** Sam asked Rowan to take over HF-617 on 2026-11-03.\n\n"
                          "- Atlas's task is stopped. No worker is live.\n"
                          "- Only the minute-0 checkpoint landed.")
 
@@ -217,6 +236,13 @@ class NonRegressionTests(unittest.TestCase):
         "University admission rules changed, so the form has a new field.",
         "The task is blocked on review. Next: address the comments.",
         "- one\n  - nested\n\n1. first\n2. second",
+        "Renamed `native_input.py` to `native_relay.py` and added tests.",
+        "Fixed the `worker_lost` and `gave_up` handling so restarts recover.",
+        "The system is quiescent now.",
+        "The board approved the admission policy for next term.",
+        "We need a fence between the worker nodes.",
+        "Run 3 failed after a restart of the database; I re-ran it.",
+        "Mr. Smith on run 4, the task lost power.",
     )
 
     def test_plain_text_is_returned_unchanged(self):
@@ -224,6 +250,11 @@ class NonRegressionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(_readable(text), text)
                 self.assertEqual(_project_summary(text, 4000), text)
+
+    def test_code_keeps_every_character_when_a_line_changes(self):
+        text = ("Task t_d8c47a32 ran `a  b` and `x ,y`. Run 34 lost to a gateway restart.\n\n"
+                "```\na = 1\n\n\n\nb = 2\n```")
+        self.assertEqual(_readable(text), "The task ran `a  b` and `x ,y`.\n\n```\na = 1\n\n\n\nb = 2\n```")
 
     def test_code_blocks_the_user_asked_for_are_untouched(self):
         text = ("Here is the command:\n\n```sh\nhermes kanban show t_d8c47a32 --board atlas-linear-v1\n"
@@ -244,16 +275,23 @@ class NonRegressionTests(unittest.TestCase):
 class BlockerWordingTests(unittest.TestCase):
     def test_hf_616_stop_reads_as_a_stop_not_a_question(self):
         kind, body = _block_message({"kind": "needs_input", "reason":
-                                     "Stopped by Ken from Linear (HF-616). Do not resume unless Ken asks."}, "blocked")
-        self.assertEqual((kind, body), ("response", "Stopped by Ken from Linear (HF-616). It stays stopped until "
-                                                    "Ken asks the agent to resume."))
+                                     "Stopped by Sam from Linear (HF-616). Do not resume unless Sam asks."}, "blocked")
+        self.assertEqual((kind, body), ("response", "Stopped by Sam from Linear (HF-616). It stays stopped until "
+                                                    "Sam asks the agent to resume."))
 
     def test_hf_617_handoff_drops_run_numbers_and_the_fence(self):
         kind, body = _block_message({"kind": "needs_input", "reason": (
-            "Handed off: Ken asked Finn to take over HF-617 (fresh 10-minute run). Keep this task stopped; do not "
+            "Handed off: Sam asked Rowan to take over HF-617 (fresh 10-minute run). Keep this task stopped; do not "
             "resume. Run 34 lost to a gateway restart, run 35 refused by the previous-execution fence.")}, "blocked")
-        self.assertEqual((kind, body), ("response", "Handed off: Ken asked Finn to take over HF-617 (fresh 10-minute "
+        self.assertEqual((kind, body), ("response", "Handed off: Sam asked Rowan to take over HF-617 (fresh 10-minute "
                                                     "run). It stays stopped until someone asks the agent to resume."))
+
+    def test_a_request_that_starts_with_stopped_still_waits_on_the_person(self):
+        kind, body = _block_message({"kind": "needs_input", "reason":
+                                     "Stopped at the login page; I need the staging account name from Sam."}, "blocked")
+        self.assertEqual((kind, body), ("elicitation", "Waiting on you: Stopped at the login page; I need the staging "
+                                                       "account name from Sam. Once this is answered, ask the agent "
+                                                       "to resume and it continues the same task."))
 
     def test_a_real_question_still_waits_on_the_person(self):
         kind, body = _block_message({"kind": "needs_input", "reason": "Stopped at login: which account should I use?"},
@@ -289,6 +327,14 @@ class PostedThroughThePluginTests(unittest.TestCase):
         native_input.queue_reply(bridge, ISSUE, SESSION, "activity-2", "Run 35 refused by the previous-execution fence.")
         self.assertEqual(bridge.queued[-1]["content"]["body"], INTERNAL_ONLY_REPLY)
 
+    def test_reply_identity_is_the_providers_text(self):
+        bridge = FakeReplyBridge()
+        native_input.queue_reply(bridge, ISSUE, SESSION, "activity-1", HF_617_START)
+        import hashlib
+        expected = bridge_module.stable_uuid4("native-reply", "synthetic", ISSUE, SESSION, "activity-1",
+                                              hashlib.sha256(HF_617_START.encode()).hexdigest())
+        self.assertEqual(bridge.queued[0]["id"], expected)  # Same id as a row queued before the filter.
+
     def test_session_prompt_asks_for_colleague_replies(self):
         projected = native_input.NativeInput("org", ISSUE, SESSION, USER, "activity-1", "hi", 1.0,
                                              source="delegation")
@@ -317,6 +363,11 @@ class PostedThroughThePluginTests(unittest.TestCase):
             with patch.object(bridge, "flush"):
                 self.assertTrue(json.loads(chat.handle(bridge, args, context))["ok"])
                 self.assertTrue(json.loads(chat.handle(bridge, args, context))["ok"])  # Same id, same content.
+                # A comment queued before the filter shipped keeps its body on a same-id retry.
+                old = {**args, "id": str(uuid.uuid4())}
+                with patch.object(bridge_module, "_readable", lambda text: text):
+                    self.assertTrue(json.loads(chat.handle(bridge, old, context))["ok"])
+                self.assertTrue(json.loads(chat.handle(bridge, old, context))["ok"])
             self.assertTrue(bridge._send(store.outbox_row(request_id)))
             self.assertEqual([c["body"] for c in remote.comments], [_readable(HF_617_TAKEOVER)])
 

@@ -256,6 +256,12 @@ def _code_spans(text: str) -> list[tuple[int, int]]:
             spans.extend((offset + m.start(), offset + m.end()) for m in re.finditer(r"(`+)[^`\n]+?\1", line))
         offset = end + 1
     return spans
+def _machine_path(path: str) -> bool:
+    """A file on the agent's machine, not an API route or URL path such as /api/v1/x."""
+    if path.startswith("/") and not path.startswith("//"):
+        segments = path.rstrip(".:!?/").split("/")
+        return segments[1] in _FS_ROOTS or bool(_FILE_NAME.search(segments[-1]))
+    return True
 def _local_path_words(path: str) -> tuple[str, bool]:
     """How a person should see a local path: (replacement, is_code). Never a bracketed placeholder.
 
@@ -271,18 +277,25 @@ def _local_path_words(path: str) -> tuple[str, bool]:
         return ("/".join(rest), True) if rest else ("the workspace", False)
     if not segments or (len(segments) <= 2 and segments[0] in _FS_ROOTS | {"~"}
                         and not _FILE_NAME.search(segments[-1])):
-        return "a local folder", False  # /home/ken or ~/x: the name would only say whose machine it is.
+        return "a local folder", False  # /home/sam or ~/x: the name would only say whose machine it is.
     return segments[-1], True
+_MD_LINK = re.compile(r"\[([^\]\n]+)\]\(([^()\s]+)\)")
+def _local_link(match: re.Match) -> str:
+    """A link to a file on the agent's machine cannot open for the reader: keep its words and the name."""
+    target = match.group(2)
+    if not (_LOCAL_PATH.fullmatch(target) and _machine_path(target)):
+        return match.group(0)
+    words, is_code = _local_path_words(target)
+    return f"{match.group(1)} (`{words}`)" if is_code else match.group(1)
 def _mask_local_paths(text: str) -> str:
     """Replace local paths with plain words or names in code, keeping the sentence readable."""
+    text = _MD_LINK.sub(_local_link, text)
     spans = _code_spans(text)
     out, last = [], 0
     for match in _LOCAL_PATH.finditer(text):
         path, start, end = match.group(0), match.start(), match.end()
-        if path.startswith("/") and not path.startswith("//"):
-            segments = path.rstrip(".:!?/").split("/")
-            if segments[1] not in _FS_ROOTS and not _FILE_NAME.search(segments[-1]):
-                continue  # An API route or URL path, not a file on the agent's machine.
+        if not _machine_path(path):
+            continue
         tail = len(path) - len(path.rstrip(".:!?"))
         path, end = path[:len(path) - tail], end - tail
         words, is_code = _local_path_words(path)
@@ -297,7 +310,7 @@ def _mask_local_paths(text: str) -> str:
             last = end
             continue
         before, after = text[last:start], text[end:]
-        if not is_code and re.search(r" ?\($", before) and after.startswith(")"):
+        if not is_code and after.startswith(")") and re.search(r"(?i)\b(?:workspace|folder|directory) ?\($", before):
             # "files in Atlas workspace (/opt/data/workspace)": the aside says nothing to a reader.
             out.append(re.sub(r" ?\($", "", before))
             last = end + 1
@@ -307,39 +320,51 @@ def _mask_local_paths(text: str) -> str:
     out.append(text[last:])
     return "".join(out)
 # Internal execution vocabulary that belongs in native Kanban history and logs, never in Linear.
+# Deliberately narrow: whole internal phrases and exact identifiers, never a single everyday word
+# (board, task, fence, admission, restart) and never a file or symbol name such as native_input.py.
 _TASK_ID = re.compile(r"\bt_[0-9a-f]{8}\b")
 _TASK_SUBJECT = re.compile(r"^(?P<lead>[*_]*)(?:(?P<owner>[A-Z][\w-]*'s|[Tt]he|[Ii]ts|[Tt]his|[Tt]hat|[Oo]ur|[Mm]y|[Yy]our)\s+)?"
                            r"(?:[Nn]ative\s+|[Kk]anban\s+)?(?:[Tt]ask\s+)?[*_`]*t_[0-9a-f]{8}[*_`]*(?![\w-])")
 _RUN_NUMBER = re.compile(r"\b[Rr]un #?\d+(?=\)|[,.;:]|'s\b|\s+(?:is|was|lost|failed|crashed|refused|ended|exited|"
                          r"started|state)\b)")
-_STRONG_INTERNAL = re.compile(r"(?i)quiescen\w*|\bprevious[- ]execution\b|\b(?:execution|admission|claim|ordering|run)"
-                              r"[- ]fence[sd]?\b|\binspect-cleanup\b|\bnative_\w+|\b\w+_not_settled\b|\bworker_lost\b|"
-                              r"\bgave_up\b|\bblock_loop_detected\b")
-_WEAK_INTERNAL = re.compile(r"(?i)\badmission\b|\bfence[sd]?\b")
-_INTERNAL_CONTEXT = re.compile(r"(?i)\b(?:task|worker|gateway|restart\w*|settle\w*|refused|native|board|lost|respawn\w*)\b")
+_RUN_CONTEXT = re.compile(r"(?i)\b(?:gateway|refused|respawn\w*|worker|admission|fence[sd]?|settle\w*|native)\b")
+_INTERNAL_PHRASE = re.compile(
+    r"(?i)\bquiescence (?:is |was )?(?:not )?prov\w*|\bquiescence_proven\b|\bprevious[- ]execution\b|"
+    r"\b(?:execution|admission|claim|ordering|run)[- ]fence[sd]?\b|\b(?:refused|held|blocked) by the (?:[\w-]+ )?fence\b|"
+    r"\bsettle (?:the |its )?admission\b|\badmission (?:is |was )?(?:still )?(?:not )?(?:unknown|unsettled|settled)\b|"
+    r"\b(?:native_)?admission_not_settled\b|\binspect-cleanup\b|\b(?:native )?[Ss]top event \d+\b")
 _BOARD_PHRASE = re.compile(r"(?i)\s+(?:on|in|from)\s+(?:the\s+)?(?:[*`]*[a-z0-9]+(?:[-_][a-z0-9]+)+[*`]*\s+board\b|"
                            r"(?:native\s+|kanban\s+)?board\s+[*`]*[a-z0-9]+(?:[-_][a-z0-9]+)+[*`]*)")
 _SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]*_]*\s+")
 # Quote and list markers and a leading label ("**Minute 2:**") belong to the line, not to its first sentence.
 _LINE_LEAD = re.compile(r"^(\s*(?:>\s*)*(?:(?:[-*+]|\d{1,3}[.)])\s+)?(?:([*_]{1,2})[^*_\n]{1,40}:\2\s+)?)")
+def _internal_sentence(sentence: str) -> bool:
+    words = sentence.replace("`", "")  # Inline code counts only through exact identifiers above.
+    return bool(_TASK_ID.search(words) or _INTERNAL_PHRASE.search(words)
+                or (_RUN_NUMBER.search(words) and _RUN_CONTEXT.search(words)))
+def _outside_code(text: str, change) -> str:
+    """Apply ``change`` to prose only; inline code keeps every character."""
+    out, last = [], 0
+    for lo, hi in _code_spans(text):
+        out += [change(text[last:lo]), text[lo:hi]]
+        last = hi
+    return "".join(out + [change(text[last:])])
 def _internal_parenthetical(match: re.Match) -> str:
     inner = match.group(0)
-    return "" if (_TASK_ID.search(inner) or _RUN_NUMBER.search(inner) or _STRONG_INTERNAL.search(inner)
-                  or re.search(r"(?i)\b(?:native\b|stop event \d+|event \d+\b)", inner)) else inner
-def _internal_sentence(sentence: str) -> bool:
-    return bool(_TASK_ID.search(sentence) or _STRONG_INTERNAL.search(sentence) or (
-        (_WEAK_INTERNAL.search(sentence) or _RUN_NUMBER.search(sentence)) and _INTERNAL_CONTEXT.search(sentence)))
+    return "" if (_TASK_ID.search(inner) or _INTERNAL_PHRASE.search(inner)
+                  or re.fullmatch(r"\s*\(\s*[Rr]un #?\d+\s*\)", inner)) else inner
 def _readable_sentence(sentence: str) -> str:
     """One sentence with task ids, board names and run numbers taken out, or "" when only internals remain."""
     subject = _TASK_SUBJECT.match(sentence)
     if subject:
         owner = subject.group("owner")
-        noun = f"{owner} task" if owner else "The task"
-        sentence = subject.group("lead") + noun + sentence[subject.end():]
+        sentence = subject.group("lead") + (f"{owner} task" if owner else "The task") + sentence[subject.end():]
     sentence = re.sub(r"\s*\([^()\n]*\)", _internal_parenthetical, sentence)
     sentence = _BOARD_PHRASE.sub("", sentence)
-    sentence = re.sub(r"\s+([,.;:!?])", r"\1", re.sub(r"[ \t]{2,}", " ", sentence))
+    sentence = _outside_code(sentence, lambda prose: re.sub(r"(?<=\S)[ \t]+([,.;:!?])(?=\s|$)", r"\1",
+                                                            re.sub(r"(?<=\S)[ \t]{2,}", " ", prose)))
     return "" if _internal_sentence(sentence) else sentence
+_ABBREVIATION = re.compile(r"(?:^|\s)(?:\d{1,3}|e\.g|i\.e|vs|etc|Mr|Mrs|Ms|Dr|St|[A-Z])\.$")
 def _split_sentences(text: str) -> list[str]:
     """Sentences of one line, never split inside code or a link."""
     protected = _code_spans(text) + [(m.start(), m.start() + len(m.group(0).rstrip(".,;:!?")))
@@ -348,7 +373,7 @@ def _split_sentences(text: str) -> list[str]:
     for match in _SENTENCE_END.finditer(text):
         if match.start() <= last or any(lo <= match.start() - 1 < hi for lo, hi in protected):
             continue
-        if re.search(r"(?:^|\s)(?:\d{1,3}|e\.g|i\.e|vs|[A-Z])\.$", text[last:match.start()]):
+        if _ABBREVIATION.search(text[last:match.start()]):
             continue  # A list number, abbreviation or initial, not the end of a sentence.
         parts.append(text[last:match.end()])
         last = match.end()
@@ -357,35 +382,42 @@ def _split_sentences(text: str) -> list[str]:
 def _readable(text: str) -> str:
     """Conservative reader filter for agent-written Linear text.
 
-    Only lines that mention a native task id, a run number or fence/quiescence vocabulary change;
-    every other line, code block and link is returned byte for byte. In a changed line a sentence
-    about the task keeps its meaning ("Task t_1a2b3c4d is blocked" becomes "The task is blocked"),
-    board names and internal asides are dropped, and a sentence that is only internal state goes.
-    Returns "" when nothing readable is left."""
-    if not text or not (_TASK_ID.search(text) or _RUN_NUMBER.search(text) or _STRONG_INTERNAL.search(text)
-                        or _WEAK_INTERNAL.search(text)):
+    Only a line that mentions a native task id, a run number next to execution words, or a whole
+    internal phrase (previous-execution fence, quiescence proven, admission not settled) changes;
+    every other line, every fenced code block and every inline code span keeps each character. In
+    a changed line a sentence about the task keeps its meaning ("Task t_1a2b3c4d is blocked"
+    becomes "The task is blocked"), board names and internal asides are dropped, and a sentence
+    that is only internal state goes. Returns "" when nothing readable is left."""
+    if not text or not any(_internal_sentence(line) for line in text.split("\n")):
         return text
-    out, in_fence = [], None
+    out, fence, removed = [], None, False
     for line in text.split("\n"):
         marker = re.match(r" {0,3}(```+|~~~+)", line)
-        if in_fence is not None or marker:
+        if fence is not None or marker:
             out.append(line)
-            if in_fence is None:
-                in_fence = marker.group(1)
-            elif marker and marker.group(1)[0] == in_fence[0] and len(marker.group(1)) >= len(in_fence):
-                in_fence = None
+            if fence is None:
+                fence = marker.group(1)
+            elif marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+                fence = None
             continue
-        if not (_TASK_ID.search(line) or _RUN_NUMBER.search(line) or _internal_sentence(line)):
+        if not line.strip() and removed and (not out or not out[-1].strip()):
+            continue  # The blank line around a removed line.
+        removed = False
+        if not _internal_sentence(line):
             out.append(line)
             continue
         lead = _LINE_LEAD.match(line).group(1)
         kept = [part for part in (_readable_sentence(sentence.strip()) for sentence in _split_sentences(line[len(lead):]))
                 if part]
-        body = " ".join(kept)
-        if re.sub(r"[\W_]+", "", body):
-            out.append(lead + body)
-        # else: nothing readable is left on this line, so its marker or label ("**Next:**") goes too.
-    return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", "\n".join(out)).strip()
+        if re.sub(r"[\W_]+", "", " ".join(kept)):
+            out.append(lead + " ".join(kept))
+        else:
+            removed = True  # Nothing readable is left, so its marker or label ("**Next:**") goes too.
+    while out and not out[-1].strip():
+        out.pop()
+    while out and not out[0].strip():
+        out.pop(0)
+    return "\n".join(out)
 def _open_fence(text: str) -> bool:
     return sum(1 for line in text.split("\n") if re.match(r" {0,3}```", line)) % 2 == 1
 def _trim_readable(text: str, limit: int) -> str:
@@ -515,10 +547,11 @@ UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check 
                     "board.")
 STALE_STOP = ("This Stop arrived after newer changes to the work, so it wasn't applied. Send Stop again "
               "if the work should still stop.")
-_STOP_REASON = re.compile(r"(?i)^(?:stopped|halted|cancell?ed|handed (?:off|over))\b|\bdo not resume\b|"
-                          r"\bkeep (?:this|the) (?:task|work) stopped\b")
+# A person stopped or handed off the work, not "Stopped at the login page; I need ...".
+_STOP_REASON = re.compile(r"(?i)^(?:stopped|halted|paused|cancell?ed) (?:by|from)\b|^handed (?:off|over)\b|"
+                          r"\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b")
 def _stopped_sentence(reason: str) -> str:
-    """"Stopped by Ken. Do not resume unless Ken asks." reads as a note to the agent; say it to people."""
+    """"Stopped by Sam. Do not resume unless Sam asks." reads as a note to the agent; say it to people."""
     kept, until = [], ""
     for sentence in _split_sentences(reason):
         sentence = sentence.strip()
@@ -2979,8 +3012,8 @@ class Bridge:
         issue_id = row["issue_id"]
         heads, failures = {}, []
         accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
-        # Paths, secrets and internal ids are not a result, however they are shown to people.
-        residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", _readable(_LOCAL_PATH.sub(
+        # Paths, secrets and task ids are not a result, however they are shown to people.
+        residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", _TASK_ID.sub("", _LOCAL_PATH.sub(
             "", _public(raw_summary or ""))), flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
             body = ("The run ended without evidence (a PR, merge, deploy check or findings link), so this "
