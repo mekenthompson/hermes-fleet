@@ -213,6 +213,14 @@ class ContentActionTests(unittest.TestCase):
         replay = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
         self.assertEqual((replay['id'], replay['readback_differences']), (self.request_id, ['description']))
         self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
+        # A reused id whose existing issue has another title is not the issue asked for.
+        with self.assertLogs('hermes_plugins.linear', 'WARNING') as logs, self.assertRaises(LinearError) as caught:
+            self.api.create_issue(self.request_id, 'team-1', 'A different outcome', description=body)
+        self.assertFalse(caught.exception.retryable)
+        self.assertIn('already belongs to an existing issue ABC-2', str(caught.exception))
+        self.assertIn('new id', str(caught.exception))
+        self.assertIn('outcome=refused reason=id_reused', logs.output[-1])
+        self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
 
     def test_autolink_description_response_loss_restart_settles_without_resend(self):
         body = '### Outcome\n\nVisit example.com'
@@ -280,6 +288,34 @@ class ContentActionTests(unittest.TestCase):
         self.assertTrue(caught.exception.retryable)
         self.assertIn('same id', str(caught.exception))
 
+    def test_create_readback_error_is_retryable_under_the_same_id(self):
+        original = self.remote._apply
+        def failing(query, variables):
+            if 'CreatedIssue' in query:
+                return 200, {'data': None, 'errors': [{'message': 'Entity not found', 'extensions': {'code': 'INVALID_INPUT'}}]}
+            return original(query, variables)
+        self.remote._apply = failing
+        with self.assertRaises(LinearError) as caught:
+            self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=BODY)
+        self.assertTrue(caught.exception.retryable)
+        self.assertIn('same id', str(caught.exception))
+        self.remote._apply = original
+        created = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=BODY)
+        self.assertEqual(created['id'], self.request_id)
+        self.assertEqual(self.remote.requests.count('mutation Create'), 2)
+        self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
+
+    def test_project_create_reports_a_renamed_project_as_created(self):
+        original = self.remote._apply
+        def renamed(query, variables):
+            status, payload = original(query, variables)
+            if 'CreatedProject' in query:
+                payload['data']['project']['name'] = 'Renamed by a rule'
+            return status, payload
+        self.remote._apply = renamed
+        created = self.api.create_project(self.request_id, 'Fleet rollout', ['team-1'])
+        self.assertEqual((created['id'], created['readback_differences']), (self.request_id, ['name']))
+
     def test_life_584_editor_rewrite_is_a_successful_create(self):
         """Linear escaped a tilde and rewrote - bullets to * (LIFE-584, 2026-11-02)."""
         authored = LIFE_584_AUTHORED
@@ -326,8 +362,10 @@ class ContentActionTests(unittest.TestCase):
             ('Ratio ~1.5:1', 'Ratio \\~1.5:1'),
             ('- Keeps `--home-cash-bar` at ~1.5:1', '* Keeps `--home-cash-bar` at \\~1.5:1'),
             ('- a\n- b', '* a\n* b'),
-            ('loan_interest and 5 * 3 > 2 | # [x]', 'loan\\_interest and 5 \\* 3 \\> 2 \\| \\# \\[x\\]'),
-            ('Line  \nNext', 'Line\nNext'),
+            ('loan_interest and 5 * 3 | 2 # x!', 'loan\\_interest and 5 \\* 3 \\| 2 \\# x\\!'),
+            ('Line \t\nNext', 'Line\nNext'),
+            ('Line   \nNext', 'Line  \nNext'),
+            ('    code\n\n\n    more', '    code\n\n\n    more'),
             ('Para\n\n\n\nNext\n\n', 'Para\n\nNext'),
             ('\n\nLead', 'Lead'),
             ('- [ ] Check `a`', '- [ ] Check `a`'),
@@ -342,6 +380,13 @@ class ContentActionTests(unittest.TestCase):
             ('Ratio ~1.5:1', 'Ratio \\~1.6:1'),          # a real text change still differs
             ('- [ ] Done', '- [x] Done'),
             ('Visit example.com', 'Visit \\[example.com](<http://example.com>)'),
+            ('Line  \nNext', 'Line\nNext'),               # a hard line break is kept
+            ('`code`', '\\`code\\`'),                     # code versus literal ticks
+            ('[a](http://x.test)', '\\[a\\](http://x.test)'),  # a link versus literal brackets
+            ('<b>x</b>', '\\<b>x\\</b>'),                 # HTML versus literal text
+            ('# H', '\\# H'), ('- item', '\\- item'), ('1. a', '1\\. a'), ('> q', '\\> q'),
+            ('- # not a heading', '- \\# not a heading'),
+            ('    code\n\n\n    more', '    code\n\n    more'),  # indented code keeps blank lines
         ):
             with self.subTest(expected=expected):
                 self.assertFalse(markdown_matches(actual, expected))

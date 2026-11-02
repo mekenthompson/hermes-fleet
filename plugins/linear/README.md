@@ -33,8 +33,13 @@ it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` b
 trailing spaces and repeated blank lines. Outside code those count as the same text. A create
 whose readback still differs is reported as created, with `readback_differences` naming the
 fields and a `content.write` `readback_differs` warning; it is never refused, because a refusal
-invites a retry under a new id, which is how duplicates happen. Only an issue that cannot be read
-back yet is refused, and the same id and content can be retried safely.
+invites a retry under a new id, which is how duplicates happen. Escapes that change structure
+(code ticks, link brackets, HTML angle brackets, an escaped block marker at the start of a line)
+and hard line breaks still count. A readback that fails or finds nothing is refused as
+retryable: the same id and content can be retried safely. An id that already belongs to an
+issue or project with a different title, name, team, project or parent is refused
+(`content.write` `id_reused`), naming that issue; use it if it is the one meant, otherwise use a
+new id.
 
 Ordinary content actions need no task link or chat ownership claim. They retain current app,
 workspace and specialist authorization. Queued content receipts confirm durable capture, not
