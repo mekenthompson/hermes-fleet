@@ -62,7 +62,8 @@ SCHEMA = {
         "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
         "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
-        "project": {"type": "string"}, "parent": {"type": "string"}, "related": {"type": "string"},
+        "project": {"type": "string", "description": "create_issue: project id or exact project name. Required unless parent has a project, which is then used. If unsure, omit it: the reply lists the team's active projects; pick the one that fits the work and retry. Use \"none\" only when the work fits no project. Never ask the user for project ids."},
+        "parent": {"type": "string"}, "related": {"type": "string"},
         "relation": {"type": "string", "enum": ["blocks", "blocked_by", "related"]},
         "body": {"type": "string", "description": "Human-readable comment or instruction; never an execution grant. Lead with verified progress, remaining work and next action. Use Linear Markdown and actual newlines for longer updates; a short sentence needs no empty headings. Preserve code and links."},
     }, "required": ["action"], "additionalProperties": False},
@@ -212,13 +213,44 @@ def _formatting_tip(content: Any) -> str:
     return ""
 
 
+def _issue_project(bridge: Any, team: str, project: str, parent: str | None) -> tuple[str | None, str]:
+    """Every new issue lands in a project: the one named, the parent's, or an explicit "none"."""
+    if project.casefold() == "none":
+        return None, ""
+    if not project and parent:
+        inherited = ((bridge.api.issue(parent) or {}).get("project") or {}).get("id")
+        if inherited:
+            return inherited, ""
+    active = bridge.api.team_projects(team)
+    if project:
+        matches = [item["id"] for item in active
+                   if project == item["id"] or project.casefold() == item["name"].casefold()]
+        if len(matches) == 1:
+            return matches[0], ""
+        try:
+            if not matches and str(uuid.UUID(project)) == project.lower():
+                return project, ""  # An exact id outside the listed page; creation still verifies it.
+        except ValueError:
+            pass
+        message = f"No single active project in this team matches {project!r}."
+    else:
+        message = "A new issue needs a project so it shows up in the right Linear view."
+    return None, _reply(False, message + " Choose the project from this list that fits the work and retry with "
+                        "its id or exact name, or project \"none\" if it fits none. Decide from the conversation; "
+                        "do not ask the user for ids.", code="project_required", projects=active)
+
+
 def _plan(bridge: Any, args: dict, action: str) -> str:
     if action == "create_issue":
         client_id, title, team = _uuid(args.get("id")), _text(args, "title"), _text(args, "team")
         if not title or not team:
             raise ValueError("create_issue needs title and team.")
+        parent = _text(args, "parent") or None
+        project_id, refusal = _issue_project(bridge, team, _text(args, "project"), parent)
+        if refusal:
+            return refusal
         created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
-                                          project_id=args.get("project") or None, parent_id=args.get("parent") or None)
+                                          project_id=project_id, parent_id=parent)
         return _reply(True, "Created an undelegated issue." + _formatting_tip(args.get("description")), issue=created)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")

@@ -34,9 +34,16 @@ class ContentRemote(FakeLinear):
                 'lead': None, 'teams': {'nodes': [{'id': team} for team in data['teamIds']]}}}}
         if 'issueCreate' in query:
             data = variables['input']
-            issue = self.add_issue(data['id'], 'ABC-2', project=None)
-            issue.update(title=data['title'], description=data.get('description'), assignee=None, parent=None)
+            self.created_issue = dict(data)
+            issue = self.add_issue(data['id'], 'ABC-2', project=data.get('projectId'))
+            issue.update(title=data['title'], description=data.get('description'), assignee=None,
+                         parent={'id': data['parentId']} if data.get('parentId') else None)
             return 200, {'data': {'issueCreate': {'success': True}}}
+        if 'TeamProjects' in query:
+            nodes = [{'id': 'proj-rollout', 'name': 'Fleet Rollout', 'completedAt': None, 'canceledAt': None, 'archivedAt': None},
+                     {'id': 'proj-done', 'name': 'Old Work', 'completedAt': '2026-10-01T00:00:00Z', 'canceledAt': None, 'archivedAt': None},
+                     {'id': 'proj-linear', 'name': 'Linear UX', 'completedAt': None, 'canceledAt': None, 'archivedAt': None}]
+            return 200, {'data': {'team': {'id': variables['id'], 'projects': {'nodes': nodes}}}}
         if 'issueUpdate' in query and 'description' in variables['input']:
             self.issues[variables['id']]['description'] = variables['input']['description']
         return super()._apply(query, variables)
@@ -391,13 +398,54 @@ class ContentActionTests(unittest.TestCase):
     def test_create_long_paragraph_warns_without_rewriting(self):
         long = 'Human prose. ' * 60
         args = {'action': 'create_issue', 'id': str(uuid.uuid4()), 'title': 'Outcome',
-                'team': 'team-1', 'description': long}
+                'team': 'team-1', 'description': long, 'project': 'Fleet Rollout'}
         reply = json.loads(chat.handle(self.bridge, args, self.context))
         self.assertTrue(reply['ok'])
         self.assertIn('Formatting tip', reply['message'])
         created = self.remote.issues[args['id']]
         self.assertEqual(created['description'], long)
         self.assertIsNone(self.store.get(args['id']))
+
+    def create(self, **fields):
+        args = {'action': 'create_issue', 'id': str(uuid.uuid4()), 'title': 'Outcome', 'team': 'team-1', **fields}
+        return args['id'], json.loads(chat.handle(self.bridge, args, self.context))
+
+    def test_create_without_a_project_lists_active_projects_and_creates_nothing(self):
+        request_id, reply = self.create()
+        self.assertFalse(reply['ok'])
+        self.assertEqual(reply['code'], 'project_required')
+        self.assertEqual(reply['projects'], [{'id': 'proj-rollout', 'name': 'Fleet Rollout'},
+                                             {'id': 'proj-linear', 'name': 'Linear UX'}])
+        self.assertIn('do not ask the user', reply['message'])
+        self.assertNotIn(request_id, self.remote.issues)
+        self.assertEqual(self.mutations(), [])
+
+    def test_create_resolves_a_project_by_exact_name_or_id(self):
+        for project, expected in (('linear ux', 'proj-linear'), ('proj-rollout', 'proj-rollout')):
+            with self.subTest(project=project):
+                request_id, reply = self.create(project=project)
+                self.assertTrue(reply['ok'], reply)
+                self.assertEqual(self.remote.issues[request_id]['project'], {'id': expected})
+
+    def test_create_refuses_an_unknown_or_finished_project_name(self):
+        for project in ('Old Work', 'Linear'):
+            with self.subTest(project=project):
+                request_id, reply = self.create(project=project)
+                self.assertEqual(reply['code'], 'project_required')
+                self.assertNotIn(request_id, self.remote.issues)
+
+    def test_create_inherits_the_parent_issue_project(self):
+        self.remote.add_issue('parent-1', 'ABC-7', project='proj-linear')
+        request_id, reply = self.create(parent='ABC-7')
+        self.assertTrue(reply['ok'], reply)
+        self.assertEqual(self.remote.created_issue['projectId'], 'proj-linear')
+        self.assertEqual(self.remote.created_issue['parentId'], 'ABC-7')
+
+    def test_explicit_none_creates_without_a_project(self):
+        request_id, reply = self.create(project='none')
+        self.assertTrue(reply['ok'], reply)
+        self.assertIsNone(self.remote.issues[request_id]['project'])
+        self.assertNotIn('projectId', self.remote.created_issue)
 
     def test_project_long_paragraph_warns_without_rewriting(self):
         body = 'Project prose. ' * 60
@@ -418,7 +466,7 @@ class ContentActionTests(unittest.TestCase):
                 with self.subTest(action=action, body_length=len(body)):
                     request_id = str(uuid.uuid4())
                     args = {'action': action, 'id': request_id, 'issue': 'ABC-1',
-                            'team': 'team-1', 'title': 'Outcome', 'name': 'Outcome',
+                            'team': 'team-1', 'title': 'Outcome', 'name': 'Outcome', 'project': 'none',
                             'description': body, 'body': body,
                             'expected_description': self.remote.issues['issue-1']['description']}
                     reply = json.loads(chat.handle(self.bridge, args, self.context))
