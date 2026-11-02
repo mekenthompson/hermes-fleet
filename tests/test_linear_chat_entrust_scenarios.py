@@ -672,6 +672,41 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.bridge.tick()
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
 
+    def test_asking_again_after_a_crash_and_a_reassignment_does_not_start_the_work(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None)  # crash before routing was queued
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
+        self.authority.issues[ISSUE]["updatedAt"] = later
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
+        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(again["native"]["admitted"], again)
+        self.assertTrue(again["message"].startswith("Not started:"), again["message"])
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(self.delegate_rows(), ["failed"])  # its queued delegate never goes out
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
+
+    def test_parked_chat_work_resumed_later_gets_its_delegate(self):
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        for _ in range(2):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # parked: not shown as worked on
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)  # someone resumes it on the board
+        self.claim(task_id)
+        for _ in range(4):
+            self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "running")
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+
     def test_native_input_stop_control_reaches_chat_started_work_before_the_delegate_lands(self):
         reply = self.ask({"action": "work_on", "issue": ISSUE})
         task_id = reply["native"]["task_id"]

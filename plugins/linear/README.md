@@ -69,13 +69,14 @@ itself. Delegated children return the request to their parent.
 When work starts, the delegate is queued inside the issue's lock, before admission, from the
 issue version read under that lock, so the status writes that follow from the work are queued
 after it. A chat admission that finds no delegate proceeds only when no person changed state,
-assignee or delegate since the chat request (a pending delegate of ours skips that history read
-only while Linear has not moved since it was queued). If admission is superseded, its queued
-delegate is dropped and recovery does not add one: parked work is not shown as worked on.
+assignee or delegate since the chat request (the history read is skipped only when Linear has
+not moved since the request). If admission is superseded, its queued delegate is dropped and
+recovery adds none while the parked task has not run: parked work is not shown as worked on.
+Once someone resumes it and a worker claims it, recovery routes the delegate as usual.
 The chat reply says only what is true: Linear shows the delegate, is being updated (a delegate
 write is still pending), the update will be retried (only when delegate recovery's own
 conditions hold), a person removed this agent as delegate or otherwise changed routing (not
-re-added), or it was not updated and nothing retries it now.
+re-added; only when Linear history proves it), or it was not updated and nothing retries it now.
 Delegate recovery retries chat-started routing that was refused before any write, once per
 binding. For chat-started work every delegate recovery is fenced from the earlier of the
 chat request and the worker's claim: a person's later change of state, assignee or delegate

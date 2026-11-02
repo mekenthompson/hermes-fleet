@@ -1592,11 +1592,10 @@ class Bridge:
 
         Only when no person changed state, assignee or delegate since the chat request: someone
         reassigning or undelegating it wins, however late admission resumes (after a crash, or
-        while our delegate write is held). A pending delegate of ours short-cuts the history read
-        only when Linear has not moved since that delegate was queued.
+        while our delegate write is pending or held). The history read is skipped only when
+        Linear has not moved since the request.
         """
-        pending = self.store.pending_delegate(issue_id)
-        if pending and pending.get("expected_updated_at") == issue.get("updatedAt"):
+        if iso_ms(issue.get("updatedAt")) <= float(payload["source_ms"]):
             return True
         if self._human_routing_changed(issue_id, float(payload["source_ms"])):
             diag.evt("claim.decision", "skipped", "human_routing_change", iss=issue_id)
@@ -1630,7 +1629,9 @@ class Bridge:
                      and node.get("actorId") != viewer]
             if any((node.get("fromDelegate") or {}).get("id") == viewer and not node.get("toDelegate") for node in human):
                 return "removed"
-            if human or not complete:
+            if not complete:
+                return "unknown"  # Unprovable: blame nobody.
+            if human:
                 return "changed"
             revision = self.store.binding_revision(issue_id)
             if self.store.native_intent(f"delegate-recovery:{issue_id}:{revision}"):
@@ -2498,8 +2499,6 @@ class Bridge:
         binding = self.store.native_binding(issue_id, adapter.executor_profile)
         if not binding or binding.get("task_id") != row["task_id"]:
             return self._log_delegate(row, "binding_mismatch")
-        if (self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}).get("chat_superseded"):
-            return self._log_delegate(row, "admission_superseded", quiet=True)  # Parked chat work never started: no delegate.
         revision = self.store.binding_revision(issue_id)
         key = f"delegate-recovery:{issue_id}:{revision}"
         retry_chat = False
@@ -2514,6 +2513,10 @@ class Bridge:
                 task.id, issue_id=issue_id, state="done")):
             return self._log_delegate(row, "task_finished", quiet=True)  # Archived, or verified finished: nothing waits on the agent any more.
         claim = self._current_claim(adapter, task)
+        if (claim is None and task.status != "running" and
+                (self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}).get("chat_superseded")):
+            # Parked chat work that never ran gets no delegate; once someone resumes it and a worker claims it, it does.
+            return self._log_delegate(row, "admission_superseded", quiet=True)
         if task.status == "running" and claim is None:
             return self._log_delegate(row, "claim_unconsumed")  # Running without a readable claim yet; decide once it is consumed.
         source = claim.created_at if claim is not None else getattr(task, "created_at", None)

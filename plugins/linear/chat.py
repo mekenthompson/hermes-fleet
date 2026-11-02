@@ -329,7 +329,10 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
                 expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester,
                 **({"recorded_done": True} if recorded_done else {}))
             # A retried request returns its earlier row: only a still-pending one is on its way.
-            routing = ("queued" if (bridge.store.outbox_row(row_id) or {}).get("state") == "pending"
+            current = bridge.store.outbox_row(row_id) or {}
+            on_its_way = (current.get("state") == "pending" and not current.get("hold_reason")
+                          and not (current.get("payload") or {}).get("reconcile_required"))
+            routing = ("queued" if on_its_way
                        else _held(bridge, issue_id, "an earlier delegate update for this work did not go through"))
         except (LinearError, ValueError) as exc:
             routing = _held(bridge, issue_id, str(exc))

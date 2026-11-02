@@ -1039,18 +1039,12 @@ class Store:
             return bool(db.execute(self._DELEGATE_PENDING, (issue_id,)).fetchone() or db.execute(
                 "SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
                 "AND json_extract(payload, '$.expected_binding_revision')=? LIMIT 1", (issue_id, revision)).fetchone())
-    def pending_delegate(self, issue_id: str) -> dict[str, Any] | None:
-        """The payload of this issue's queued delegate write, if any."""
-        with self._tx() as db:
-            row = db.execute("SELECT payload FROM outbox WHERE kind='delegate' AND state='pending' "
-                             "AND json_extract(payload, '$.issue_id')=? ORDER BY rowid LIMIT 1", (issue_id,)).fetchone()
-        return json.loads(row[0]) if row else None
     def drop_unsent_delegate(self, issue_id: str, task_id: str, *, at: float) -> int:
         """Refuse this task's queued delegate writes that never started; recovery treats them as decided."""
         with self._tx() as db:
-            return db.execute("UPDATE outbox SET state='failed', payload=json_set(json_set(json_set(payload, "
-                              "'$.failure_kind', 'rejected'), '$.last_error', 'Admission was superseded before the delegate was sent'), "
-                              "'$.admission_superseded', json('true')) WHERE kind='delegate' AND state='pending' "
+            return db.execute("UPDATE outbox SET state='failed', payload=json_set(payload, "
+                              "'$.failure_kind', 'rejected', '$.last_error', 'Admission was superseded before the delegate was sent', "
+                              "'$.admission_superseded', json('true'), '$.reported', 1) WHERE kind='delegate' AND state='pending' "
                               "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.task_id')=? "
                               "AND json_type(payload, '$.write_started')='false'", (issue_id, task_id)).rowcount
     _DELEGATE_WRITTEN = ("SELECT 1 FROM outbox WHERE kind='delegate' AND json_extract(payload, '$.issue_id')=? "
