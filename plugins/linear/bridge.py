@@ -322,12 +322,21 @@ def _existing_work_notice(status: str | None) -> str:
         return "Earlier work on this issue has already finished, so nothing new was started."
     return ("This issue already has paused work, so nothing new was started. Ask the agent to resume it "
             "when ready.")
-def _same_work_notice(status: str | None) -> str:
-    """The Agent Session our own chat-started delegation opens: acknowledged as the same work."""
+def _same_work_notice(status: str | None, from_chat: bool, recorded: bool = False) -> str:
+    """Another Agent Session on already admitted work, such as our own chat delegation's echo."""
+    if not from_chat:
+        if status in ("done", "archived"):
+            return "This work has already finished, so nothing new was started."
+        if status in ("running", "ready", "review"):
+            return "The agent is already working on this, so nothing new was started."
+        return "This issue already has paused work, so nothing new was started."
     if status in ("done", "archived"):
         return "This work was already finished from the chat that asked, so nothing new was started."
+    if recorded:
+        return "This work is being recorded as finished from chat, so nothing new was started."
     if status in ("running", "ready", "review"):
-        return "This is the work already started from chat, so nothing new was started. Updates continue here."
+        return ("This is the work already started from chat, so nothing new was started. Updates are "
+                "posted on this issue and in that chat.")
     return "This work was set up from chat and is waiting to start, so nothing new was started."
 STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
 UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
@@ -1250,7 +1259,10 @@ class Bridge:
                 if row.get("owner_ref") != session_id:
                     # Our own chat-started work (or a re-delegation): the same work, never a second session.
                     task = self.native_status(issue["id"])
-                    self._decline(issue["id"], session_id, _same_work_notice(task.get("status")), activity_id=session_id)
+                    created = (self.store.native_intent(f"create:{issue['id']}") or {}).get("payload") or {}
+                    notice = _same_work_notice(task.get("status"), created.get("origin") == "chat",
+                                               created.get("record_done") is True)
+                    self._decline(issue["id"], session_id, notice, activity_id=session_id)
                 return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
@@ -1494,7 +1506,13 @@ class Bridge:
                                                       {"state": "applied", "task_id": row["task_id"]})
         if created.get("state") != "applied" or created.get("task_id") != row["task_id"]:
             return False
-        # The chat request authorized this creation; Linear routing to this app follows it.
+        if payload.get("record_done"):
+            # Work already finished in chat is never runnable: only _record_done settles it,
+            # even after a crash between creation and completion. Never admitted here.
+            diag.evt("claim.decision", "skipped", "record_done_parked", iss=issue_id, task=row["task_id"])
+            return True
+        # The chat request authorized this creation; Linear routing to this app follows it,
+        # unless someone has since delegated the issue elsewhere.
         from_chat = payload.get("origin") == "chat"
         key = f"activate:{issue_id}:{row['task_id']}"
         prior = self.store.native_intent(key)
@@ -1522,8 +1540,9 @@ class Bridge:
         self.store.native_intent_prepare(key, request)
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         issue = self._effect_issue(issue_id)
+        delegate_id = (issue.get("delegate") or {}).get("id")
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
-                (not from_chat and (issue.get("delegate") or {}).get("id") != self.api.viewer_id()) or
+                (delegate_id != self.api.viewer_id() and (not from_chat or delegate_id is not None)) or
                 (issue.get("state") or {}).get("type") in CLOSED):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission"})
             if stop:
@@ -1741,8 +1760,15 @@ class Bridge:
                 and created["payload"].get("origin") == "chat")
         if record_done:
             if not self._recorded_done(issue_id, task_id):
+                diag.evt("chat.record_done", "refused", "existing_binding", iss=issue_id, task=task_id)
                 raise LinearError("This issue already has native work; read status instead of recording it as done", retryable=False)
             return self._record_done(row, adapter, record_done)
+        task = adapter.require_task(task_id)
+        if self._recorded_done(issue_id, task_id) and task.status not in ("done", "archived"):
+            # An interrupted record_done never becomes runnable; only repeating it finishes it.
+            diag.evt("chat.entrust", "refused", "record_done_parked", iss=issue_id, task=task_id)
+            raise LinearError("This issue is being recorded as already done from chat; repeat that request "
+                              "to finish it. Nothing was started", retryable=False)
         if ours:
             self._assignment_activation(row)  # Idempotent: an applied admission is never repeated.
         task = adapter.require_task(task_id)
@@ -1751,6 +1777,9 @@ class Bridge:
             # After admission, so the chat hears checkpoints and the result, not our own unblock.
             adapter.subscribe_origin(task_id, route)
         activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
+        diag.evt("chat.entrust", "applied" if activation.get("accepted") else "skipped",
+                 "-" if activation.get("accepted") else ("created_from_chat" if ours else "existing_binding"),
+                 iss=issue_id, task=task_id)
         return {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
                 "admitted": bool(activation.get("accepted")), "chat_subscribed": subscribed}
 
@@ -1773,8 +1802,10 @@ class Bridge:
                 self._capture_native_event(issue_id, token, [], at=self.clock())
             if not adapter.complete_recorded(task.id, token, summary=record_done["summary"],
                                              evidence=record_done.get("evidence") or []):
+                diag.evt("chat.record_done", "refused", "native_changed", iss=issue_id, task=task.id)
                 raise LinearError("The task changed before it could be recorded as done; inspect it", retryable=False)
             task = adapter.require_task(task.id)
+        diag.evt("chat.record_done", "applied", iss=issue_id, task=task.id)
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status, "recorded_done": True,
                 "worker_started": False}
 

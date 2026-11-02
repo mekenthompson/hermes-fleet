@@ -46,7 +46,7 @@ ACTIONS = frozenset({
     "webhook.delivery", "session.start", "session.reuse", "claim.decision", "handoff.decision",
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
-    "ingress.parked", "api.result", "diag.throttled", "diag.config",
+    "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -77,6 +77,8 @@ REASONS = frozenset({
     # session / claim / handoff
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
+    # chat entrust / record_done
+    "record_done_parked", "created_from_chat",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",

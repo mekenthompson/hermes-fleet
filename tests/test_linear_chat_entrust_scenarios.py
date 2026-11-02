@@ -33,7 +33,7 @@ except Exception as exc:
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat
-from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
+from hermes_fleet_linear_plugin.bridge import Bridge, Kanban, _same_work_notice
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
 from test_linear_specialist_authorization import Authority, ISSUE, TEAM, PROJECT, USER, VIEWER, issue_record
@@ -244,6 +244,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(len([r for r in self.authority.activity_records if r["agentSessionId"] == "echo-session"]), 1)
 
     def test_work_on_an_existing_issue_binds_and_starts_it(self):
+        self.authority.issues[ISSUE]["assignee"] = {"id": USER}  # a human owns the issue
         reply = self.ask({"action": "work_on", "issue": ISSUE})
         self.assertTrue(reply["ok"], reply)
         native = reply["native"]
@@ -253,6 +254,10 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [native["task_id"]])
         self.flush()
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
+        self.assertEqual(self.authority.issues[ISSUE]["assignee"], {"id": USER})  # the human assignee is untouched
+        writes = [query for query in self.authority.mutations if "issueUpdate" in query]
+        self.assertTrue(writes)
+        self.assertFalse(any("assigneeId" in query for query in writes), writes)
         status = self.ask({"action": "status", "issue": ISSUE})
         self.assertTrue(status["native"]["linked"])
 
@@ -340,6 +345,63 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.tick()  # the existing recovery path finishes the chat admission
         self.assertEqual(self.board.get(task_id).status, "ready")
         self.assertEqual(self.tasks(), [task_id])
+
+    def test_record_done_crash_before_completion_never_runs_on_recovery(self):
+        record = {"summary": "Proxy rolled out and checked live.", "evidence": ["https://ci.example/run/42"]}
+        with patch.object(self.bridge, "_record_done", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None, record_done=record)
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        for _ in range(3):
+            self.bridge.tick()  # recovery must not admit work already finished in chat
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
+        # Asking to start it is refused; nothing runs.
+        refused = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertFalse(refused["ok"], refused)
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        # Repeating the record finishes it as done with the evidence, still without a run.
+        again = self.bridge.entrust(ISSUE, route=None, record_done=record)
+        self.assertEqual((again["task_id"], again["status"], again["worker_started"]), (task_id, "done", False))
+        events = self.history(task_id)
+        self.assertNotIn("unblocked", events)
+        self.assertNotIn("claimed", events)
+        self.assertIsNone(self.board.get(task_id).current_run_id)
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_record_done_crash_mid_completion_never_runs_on_recovery(self):
+        # The crash lands after creation and binding, inside record_done before the activation fence.
+        original = self.bridge.store.native_intent_prepare
+
+        def crash(key, request):
+            if key.startswith("activate:"):
+                raise RuntimeError("crash")
+            return original(key, request)
+        with patch.object(self.bridge.store, "native_intent_prepare", side_effect=crash):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None, record_done={"summary": "Done.", "evidence": []})
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
+
+    def test_recovery_of_chat_admission_respects_a_later_delegation_elsewhere(self):
+        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.entrust(ISSUE, route=None)
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        self.authority.issues[ISSUE]["delegate"] = {"id": str(uuid.UUID(int=0x99, version=4))}
+        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
+        self.bridge.tick()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertNotIn("unblocked", self.history(task_id))
+
+    def test_another_session_on_assignment_work_gets_a_neutral_notice(self):
+        self.assertIn("already working on this", _same_work_notice("running", False))
+        for status in ("running", "blocked", "done"):
+            self.assertNotIn("chat", _same_work_notice(status, False))
+        self.assertNotIn("continue here", _same_work_notice("running", True))
 
 
 class OriginRouteTests(unittest.TestCase):
