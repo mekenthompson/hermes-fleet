@@ -58,6 +58,12 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertIn("permission-contents: write", mint)
         self.assertIn("permission-pull-requests: write", mint)
         self.assertIn("permission-workflows: write", mint)
+        # Exactly these App scopes, no more: any new permission-* input must be a deliberate change here.
+        self.assertEqual(
+            set(re.findall(r"(?m)^\s+(permission-[a-z-]+:.*?)\s*$", mint)),
+            {"permission-contents: write", "permission-pull-requests: write", "permission-workflows: write"},
+        )
+        self.assertEqual(len(re.findall(r"(?m)^\s+permission-", mint)), 3)
         self.assertNotIn("skip-token-revoke", self.text)
         # The token flows to one sink: gh's environment in the update step.
         self.assertEqual(self.text.count(APP_TOKEN), 1)

@@ -108,8 +108,9 @@ jobs:
           - {lane: kanban, shard: 1/3}
           - {lane: kanban, shard: 2/3}
           - {lane: kanban, shard: 3/3}
-          - {lane: origin, shard: 1/2}
-          - {lane: origin, shard: 2/2}
+          - {lane: origin, shard: 1/3}
+          - {lane: origin, shard: 2/3}
+          - {lane: origin, shard: 3/3}
           - {lane: native, shard: ''}
     name: runtime (${{ matrix.lane }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     steps:
