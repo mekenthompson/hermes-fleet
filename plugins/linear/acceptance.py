@@ -6,10 +6,13 @@ commit statuses and Actions runs. Then, and only then, the required checks are
 proved from GitHub Actions jobs instead, with the safeguards of hermes-agent
 #133 / a3faa265: every requirement pinned to the GitHub Actions app, the exact
 head SHA, the latest attempt of trusted runs (pull_request, push or merge_group)
-whose head repository is the PR's own repository and whose workflow file exists
-on the base branch, complete pagination, and a final PR re-read that still shows
-the same head and base (merged is accepted, closed without merging is not).
-Anything this path cannot decide stays unverified; it is never accepted.
+whose head repository is the PR's own repository and whose workflow file (for the
+runs that produce a required check) exists on the base branch, complete
+pagination, and a final PR re-read that still shows the same head and base
+(merged is accepted, closed without merging is not). Nothing is accepted that is
+not proved. Where Actions cannot stand in for the checks at all (requirements that
+are not Actions jobs, a fork, only untrusted runs) the answer is the definite
+"unprovable"; only GitHub refusing or not answering stays unverified.
 
 ``unverified`` separates "GitHub could not be asked" (refused, unreachable,
 still running) from "GitHub answered no" (a check failed, the PR was closed, no
@@ -139,15 +142,20 @@ def _trusted_workflow_path(path: Any) -> bool:
             and ".." not in path.split("/") and (path.endswith(".yml") or path.endswith(".yaml")))
 
 
-def _trusted_run(run: dict, repo: str) -> None:
-    """Fail closed unless this run is a workflow of the protected repository itself."""
-    if not _trusted_workflow_path(run.get("path")):
-        raise ValueError("an Actions run on the PR head has no trusted workflow provenance")
+def _trusted_run(run: dict, repo: str, sha: str) -> bool:
+    """A required-check event of the protected repository itself, on the exact head.
+
+    Other events (workflow_dispatch, pull_request_target, schedule ...), runs whose head
+    repository is another repository and runs outside .github/workflows are not evidence.
+    """
     head_repo = run.get("head_repository")
-    if (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo:
-        raise ValueError("an Actions run on the PR head comes from another repository")
+    if (run.get("head_sha") != sha or run.get("event") not in TRUSTED_EVENTS
+            or not _trusted_workflow_path(run.get("path"))
+            or (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo):
+        return False
     if not isinstance(run.get("run_attempt"), int) or run["run_attempt"] < 1:
         raise ValueError("an Actions run attempt is missing")
+    return True
 
 
 def _classify(job: dict, sha: str) -> str:
@@ -169,72 +177,76 @@ def _current_pr(gh: Callable[..., Any], repo: str, number: int, sha: str, branch
 
 
 def actions_fallback(receipt: dict, url: str, *, gh: Callable[..., Any] | None = None) -> dict:
-    """Prove Actions-pinned requirements from exact-head workflow jobs. Never accepts what it cannot decide."""
+    """Prove Actions-pinned requirements from exact-head workflow jobs. Never accepts what it cannot decide.
+
+    Classes: success; failure/infra (a job's own conclusion); pending (a job or the PR's CI has not
+    finished); missing; closed/stale (PR closed unmerged or its head moved); "unprovable" (a definite
+    answer that Actions cannot stand in for these checks: not Actions jobs, a fork, or only runs that
+    are not trusted evidence); auth/infra at top level (GitHub refused or did not answer the reads).
+    """
     gh = gh or gh_api
     match = _PR.fullmatch(url)
     repo, number, sha = match[1], int(match[2]), receipt["head_sha"]
     out = {**receipt, "ok": False, "checks": [], "evidence_source": "actions"}
 
-    def undecided(detail: str, classification: str = "auth") -> dict:
-        return {**out, "classification": classification,
-                "detail": f"GitHub refused the Checks read and Actions evidence {detail}"}
+    def result(classification: str, detail: str, checks: list | None = None) -> dict:
+        return {**out, "checks": checks or [], "classification": classification, "detail": detail}
 
     if not isinstance(sha, str) or not _SHA.fullmatch(sha):
-        return undecided("has no exact head to check")
+        return result("infra", "GitHub returned no exact head commit for the pull request")
     try:
         required = sorted({(str(row["context"]), row.get("app_id")) for row in receipt["required"]}, key=str)
     except (KeyError, TypeError):
-        return undecided("cannot read the required checks", "infra")
+        return result("infra", "GitHub returned an unreadable list of required checks")
     foreign = [context for context, app_id in required if app_id != ACTIONS_APP_ID]
     if foreign:
-        return undecided("cannot prove checks that are not pinned to GitHub Actions: " + ", ".join(foreign)[:200])
+        return result("unprovable", "the agent's GitHub access cannot read check results, and the required checks "
+                      + ", ".join(foreign)[:200] + " are not GitHub Actions jobs, so they cannot be confirmed another way")
     try:
         refusal, detail, pr = _current_pr(gh, repo, number, sha, None)
         if refusal:
-            return {**out, "classification": refusal, "detail": detail}
+            return result(refusal, detail)
         if (pr["head"].get("repo") or {}).get("full_name") != repo:
-            return undecided("cannot vouch for a pull request from another repository")
-        branch = pr["base"]["ref"]
+            return result("unprovable", "the pull request comes from a fork, and the agent's GitHub access can only "
+                                        "confirm checks from the repository's own Actions runs")
+        branch, still_open = pr["base"]["ref"], pr["state"] == "open"
         runs = _rows(gh(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100", paginate=True), "workflow_runs")
-        trusted, untrusted = [], False
-        for run in runs:
-            if run.get("head_sha") != sha:
-                continue
-            if run.get("event") not in TRUSTED_EVENTS:
-                untrusted = True  # workflow_dispatch, pull_request_target and the like are not evidence
-                continue
-            _trusted_run(run, repo)
-            trusted.append(run)
-        if not trusted and untrusted:
-            return undecided("has only untrusted runs on the PR head", "infra")
-        for path in sorted({run["path"] for run in trusted}):
-            try:
-                body = gh(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}")
-            except Denied as exc:
-                if exc.status == "404":
-                    return undecided("names a workflow that is not on the base branch", "infra")
-                raise
-            if not isinstance(body, dict) or body.get("type") != "file" or body.get("path") != path:
-                return undecided("names a workflow that is not a file on the base branch", "infra")
-        jobs = []
+        trusted = [run for run in runs if _trusted_run(run, repo, sha)]
+        running = not trusted or any(run.get("status") not in (None, "completed") for run in trusted)
+        if not trusted and runs and not still_open:
+            return result("unprovable", "the pull request's head has only GitHub Actions runs that are not trusted "
+                                        "evidence (manually started or run from another repository)")
+        candidates: dict[Any, list] = {}
         for run in trusted:
             for job in _rows(gh(f"repos/{repo}/actions/runs/{int(run['id'])}/jobs?filter=latest&per_page=100",
                                 paginate=True), "jobs"):
-                if job.get("run_attempt") == run["run_attempt"]:
-                    jobs.append((run, job))
-        by_name: dict[Any, list] = {}
-        for run, job in jobs:
-            by_name.setdefault(job.get("name"), []).append((run, job))
-        outcomes, checks = [], []
+                if job.get("run_attempt") == run["run_attempt"]:  # earlier attempts of a re-run are history
+                    candidates.setdefault(job.get("name"), []).append((run, job))
+        # Only workflows that produce a required check must be the base branch's own workflows;
+        # an unrelated workflow the PR adds is not evidence and does not block.
+        on_base: dict[str, bool] = {}
+        for path in sorted({run["path"] for context, _ in required for run, _job in candidates.get(context, [])}):
+            try:
+                body = gh(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}")
+                on_base[path] = isinstance(body, dict) and body.get("type") == "file" and body.get("path") == path
+            except Denied as exc:
+                if exc.status != "404":
+                    raise
+                on_base[path] = False
+        outcomes, checks, foreign_workflow = [], [], []
         for context, _app_id in required:
-            selected = by_name.get(context) or []
+            found = candidates.get(context) or []
+            selected = [(run, job) for run, job in found if on_base[run["path"]]]
+            if found and not selected:
+                foreign_workflow.append(context)
             if selected:
-                newest = max(int(run["id"]) for run, _job in selected)
+                newest = max(int(run["id"]) for run, _job in selected)  # the latest run decides, as on GitHub
                 selected = [(run, job) for run, job in selected if int(run["id"]) == newest]
             if not selected:
-                outcomes.append("missing")
-                checks.append({"name": context, "classification": "missing", "head_sha": sha,
-                               "evidence_source": "actions"})
+                waiting = still_open and running and context not in foreign_workflow
+                outcomes.append("pending" if waiting else "missing")
+                checks.append({"name": context, "classification": "pending" if waiting else "missing",
+                               "head_sha": sha, "evidence_source": "actions"})
             for run, job in selected:
                 classification = _classify(job, sha)
                 outcomes.append(classification)
@@ -242,17 +254,21 @@ def actions_fallback(receipt: dict, url: str, *, gh: Callable[..., Any] | None =
                                "head_sha": job.get("head_sha"), "classification": classification,
                                "conclusion": job.get("conclusion"), "evidence_source": "actions",
                                "workflow": run.get("path"), "run_attempt": run.get("run_attempt")})
+        if foreign_workflow and "failure" not in outcomes:
+            return result("unprovable", "the required checks " + ", ".join(foreign_workflow)[:200] + " ran only from "
+                          "a workflow that is not on the base branch, so they are not trusted evidence", checks)
         # Re-read after every page: old-head successes never transfer.
         refusal, detail, _pr = _current_pr(gh, repo, number, sha, branch)
         if refusal:
-            return {**out, "checks": checks, "classification": refusal, "detail": detail}
+            return result(refusal, detail, checks)
     except Denied as exc:
-        return undecided(f"was refused too ({exc})")
+        return result("auth", f"GitHub refused the agent's access to the pull request's Actions runs ({exc})")
     except Unavailable as exc:
-        return undecided(f"is unavailable ({exc})", "infra")
+        return result("infra", f"GitHub did not return the pull request's Actions runs ({exc})")
     except (ValueError, KeyError, TypeError, IndexError) as exc:
-        return undecided(f"is incomplete ({exc if isinstance(exc, ValueError) else 'unexpected reply'})", "infra")
+        return result("infra", "GitHub returned incomplete Actions runs ("
+                      + (str(exc) if isinstance(exc, ValueError) else "unexpected reply") + ")")
     classification = next((x for x in outcomes if x != "success"), "success" if outcomes else "missing")
-    result = {**out, "checks": checks, "classification": classification, "ok": classification == "success"}
-    result.pop("detail", None)  # core's refusal detail no longer describes this receipt
-    return result
+    final = {**out, "checks": checks, "classification": classification, "ok": classification == "success"}
+    final.pop("detail", None)  # core's refusal detail no longer describes this receipt
+    return final

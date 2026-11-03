@@ -33,9 +33,10 @@ class FakeGh:
 
     def __init__(self):
         self.calls = []
-        self.pr_state, self.merged = "closed", True
+        self.pr_state, self.merged, self.sha, self.head_repo = "closed", True, SHA, REPO
         self.job = ("completed", "success")
         self.actions_refused = False
+        self.fail_jobs_reads: set[int] = set()  # which jobs reads (1-based) GitHub answers with a 502
         self.real_run = subprocess.run
 
     def run(self, command, *args, **kwargs):
@@ -46,13 +47,15 @@ class FakeGh:
         reply = self.reply(endpoint)
         if isinstance(reply, int):
             raise subprocess.CalledProcessError(1, command, output="", stderr=(
-                f"gh: Resource not accessible by personal access token (HTTP {reply})"))
+                f"gh: Resource not accessible by personal access token (HTTP {reply})" if reply < 500
+                else f"gh: Bad Gateway (HTTP {reply})"))
         return subprocess.CompletedProcess(command, 0, stdout=json.dumps(reply), stderr="")
 
     def reply(self, endpoint):
         state = "MERGED" if self.merged else ("CLOSED" if self.pr_state == "closed" else "OPEN")
+        sha = self.sha
         if endpoint == "graphql":
-            return {"data": {"repository": {"pullRequest": {"headRefOid": SHA, "baseRefName": "main", "state": state,
+            return {"data": {"repository": {"pullRequest": {"headRefOid": sha, "baseRefName": "main", "state": state,
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "Backend Pytest", "app": {"databaseId": 15368}}]}}}}}}
         if endpoint.startswith(f"repos/{REPO}/rules/branches/main"):
@@ -61,19 +64,21 @@ class FakeGh:
             return 403  # the fine-grained token lacks checks:read
         if endpoint == f"repos/{REPO}/pulls/7":
             return {"state": self.pr_state, "merged": self.merged, "base": {"ref": "main"},
-                    "head": {"sha": SHA, "ref": "fix/receipts", "repo": {"full_name": REPO}}}
-        if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha={SHA}"):
+                    "head": {"sha": sha, "ref": "fix/receipts", "repo": {"full_name": self.head_repo}}}
+        if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha={sha}"):
             if self.actions_refused:
                 return 403
-            return [{"total_count": 1, "workflow_runs": [{"id": 41, "head_sha": SHA, "event": "pull_request",
-                     "path": ".github/workflows/backend-tests.yml", "run_attempt": 1,
-                     "head_repository": {"full_name": REPO}}]}]
+            return [{"total_count": 1, "workflow_runs": [{"id": 41, "head_sha": sha, "event": "pull_request",
+                     "path": ".github/workflows/backend-tests.yml", "run_attempt": 1, "status": "completed",
+                     "head_repository": {"full_name": self.head_repo}}]}]
         if endpoint.startswith(f"repos/{REPO}/contents/.github/workflows/backend-tests.yml?ref=main"):
             return {"type": "file", "path": ".github/workflows/backend-tests.yml"}
         if endpoint.startswith(f"repos/{REPO}/actions/runs/41/jobs"):
+            if sum("/actions/runs/41/jobs" in call for call in self.calls) in self.fail_jobs_reads:
+                return 502
             status, conclusion = self.job
             return [{"total_count": 1, "jobs": [{"id": 9, "name": "Backend Pytest", "status": status,
-                     "conclusion": conclusion, "run_attempt": 1, "head_sha": SHA}]}]
+                     "conclusion": conclusion, "run_attempt": 1, "head_sha": sha}]}]
         return 404
 
 
@@ -173,7 +178,7 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         self.gh.actions_refused = True
         self.ticks()
         self.assertEqual(self.state(), "In Review")
-        waiting = [body for body in self.said() if "moves to Done by itself" in body]
+        waiting = [body for body in self.said() if "checks again by itself" in body]
         self.assertEqual(len(waiting), 1, self.said())
         self.assertIn(PR, waiting[0])
         self.assertFalse(self.bridge.store.terminal_captured(task, issue_id="issue-1"))
@@ -204,7 +209,7 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         self.gh.job = ("in_progress", None)
         self.ticks()
         self.assertEqual(self.state(), "In Review")
-        self.assertTrue(any("still running" in body for body in self.said()))
+        self.assertTrue(any("have not finished yet" in body for body in self.said()))
         self.gh.job = ("completed", "failure")
         self.ticks(3, after=4000)
         self.assertEqual(self.state(), "Blocked")
@@ -220,7 +225,7 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         self.ticks()
         self.assertEqual(self.state(), "Blocked")
         self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="blocked"))
-        self.assertFalse(any("moves to Done by itself" in body for body in self.said()))
+        self.assertFalse(any("checks again by itself" in body for body in self.said()))
         calls, writes = len(self.gh.calls), len(self.mutations())
         self.gh.job = ("completed", "success")
         self.ticks(3, after=4000)
@@ -266,6 +271,107 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         self.set_state("Todo")  # Ken reopened it himself
         self.ticks()
         self.assertEqual(self.state(), "Todo")
+
+
+    def wait_in_review(self):
+        task = self.finish_with_pr()
+        self.gh.actions_refused = True
+        self.ticks()
+        self.assertEqual(self.state(), "In Review")
+        self.gh.actions_refused = False
+        return task
+
+    def test_transient_github_failure_when_done_is_sent_retries_and_reaches_done(self):
+        # Review round 1, probe 1: the recheck passes, then GitHub fails once at the send-time re-verify.
+        task = self.wait_in_review()
+        reads = sum("/actions/runs/41/jobs" in call for call in self.gh.calls)
+        self.gh.fail_jobs_reads = {reads + 2}  # the recheck's read passes, the send-time read gets a 502
+        self.ticks(1, after=4000)
+        self.assertEqual(self.state(), "In Review")
+        self.assertEqual(self.failed(), [])  # retryable, not rejected
+        with self.bridge.store._tx() as db:
+            retried = db.execute("SELECT attempts FROM outbox WHERE kind='status' AND state='pending' "
+                                 "AND json_extract(payload,'$.state')='done'").fetchall()
+        self.assertEqual([row[0] for row in retried], [1])
+        self.ticks(3, after=4000)
+        self.assertEqual(self.state(), "Done")
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="done"))
+        self.assertEqual(self.failed(), [])
+
+    def test_done_rejected_at_send_resumes_the_wait_and_reaches_done(self):
+        task = self.wait_in_review()
+        from hermes_fleet_linear_plugin import bridge
+        original, calls = bridge.Bridge.accepted_evidence, []
+
+        def flaky(this, *args, **kwargs):  # one definite-looking refusal at send time only
+            calls.append(1)
+            if len(calls) == 2:
+                kwargs.get("failures", []).append("synthetic refusal")
+                return False
+            return original(this, *args, **kwargs)
+        with patch.object(bridge.Bridge, "accepted_evidence", flaky):
+            self.ticks(1, after=4000)
+        self.assertEqual(self.state(), "In Review")
+        self.assertEqual(len(self.failed()), 1)  # that Done row failed for good ...
+        self.ticks(3, after=4000)  # ... and the wait it ended picks up again
+        self.assertEqual(self.state(), "Done")
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="done"))
+
+    def test_fork_pr_is_blocked_with_a_plain_reason_and_not_rechecked(self):
+        # Review round 1, probe 2: a fork is a definite answer, not "couldn't ask GitHub".
+        task = self.finish_with_pr()
+        self.gh.head_repo = "mallory/app"
+        self.ticks()
+        self.assertEqual(self.state(), "Blocked")
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="blocked"))
+        said = [body for body in self.said() if "could not be verified as ready" in body]
+        self.assertEqual(len(said), 1)
+        self.assertIn("comes from a fork", said[0])
+        self.assertFalse(any("checks again by itself" in body for body in self.said()))
+        calls = len(self.gh.calls)
+        for _ in range(6):
+            self.ticks(1, after=4000)
+        self.assertEqual(len(self.gh.calls), calls)
+
+    def test_no_answer_for_seven_days_goes_to_blocked_and_stops(self):
+        task = self.finish_with_pr()
+        self.gh.actions_refused = True
+        self.ticks()
+        self.assertEqual(self.state(), "In Review")
+        for _ in range(8 * 24):  # hourly-capped rechecks across eight days
+            self.ticks(1, after=3600)
+            if self.state() != "In Review":
+                break
+        self.assertEqual(self.state(), "Blocked")
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="blocked"))
+        self.assertTrue(any("could not be confirmed within 7 days" in body for body in self.said()))
+        calls = len(self.gh.calls)
+        self.ticks(3, after=4000)
+        self.assertEqual(len(self.gh.calls), calls)
+
+    def test_head_moved_during_the_wait_is_verified_on_the_new_head_and_said(self):
+        task = self.wait_in_review()
+        self.gh.sha = "d" * 40  # someone pushed to the PR while it waited
+        self.ticks(3, after=4000)
+        self.assertEqual(self.state(), "Done")
+        done = [body for body in self.said() if "changed after the work finished" in body]
+        self.assertEqual(len(done), 1)
+        self.assertIn("d" * 12, done[0])
+        self.assertTrue(any(f"head_sha={'d' * 40}" in call for call in self.gh.calls))
+        self.assertTrue(self.bridge.store.terminal_captured(task, issue_id="issue-1", state="done"))
+
+    def test_delegate_removed_during_the_wait_leaves_the_issue_to_the_person(self):
+        self.wait_in_review()
+        self.clock.now = max(self.clock.now, time.time()) + 5
+        self.remote.set_delegate("issue-1", {"id": "other-agent"}, actor="human-1")
+        writes = len(self.mutations())
+        self.ticks(3, after=4000)
+        self.assertEqual(self.state(), "In Review")
+        self.assertEqual(len(self.mutations()), writes)
+        self.assertFalse(any("Fixed the receipts" in body for body in self.said()))
+        calls = len(self.gh.calls)
+        self.ticks(3, after=4000)
+        self.assertEqual(len(self.gh.calls), calls)
 
 
 if __name__ == "__main__":

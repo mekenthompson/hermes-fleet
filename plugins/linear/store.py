@@ -851,45 +851,63 @@ class Store:
                                    (task_id, issue_id, issue_id, state, state)).fetchone())
     # A Blocked closeout written before unverified acceptance showed In Review: its own message
     # (acceptance_refusal) names the PR and a receipt class meaning GitHub refused or did not answer.
-    _UNVERIFIED_CLOSEOUT = re.compile(r"could not be verified as ready \(https://github\.com/[A-Za-z0-9_.-]+/"
-                                      r"[A-Za-z0-9_.-]+/pull/[1-9][0-9]*: (?:auth|infra|pending): ")
+    _UNVERIFIED_CLOSEOUT = re.compile(r"could not be verified as ready \((https://github\.com/[A-Za-z0-9_.-]+/"
+                                      r"[A-Za-z0-9_.-]+/pull/[1-9][0-9]*): (auth|infra|pending): ")
+    _CLOSEOUT_HEAD = re.compile(r"/commits/([0-9a-f]{40})/check-runs\)")
+    # The newest status intent for an issue, passing over a Done closeout that failed to deliver
+    # (Linear or GitHub refused it at send time): that Done is not the issue's word, and the
+    # closeout it would have replaced is still waiting.
+    _LATEST_LIVE_STATUS = ("SELECT id, state, hold_reason, payload FROM outbox WHERE kind='status' "
+                           "AND json_extract(payload, '$.issue_id')=? AND NOT (state='failed' "
+                           "AND json_extract(payload, '$.state')='done' AND json_extract(payload, '$.terminal')=1) "
+                           "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1")
     def acceptance_recheck(self, issue_id: str, task_id: str) -> dict[str, Any] | None:
         """The closeout of a done task that waits on GitHub rather than on a person, or None.
 
         ``in_review``: the latest status is the non-terminal In Review that names the completed
         event (bridge._await_acceptance). ``blocked``: the latest status is a sent terminal Blocked
         closeout of this task whose message says GitHub refused or did not answer, not yet settled
-        by a recheck. Either way no Done closeout exists for the task. Local reads only.
+        by a recheck. Either way no pending or delivered Done closeout exists for the task (a Done
+        that failed to deliver does not end the wait). Local reads only.
         """
         with self._tx() as db:
             return self._acceptance_recheck(db, issue_id, task_id)
     @classmethod
     def _acceptance_recheck(cls, db: sqlite3.Connection, issue_id: str, task_id: str) -> dict[str, Any] | None:
-        latest = db.execute(cls._LATEST_STATUS, (issue_id,)).fetchone()
+        latest = db.execute(cls._LATEST_LIVE_STATUS, (issue_id,)).fetchone()
         if not latest or latest["hold_reason"] is not None:
             return None
-        row = db.execute("SELECT state, payload FROM outbox WHERE id=?", (latest["id"],)).fetchone()
-        payload = json.loads(row["payload"])
-        if payload.get("task_id") != task_id or payload.get("admission_id") or db.execute(
-                "SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND json_extract(payload,'$.task_id')=? "
-                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.state')='done' "
-                "AND json_extract(payload,'$.terminal')=1 LIMIT 1", (task_id, issue_id)).fetchone():
+        payload = json.loads(latest["payload"])
+        if (payload.get("task_id") != task_id or payload.get("admission_id")
+                or payload.get("state") not in ("in_review", "blocked")):
+            return None  # The common case (Done, running, ...) ends here without the scan below.
+        if db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND state IN ('pending','sent') "
+                      "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.issue_id')=? "
+                      "AND json_extract(payload,'$.state')='done' AND json_extract(payload,'$.terminal')=1 LIMIT 1",
+                      (task_id, issue_id)).fetchone():
             return None
         wait = payload.get("acceptance_wait")
-        if (payload.get("state") == "in_review" and not payload.get("terminal") and isinstance(wait, dict)
-                and type(wait.get("event_id")) is int):
-            return {"kind": "in_review", "status_id": latest["id"], "event_id": wait["event_id"]}
+        if payload["state"] == "in_review":
+            if payload.get("terminal") or not isinstance(wait, dict) or type(wait.get("event_id")) is not int:
+                return None
+            return {"kind": "in_review", "status_id": latest["id"], "event_id": wait["event_id"],
+                    "url": wait.get("url") or "", "classification": wait.get("classification") or "",
+                    "head_sha": wait.get("head_sha") or "", "since": wait.get("since", payload.get("enqueued_at"))}
         source_ms = payload.get("source_ms")
-        if (payload.get("state") != "blocked" or not payload.get("terminal") or row["state"] != "sent"
+        if (not payload.get("terminal") or latest["state"] != "sent"
                 or not isinstance(source_ms, (int, float)) or isinstance(source_ms, bool)
                 or db.execute("SELECT 1 FROM metadata WHERE key=?", (cls._settled_key(latest["id"]),)).fetchone()):
             return None
         texts = db.execute("SELECT COALESCE(json_extract(payload,'$.body'), json_extract(payload,'$.content.body'), '') "
                            "FROM outbox WHERE hold_reason IS NULL AND json_extract(payload,'$.requires_status_id')=?",
                            (latest["id"],)).fetchall()
-        if not any(cls._UNVERIFIED_CLOSEOUT.search(text[0] or "") for text in texts):
-            return None
-        return {"kind": "blocked", "status_id": latest["id"], "source_ms": source_ms}
+        for (text,) in texts:
+            found = cls._UNVERIFIED_CLOSEOUT.search(text or "")
+            if found:
+                head = cls._CLOSEOUT_HEAD.search(text)
+                return {"kind": "blocked", "status_id": latest["id"], "source_ms": source_ms, "url": found[1],
+                        "classification": found[2], "head_sha": head[1] if head else ""}
+        return None
     @staticmethod
     def _settled_key(status_id: str) -> str:
         return f"acceptance-recheck-settled:{status_id}"

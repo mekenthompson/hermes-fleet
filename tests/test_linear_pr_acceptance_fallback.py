@@ -119,22 +119,24 @@ class ActionsFallbackTests(unittest.TestCase):
         self.assertEqual(receipt["classification"], "pending")
         self.assertTrue(acceptance.unverified(receipt))
 
-    def test_fork_head_is_refused_and_never_accepted(self):
-        receipt = self.settle(FakeGitHub(head_repo="mallory/app"))
+    def assert_definite(self, receipt, words):
+        """Refused for good: never accepted, and not mistaken for GitHub not answering."""
         self.assertFalse(receipt["ok"])
-        self.assertTrue(acceptance.unverified(receipt))
-        self.assertIn("another repository", receipt["detail"])
+        self.assertEqual(receipt["classification"], "unprovable")
+        self.assertFalse(acceptance.unverified(receipt))
+        self.assertIn(words, receipt["detail"])
+        self.assertNotIn("HTTP", receipt["detail"])
 
-    def test_fork_run_on_the_same_sha_is_untrusted_provenance(self):
-        receipt = self.settle(FakeGitHub(run_repo="mallory/app"))
-        self.assertFalse(receipt["ok"])
-        self.assertTrue(acceptance.unverified(receipt))
-        self.assertIn("another repository", receipt["detail"])
+    def test_fork_head_is_refused_for_good(self):
+        self.assert_definite(self.settle(FakeGitHub(head_repo="mallory/app")), "comes from a fork")
+
+    def test_fork_run_on_the_same_sha_is_not_evidence(self):
+        self.assert_definite(self.settle(FakeGitHub(run_repo="mallory/app")), "not trusted evidence")
 
     def test_run_on_another_sha_is_not_evidence(self):
         receipt = self.settle(FakeGitHub(run_sha=OTHER_SHA))
         self.assertFalse(receipt["ok"])
-        self.assertEqual(receipt["classification"], "missing")
+        self.assertFalse(acceptance.unverified(receipt))
 
     def test_pr_head_moved_from_the_recorded_head_is_refused(self):
         receipt = self.settle(FakeGitHub(head_sha=OTHER_SHA))
@@ -155,26 +157,87 @@ class ActionsFallbackTests(unittest.TestCase):
         self.assertFalse(acceptance.unverified(receipt))
 
     def test_dispatch_only_runs_are_untrusted(self):
-        receipt = self.settle(FakeGitHub(event="workflow_dispatch"))
-        self.assertFalse(receipt["ok"])
+        self.assert_definite(self.settle(FakeGitHub(event="workflow_dispatch")), "not trusted evidence")
+
+    def test_open_pr_without_any_run_yet_is_pending_not_missing(self):
+        github = FakeGitHub(state="open", merged=False)
+        github.runs = []
+        receipt = self.settle(github)
+        self.assertEqual(receipt["classification"], "pending")
         self.assertTrue(acceptance.unverified(receipt))
+        github = FakeGitHub(state="open", merged=False)
+        github.runs[0]["status"] = "in_progress"
+        github.jobs = []
+        self.assertEqual(self.settle(github)["classification"], "pending")
+
+    def test_merged_pr_whose_completed_runs_lack_the_job_is_missing(self):
+        github = FakeGitHub(state="open", merged=False)
+        github.runs[0]["status"] = "completed"
+        github.jobs = []
+        receipt = self.settle(github)
+        self.assertEqual(receipt["classification"], "missing")
+        self.assertFalse(acceptance.unverified(receipt))
+        github = FakeGitHub()
+        github.runs = []
+        self.assertEqual(self.settle(github)["classification"], "missing")
+
+    def test_only_the_latest_attempt_of_a_rerun_counts(self):
+        github = FakeGitHub(jobs=(("Backend Pytest", "completed", "failure"),))
+        github.runs[0]["run_attempt"] = 2
+        github.jobs[0]["run_attempt"] = 1  # the failed first attempt
+        github.jobs.append({**github.jobs[0], "id": 200, "conclusion": "success", "run_attempt": 2})
+        self.assertIs(self.settle(github)["ok"], True)
+        github.jobs[1]["conclusion"] = "failure"
+        github.jobs[0]["conclusion"] = "success"
+        self.assertEqual(self.settle(github)["classification"], "failure")
+
+    def test_same_job_name_in_two_workflows_the_latest_run_decides(self):
+        for older, newer, expected in (("failure", "success", "success"), ("success", "failure", "failure")):
+            with self.subTest(older=older, newer=newer):
+                github = FakeGitHub()
+                github.runs.append({**github.runs[0], "id": 12, "path": ".github/workflows/other.yml"})
+                github.jobs[0]["conclusion"] = older
+                jobs12 = [{**github.jobs[0], "id": 300, "conclusion": newer}]
+                original = github.__call__
+
+                def reply(endpoint, *, paginate=False, original=original, jobs12=jobs12, github=github):
+                    if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha="):
+                        return [{"total_count": 2, "workflow_runs": github.runs}]
+                    if endpoint.startswith(f"repos/{REPO}/actions/runs/12/jobs"):
+                        return [{"total_count": 1, "jobs": jobs12}]
+                    return original(endpoint, paginate=paginate)
+                self.assertEqual(acceptance.settle(denied_receipt(), URL, gh=reply)["classification"], expected)
 
     def test_pull_request_target_is_ignored_as_evidence(self):
         receipt = self.settle(FakeGitHub(event="pull_request_target"))
         self.assertFalse(receipt["ok"])
 
-    def test_workflow_missing_on_base_branch_is_unknown_provenance(self):
-        receipt = self.settle(FakeGitHub(on_base=False))
-        self.assertFalse(receipt["ok"])
-        self.assertTrue(acceptance.unverified(receipt))
+    def test_required_job_only_from_a_workflow_missing_on_base_is_refused_for_good(self):
+        self.assert_definite(self.settle(FakeGitHub(on_base=False)), "not on the base branch")
 
-    def test_unpinned_or_third_party_requirement_is_undecided(self):
+    def test_an_unrelated_new_workflow_in_the_pr_does_not_block(self):
+        github = FakeGitHub()
+        github.runs.append({**github.runs[0], "id": 12, "path": ".github/workflows/new-in-this-pr.yml"})
+        original = github.__call__
+
+        def reply(endpoint, *, paginate=False):
+            if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha="):
+                return [{"total_count": 2, "workflow_runs": github.runs}]
+            if endpoint.startswith(f"repos/{REPO}/actions/runs/12/jobs"):
+                return [{"total_count": 1, "jobs": [{**github.jobs[0], "id": 400, "name": "Docs preview"}]}]
+            if "/contents/.github/workflows/new-in-this-pr.yml" in endpoint:
+                raise acceptance.Denied("HTTP 404 on contents", "404")
+            return original(endpoint, paginate=paginate)
+        receipt = acceptance.settle(denied_receipt(), URL, gh=reply)
+        self.assertIs(receipt["ok"], True)
+        self.assertFalse(any("new-in-this-pr" in call for call in github.calls))
+
+    def test_unpinned_or_third_party_requirement_is_refused_for_good(self):
         for app_id in (None, -1, 999):
             with self.subTest(app_id=app_id):
                 github = FakeGitHub()
                 receipt = self.settle(github, denied_receipt(required=[{"context": "Backend Pytest", "app_id": app_id}]))
-                self.assertFalse(receipt["ok"])
-                self.assertTrue(acceptance.unverified(receipt))
+                self.assert_definite(receipt, "not GitHub Actions jobs")
                 self.assertEqual(github.calls, [])
 
     def test_refused_actions_read_is_undecided(self):
@@ -277,14 +340,16 @@ class BridgeAcceptanceTests(unittest.TestCase):
             with self.subTest(expected=expected), patch.object(bridge, "pr_acceptance", return_value=receipt):
                 waiting, failures = [], []
                 self.assertFalse(bridge.Bridge.accepted_evidence(object(), [URL], failures=failures, unverified=waiting))
-                self.assertEqual(waiting, [(URL, expected)])
+                self.assertEqual(waiting, [(URL, expected, SHA)])
 
     def test_waiting_sentence_is_plain_and_promises_only_what_happens(self):
         for cls in ("auth", "infra", "pending"):
             text = bridge.acceptance_waiting(URL, cls)
             self.assertIn(URL, text)
             self.assertIn("In Review", text)
-            self.assertIn("Done by itself", text)
+            self.assertIn("checks again by itself", text)
+            self.assertIn("moves to Done", text)
+            self.assertIn("Blocked if one fails", text)
             self.assertNotIn("HTTP", text)
             self.assertNotIn("check-runs", text)
 
@@ -317,7 +382,27 @@ class StoredCloseoutTests(unittest.TestCase):
     def test_auth_blocked_closeout_is_rechecked(self):
         self.closeout("blocked", LEGACY_AUTH_BLOCK)
         wait = self.store.acceptance_recheck("issue-1", "t_1")
-        self.assertEqual((wait["kind"], wait["source_ms"]), ("blocked", 1_000_000.0))
+        self.assertEqual((wait["kind"], wait["source_ms"], wait["url"], wait["classification"], wait["head_sha"]),
+                         ("blocked", 1_000_000.0, URL, "auth", SHA))
+
+    def test_a_done_that_failed_to_deliver_does_not_end_the_wait(self):
+        self.store.update("issue-1", last_event_id=9)  # the completion event was consumed with the In Review
+        self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_review", "task_id": "t_1",
+                                      "acceptance_wait": {"event_id": 9, "classification": "auth"}}, at=5)
+        wait = self.store.acceptance_recheck("issue-1", "t_1")
+        done = [("status", {"issue_id": "issue-1", "state": "done", "task_id": "t_1", "terminal": True,
+                            "owner_issue_id": "issue-1", "write_started": False})]
+        self.assertTrue(self.store.finish_acceptance_recheck("issue-1", wait, done, at=30))
+        self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))  # pending Done: wait is over
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET state='failed', attempts=3, "
+                       "payload=json_set(payload,'$.failure_kind','rejected') WHERE json_extract(payload,'$.state')='done'")
+        again = self.store.acceptance_recheck("issue-1", "t_1")
+        self.assertEqual((again["kind"], again["status_id"]), ("in_review", wait["status_id"]))
+        self.assertTrue(self.store.finish_acceptance_recheck("issue-1", again, done, at=40))
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET state='sent' WHERE state='pending' AND json_extract(payload,'$.state')='done'")
+        self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))  # a delivered Done is final
 
     def test_infra_and_pending_blocked_closeouts_are_rechecked(self):
         for cls in ("infra", "pending"):

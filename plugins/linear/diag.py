@@ -117,7 +117,8 @@ REASONS = frozenset({
     # retired Linear notify subscriptions (the bridge relays those events itself)
     "bridge_relayed",
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
-    "acceptance_unverified", "acceptance_verified", "acceptance_failed",
+    "acceptance_unverified", "acceptance_verified", "acceptance_failed", "acceptance_expired",
+    "acceptance_head_moved",
 })
 _OPEN_REASON = re.compile(r"(?:native|graphql)_[a-z0-9_]{1,32}")
 
