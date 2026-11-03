@@ -68,30 +68,41 @@ itself. Delegated children return the request to their parent.
 
 #### Chat guard: tracked work is started, not done inline
 
-`guard.py` turns that rule into code. A chat turn (any platform except `linear`, `cron`,
-`subagent` and webhooks; never a subagent or a native Kanban worker) is *armed* when its
-inbound message asks for Linear-tracked work:
+`guard.py` turns that rule into code. It is on by default; `chat_guard: false` in the plugin's
+`settings` block turns it off (read at gateway start). It *arms* a turn only when all of these hold:
 
-1. an explicit tracking request: `track it` / `track this` / `track the work` (not `track ... down`),
-   or `track` ... `in Linear`;
-2. Linear named as the tracker (`in Linear`, `to Linear` at a clause end, `Linear issue`,
-   `Linear project`, a `linear.app/` link) together with a work verb (research, write, build,
-   fix, implement, investigate, finish, take over, work on, continue, ...). `linear regression`,
-   `linear time` and `the linear plugin` are not the tracker;
-3. an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not `SHA-256`/`UTF-8`/`CVE-...`) together with
-   take over, finish, work on, do it, continue, pick up, carry on or resume.
+- the turn is a person's chat turn: not the `linear`, `cron`, `a2a`, `subagent` or webhook
+  platforms, not a subagent session, not a native Kanban worker, and not a machine-authored
+  prompt (`[kanban]` wakes, `[Heartbeat — recurring instruction ...]`, core system notes);
+- this session can start tracked work: core's resolved tool selection for the agent includes
+  `linear`, and the process is neither a native worker nor a delegated child;
+- what the person typed asks this agent for Linear-tracked work. The reply pointer
+  (`[Replying to ...: "..."]`), attached-document notes and inlined documents, `@`-reference
+  footers, code blocks, inline code and quoted lines are removed first. Then one rule must hold,
+  each needing an *imperative request*: a clause that starts with the verb, optionally after
+  `please`, `now`, `can you`, `I need you to` or similar. Questions (other than "can you ...?"),
+  negations ("don't do it until HF-12 merges") and other subjects ("Atlas is working on HF-9",
+  "I'll take over HF-9") are not requests.
+  1. `track it` / `track this` / `track the work` / `track progress` (not `track ... down`), with
+     Linear named or an issue key in the message;
+  2. a work verb (research, write, build, fix, implement, investigate, finish, take over, work on,
+     continue, ...) with Linear named as the tracker (`in Linear` or `to Linear` at a clause end,
+     `Linear issue`, `Linear project`, a `linear.app/` link). `linear regression`, `linear time` and
+     `the linear plugin` are not the tracker;
+  3. take over, finish, work on, continue, pick up, carry on, resume or `do it` in a sentence with
+     an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not `SHA-256`/`UTF-8`/`CVE-...`).
 
-Code blocks, inline code, quoted lines and native `[kanban]` wake notifications are ignored, and
-`don't track` / `no tracking` / `do it here` keep the work in chat. Status questions such as
-"what's the status of HF-12?" do not arm.
+  `don't track`, `no tracking` and `do it here` keep that turn's work in chat.
 
 An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
 `GRACE_SECONDS` (60 s, counted from the first one). After that, every tool except `linear`,
 `linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search` and
-`tool_describe` is blocked with a message naming the exact `work_on` / `create_issue` +
-`start_work` call. A successful `work_on`, `track` or `create_issue` with `start_work` releases
-the turn, as does the turn's end. Each transition logs one `chat.guard` line
-(`armed`, `blocked`, `released`); an exception inside the guard logs once and allows the call.
+`tool_describe` is blocked. The block message names the exact `work_on` / `create_issue` +
+`start_work` call, and says that a status question or discussion is answered with what the
+agent has (or `clarify`), since inspection and discussion do not transfer execution. A
+successful `work_on`, `track` or `create_issue` with `start_work` releases the turn, as does
+the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`, `released`);
+an exception inside the guard is logged at most hourly and the call proceeds.
 
 When work starts, the delegate is queued inside the issue's lock right after admission (which
 writes nothing to Linear), from the issue version read under that lock, so the status writes
@@ -388,7 +399,8 @@ profile state. The immutable viewer/workspace binding is revalidated on requests
 `identity.teams` and `identity.projects` restrict issue access and writes. `state_database`
 defaults to `<profile home>/linear/state.db`; optional `board` selects the destination for
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
-`completion_contracts` retain their existing meanings.
+`completion_contracts` retain their existing meanings. `chat_guard` (default `true`) enables the
+[chat guard](#chat-guard-tracked-work-is-started-not-done-inline).
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not

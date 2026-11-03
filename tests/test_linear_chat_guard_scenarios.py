@@ -8,7 +8,6 @@ hook names and keyword contracts the guard relies on. It does not claim a deploy
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 import tempfile
@@ -52,9 +51,23 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
         delivery = patch.object(plugins, "_delivery_manager", lambda: self.manager)
         delivery.start()
         self.addCleanup(delivery.stop)
+        self.resolve(["linear", "terminal"])
         self.agent = SimpleNamespace(session_id="sess-1", model="m", platform="slack", _parent_session_id=None,
                                      _user_id="U1", _persist_disabled=False, _current_turn_id="",
                                      _current_api_request_id="")
+
+    def resolve(self, toolsets: list[str]) -> None:
+        """Core's own tool selection for this agent, which the guard reads to know linear is reachable."""
+        import model_tools
+        previous = list(model_tools._last_resolved_tool_names)
+        self.addCleanup(setattr, model_tools, "_last_resolved_tool_names", previous)
+        model_tools.get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+
+    def end_turn(self, message: str, turn_id: str) -> None:
+        import logging
+        from agent.turn_finalizer import _apply_output_hooks
+        _apply_output_hooks(self.agent, "done", logging.getLogger("test"), platform=self.agent.platform,
+                            effective_task_id="task-1", turn_id=turn_id, original_user_message=message, messages=[])
 
     def begin_turn(self, message: str, turn_id: str) -> None:
         import inspect
@@ -93,10 +106,31 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
         self.assertIn('"action": "work_on", "issue": "QA-9"', block)
         self.assertIsNone(self.gate("linear", {"action": "status", "issue": "QA-9"}))
         self.assertIsNone(self.gate("kanban_show", {"task_id": "t_1"}))
+        from test_linear_chat_guard import work_on_reply
         _emit_post_tool_call_hook(function_name="linear", function_args={"action": "work_on", "issue": "QA-9"},
-                                  result=json.dumps({"ok": True, "message": "One native task"}), task_id="task-1",
+                                  result=work_on_reply(), task_id="task-1",
                                   session_id="sess-1", tool_call_id="call-2", turn_id="sess-1:task-1:aaaa1111")
         self.assertIsNone(self.gate("terminal", {"command": "true"}))
+
+    def test_resolved_tools_include_linear(self) -> None:
+        import model_tools
+        self.assertIn("linear", model_tools._last_resolved_tool_names)
+        self.assertTrue(guard.linear_reachable())
+
+    def test_core_turn_end_releases(self) -> None:
+        turn = "sess-1:task-1:eeee5555"
+        self.begin_turn(TAKEOVER_CASE, turn)
+        for _ in range(guard.GRACE_TOOL_CALLS):
+            self.gate("terminal")
+        self.assertIsNotNone(self.gate("terminal"))
+        self.end_turn(TAKEOVER_CASE, turn)
+        self.assertIsNone(self.gate("terminal"))
+
+    def test_session_without_the_linear_tool_is_never_armed(self) -> None:
+        self.resolve(["terminal"])
+        self.begin_turn(TAKEOVER_CASE, "sess-1:task-1:ffff6666")
+        for _ in range(guard.GRACE_TOOL_CALLS + 3):
+            self.assertIsNone(self.gate("terminal"))
 
     def test_linear_platform_turn_is_never_armed(self) -> None:
         self.agent.platform = "linear"
