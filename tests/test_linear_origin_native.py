@@ -781,6 +781,106 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 payload={"text": "Do not run this source fixture"})
             self.assertFalse((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
 
+    async def restarted_instance_issue(self):
+        """HF-617: the whole instance restarted mid-attempt, killing the attempt and its gateway.
+
+        Returns this (later) instance's epoch. The attempt's admission is already settled
+        interrupted, as core (hermes-agent #217) settles it at startup; no host receipt exists.
+        """
+        from gateway.drain_control import current_instantiation_epoch
+        await self.stopped_issue()
+        event = self.board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='owner_admitted'",
+                                   (self.task_id,)).fetchone()
+        marker = json.loads(event["payload"])
+        self.live_owner = dict(marker)
+        marker["pid"] = 99999996  # the old gateway went down with its instance
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(marker), event["id"]))
+        self.owner_event = event["id"]
+        boot, _, start = current_instantiation_epoch().rpartition(":")
+        self.recorded_start = int(start)
+        return boot + ":" + str(int(start) + 1)
+
+    def core_restart_proof(self):
+        try:
+            from hermes_cli.kanban_owner_recovery import attempt_instance_replaced  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    async def test_cleanup_hf617_restart_settled_by_core_lets_takeover_proceed_once(self):
+        from hermes_cli import kanban_db as kb
+        restarted = await self.restarted_instance_issue()
+        ingress = self.home / "protected" / "default" / "ingress.db"  # no host receipt was ever written
+        before = {table: [tuple(row) for row in self.board.execute("SELECT * FROM " + table)]
+                  for table in ("tasks", "task_runs", "task_events")}
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=restarted):
+            evidence = await self.cleanup_inspected(ingress=ingress)
+            if not self.core_restart_proof():
+                # A core without #217's proof holds, and says what is needed.
+                self.assertFalse(evidence["quiescence_proven"])
+                self.assertEqual(evidence["reason"], "restart_proof_unsupported")
+                self.assertIn("Update the agent", evidence["needed"])
+                return
+            self.assertTrue(evidence["quiescence_proven"], evidence)
+            self.assertFalse(evidence["permission_granted"])
+            fates = [worker["fate"] for attempt in evidence["attempts"] for worker in attempt["workers"]]
+            self.assertTrue(fates)
+            self.assertEqual(set(fates), {"instance_replaced"})
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        # A reboot (another boot id) ended the old instance too.
+        rebooted = "00000000-0000-4000-8000-000000000001:1"
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=rebooted):
+            self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        for table, rows in before.items():
+            self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], rows)
+        # The takeover then starts the remainder exactly once: the Stop anchor admits one resume,
+        # and the same evidence cannot be replayed for a second execution.
+        self.assertTrue(kb.unblock_task(self.board, self.task_id, expected_event_id=self.stop_id))
+        self.assertFalse(kb.unblock_task(self.board, self.task_id, expected_event_id=self.stop_id))
+        with patch("gateway.drain_control.current_instantiation_epoch", return_value=restarted):
+            replay = await self.cleanup_inspected()
+        self.assertFalse(replay["quiescence_proven"])
+
+    async def test_cleanup_hf617_old_attempt_that_may_be_alive_stays_held_with_plain_reason(self):
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        restarted = await self.restarted_instance_issue()
+        boot = restarted.rpartition(":")[0]
+        async def inspected(epoch):
+            with patch("gateway.drain_control.current_instantiation_epoch", return_value=epoch):
+                return await self.cleanup_inspected()
+        # The gateway that admitted the old attempt is still running here.
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(self.live_owner), self.owner_event))
+        result = await inspected(restarted)
+        self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "old_gateway_alive"))
+        self.assertIn("may still be running", result["needed"])
+        live_owner = dict(self.live_owner, pid=99999996)
+        self.board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(live_owner), self.owner_event))
+        # The recorded instance is not an earlier one: another running copy may own the attempt.
+        result = await inspected(boot + ":" + str(self.recorded_start - 1))
+        self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "worker_instance_not_earlier"))
+        self.assertIn("confirmed stopped", result["needed"])
+        # This instance's identity cannot be read right now: never mistaken for a restart.
+        for degraded in ("", ":" + str(self.recorded_start + 1), "not-a-boot-id:" + str(self.recorded_start + 1)):
+            with self.subTest(epoch=degraded):
+                result = await inspected(degraded)
+                self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "worker_identity_unreadable"))
+                self.assertIn("Check again", result["needed"])
+        # A worker of the current instance is alive: the long-standing live-PID hold.
+        self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+            (json.dumps({"pid": os.getpid(), "started_at": _process_fingerprint(os.getpid()),
+                         "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        result = await self.cleanup_inspected()
+        self.assertEqual((result["quiescence_proven"], result["reason"]), (False, "old_worker_alive"))
+        self.assertIn("still running", result["needed"])
+        # Mixed evidence (one worker from this instance, one from before the restart) is not core's proof.
+        self.board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='worker_bound'",
+            (json.dumps({"pid": 99999998, "started_at": restarted + "|1",
+                         "claim_lock": self.work_context["claim_lock"]}), self.task_id))
+        result = await inspected(restarted)
+        self.assertFalse(result["quiescence_proven"])
+        self.assertEqual(result["reason"], "old_instance_unproven" if self.core_restart_proof()
+                         else "restart_proof_unsupported")
+
     def cancelled_control(self):
         """Pinned-fae final-row adapter for candidate c9b8ad4's atomic Stop writer.
 
