@@ -25,7 +25,7 @@ if SOURCE:
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import guard  # noqa: E402
 
-FINN_CASE = "Take over QA-9 from Klanker and finish it."
+TAKEOVER_CASE = "Take over QA-9 from Atlas and finish it."
 
 
 @unittest.skipUnless(SOURCE, "requires explicit official HERMES_AGENT_SRC")
@@ -85,7 +85,7 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
 
     def test_core_turn_blocks_inline_work_then_releases_on_work_on(self) -> None:
         from model_tools import _emit_post_tool_call_hook
-        self.begin_turn(FINN_CASE, "sess-1:task-1:aaaa1111")
+        self.begin_turn(TAKEOVER_CASE, "sess-1:task-1:aaaa1111")
         for _ in range(guard.GRACE_TOOL_CALLS):
             self.assertIsNone(self.gate("terminal", {"command": "sleep 60"}))
         block = self.gate("terminal", {"command": "sleep 60"})
@@ -100,12 +100,12 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
 
     def test_linear_platform_turn_is_never_armed(self) -> None:
         self.agent.platform = "linear"
-        self.begin_turn(FINN_CASE, "sess-1:task-1:bbbb2222")
+        self.begin_turn(TAKEOVER_CASE, "sess-1:task-1:bbbb2222")
         for _ in range(guard.GRACE_TOOL_CALLS + 3):
             self.assertIsNone(self.gate("terminal"))
 
     def test_next_turn_status_question_is_not_blocked(self) -> None:
-        self.begin_turn(FINN_CASE, "sess-1:task-1:cccc3333")
+        self.begin_turn(TAKEOVER_CASE, "sess-1:task-1:cccc3333")
         for _ in range(guard.GRACE_TOOL_CALLS + 1):
             self.gate("terminal")
         self.begin_turn("what's the status of QA-9?", "sess-1:task-2:dddd4444")
