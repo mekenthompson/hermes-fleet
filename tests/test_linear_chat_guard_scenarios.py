@@ -57,11 +57,15 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
                                      _current_api_request_id="")
 
     def begin_turn(self, message: str, turn_id: str) -> None:
+        import inspect
         from agent.turn_context import _collect_pre_llm_call_context
         self.agent._current_turn_id = turn_id
+        # Newer cores also collect pre_llm_call vetoes; the guard never returns one.
+        vetoes = {"blocks": []} if "blocks" in inspect.signature(_collect_pre_llm_call_context).parameters else {}
         context = _collect_pre_llm_call_context(
             self.agent, effective_task_id="task-1", turn_id=turn_id, original_user_message=message,
-            messages=[], conversation_history=[], blocks=[])
+            messages=[], conversation_history=[], **vetoes)
+        self.assertEqual(vetoes.get("blocks", []), [])
         self.assertEqual(context, "")  # the guard injects nothing into the prompt
 
     def gate(self, tool: str, args: dict | None = None) -> str | None:
