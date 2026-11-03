@@ -249,8 +249,39 @@ class FakeLinear:
                     count = int(page[2])
                     comments = comments[:count] if page[1] == "first" else comments[-count:]
                 issue["comments"] = {"nodes": comments, "pageInfo": {"hasNextPage": bool(page and total > count)}}
+            if issue and "agentSessions(" in query:
+                issue["agentSessions"] = self._agent_sessions(issue["id"], query)
             return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}
+
+    def _agent_sessions(self, issue_id: str, query: str) -> dict:
+        """Issue.agentSessions { activities }: sessions by latest activity, activities newest first.
+
+        Activities may carry createdAt/updatedAt, ephemeral, user_id/user_name and app (the
+        session's appUser); a created activity defaults to this app."""
+        kinds = re.search(r"type: \{ in: \[([^\]]*)\] \}", query)
+        kinds = set(re.findall(r'"(\w+)"', kinds[1])) if kinds else None
+        sessions: dict[str, list[dict]] = {}
+        for item in self.activities:
+            if item.get("issueId") == issue_id:
+                sessions.setdefault(item["agentSessionId"], []).append(item)
+        ordered = sorted(sessions.items(), key=lambda entry: max(a.get("createdAt", "") for a in entry[1]), reverse=True)
+        session_count = int(re.search(r"agentSessions\(first: (\d+)", query)[1])
+        activity_count = int(re.search(r"activities\(first: (\d+)", query)[1])
+        nodes = []
+        for session_id, items in ordered[:session_count]:
+            items = sorted((a for a in items if kinds is None or a["content"].get("type") in kinds),
+                           key=lambda a: a.get("createdAt", ""), reverse=True)
+            app = items[0].get("app", {"id": SELF, "name": "This Agent"}) if items else {"id": SELF, "name": "This Agent"}
+            nodes.append({"id": session_id, "appUser": app, "activities": {
+                "nodes": [{"id": a["id"], "createdAt": a.get("createdAt", self.clock.iso()),
+                           "updatedAt": a.get("updatedAt", a.get("createdAt", self.clock.iso())),
+                           "ephemeral": bool(a.get("ephemeral")),
+                           "user": {"id": a.get("user_id", app["id"]), "name": a.get("user_name", app["name"])},
+                           "content": {"__typename": "AgentActivity%sContent" % a["content"]["type"].capitalize(),
+                                       **a["content"]}} for a in items[:activity_count]],
+                "pageInfo": {"hasNextPage": len(items) > activity_count}}})
+        return {"nodes": nodes, "pageInfo": {"hasNextPage": len(ordered) > session_count}}
 
     def session_event(self, action: str, issue_id: str, session_id: str, *, body: str = "", signal: str | None = None,
                       creator: str = "human-1", activity_id: str = "act-1", at: float = 0.0) -> dict:

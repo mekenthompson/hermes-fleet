@@ -32,6 +32,20 @@ OPTIONAL_FLOOR, ESSENTIAL_FLOOR = 0.20, 0.05
 BUDGETS = ("requests", "complexity")
 PRIORITIES = ("optional", "normal", "essential")
 LEAN_HISTORY_PAGE = 100  # entries per later IssueHistory page; those pages carry no issue fields
+# A status read also shows what people saw from agents in the issue thread: Agent Session
+# activities, which are not comments. One nested selection in the same IssueProgress query
+# (no extra request) reads the newest ACTIVITY_SESSIONS sessions and their newest ACTIVITY_PAGE
+# activities. Prompts are excluded server side: a person's prompt is already their comment.
+ACTIVITY_SESSIONS, ACTIVITY_PAGE = 5, 10
+ACTIVITY_REFUSAL_PAUSE = 3600.0  # after a definite refusal, plain comment reads for an hour
+ACTIVITY_TYPES = ("thought", "response", "action", "error", "elicitation")
+_ACTIVITY_BODY = " ".join("... on AgentActivity%sContent { type body }" % kind.capitalize()
+                          for kind in ACTIVITY_TYPES if kind != "action")
+ACTIVITY_FIELDS = ("agentSessions(first: %d, orderBy: updatedAt) { nodes { id appUser { id name } "
+                   "activities(first: %d, filter: { type: { in: [%s] } }) { nodes { id createdAt updatedAt ephemeral "
+                   "user { id name } content { %s ... on AgentActivityActionContent { type action parameter result } } } "
+                   "pageInfo { hasNextPage } } } pageInfo { hasNextPage } }"
+                   % (ACTIVITY_SESSIONS, ACTIVITY_PAGE, ", ".join('"%s"' % kind for kind in ACTIVITY_TYPES), _ACTIVITY_BODY))
 ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id } assignee { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type position } } }"""
@@ -305,6 +319,7 @@ class LinearAPI:
         self.rate_limit_path = rate_limit_path
         self._request_lock = threading.RLock()
         self._viewer: str | None = None
+        self._activities_refused_until = 0.0  # Linear refused the internal Issue.agentSessions selection
         self._mutation_guard = threading.local()
         self._priority = threading.local()
         self.budget: dict[str, dict[str, float]] = {}
@@ -510,15 +525,36 @@ class LinearAPI:
         if not data.get("issue"):
             raise LinearError(f"Linear issue {ref} not found", retryable=False)
         return data["issue"]
-    def issue_with_thread(self, issue_id: str, limit: int = 50, *, progress: bool = False) -> tuple[dict[str, Any], list[dict[str, str]]]:
-        """Read one bounded page; ordinary threads retain creation-time chronology."""
+    def issue_with_thread(self, issue_id: str, limit: int = 50, *, progress: bool = False,
+                          activities: bool = False) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        """Read one bounded page; ordinary threads retain creation-time chronology.
+
+        ``activities`` (progress reads only) adds the bounded Agent Session selection to the same
+        query; read it with ``agent_activities(issue)``. Linear marks ``Issue.agentSessions``
+        internal, so a definite rejection of the combined read retries once without it (comments
+        must not be lost to it); when that plain read succeeds, this client stops asking for
+        ACTIVITY_REFUSAL_PAUSE seconds. The issue then carries no ``agentSessions``."""
         operation = "IssueProgress" if progress else "IssueThread"
         order = "updatedAt" if progress else "createdAt"
         updated = " updatedAt" if progress else ""
         page = " pageInfo { hasNextPage }" if progress else ""
-        data = self.graphql("query %s($id: String!) { issue(id: $id) { %s comments(first: %d, orderBy: %s) "
-                            "{ nodes { id url body createdAt%s user { id name } botActor { name } }%s } } }"
-                            % (operation, ISSUE_FIELDS, limit, order, updated, page), {"id": issue_id})
+        def read(extra: str) -> dict[str, Any]:
+            return self.graphql("query %s($id: String!) { issue(id: $id) { %s comments(first: %d, orderBy: %s) "
+                                "{ nodes { id url body createdAt%s user { id name } botActor { name } }%s }%s } }"
+                                % (operation, ISSUE_FIELDS, limit, order, updated, page, extra), {"id": issue_id})
+        if activities and progress and self.clock() >= self._activities_refused_until:
+            try:
+                data = read(" " + ACTIVITY_FIELDS)
+            except LinearError as exc:
+                if exc.retryable or isinstance(exc, RateLimited):
+                    raise
+                data = read("")  # A refusal that also refuses the plain read propagates unchanged.
+                self._activities_refused_until = self.clock() + ACTIVITY_REFUSAL_PAUSE
+                logging.getLogger(diag.LOGGER_NAME).warning(
+                    "linear: agent session activities refused on issue reads; showing comments only for %.0fs",
+                    ACTIVITY_REFUSAL_PAUSE)
+        else:
+            data = read("")
         if not data.get("issue"):
             raise LinearError(f"Linear issue {issue_id} not found", retryable=False)
         nodes = (data["issue"].get("comments") or {}).get("nodes") or []
@@ -538,6 +574,43 @@ class LinearAPI:
         # Linear's first page is newest first for the selected order. Only
         # ordinary worker threads need their existing oldest-first presentation.
         return data["issue"], comments if progress else sorted(comments, key=lambda comment: comment["at"])
+    @staticmethod
+    def agent_activities(issue: dict[str, Any]) -> tuple[list[dict[str, Any]], bool] | None:
+        """The user-visible Agent Session activities in one issue read, newest first per session.
+
+        None when the read carried no activity selection. ``complete`` is False when Linear has
+        more sessions or older activities than the bounded selection. An ephemeral activity is
+        shown by Linear only until the next one replaces it, so only a session's newest survives."""
+        sessions = issue.get("agentSessions") if isinstance(issue, dict) else None
+        if not isinstance(sessions, dict) or not isinstance(sessions.get("nodes"), list):
+            return None
+        complete = (sessions.get("pageInfo") or {}).get("hasNextPage") is False
+        found: list[dict[str, Any]] = []
+        for session in sessions["nodes"]:
+            if not isinstance(session, dict):
+                continue
+            page = session.get("activities")
+            if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                complete = False
+                continue
+            complete = complete and (page.get("pageInfo") or {}).get("hasNextPage") is False
+            app = session.get("appUser") if isinstance(session.get("appUser"), dict) else {}
+            nodes = [node for node in page["nodes"] if isinstance(node, dict)]
+            newest = max((str(node.get("createdAt") or "") for node in nodes), default="")
+            for node in nodes:
+                content = node.get("content") if isinstance(node.get("content"), dict) else {}
+                created = str(node.get("createdAt") or "")
+                if content.get("type") not in ACTIVITY_TYPES or (node.get("ephemeral") and created != newest):
+                    continue
+                user = node.get("user") if isinstance(node.get("user"), dict) else {}
+                found.append({"id": str(node.get("id") or ""), "session_id": str(session.get("id") or ""),
+                              "at": created, "created_at": created, "updated_at": str(node.get("updatedAt") or created),
+                              "type": str(content["type"]), "ephemeral": bool(node.get("ephemeral")),
+                              "content": {key: str(content.get(key) or "")
+                                          for key in ("type", "body", "action", "parameter", "result")},
+                              "user_id": user.get("id"),
+                              "who": str(app.get("name") or user.get("name") or "unknown")})
+        return found, complete
     def routing_history(self, issue_id: str, limit: int = 50, after: str | None = None) -> tuple[list[dict[str, Any]], str | None]:
         """One newest-first IssueHistory page: who changed state, assignee or delegate, and when.
 
