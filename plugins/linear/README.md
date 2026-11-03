@@ -72,41 +72,55 @@ itself. Delegated children return the request to their parent.
 
 #### Chat guard: tracked work is started, not done inline
 
-`guard.py` turns that rule into code. It is on by default; `chat_guard: false` in the plugin's
-`settings` block turns it off (read at gateway start). It *arms* a turn only when all of these hold:
+`guard.py` turns that rule into code. It is on by default; `chat_guard: false` (also `"false"`,
+`"off"`, `"0"`, `"no"`) in the plugin's `settings` block turns it off (read at gateway start).
+It *arms* a turn only when all of these hold:
 
 - the turn is a person's chat turn: not the `linear`, `cron`, `a2a`, `subagent` or webhook
   platforms, not a subagent session, not a native Kanban worker, and not a machine-authored
   prompt (`[kanban]` wakes, `[Heartbeat — recurring instruction ...]`, core system notes);
-- this session can start tracked work: core's resolved tool selection for the agent includes
-  `linear`, and the process is neither a native worker nor a delegated child;
-- what the person typed asks this agent for Linear-tracked work. The reply pointer
-  (`[Replying to ...: "..."]`), attached-document notes and inlined documents, `@`-reference
-  footers, code blocks, inline code and quoted lines are removed first. Then one rule must hold,
-  each needing an *imperative request*: a clause that starts with the verb, optionally after
-  `please`, `now`, `can you`, `I need you to` or similar. Questions (other than "can you ...?"),
-  negations ("don't do it until HF-12 merges") and other subjects ("Atlas is working on HF-9",
-  "I'll take over HF-9") are not requests.
+- what the person typed asks this agent for Linear-tracked work. Only the typed text counts:
+  the reply pointer (`[Replying to ...: "..."]`, stripped up to its last `"]`), channel history
+  before core's `[New message]` marker (Slack thread context, Discord recent channel messages),
+  the sender tag, attached-document notes and inlined documents, `@`-reference footers, code
+  blocks, inline code and quoted lines are removed first. Then one rule must hold, each needing
+  an *imperative request*: a clause that starts with the verb, optionally after `please`, `now`,
+  `hey <name>`, `can you`, `I need you to` or similar. Not requests: questions (other than "can
+  you ...?"), negations ("don't do it until HF-12 merges"), other subjects ("Atlas is working on
+  HF-9", "I'll take over HF-9"), conditional sentences ("If Atlas fails, take over HF-9"),
+  messages addressed to someone else (a leading `Atlas:` or `@atlas`, unless that name is this
+  agent's profile or `ingress_profile`) and messages that retract themselves ("... Actually no,
+  wait").
   1. `track it` / `track this` / `track the work` / `track progress` (not `track ... down`), with
-     Linear named or an issue key in the message;
+     an issue key or Linear as the destination in the message;
   2. a work verb (research, write, build, fix, implement, investigate, finish, take over, work on,
-     continue, ...) with Linear named as the tracker (`in Linear` or `to Linear` at a clause end,
-     `Linear issue`, `Linear project`, a `linear.app/` link). `linear regression`, `linear time` and
-     `the linear plugin` are not the tracker;
-  3. take over, finish, work on, continue, pick up, carry on, resume or `do it` in a sentence with
-     an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not `SHA-256`/`UTF-8`/`CVE-...`).
+     continue, ...) with Linear as the tracking *destination*: `in`/`on`/`into`/`to Linear` at a
+     clause end, `track`/`log`/`file`/`record`/`put ... in Linear`, `create`/`open`/`file a
+     Linear issue`, `as a Linear project`. Linear as the subject of the work ("fix the Linear
+     issue sync bug", "the Linear project picker", "linear.app/ links", "the linear plugin",
+     "linear regression") does not count;
+  3. take over, finish, complete, work on, continue, pick up, carry on, resume, `do it` or `get
+     HF-1 done` in a sentence with an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not
+     `SHA-256`/`UTF-8`/`CVE-...`).
 
-  `don't track`, `no tracking` and `do it here` keep that turn's work in chat.
+  `don't track`, `no tracking` and `do it here` keep that turn's work in chat;
+- the turn's platform can reach the `linear` tool: core's toolset resolution for that platform
+  (`platform_toolsets`, Desktop/TUI under `cli`) includes it, its registry entry and availability
+  check pass, and the process is neither a native worker nor a delegated child. When it cannot,
+  that turn logs `chat.guard outcome=skipped reason=linear_unreachable` and runs unguarded. When
+  reachability cannot be determined the guard arms, and its block message says what to do if the
+  tool is missing.
 
 An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
 `GRACE_SECONDS` (60 s, counted from the first one). After that, every tool except `linear`,
-`linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search` and
-`tool_describe` is blocked. The block message names the exact `work_on` / `create_issue` +
-`start_work` call, and says that a status question or discussion is answered with what the
-agent has (or `clarify`), since inspection and discussion do not transfer execution. A
-successful `work_on`, `track` or `create_issue` with `start_work` releases the turn, as does
-the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`, `released`);
-an exception inside the guard is logged at most hourly and the call proceeds.
+`linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search`,
+`tool_describe` and `tool_call` is blocked. The block message names the exact `work_on` /
+`create_issue` + `start_work` call, and says that a status question or discussion is answered
+with what the agent has (or `clarify`), since inspection and discussion do not transfer
+execution. A successful `work_on`, `track` or `create_issue` with `start_work` releases the
+turn, as does the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`,
+`released`, `skipped`); an exception inside the guard is logged at most hourly and the call
+proceeds.
 
 When work starts, the delegate is queued inside the issue's lock right after admission (which
 writes nothing to Linear), from the issue version read under that lock, so the status writes

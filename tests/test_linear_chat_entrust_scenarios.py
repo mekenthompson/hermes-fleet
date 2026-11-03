@@ -310,7 +310,7 @@ class ChatEntrustScenarios(unittest.TestCase):
 
     def test_chat_guard_releases_on_the_real_work_on_reply_and_holds_on_a_refusal(self):
         from hermes_fleet_linear_plugin import guard
-        chat_guard = guard.ChatGuard(reachable=lambda: True)
+        chat_guard = guard.ChatGuard(reachable=lambda platform: True)
         ids = {"session_id": "chat-session", "turn_id": "chat-session:task:0001", "task_id": "task"}
         chat_guard.pre_llm_call(**ids, user_message="Take over OPS-1 and finish it.", platform="telegram",
                                 parent_session_id="")

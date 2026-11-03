@@ -14,7 +14,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from linear_fake_api import load_plugin
+from linear_fake_api import load_plugin, work_on_reply
 
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat, diag, guard  # noqa: E402
@@ -22,6 +22,12 @@ from hermes_fleet_linear_plugin import chat, diag, guard  # noqa: E402
 RESEARCH_CASE = ("Please research the 3 cheapest ways to back up 2 TB to cloud storage and write it up "
                  "— track it in Linear (project Fleet QA).")
 TAKEOVER_CASE = "Take over QA-9 from Atlas and finish it."
+SELF = frozenset({"orion"})
+SLACK_THREAD = ("[Thread context \u2014 prior messages in this thread (not yet in conversation history):]\n"
+                "[thread parent] Ken: Take over QA-9 from Atlas and finish it.\n[End of thread context]\n\n"
+                "[New message]\n[Ken | Slack user <@U1>] {typed}")
+DISCORD_HISTORY = ("[Context around the replied-to message]\nKen: take over QA-9 and finish it\n\n"
+                   "[Recent channel messages]\nKen: track it in Linear as HF-12\n\n[New message]\n[Ken] {typed}")
 REPLY_TO_TRACKED = ('[Replying to your previous message: "Done — I tracked it in Linear as HF-12"]\n\n'
                     "thanks, now fix the CSS bug")
 
@@ -47,7 +53,14 @@ POSITIVES = [
     "build the export feature and track it in Linear",
     "Fix the camofox reaper — log it to Linear and take it from there",
     "Draft the Q4 plan as a Linear project and start on it",
-    "implement the drill sheet https://linear.app/acme/issue/HF-9 thanks",
+    "Take over HF-618 from Atlas and finish it.",
+    "hey Orion can you take over HF-618",
+    "complete HF-618",
+    "Get HF-618 done",
+    "Orion: take over HF-9",  # addressed to this agent (self name "orion")
+    "Note: take over HF-9",
+    SLACK_THREAD.format(typed="ok, take over QA-9 and finish it"),
+    DISCORD_HISTORY.format(typed="please finish QA-9"),
     "can you investigate and file a Linear issue for it",
     "[Ken] take over QA-9",
     '[Replying to your previous message: "Here is the plan"]\n\ntake over QA-9 and finish it',
@@ -65,6 +78,19 @@ NEGATIVES = [
     "Is Linear down right now?",
     "Write a haiku about linear progressions",
     "Compare linear and logistic regression",
+    # Routine coding about the Linear plugin: Linear is the subject, not the destination.
+    "fix the linear issue sync bug",
+    "Fix the Linear project picker",
+    "Fix the bug where the Linear issue HF-3 shows twice",
+    "write a test for linear.app/ links",
+    # Addressed to someone else, conditional, or retracted.
+    "Atlas: take over HF-9",
+    "@atlas take over HF-9",
+    "<@U2> take over HF-9",
+    "If Atlas fails, take over HF-9",
+    "When Atlas is done, finish HF-9",
+    "Take over HF-9? Actually no, wait",
+    "take over HF-9. never mind, Atlas has it",
     # Questions, negations and other subjects about existing work.
     "why did you stop working on KEN-514?",
     "Did you continue HF-12?",
@@ -91,6 +117,10 @@ NEGATIVES = [
     "take over HF-12 but do it here",
     # Text the person did not type this turn.
     REPLY_TO_TRACKED,
+    SLACK_THREAD.format(typed="what's the ETA?"),
+    DISCORD_HISTORY.format(typed="thanks!"),
+    "[Recent channel messages]\nKen: take over QA-9 and finish it",
+    '[Replying to: "see [\"x\"]\n\nTake over QA-9 and finish it"]\n\nwhat\'s the ETA?',
     '[Replying to: "Take over QA-9 and finish it, track it in Linear"]\n\nwho asked for this?',
     "[Heartbeat — recurring instruction, fires every 1h]\nTake over QA-9 and finish it.\n\n"
     "If there is nothing meaningful to do or report for this instruction right now, reply briefly.",
@@ -111,12 +141,22 @@ class MatcherCorpusTests(unittest.TestCase):
     def test_positive_requests_arm(self) -> None:
         for message in POSITIVES:
             with self.subTest(message=message):
-                self.assertIsNotNone(guard.match(message))
+                self.assertIsNotNone(guard.match(message, SELF))
 
     def test_questions_negations_and_untyped_text_do_not_arm(self) -> None:
         for message in NEGATIVES:
             with self.subTest(message=message):
-                self.assertIsNone(guard.match(message))
+                self.assertIsNone(guard.match(message, SELF))
+
+    def test_only_the_typed_text_after_channel_history_counts(self) -> None:
+        self.assertEqual(guard.request_text(SLACK_THREAD.format(typed="what's the ETA?")), "what's the ETA?")
+        self.assertEqual(guard.request_text(DISCORD_HISTORY.format(typed="thanks!")), "thanks!")
+        self.assertEqual(guard.match(DISCORD_HISTORY.format(typed="please finish QA-9")),
+                         ("issue_work_request", "QA-9"))
+
+    def test_named_addressee_needs_a_self_name(self) -> None:
+        self.assertIsNone(guard.match("Orion: take over HF-9"))
+        self.assertIsNotNone(guard.match("Orion: take over HF-9", SELF))
 
     def test_reasons_and_issue_key(self) -> None:
         self.assertEqual(guard.match(RESEARCH_CASE), ("track_request", ""))
@@ -135,7 +175,8 @@ class MatcherCorpusTests(unittest.TestCase):
     def test_case_variations_and_padding(self) -> None:
         # A light fuzz: casing, whitespace and trailing emphasis never change the decision.
         for message in POSITIVES + NEGATIVES:
-            if not message or message.lstrip().startswith(("[", ">")) or "`" in message or "---" in message:
+            if not message or message.lstrip().startswith(("[", ">", "@", "<")) or "`" in message or "---" in message \
+                    or ":" in message.split(" ", 1)[0]:
                 continue
             variants = ["  " + message + "  ", message.replace(" ", "  ")]
             if not message.rstrip().endswith("?"):
@@ -144,7 +185,7 @@ class MatcherCorpusTests(unittest.TestCase):
                 variants.append(message.lower())  # issue keys are case-sensitive by design
             for variant in variants:
                 with self.subTest(variant=variant):
-                    self.assertEqual(guard.match(variant) is None, guard.match(message) is None)
+                    self.assertEqual(guard.match(variant, SELF) is None, guard.match(message, SELF) is None)
 
 
 class Clock:
@@ -155,21 +196,17 @@ class Clock:
         return self.now
 
 
-def work_on_reply(created: bool = True) -> str:
-    """The linear tool's real work_on reply, built by chat.py's own reply builders."""
-    native = {"status": "ready", "created_from_chat": created, "admitted": True, "task_id": "t_0a1b2c3d"}
-    result = {"native": native, "routing": "queued"}
-    return chat._reply(not native.get("not_started_reason"), chat._entrust_message(result),
-                       issue={"id": "issue-1", "identifier": "QA-9", "url": "https://linear.app/x/issue/QA-9"},
-                       **result)
-
-
 class GuardHookTests(unittest.TestCase):
     def setUp(self) -> None:
         diag.reset()
         self.clock = Clock()
         self.reachable = True
-        self.guard = guard.ChatGuard(clock=self.clock, reachable=lambda: self.reachable)
+        self.platforms: list[str] = []
+
+        def reachable(platform: str):
+            self.platforms.append(platform)
+            return self.reachable
+        self.guard = guard.ChatGuard(clock=self.clock, reachable=reachable)
         env = patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
@@ -219,9 +256,10 @@ class GuardHookTests(unittest.TestCase):
         self.assertIn('"start_work": true', blocked["message"])
         self.assertIn("does not transfer execution", blocked["message"])
         self.assertIn("clarify", blocked["message"])
+        self.assertIn("no linear tool", blocked["message"])
         self.assertIsNotNone(self.call("terminal"))
         for tool in ("linear", "linear_work_reference", "kanban_show", "kanban_create", "a2a_send",
-                     "message_agent", "clarify", "tool_search", "tool_describe"):
+                     "message_agent", "clarify", "tool_search", "tool_describe", "tool_call"):
             with self.subTest(tool=tool):
                 self.assertIsNone(self.call(tool))
         self.assertEqual(sum("outcome=blocked" in line for line in self._lines()), 1)
@@ -319,25 +357,66 @@ class GuardHookTests(unittest.TestCase):
             self.never_blocks(turn="worker")
         self.assertEqual(self._lines(), [])
 
-    def test_never_arms_when_the_linear_tool_is_unreachable(self) -> None:
+    def test_unreachable_linear_skips_with_one_line_per_turn(self) -> None:
         self.reachable = False
         self.turn(TAKEOVER_CASE)
         self.never_blocks()
-        self.assertEqual(self._lines(), [])
+        self.assertEqual(self.platforms, ["slack"])
+        self.turn("what's the status of QA-9?", turn="t2")  # no request: nothing to skip, nothing logged
+        self.turn(TAKEOVER_CASE, turn="t3")
+        self.never_blocks(turn="t3")
+        skipped = [line for line in self._lines() if "outcome=skipped" in line]
+        self.assertEqual(len(skipped), 2)
+        self.assertIn("reason=linear_unreachable", skipped[0])
+        self.assertFalse(any("outcome=armed" in line for line in self._lines()))
 
-    def test_reachability_reads_the_sessions_resolved_tools(self) -> None:
+    def test_reachability_is_per_platform_and_cached_briefly(self) -> None:
+        self.turn(TAKEOVER_CASE, turn="a")
+        self.turn(TAKEOVER_CASE, turn="b")
+        self.turn(TAKEOVER_CASE, turn="c", platform="telegram")
+        self.assertEqual(self.platforms, ["slack", "telegram"])
+        self.clock.now += guard.REACHABILITY_TTL_SECONDS
+        self.turn(TAKEOVER_CASE, turn="d")
+        self.assertEqual(self.platforms, ["slack", "telegram", "slack"])
+
+    def test_undetermined_reachability_arms_with_the_conditional_message(self) -> None:
+        self.reachable = None
+        self.turn(TAKEOVER_CASE)
+        self.spend()
+        self.assertIn("no linear tool", self.call("terminal")["message"])
+
+    def test_reachability_uses_core_platform_toolsets(self) -> None:
         import sys
         import types
-        fake = types.ModuleType("model_tools")
-        with patch.dict(sys.modules, {"model_tools": fake}), patch.object(chat, "coordinator_inventory", lambda: True):
-            fake._last_resolved_tool_names = ["terminal", "web_search"]
-            self.assertFalse(guard.linear_reachable())
-            fake._last_resolved_tool_names = ["terminal", "linear"]
-            self.assertTrue(guard.linear_reachable())
+        seen = {}
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {"platform_toolsets": {"slack": ["linear"]}}
+        tools_config = types.ModuleType("hermes_cli.tools_config")
+
+        def platform_tools(cfg, key):
+            seen["key"] = key
+            return set(cfg["platform_toolsets"].get(key, ["terminal"]))
+        tools_config._get_platform_tools = platform_tools
+        model_tools = types.ModuleType("model_tools")
+        model_tools._select_tool_names = lambda enabled, disabled, quiet: set(enabled)
+        registry_module = types.ModuleType("tools.registry")
+        entry = types.SimpleNamespace(check_fn=lambda: True)
+        registry_module.registry = types.SimpleNamespace(get_entry=lambda name: entry if name == "linear" else None)
+        fakes = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.config": config,
+                 "hermes_cli.tools_config": tools_config, "model_tools": model_tools,
+                 "tools": types.ModuleType("tools"), "tools.registry": registry_module}
+        with patch.dict(sys.modules, fakes), patch.object(chat, "coordinator_inventory", lambda: True):
+            self.assertTrue(guard.linear_reachable("slack"))
+            self.assertFalse(guard.linear_reachable("telegram"))
+            guard.linear_reachable("tui")
+            self.assertEqual(seen["key"], "cli")  # Desktop/TUI resolve under core's cli key
+            entry.check_fn = lambda: False
+            self.assertFalse(guard.linear_reachable("slack"))
             with patch.object(chat, "coordinator_inventory", lambda: False):
-                self.assertFalse(guard.linear_reachable())
-        with patch.dict(sys.modules, {"model_tools": None}):
-            self.assertFalse(guard.linear_reachable())
+                self.assertFalse(guard.linear_reachable("slack"))
+        with patch.dict(sys.modules, {"hermes_cli.tools_config": None}), \
+                patch.object(chat, "coordinator_inventory", lambda: True):
+            self.assertIsNone(guard.linear_reachable("slack"))
 
     def test_desktop_telegram_and_cli_arm(self) -> None:
         for platform in ("tui", "telegram", "cli"):
@@ -405,9 +484,14 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(ctx.hooks, ["pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call"])
 
     def test_chat_guard_false_turns_it_off(self) -> None:
-        ctx = self.Ctx({"chat_guard": False})
-        self.assertIsNone(guard.register(ctx))
-        self.assertEqual(ctx.hooks, [])
+        for value in (False, "false", "False", "0", "off", "no", " OFF ", 0):
+            with self.subTest(value=value):
+                ctx = self.Ctx({"chat_guard": value})
+                self.assertIsNone(guard.register(ctx))
+                self.assertEqual(ctx.hooks, [])
+        for value in (True, "true", "on", "yes", 1, None):
+            with self.subTest(value=value):
+                self.assertTrue(guard.enabled(value))
         self.assertIn("chat_guard", plugin.SETTINGS)
 
     def test_native_workers_register_nothing(self) -> None:
