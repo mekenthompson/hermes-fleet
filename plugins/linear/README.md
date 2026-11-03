@@ -94,11 +94,11 @@ It *arms* a turn only when all of these hold:
   1. `track it` / `track this` / `track the work` / `track progress` (not `track ... down`), with
      an issue key or Linear as the destination in the message;
   2. a work verb (research, write, build, fix, implement, investigate, finish, take over, work on,
-     continue, ...) with Linear as the tracking *destination*: `in`/`on`/`into`/`to Linear` at a
-     clause end, `track`/`log`/`file`/`record`/`put ... in Linear`, `create`/`open`/`file a
+     continue, ...) with Linear as the tracking *destination*: `track`/`log`/`file`/`record`/`put`
+     followed by it/this/the work/progress/results `... in Linear`, `create`/`open`/`file a
      Linear issue`, `as a Linear project`. Linear as the subject of the work ("fix the Linear
-     issue sync bug", "the Linear project picker", "linear.app/ links", "the linear plugin",
-     "linear regression") does not count;
+     issue sync bug", "the Linear project picker", "fix the bug where comments don't post to
+     Linear", "linear.app/ links", "the linear plugin", "linear regression") does not count;
   3. take over, finish, complete, work on, continue, pick up, carry on, resume, `do it` or `get
      HF-1 done` in a sentence with an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not
      `SHA-256`/`UTF-8`/`CVE-...`).

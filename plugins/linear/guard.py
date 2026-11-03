@@ -118,15 +118,16 @@ _WORK = re.compile(_PREFACE + r"(?:research|investigate|write|draft|build|implem
                    + "|" + _PREFACE + "(?:" + _DO + "|" + _GET_DONE + ")", re.I)
 _ISSUE_WORK = re.compile(_PREFACE + r"(?:take\s+over|finish|complete|work\s+on|continue|pick\s+up|carry\s+on|resume)\b"
                          + _NOT + "|" + _PREFACE + "(?:" + _DO + "|" + _GET_DONE + ")", re.I)
-# Linear as the tracking destination, not the thing being worked on: "in/on/into Linear" at a
-# clause end, "track/log/file/record/put ... in Linear", "create/open/file a Linear issue ...",
+# Linear as the tracking destination, not the thing being worked on: "track/log/file/record/put
+# it (or the work/progress/results) ... in Linear", "create/open/file a Linear issue ...",
 # "as a Linear issue/project". "fix the linear issue sync bug", "the Linear project picker",
 # "linear.app/ links", "linear regression" and "the linear plugin" are not.
 _CLAUSE_END = (r"(?=\s*$|\s*[.,;:!?()\[\]]|\s+[-–—]\s|\s+(?:and|then|so|too|as|please|pls|under|for|with|"
                r"now|first|project|team|board|thanks)\b)")
 _LINEAR_REF = re.compile(
-    r"\b(?:in|on|into|onto|to)\s+linear\b" + _CLAUSE_END +
-    r"|\b(?:track|log|file|record|put|add|capture)\b[^.?!\n]{0,40}\b(?:in|on|into|onto|to)\s+linear\b" +
+    r"\b(?:track|log|file|record|put|add|capture)\s+(?:it|this|that|them|this\s+work|(?:the\s+)?progress|"
+    r"the\s+(?:work|task|job|research|results?|write-?up|findings))\b"
+    r"[^.?!\n]{0,40}\b(?:in|on|into|onto|to)\s+linear\b" + _CLAUSE_END +
     r"|\b(?:create|open|file|raise|make|add|log|start)\s+(?:a|an|the)?\s*(?:new\s+)?linear\s+(?:issue|ticket|card|project)s?\b"
     r"|\bas\s+(?:a|an)\s+linear\s+(?:issue|ticket|card|project)\b", re.I)
 # Case-sensitive keys keep "utf-8"/"covid-19" out; common non-issue prefixes are excluded.

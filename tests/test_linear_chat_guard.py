@@ -67,6 +67,15 @@ POSITIVES = [
 ]
 
 NEGATIVES = [
+    # Coding on the Linear plugin itself, described by what goes wrong on the Linear side.
+    "fix the bug where comments don't post to Linear",
+    "Fix the plugin so status updates show up in Linear",
+    "fix why the status isn't syncing to linear",
+    "Investigate why work_on doesn't show In Progress in Linear",
+    "Fix the session-end project update so it posts to Linear",
+    "Refactor how we write comments to Linear",
+    "write a test that the plugin posts to Linear",
+    "Implement a fix so we log errors to Linear only once",
     # Status, arithmetic and non-tracker "linear".
     "what's the status of HF-12?",
     "what's 15% of 240?",
