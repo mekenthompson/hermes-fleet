@@ -373,6 +373,12 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT * FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
         return dict(row) if row else None
+    def native_boards(self) -> set[str]:
+        """Every board a native binding (current or finished) was recorded on."""
+        with self._tx() as db:
+            rows = db.execute("SELECT json_extract(value, '$.board') FROM metadata "
+                              "WHERE key LIKE 'native-binding:%'").fetchall()
+        return {row[0] for row in rows if isinstance(row[0], str) and row[0]}
     def native_binding(self, issue_id: str, profile: str | None = None,
                        board: str | None = None) -> dict[str, Any] | None:
         with self._tx() as db:
