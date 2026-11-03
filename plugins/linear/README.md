@@ -66,6 +66,33 @@ reported, never duplicated. An unlinked task already on the board is adopted onl
 definition of done matches the project's, and then as progress: it never closes the issue by
 itself. Delegated children return the request to their parent.
 
+#### Chat guard: tracked work is started, not done inline
+
+`guard.py` turns that rule into code. A chat turn (any platform except `linear`, `cron`,
+`subagent` and webhooks; never a subagent or a native Kanban worker) is *armed* when its
+inbound message asks for Linear-tracked work:
+
+1. an explicit tracking request: `track it` / `track this` / `track the work` (not `track ... down`),
+   or `track` ... `in Linear`;
+2. Linear named as the tracker (`in Linear`, `to Linear` at a clause end, `Linear issue`,
+   `Linear project`, a `linear.app/` link) together with a work verb (research, write, build,
+   fix, implement, investigate, finish, take over, work on, continue, ...). `linear regression`,
+   `linear time` and `the linear plugin` are not the tracker;
+3. an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not `SHA-256`/`UTF-8`/`CVE-...`) together with
+   take over, finish, work on, do it, continue, pick up, carry on or resume.
+
+Code blocks, inline code, quoted lines and native `[kanban]` wake notifications are ignored, and
+`don't track` / `no tracking` / `do it here` keep the work in chat. Status questions such as
+"what's the status of HF-12?" do not arm.
+
+An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
+`GRACE_SECONDS` (60 s, counted from the first one). After that, every tool except `linear`,
+`linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search` and
+`tool_describe` is blocked with a message naming the exact `work_on` / `create_issue` +
+`start_work` call. A successful `work_on`, `track` or `create_issue` with `start_work` releases
+the turn, as does the turn's end. Each transition logs one `chat.guard` line
+(`armed`, `blocked`, `released`); an exception inside the guard logs once and allows the call.
+
 When work starts, the delegate is queued inside the issue's lock right after admission (which
 writes nothing to Linear), from the issue version read under that lock, so the status writes
 that follow from the work are queued after it. Chat work that was not admitted (parked by a

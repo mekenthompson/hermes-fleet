@@ -47,11 +47,11 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
-    "session.admit", "cleanup.inspect",
+    "session.admit", "cleanup.inspect", "chat.guard",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
-    "skipped", "retry", "gave_up", "failed", "held", "started", "stopped", "-",
+    "skipped", "retry", "gave_up", "failed", "held", "started", "stopped", "armed", "blocked", "released", "-",
 })
 # Closed reason vocabulary. Each code maps to one code branch; see README "Diagnostics".
 REASONS = frozenset({
@@ -84,6 +84,9 @@ REASONS = frozenset({
     "delegation_started", "delegation_linked", "admission_declined", "admission_held", "admission_failed",
     "mention_conversation", "delegated_awaiting_session", "session_turn", "same_session",
     "finished_work_conversation",
+    # chat guard (guard.py): armed by which matcher rule, blocked after which allowance, released why
+    "track_request", "linear_work_request", "issue_work_request", "grace_calls", "grace_time",
+    "tracked_work_started", "turn_ended",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",

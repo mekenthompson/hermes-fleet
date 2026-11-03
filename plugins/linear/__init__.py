@@ -592,6 +592,9 @@ def register(ctx: Any) -> None:
     for event in ("on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
                   "on_kanban_task_updated", "on_kanban_dispatch_tick"):
         ctx.register_hook(event, native_hint)
+    # Chat turns asking for Linear-tracked work start native work instead of doing it inline.
+    from . import guard
+    guard.register(ctx)
 
     stop_requested = threading.Event()
 
