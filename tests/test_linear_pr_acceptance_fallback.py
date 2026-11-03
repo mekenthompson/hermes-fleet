@@ -191,11 +191,30 @@ class ActionsFallbackTests(unittest.TestCase):
         github.jobs[0]["conclusion"] = "success"
         self.assertEqual(self.settle(github)["classification"], "failure")
 
-    def test_same_job_name_in_two_workflows_the_latest_run_decides(self):
-        for older, newer, expected in (("failure", "success", "success"), ("success", "failure", "failure")):
+    def test_same_job_name_in_two_workflows_must_pass_in_both(self):
+        # As core does for check runs: each workflow's newest run counts, and all of them must pass.
+        for older, newer, expected in (("failure", "success", "failure"), ("success", "failure", "failure"),
+                                       ("success", "success", "success")):
             with self.subTest(older=older, newer=newer):
                 github = FakeGitHub()
                 github.runs.append({**github.runs[0], "id": 12, "path": ".github/workflows/other.yml"})
+                github.jobs[0]["conclusion"] = older
+                jobs12 = [{**github.jobs[0], "id": 300, "conclusion": newer}]
+                original = github.__call__
+
+                def reply(endpoint, *, paginate=False, original=original, jobs12=jobs12, github=github):
+                    if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha="):
+                        return [{"total_count": 2, "workflow_runs": github.runs}]
+                    if endpoint.startswith(f"repos/{REPO}/actions/runs/12/jobs"):
+                        return [{"total_count": 1, "jobs": jobs12}]
+                    return original(endpoint, paginate=paginate)
+                self.assertEqual(acceptance.settle(denied_receipt(), URL, gh=reply)["classification"], expected)
+
+    def test_within_one_workflow_the_newest_run_decides(self):
+        for older, newer, expected in (("failure", "success", "success"), ("success", "failure", "failure")):
+            with self.subTest(older=older, newer=newer):
+                github = FakeGitHub()
+                github.runs.append({**github.runs[0], "id": 12})  # the same workflow, run again (a new push event)
                 github.jobs[0]["conclusion"] = older
                 jobs12 = [{**github.jobs[0], "id": 300, "conclusion": newer}]
                 original = github.__call__
@@ -342,6 +361,25 @@ class BridgeAcceptanceTests(unittest.TestCase):
                 self.assertFalse(bridge.Bridge.accepted_evidence(object(), [URL], failures=failures, unverified=waiting))
                 self.assertEqual(waiting, [(URL, expected, SHA)])
 
+    def test_refusal_on_linear_has_no_internal_labels(self):
+        causes = [bridge.acceptance_cause({"ok": False, "classification": "unprovable", "evidence_source": "actions",
+                                           "detail": "the pull request comes from a fork"}, URL),
+                  bridge.acceptance_cause({"ok": False, "classification": "infra", "evidence_source": "actions",
+                                           "checks": [{"name": "Backend Pytest", "classification": "infra",
+                                                       "conclusion": "cancelled"}]}, URL)]
+        for cause in causes:
+            with self.subTest(cause=cause):
+                for where in ("kanban", "chat"):
+                    text = bridge.acceptance_refusal([cause], where=where)
+                    self.assertIn(URL, text)
+                    for label in ("unprovable:", "infra:", "auth:", "source actions", "infra (conclusion"):
+                        self.assertNotIn(label, text)
+        text = bridge.acceptance_refusal([causes[1]], where="kanban")
+        self.assertIn("required check Backend Pytest ended as cancelled", text)
+        self.assertIn("comes from a fork", bridge.acceptance_refusal([causes[0]], where="kanban"))
+        delivery = bridge.acceptance_refusal([causes[0]], where="delivery")
+        self.assertTrue(delivery.startswith(acceptance.DELIVERY_REFUSAL))
+
     def test_waiting_sentence_is_plain_and_promises_only_what_happens(self):
         for cls in ("auth", "infra", "pending"):
             text = bridge.acceptance_waiting(URL, cls)
@@ -394,15 +432,48 @@ class StoredCloseoutTests(unittest.TestCase):
                             "owner_issue_id": "issue-1", "write_started": False})]
         self.assertTrue(self.store.finish_acceptance_recheck("issue-1", wait, done, at=30))
         self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))  # pending Done: wait is over
-        with self.store._tx() as db:
-            db.execute("UPDATE outbox SET state='failed', attempts=3, "
-                       "payload=json_set(payload,'$.failure_kind','rejected') WHERE json_extract(payload,'$.state')='done'")
+        with self.store._tx() as db:  # the send-time re-verify refused it (GitHub's answer changed)
+            db.execute("UPDATE outbox SET state='failed', attempts=3, payload=json_set(json_set(payload,"
+                       "'$.failure_kind','rejected'), '$.last_error', ?) WHERE json_extract(payload,'$.state')='done'",
+                       (acceptance.DELIVERY_REFUSAL + " (https://github.com/acme/app/pull/7: failure: build)",))
         again = self.store.acceptance_recheck("issue-1", "t_1")
         self.assertEqual((again["kind"], again["status_id"]), ("in_review", wait["status_id"]))
         self.assertTrue(self.store.finish_acceptance_recheck("issue-1", again, done, at=40))
         with self.store._tx() as db:
             db.execute("UPDATE outbox SET state='sent' WHERE state='pending' AND json_extract(payload,'$.state')='done'")
         self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))  # a delivered Done is final
+
+    def test_a_done_linear_refused_ends_the_wait(self):
+        # Review round 2 blocker: only the send-time acceptance refusal reopens a wait.
+        self.store.update("issue-1", last_event_id=9)
+        self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_review", "task_id": "t_1",
+                                      "acceptance_wait": {"event_id": 9, "classification": "auth"}}, at=5)
+        wait = self.store.acceptance_recheck("issue-1", "t_1")
+        done = [("status", {"issue_id": "issue-1", "state": "done", "task_id": "t_1", "terminal": True,
+                            "owner_issue_id": "issue-1", "write_started": False})]
+        self.assertTrue(self.store.finish_acceptance_recheck("issue-1", wait, done, at=30))
+        for error in ("Linear issueUpdate rejected the mutation", None):
+            with self.subTest(error=error), self.store._tx() as db:
+                db.execute("UPDATE outbox SET state='failed', attempts=1, payload=json_set(json_set(payload,"
+                           "'$.failure_kind','rejected'), '$.last_error', ?) WHERE json_extract(payload,'$.state')='done'",
+                           (error,))
+            self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))
+
+    def test_a_settled_wait_is_not_rechecked(self):
+        self.store.enqueue("status", {"issue_id": "issue-1", "state": "in_review", "task_id": "t_1",
+                                      "acceptance_wait": {"event_id": 9, "classification": "auth"}}, at=5)
+        wait = self.store.acceptance_recheck("issue-1", "t_1")
+        self.store.settle_acceptance_recheck(wait["status_id"])
+        self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))
+
+    def test_this_builds_blocked_closeouts_are_final_even_with_matching_text(self):
+        cancelled = LEGACY_AUTH_BLOCK.replace("pull/7: auth: GitHub refused", "pull/7: infra: required check Backend "
+                                              "Pytest: infra (conclusion cancelled); GitHub refused")
+        self.closeout("blocked", cancelled)
+        self.assertIsNotNone(self.store.acceptance_recheck("issue-1", "t_1"))  # an older build's row qualifies
+        self.setUp()
+        self.closeout("blocked", cancelled, acceptance_final=True)
+        self.assertIsNone(self.store.acceptance_recheck("issue-1", "t_1"))
 
     def test_infra_and_pending_blocked_closeouts_are_rechecked(self):
         for cls in ("infra", "pending"):

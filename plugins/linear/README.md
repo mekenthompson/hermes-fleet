@@ -427,18 +427,20 @@ verified completion. A PR named as evidence is verified by core's exact-head req
 verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
 token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
 jobs instead (`acceptance.py`: every requirement pinned to the Actions app, trusted runs of the
-PR's own repository, the base branch's own workflow for each required job, latest attempt, the
-latest run deciding a job name, full pagination, and a final re-read showing the same head;
+PR's own repository, the base branch's own workflow for each required job, latest attempt, each
+workflow's newest run of a required job passing, full pagination, and a final re-read showing the same head;
 merged counts, closed unmerged does not). Where Actions cannot stand in for the checks (they
 are not Actions jobs, the PR is from a fork, or only untrusted runs exist) the answer is final.
 When GitHub cannot be asked (refused, unreachable, or checks not finished, including CI not
 started on an open PR), finished work shows In Review with one plain sentence instead of
 Blocked, and the PR is asked about again on a persisted gap (2 minutes doubling to an hour):
 Done once it passes (a head that moved meanwhile is verified as the new head and said so),
-Blocked once a check fails, and Blocked with one sentence if nothing is confirmed within 7
-days. A Done whose send-time re-check finds GitHub not answering is retried on the outbox
-schedule; one that fails for good resumes the wait. An older build's Blocked closeout whose own
-message says GitHub refused or did not answer is rechecked the same way. A failed check, a PR
+Blocked once a check fails, and Blocked with one sentence once 7 days have passed since the
+wait began, whatever the answers were. A Done whose send-time re-check finds GitHub not
+answering is retried on the outbox schedule; one that re-check refuses resumes the wait (after
+its gap); one Linear refuses ends it. An older build's Blocked closeout whose own
+message says GitHub refused or did not answer is rechecked the same way. Blocked closeouts written by this build
+are final answers and are never rechecked. A failed check, a PR
 closed without merging or missing evidence stays Blocked and is not rechecked. Work archived or cancelled without a verified outcome posts nothing; a
 started state this app set (In Progress, Blocked, In Review) becomes Todo, since no agent is
 working on it now, including after an older build's Blocked closeout.

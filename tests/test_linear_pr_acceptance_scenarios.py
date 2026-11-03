@@ -151,6 +151,8 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
                 patch.object(acceptance, "unverified", lambda receipt: False), \
                 patch.object(bridge, "acceptance_refusal", lambda failures, where="chat": LEGACY_BODY):
             self.bridge.pump_kanban()  # the old build captures the completion as Blocked ...
+            with self.bridge.store._tx() as db:  # ... without this build's final-answer mark ...
+                db.execute("UPDATE outbox SET payload=json_remove(payload,'$.acceptance_final')")
             self.bridge.flush()  # ... and sends it
         self.assertEqual(self.state(), "Blocked")
         self.assertIn(LEGACY_BODY, self.said())
@@ -372,6 +374,117 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         calls = len(self.gh.calls)
         self.ticks(3, after=4000)
         self.assertEqual(len(self.gh.calls), calls)
+
+    # -- review round 2 probes ---------------------------------------------
+
+    def done_rows(self):
+        with self.bridge.store._tx() as db:
+            return [tuple(row) for row in db.execute(
+                "SELECT state, json_extract(payload,'$.failure_kind') FROM outbox WHERE kind='status' "
+                "AND json_extract(payload,'$.state')='done' ORDER BY rowid")]
+
+    def test_done_linear_refuses_for_good_ends_the_wait_without_a_storm(self):
+        # Blocker: Linear refuses the Done write (non-retryable) -> no re-check / re-write loop.
+        self.wait_in_review()
+        from hermes_fleet_linear_plugin.api import LinearError
+        api, done_state = self.bridge.api, self.bridge.state_id(self.fixture.issue, "done")
+        original = api.update_issue
+
+        def refuse(issue_id, fields, *args, **kwargs):
+            if fields.get("stateId") == done_state:
+                raise LinearError("synthetic Linear refusal", retryable=False)
+            return original(issue_id, fields, *args, **kwargs)
+        with patch.object(api, "update_issue", refuse):
+            self.ticks(1, after=4000)
+            self.assertEqual(self.done_rows(), [("failed", "rejected")])
+            calls = len(self.gh.calls)
+            for _ in range(10):
+                self.ticks(1, after=5)
+            for _ in range(10):
+                self.ticks(1, after=4000)
+            self.assertEqual(len(self.gh.calls), calls)  # bounded: not one more GitHub read
+        self.assertEqual(self.done_rows(), [("failed", "rejected")])
+        self.assertEqual(self.state(), "In Review")
+
+    def test_person_moves_the_wait_to_blocked_and_it_stays_theirs(self):
+        self.wait_in_review()
+        self.clock.now = max(self.clock.now, time.time()) + 5
+        self.set_state("Blocked")
+        self.ticks(3, after=4000)
+        self.assertEqual(self.state(), "Blocked")
+        calls = len(self.gh.calls)
+        self.ticks(3, after=4000)
+        self.assertEqual(len(self.gh.calls), calls)
+
+    def test_person_moves_a_legacy_block_and_nothing_rechecks(self):
+        self.finish_with_pr()
+        self.legacy_closeout()
+        self.clock.now = max(self.clock.now, time.time()) + 5
+        self.set_state("Todo")
+        self.ticks()
+        calls = len(self.gh.calls)
+        for _ in range(6):
+            self.ticks(1, after=4000)
+        self.assertEqual((self.state(), len(self.gh.calls)), ("Todo", calls))
+
+    def test_open_pr_with_only_untrusted_runs_waits_in_review(self):
+        self.gh.pr_state, self.gh.merged = "open", False
+        reply = self.gh.reply
+
+        def dispatch_only(endpoint):
+            answer = reply(endpoint)
+            if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha=") and isinstance(answer, list):
+                answer = [{**page, "workflow_runs": [{**run, "event": "workflow_dispatch"}
+                                                     for run in page["workflow_runs"]]} for page in answer]
+            return answer
+        self.gh.reply = dispatch_only
+        self.finish_with_pr()
+        self.ticks()
+        self.assertEqual(self.state(), "In Review")
+        self.assertTrue(any("have not finished yet" in body for body in self.said()))
+
+    def test_cancelled_or_skipped_or_failed_check_is_final_and_plain(self):
+        for conclusion in ("cancelled", "skipped", "failure"):
+            with self.subTest(conclusion=conclusion):
+                self.setUp()
+                task = self.finish_with_pr()
+                self.gh.job = ("completed", conclusion)
+                self.ticks()
+                self.assertEqual(self.state(), "Blocked")
+                said = [body for body in self.said() if "could not be verified as ready" in body]
+                self.assertEqual(len(said), 1)
+                self.assertIn(f"required check Backend Pytest ended as {conclusion}", said[0])
+                for label in ("infra:", "failure:", "source actions", "(conclusion"):
+                    self.assertNotIn(label, said[0])
+                self.assertIsNone(self.bridge.store.acceptance_recheck("issue-1", task))
+                jobs_reads = sum("/jobs" in call for call in self.gh.calls)
+                self.gh.job = ("completed", "success")  # someone re-ran it green later
+                self.ticks(3, after=4000)
+                self.assertEqual(self.state(), "Blocked")
+                self.assertEqual(sum("/jobs" in call for call in self.gh.calls), jobs_reads)
+
+    def test_a_wait_that_cannot_write_is_settled_at_the_cap(self):
+        # A recheck that keeps ending as effect_unresolved still stops after 7 days.
+        self.wait_in_review()
+        from hermes_fleet_linear_plugin import bridge
+        rechecks = []
+        original = bridge.Bridge._finished
+
+        def unresolved(this, row, **kwargs):
+            if kwargs.get("recheck") is not None:
+                rechecks.append(1)
+                return None
+            return original(this, row, **kwargs)
+        with patch.object(bridge.Bridge, "_finished", unresolved):
+            for _ in range(8 * 24):
+                self.ticks(1, after=3600)
+            self.assertEqual(self.state(), "Blocked")
+            self.assertTrue(any("could not be confirmed within 7 days" in body for body in self.said()))
+            asked = len(rechecks)
+            self.assertLess(asked, 8 * 24)
+            for _ in range(48):
+                self.ticks(1, after=3600)
+            self.assertEqual(len(rechecks), asked)
 
 
 if __name__ == "__main__":

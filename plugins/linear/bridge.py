@@ -610,10 +610,18 @@ def acceptance_cause(receipt, url: str = "") -> str:
     else:
         cause = "acceptance verifier returned no receipt"
     return _public(f"{url}: {cause}" if url else cause)[:500]
+_RECEIPT_LABEL = re.compile(r"(^|: |; )(?:auth|infra|pending|failure|missing|stale|closed|unprovable|unknown): ")
+_CHECK_OUTCOME = re.compile(r"(required check [^;:()]{1,100}): [a-z]{1,30} \(conclusion ([a-z_]{1,30})\)")
+def _plain_cause(cause: str) -> str:
+    """The cause as people read it: no receipt class labels, evidence-source tags or check classes."""
+    cause = re.sub(r"; source [a-z]+", "", cause)
+    cause = _CHECK_OUTCOME.sub(lambda m: f"{m[1]} {'has no result' if m[2] == 'unavailable' else 'ended as ' + m[2]}", cause)
+    return _RECEIPT_LABEL.sub(lambda m: m[1], cause)
 def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
     cause = _public("; ".join(failures) if failures else "no acceptance receipt")
-    if where == "delivery":
-        return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
+    if where == "delivery":  # an outbox error, read by the recheck (acceptance.DELIVERY_REFUSAL); never shown as is
+        return f"{acceptance.DELIVERY_REFUSAL} ({cause})"
+    cause = _plain_cause(cause)
     if where == "kanban":
         return (f"The work finished, but its pull request could not be verified as ready ({cause}). The issue "
                 "stays open until that is fixed and the work is completed again.")
@@ -3165,7 +3173,7 @@ class Bridge:
             if not self.authorize_specialist_effect(issue_id): return
             written = self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
-                                                    "owner_issue_id": issue_id}),
+                                                    "owner_issue_id": issue_id, "acceptance_final": True}),
                                          ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                                        "task_id": row["task_id"],
                                                        "terminal": True, "owner_issue_id": issue_id,
@@ -3183,7 +3191,7 @@ class Bridge:
                 if not self.authorize_specialist_effect(issue_id): return
                 written = self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                         "task_id": row["task_id"], "terminal": True,
-                                                        "owner_issue_id": issue_id}),
+                                                        "owner_issue_id": issue_id, "acceptance_final": True}),
                                              ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                                            "task_id": row["task_id"],
                                                            "terminal": True, "owner_issue_id": issue_id,
@@ -3297,30 +3305,29 @@ class Bridge:
             return
         if not self.store.effect_admitted(issue_id):
             return
-        # The next gap is taken before asking, so a pass cut short (Linear budget, an error) cannot
-        # turn into GitHub reads on every tick; a settled outcome clears it.
+        marker, fields = ("acceptance", issue_id, completed.id), {"iss": issue_id, "task": task.id, "evt": completed.id}
+        # Backstop for every outcome class: a wait is asked about for at most ACCEPTANCE_MAX_WAIT from
+        # its start. Then In Review goes to Blocked (an older Blocked stands) and the wait is settled
+        # whether or not that write could be queued, so nothing rechecks forever.
+        since = wait.get("since")
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            since = float(self.store.first_value(f"acceptance-wait-since:{wait['status_id']}", repr(float(now))))
+        if now - since >= ACCEPTANCE_MAX_WAIT:
+            try:
+                written = self._expire_acceptance(row, completed.id, wait) == "failed" and wait["kind"] == "in_review"
+            finally:
+                self.store.settle_acceptance_recheck(wait["status_id"])
+            diag.transition("status.write", "queued" if written else "skipped", "acceptance_expired", key=marker,
+                            state="blocked", **fields)
+            return
+        # The next gap is taken before asking and kept until a new wait starts: a pass cut short
+        # (Linear budget, an error) or a Done refused at send cannot turn into GitHub reads per tick.
         until = self.store.backoff_fail(key, now, base=ACCEPTANCE_RECHECK_BASE, cap=ACCEPTANCE_RECHECK_CAP)
         outcome = self._finished(row, event_id=completed.id, recheck=wait)
-        marker, fields = ("acceptance", issue_id, completed.id), {"iss": issue_id, "task": task.id, "evt": completed.id}
-        if outcome == "unverified":
-            since = wait.get("since")
-            if not isinstance(since, (int, float)):
-                since = float(self.store.first_value(f"acceptance-wait-since:{wait['status_id']}", repr(float(now))))
-            if now - since >= ACCEPTANCE_MAX_WAIT:
-                outcome = self._expire_acceptance(row, completed.id, wait)
-                if outcome != "failed":
-                    return
-                self.store.backoff_clear(key)
-                if wait["kind"] == "blocked":
-                    self.store.settle_acceptance_recheck(wait["status_id"])
-                diag.transition("status.write", "skipped" if wait["kind"] == "blocked" else "queued",
-                                "acceptance_expired", key=marker, state="blocked", **fields)
-                return
         if outcome == "unverified" or not outcome:
             diag.transition("status.write", "held", "acceptance_unverified" if outcome else "effect_unresolved",
                             key=marker, next_s=int(until - now), **fields)
             return
-        self.store.backoff_clear(key)
         if outcome == "failed":
             if wait["kind"] == "blocked":
                 self.store.settle_acceptance_recheck(wait["status_id"])
@@ -3341,7 +3348,7 @@ class Bridge:
         body = acceptance_expired(wait.get("url") or "", wait.get("classification") or "infra")
         written = self._finish_work(issue_id, [
             ("status", {"issue_id": issue_id, "state": "blocked", "task_id": row["task_id"], "terminal": True,
-                        "owner_issue_id": issue_id}),
+                        "owner_issue_id": issue_id, "acceptance_final": True}),
             ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
                           "terminal": True, "owner_issue_id": issue_id,
                           "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id, recheck=wait)

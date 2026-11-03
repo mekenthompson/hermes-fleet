@@ -32,6 +32,9 @@ ACTIONS_APP_ID = 15368  # GitHub's own Actions app. Unpinned and third-party req
 TRUSTED_EVENTS = frozenset({"merge_group", "pull_request", "push"})
 # Receipt classes that mean GitHub could not be asked, not that it said no.
 UNVERIFIED = frozenset({"auth", "infra", "pending"})
+# The outbox error of a Done whose send-time re-verify refused it (bridge.acceptance_refusal). Only
+# that refusal reopens the wait it ended; any other refusal of a Done (Linear's) is final.
+DELIVERY_REFUSAL = "PR acceptance on the recorded exact head failed at delivery"
 # Per-check classes that are a definite answer about a check, not a failed read.
 DEFINITE_CHECK = frozenset({"failure", "infra"})
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)\Z")
@@ -240,8 +243,12 @@ def actions_fallback(receipt: dict, url: str, *, gh: Callable[..., Any] | None =
             if found and not selected:
                 foreign_workflow.append(context)
             if selected:
-                newest = max(int(run["id"]) for run, _job in selected)  # the latest run decides, as on GitHub
-                selected = [(run, job) for run, job in selected if int(run["id"]) == newest]
+                # As core does for check runs: each workflow's newest run of this job counts, and every
+                # workflow that produces it must pass (an older failing workflow is not hidden by a newer one).
+                newest = {}
+                for run, _job in selected:
+                    newest[run["path"]] = max(newest.get(run["path"], 0), int(run["id"]))
+                selected = [(run, job) for run, job in selected if int(run["id"]) == newest[run["path"]]]
             if not selected:
                 waiting = still_open and running and context not in foreign_workflow
                 outcomes.append("pending" if waiting else "missing")

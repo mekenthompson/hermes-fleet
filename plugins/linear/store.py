@@ -15,6 +15,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 from .api import backoff_delay
+from .acceptance import DELIVERY_REFUSAL
 MIN_BACKOFF, MAX_BACKOFF, GIVE_UP_AFTER = 60.0, 3600.0, 86_400.0
 # A guard-deferred outbox row keeps two quick retries (the native state it waits for is usually
 # captured within a tick), then waits 30 s doubling to 30 min instead of re-reading Linear every tick.
@@ -854,12 +855,13 @@ class Store:
     _UNVERIFIED_CLOSEOUT = re.compile(r"could not be verified as ready \((https://github\.com/[A-Za-z0-9_.-]+/"
                                       r"[A-Za-z0-9_.-]+/pull/[1-9][0-9]*): (auth|infra|pending): ")
     _CLOSEOUT_HEAD = re.compile(r"/commits/([0-9a-f]{40})/check-runs\)")
-    # The newest status intent for an issue, passing over a Done closeout that failed to deliver
-    # (Linear or GitHub refused it at send time): that Done is not the issue's word, and the
-    # closeout it would have replaced is still waiting.
+    # The newest status intent for an issue, passing over a Done closeout whose send-time re-verify
+    # refused it (DELIVERY_REFUSAL): GitHub changed its answer, so the wait that Done ended goes on.
+    # A Done refused for any other reason (Linear's) is the issue's last word and ends the wait.
     _LATEST_LIVE_STATUS = ("SELECT id, state, hold_reason, payload FROM outbox WHERE kind='status' "
                            "AND json_extract(payload, '$.issue_id')=? AND NOT (state='failed' "
-                           "AND json_extract(payload, '$.state')='done' AND json_extract(payload, '$.terminal')=1) "
+                           "AND json_extract(payload, '$.state')='done' AND json_extract(payload, '$.terminal')=1 "
+                           "AND substr(COALESCE(json_extract(payload, '$.last_error'), ''), 1, ?)=?) "
                            "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1")
     def acceptance_recheck(self, issue_id: str, task_id: str) -> dict[str, Any] | None:
         """The closeout of a done task that waits on GitHub rather than on a person, or None.
@@ -874,8 +876,9 @@ class Store:
             return self._acceptance_recheck(db, issue_id, task_id)
     @classmethod
     def _acceptance_recheck(cls, db: sqlite3.Connection, issue_id: str, task_id: str) -> dict[str, Any] | None:
-        latest = db.execute(cls._LATEST_LIVE_STATUS, (issue_id,)).fetchone()
-        if not latest or latest["hold_reason"] is not None:
+        latest = db.execute(cls._LATEST_LIVE_STATUS, (issue_id, len(DELIVERY_REFUSAL), DELIVERY_REFUSAL)).fetchone()
+        if (not latest or latest["hold_reason"] is not None
+                or db.execute("SELECT 1 FROM metadata WHERE key=?", (cls._settled_key(latest["id"]),)).fetchone()):
             return None
         payload = json.loads(latest["payload"])
         if (payload.get("task_id") != task_id or payload.get("admission_id")
@@ -894,10 +897,9 @@ class Store:
                     "url": wait.get("url") or "", "classification": wait.get("classification") or "",
                     "head_sha": wait.get("head_sha") or "", "since": wait.get("since", payload.get("enqueued_at"))}
         source_ms = payload.get("source_ms")
-        if (not payload.get("terminal") or latest["state"] != "sent"
-                or not isinstance(source_ms, (int, float)) or isinstance(source_ms, bool)
-                or db.execute("SELECT 1 FROM metadata WHERE key=?", (cls._settled_key(latest["id"]),)).fetchone()):
-            return None
+        if (not payload.get("terminal") or latest["state"] != "sent" or payload.get("acceptance_final")
+                or not isinstance(source_ms, (int, float)) or isinstance(source_ms, bool)):
+            return None  # Only an older build's Blocked qualifies; this build's Blocked is a final answer.
         texts = db.execute("SELECT COALESCE(json_extract(payload,'$.body'), json_extract(payload,'$.content.body'), '') "
                            "FROM outbox WHERE hold_reason IS NULL AND json_extract(payload,'$.requires_status_id')=?",
                            (latest["id"],)).fetchall()
@@ -912,7 +914,7 @@ class Store:
     def _settled_key(status_id: str) -> str:
         return f"acceptance-recheck-settled:{status_id}"
     def settle_acceptance_recheck(self, status_id: str) -> None:
-        """A recheck got a definite answer for this older Blocked closeout: it stands, stop asking."""
+        """This waiting closeout is decided (a definite answer, or the 7-day cap): stop asking about it."""
         with self._tx() as db:
             db.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
                        (self._settled_key(status_id), json.dumps({"settled": True})))
