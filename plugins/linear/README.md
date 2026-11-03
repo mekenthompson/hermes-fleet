@@ -423,7 +423,18 @@ Linear status follows the bound native task: queued (ready, todo, scheduled) sho
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
 verified shows In Review (it awaits review, CI or merge; never Todo). Done comes only from
-verified completion. Work archived or cancelled without a verified outcome posts nothing; a
+verified completion. A PR named as evidence is verified by core's exact-head required-check
+verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
+token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
+jobs instead (`acceptance.py`: every requirement pinned to the Actions app, trusted runs of the
+PR's own repository whose workflow exists on the base branch, latest attempt, full pagination,
+and a final re-read showing the same head; merged counts, closed unmerged does not). When
+GitHub still cannot be asked (refused, unreachable, or checks still running), finished work
+shows In Review with one plain sentence instead of Blocked, and the PR is asked about again
+on a persisted gap (2 minutes doubling to an hour), reaching Done once it passes or Blocked
+once a check fails. An older build's Blocked closeout whose own message says GitHub refused or
+did not answer is rechecked the same way. A failed check, a PR closed without merging or
+missing evidence stays Blocked and is not rechecked. Work archived or cancelled without a verified outcome posts nothing; a
 started state this app set (In Progress, Blocked, In Review) becomes Todo, since no agent is
 working on it now, including after an older build's Blocked closeout.
 Backlog, Todo, Done and Canceled stay as they are. A team without a named state uses its first state of
