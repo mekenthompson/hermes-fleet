@@ -9,8 +9,9 @@ head SHA, the latest attempt of trusted runs (pull_request, push or merge_group)
 whose head repository is the PR's own repository and whose workflow file (for the
 runs that produce a required check) exists on the base branch, complete
 pagination, and a final PR re-read that still shows the same head and base
-(merged is accepted, closed without merging is not). Nothing is accepted that is
-not proved. Where Actions cannot stand in for the checks at all (requirements that
+(merged is accepted, closed without merging is not). As in core, every Actions run
+on the head is read: a failed or unfinished required job in any of them refuses, and
+only trusted runs can supply the success. Nothing is accepted that is not proved. Where Actions cannot stand in for the checks at all (requirements that
 are not Actions jobs, a fork, only untrusted runs) the answer is the definite
 "unprovable"; only GitHub refusing or not answering stays unverified.
 
@@ -175,7 +176,7 @@ def _current_pr(gh: Callable[..., Any], repo: str, number: int, sha: str, branch
     if pr["state"] == "closed" and not pr.get("merged"):
         return "closed", "the pull request was closed without being merged", pr
     if pr["head"]["sha"] != sha or (branch is not None and pr["base"]["ref"] != branch):
-        return "stale", "the pull request's head or base changed while its checks were read; retry", pr
+        return "pending", "the pull request changed while its checks were being read", pr  # ask again later
     return None, "", pr
 
 
@@ -214,21 +215,25 @@ def actions_fallback(receipt: dict, url: str, *, gh: Callable[..., Any] | None =
                                         "confirm checks from the repository's own Actions runs")
         branch, still_open = pr["base"]["ref"], pr["state"] == "open"
         runs = _rows(gh(f"repos/{repo}/actions/runs?head_sha={sha}&per_page=100", paginate=True), "workflow_runs")
-        trusted = [run for run in runs if _trusted_run(run, repo, sha)]
-        running = not trusted or any(run.get("status") not in (None, "completed") for run in trusted)
-        if not trusted and runs and not still_open:
-            return result("unprovable", "the pull request's head has only GitHub Actions runs that are not trusted "
-                                        "evidence (manually started or run from another repository)")
-        candidates: dict[Any, list] = {}
-        for run in trusted:
+        on_head = [run for run in runs if run.get("head_sha") == sha]
+        trusted = {int(run["id"]) for run in on_head if _trusted_run(run, repo, sha)}
+        running = not trusted or any(run.get("status") not in (None, "completed")
+                                     for run in on_head if int(run["id"]) in trusted)
+        # Every Actions run on the exact head is read, as core reads every check run: a failed or
+        # unfinished required job anywhere refuses. Only trusted runs can supply the success.
+        found: dict[Any, list] = {}
+        for run in on_head:
+            attempt = run.get("run_attempt")
             for job in _rows(gh(f"repos/{repo}/actions/runs/{int(run['id'])}/jobs?filter=latest&per_page=100",
                                 paginate=True), "jobs"):
-                if job.get("run_attempt") == run["run_attempt"]:  # earlier attempts of a re-run are history
-                    candidates.setdefault(job.get("name"), []).append((run, job))
+                if isinstance(attempt, int) and job.get("run_attempt") != attempt:
+                    continue  # earlier attempts of a re-run are history
+                found.setdefault(job.get("name"), []).append((run, job, int(run["id"]) in trusted))
         # Only workflows that produce a required check must be the base branch's own workflows;
         # an unrelated workflow the PR adds is not evidence and does not block.
         on_base: dict[str, bool] = {}
-        for path in sorted({run["path"] for context, _ in required for run, _job in candidates.get(context, [])}):
+        for path in sorted({run["path"] for context, _ in required
+                            for run, _job, ok in found.get(context, []) if ok}):
             try:
                 body = gh(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}")
                 on_base[path] = isinstance(body, dict) and body.get("type") == "file" and body.get("path") == path
@@ -236,34 +241,32 @@ def actions_fallback(receipt: dict, url: str, *, gh: Callable[..., Any] | None =
                 if exc.status != "404":
                     raise
                 on_base[path] = False
-        outcomes, checks, foreign_workflow = [], [], []
+        outcomes, checks, untrusted_only = [], [], []
         for context, _app_id in required:
-            found = candidates.get(context) or []
-            selected = [(run, job) for run, job in found if on_base[run["path"]]]
-            if found and not selected:
-                foreign_workflow.append(context)
-            if selected:
-                # As core does for check runs: each workflow's newest run of this job counts, and every
-                # workflow that produces it must pass (an older failing workflow is not hidden by a newer one).
-                newest = {}
-                for run, _job in selected:
-                    newest[run["path"]] = max(newest.get(run["path"], 0), int(run["id"]))
-                selected = [(run, job) for run, job in selected if int(run["id"]) == newest[run["path"]]]
-            if not selected:
-                waiting = still_open and running and context not in foreign_workflow
+            jobs = found.get(context) or []
+            counted = [(run, job) for run, job, ok in jobs if ok and on_base[run["path"]]]
+            # Not evidence of success, but a refusal all the same when it failed or has not finished.
+            refusing = [(run, job) for run, job, ok in jobs if not (ok and on_base[run["path"]])
+                        and _classify(job, sha) != "success"]
+            if jobs and not counted and not refusing and (any(ok for _run, _job, ok in jobs)
+                                                          or not (still_open and running)):
+                untrusted_only.append(context)  # an open PR with no trusted run yet may still get one
+            if not counted and not refusing:
+                waiting = still_open and running and context not in untrusted_only
                 outcomes.append("pending" if waiting else "missing")
                 checks.append({"name": context, "classification": "pending" if waiting else "missing",
                                "head_sha": sha, "evidence_source": "actions"})
-            for run, job in selected:
+            for run, job in counted + refusing:  # every counted run's latest attempt must pass
                 classification = _classify(job, sha)
                 outcomes.append(classification)
                 checks.append({"name": context, "id": job.get("id"), "url": job.get("html_url"),
                                "head_sha": job.get("head_sha"), "classification": classification,
                                "conclusion": job.get("conclusion"), "evidence_source": "actions",
                                "workflow": run.get("path"), "run_attempt": run.get("run_attempt")})
-        if foreign_workflow and "failure" not in outcomes:
-            return result("unprovable", "the required checks " + ", ".join(foreign_workflow)[:200] + " ran only from "
-                          "a workflow that is not on the base branch, so they are not trusted evidence", checks)
+        if untrusted_only and all(x in ("success", "missing") for x in outcomes):
+            return result("unprovable", "the required checks " + ", ".join(untrusted_only)[:200] + " ran only in "
+                          "GitHub Actions runs that are not trusted evidence (manually started, from another "
+                          "repository, or from a workflow that is not on the base branch)", checks)
         # Re-read after every page: old-head successes never transfer.
         refusal, detail, _pr = _current_pr(gh, repo, number, sha, branch)
         if refusal:

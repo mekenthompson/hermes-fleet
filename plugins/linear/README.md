@@ -427,8 +427,8 @@ verified completion. A PR named as evidence is verified by core's exact-head req
 verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
 token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
 jobs instead (`acceptance.py`: every requirement pinned to the Actions app, trusted runs of the
-PR's own repository, the base branch's own workflow for each required job, latest attempt, each
-workflow's newest run of a required job passing, full pagination, and a final re-read showing the same head;
+PR's own repository, the base branch's own workflow for each required job, latest attempt of every
+counted run passing, a failed or unfinished required job in any Actions run on the head refusing, full pagination, and a final re-read showing the same head;
 merged counts, closed unmerged does not). Where Actions cannot stand in for the checks (they
 are not Actions jobs, the PR is from a fork, or only untrusted runs exist) the answer is final.
 When GitHub cannot be asked (refused, unreachable, or checks not finished, including CI not

@@ -138,18 +138,18 @@ class ActionsFallbackTests(unittest.TestCase):
         self.assertFalse(receipt["ok"])
         self.assertFalse(acceptance.unverified(receipt))
 
-    def test_pr_head_moved_from_the_recorded_head_is_refused(self):
+    def test_pr_head_moved_from_the_recorded_head_is_asked_again(self):
         receipt = self.settle(FakeGitHub(head_sha=OTHER_SHA))
         self.assertFalse(receipt["ok"])
-        self.assertEqual(receipt["classification"], "stale")
-        self.assertFalse(acceptance.unverified(receipt))
+        self.assertEqual(receipt["classification"], "pending")
+        self.assertTrue(acceptance.unverified(receipt))
 
-    def test_head_moved_during_collection_is_refused(self):
+    def test_head_moved_during_collection_is_asked_again_never_accepted(self):
         github = FakeGitHub(state="open", merged=False)
         github.after_reread = {**github.pr, "head": {**github.pr["head"], "sha": OTHER_SHA}}
         receipt = self.settle(github)
         self.assertFalse(receipt["ok"])
-        self.assertEqual(receipt["classification"], "stale")
+        self.assertEqual(receipt["classification"], "pending")
 
     def test_closed_without_merge_is_refused(self):
         receipt = self.settle(FakeGitHub(state="closed", merged=False))
@@ -210,8 +210,11 @@ class ActionsFallbackTests(unittest.TestCase):
                     return original(endpoint, paginate=paginate)
                 self.assertEqual(acceptance.settle(denied_receipt(), URL, gh=reply)["classification"], expected)
 
-    def test_within_one_workflow_the_newest_run_decides(self):
-        for older, newer, expected in (("failure", "success", "success"), ("success", "failure", "failure")):
+    def test_every_run_of_one_workflow_must_pass(self):
+        # As core reads the latest check run of every workflow run: a push run and a pull_request run
+        # of the same file both count, so an older failing run is not hidden by a newer passing one.
+        for older, newer, expected in (("failure", "success", "failure"), ("success", "failure", "failure"),
+                                       ("success", "success", "success")):
             with self.subTest(older=older, newer=newer):
                 github = FakeGitHub()
                 github.runs.append({**github.runs[0], "id": 12})  # the same workflow, run again (a new push event)
@@ -226,6 +229,65 @@ class ActionsFallbackTests(unittest.TestCase):
                         return [{"total_count": 1, "jobs": jobs12}]
                     return original(endpoint, paginate=paginate)
                 self.assertEqual(acceptance.settle(denied_receipt(), URL, gh=reply)["classification"], expected)
+
+    def with_second_run(self, run, job):
+        """A FakeGitHub whose head also has run 12 with one job, next to the passing pull_request run."""
+        github = FakeGitHub()
+        github.runs.append({**github.runs[0], "id": 12, **run})
+        original = github.__call__
+
+        def reply(endpoint, *, paginate=False):
+            if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha="):
+                return [{"total_count": 2, "workflow_runs": github.runs}]
+            if endpoint.startswith(f"repos/{REPO}/actions/runs/12/jobs"):
+                github.calls.append(endpoint)
+                return [{"total_count": 1, "jobs": [{**github.jobs[0], "id": 500, **job}]}]
+            return original(endpoint, paginate=paginate)
+        return reply
+
+    def test_a_failing_manual_run_refuses_despite_a_passing_pull_request_run(self):
+        receipt = acceptance.settle(denied_receipt(), URL, gh=self.with_second_run(
+            {"event": "workflow_dispatch"}, {"conclusion": "failure"}))
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["classification"], "failure")
+        self.assertFalse(acceptance.unverified(receipt))
+
+    def test_an_unfinished_manual_run_is_pending(self):
+        receipt = acceptance.settle(denied_receipt(), URL, gh=self.with_second_run(
+            {"event": "workflow_dispatch", "status": "in_progress"}, {"status": "in_progress", "conclusion": None}))
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["classification"], "pending")
+        self.assertTrue(acceptance.unverified(receipt))
+
+    def test_a_failing_run_from_another_repository_on_the_same_sha_refuses(self):
+        receipt = acceptance.settle(denied_receipt(), URL, gh=self.with_second_run(
+            {"head_repository": {"full_name": "mallory/app"}}, {"conclusion": "failure"}))
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["classification"], "failure")
+
+    def test_a_failing_run_of_a_workflow_not_on_base_refuses(self):
+        github = FakeGitHub()
+        github.runs.append({**github.runs[0], "id": 12, "path": ".github/workflows/added-by-pr.yml"})
+        original = github.__call__
+
+        def reply(endpoint, *, paginate=False):
+            if endpoint.startswith(f"repos/{REPO}/actions/runs?head_sha="):
+                return [{"total_count": 2, "workflow_runs": github.runs}]
+            if endpoint.startswith(f"repos/{REPO}/actions/runs/12/jobs"):
+                return [{"total_count": 1, "jobs": [{**github.jobs[0], "id": 501, "conclusion": "failure"}]}]
+            if "/contents/.github/workflows/added-by-pr.yml" in endpoint:
+                raise acceptance.Denied("HTTP 404 on contents", "404")
+            return original(endpoint, paginate=paginate)
+        self.assertEqual(acceptance.settle(denied_receipt(), URL, gh=reply)["classification"], "failure")
+
+    def test_a_passing_manual_run_alone_is_still_not_enough(self):
+        github = FakeGitHub(event="workflow_dispatch")
+        receipt = self.settle(github)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["classification"], "unprovable")
+        receipt = acceptance.settle(denied_receipt(), URL, gh=self.with_second_run(
+            {"event": "workflow_dispatch"}, {"conclusion": "success"}))
+        self.assertIs(receipt["ok"], True)  # it neither counts nor refuses next to a trusted pass
 
     def test_pull_request_target_is_ignored_as_evidence(self):
         receipt = self.settle(FakeGitHub(event="pull_request_target"))
