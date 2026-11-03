@@ -226,11 +226,12 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [native["task_id"]])
         task_id = native["task_id"]
 
-        # The asking chat is a native notify subscriber (wake: one reply per update), as is the issue.
+        # The asking chat is a native notify subscriber (wake: one reply per update). The issue is
+        # not: the bridge relays to it, and core's notifier cannot reply there without a session.
         subs = {(sub["platform"], sub["chat_id"]): sub for sub in self.subs(task_id)}
         self.assertEqual(subs[("telegram", "chat-1")]["thread_id"], "thread-1")
         self.assertEqual(subs[("telegram", "chat-1")]["delivery_mode"], "wake")
-        self.assertIn(("linear", NEW_ISSUE), subs)
+        self.assertEqual(set(subs), {("telegram", "chat-1")})
         self.assertEqual(self.chat_events(task_id), [])  # our own admission is not news for the chat
 
         # Delegate: this app, the human assignee untouched.

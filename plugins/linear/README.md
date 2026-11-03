@@ -56,7 +56,11 @@ session or worker. Linear status comes from native execution (In Progress once a
 claims it). The asking chat is a native notify subscriber built like core `kanban_create`
 auto-subscribe from host-captured context (messaging chats are woken in their thread,
 Desktop targets its native local conversation, TUI its session key), added after admission so
-it hears checkpoints and the result, not the admission itself. `record_done` never runs a
+it hears checkpoints and the result, not the admission itself. The issue itself is not a
+notify subscriber: the bridge reports the task's events there from its own cursor. Core's
+notifier cannot reply in Linear without an Agent Session, so on start the service removes the
+session-less `linear` subscriptions earlier releases created, inherited child copies included
+(one `action=notify.retire outcome=applied` line each). `record_done` never runs a
 worker or re-runs work, even after a crash part-way through: recovery and the assignment
 echo never admit a record_done task, `work_on` is refused, and repeating the same
 `record_done` finishes it. A chat admission recovered after a crash is held if the issue

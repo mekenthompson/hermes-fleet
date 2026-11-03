@@ -248,18 +248,27 @@ class BoundLinearAPI(LinearAPI):
             issue, comments = super().issue_with_thread(issue_id, limit)
         return self._scoped_comments(issue, issue_id, comments)
     def issue_progress(self, issue_id, limit=20):
-        """Recent updates for status only, with the same issue/author authorization as threads."""
+        """Recent updates for status only, with the same issue/author authorization as threads.
+
+        The same read carries the issue's user-visible Agent Session activities (``activities``
+        is None when Linear did not return them), filtered by the same author rule as comments."""
         with self._permit_specialist_operation():
-            issue, comments = super().issue_with_thread(issue_id, limit, progress=True)
+            issue, comments = super().issue_with_thread(issue_id, limit, progress=True, activities=True)
         comments = self._scoped_comments(issue, issue_id, comments)
         page = (issue.get("comments") or {}).get("pageInfo") or {}
-        return {"comments": comments, "history_complete": page.get("hasNextPage") is False}
+        result = {"comments": comments, "history_complete": page.get("hasNextPage") is False, "activities": None}
+        read = self.agent_activities(issue)
+        if read is not None:
+            result.update(activities=self._allowed_authors(read[0]), activities_complete=read[1])
+        return result
     def _scoped_comments(self, issue, issue_id, comments):
         self._scoped(issue, issue_id)
+        return self._allowed_authors(comments)
+    def _allowed_authors(self, items):
         if self.specialist_scope is not None:
             allowed = set(self.specialist_scope["allowed_requester_ids"]) | {self.viewer_id()}
-            comments = [comment for comment in comments if comment.get("user_id") in allowed]
-        return comments
+            items = [item for item in items if item.get("user_id") in allowed]
+        return items
     def _mutation_issue(self, issue_id):
         issue = self.issue(issue_id)
         if not isinstance(issue_id, str) or not issue_id.strip() or issue.get("id") != issue_id:

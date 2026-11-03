@@ -47,7 +47,7 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
-    "session.admit", "cleanup.inspect", "chat.guard",
+    "session.admit", "cleanup.inspect", "notify.retire", "chat.guard",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -114,6 +114,8 @@ REASONS = frozenset({
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",
     "context_or_service_unavailable", "delivery_uncertain",
+    # retired Linear notify subscriptions (the bridge relays those events itself)
+    "bridge_relayed",
 })
 _OPEN_REASON = re.compile(r"(?:native|graphql)_[a-z0-9_]{1,32}")
 
