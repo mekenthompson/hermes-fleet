@@ -621,6 +621,18 @@ def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
         return collect_acceptance(contract or url, url)
     except (ImportError, KeyError, TypeError):
         return {}
+def relayed_notify_sub(sub: dict) -> bool:
+    """A passive ``linear`` subscription with no Agent Session to reply in.
+
+    The Linear adapter's send() refuses these on every attempt, so core's
+    notifier holds them forever; the bridge relays the same task events itself.
+    Session-bound Linear subscriptions are left alone.
+    """
+    metadata = sub.get("delivery_metadata") or {}
+    return (str(sub.get("platform") or "").lower() == "linear"
+            and (sub.get("delivery_mode") or "notify") == "notify"
+            and not sub.get("thread_id")
+            and not (isinstance(metadata, dict) and metadata.get("thread_id")))
 def iso_ms(raw: Any) -> float:
     try:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000
@@ -779,10 +791,35 @@ class Kanban:
         for row in conn.execute(f"SELECT task_id FROM {table}"):
             native_text_row(row, "task_id")
     def subscribe(self, task_id: str, issue_id: str, *, issue: dict | None = None) -> None:
-        with self.conn() as conn:
+        """Final issue-scope check at the reporting boundary; no core notify subscription.
+
+        The bridge relays the task's native events to the issue itself (outbox
+        activities and comments, own cursor). A thread-less ``linear`` notify
+        subscription can never be delivered by the Linear platform adapter (no
+        Agent Session or source Activity), so core's notifier would only hold
+        and retry it forever.
+        """
+        with self.conn():
             if issue is not None:
                 require_task_issue_scope(self.require_task(task_id), issue)
-            self.kn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=issue_id)
+    def retire_relayed_notify_subs(self) -> list[tuple[str, str]]:
+        """Remove the thread-less Linear notify subscriptions earlier releases created.
+
+        Returns (task id, issue id) for each removed row. Only rows the Linear
+        adapter refuses on every attempt qualify (see ``relayed_notify_sub``);
+        nothing they would deliver is lost, because the bridge already reports
+        those events. Child tasks inherited the same rows, so they go too.
+        """
+        if getattr(self, "history_only", False):
+            return []
+        removed = []
+        with self.conn() as conn:
+            for sub in self.kn.list_notify_subs(conn):
+                if relayed_notify_sub(sub) and self.kn.remove_notify_sub(
+                        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or ""):
+                    removed.append((sub["task_id"], sub["chat_id"]))
+        return removed
     def subscribe_origin(self, task_id: str, route: dict) -> None:
         """Native notify subscription for the chat that asked; core's notifier delivers to it."""
         with self.conn() as conn:
@@ -1084,6 +1121,7 @@ class Bridge:
         self._rechecked_at: dict[str, float] = {}
         self._pump_authorized: dict[str, float] = {}  # issue id -> when its cached specialist-scope proof expires
         self._last_unbound_sweep = 0.0
+        self._notify_subs_retired: set[str] = set()  # boards swept of relayed Linear notify subs
         self.native_ingress = None
         # (issue id, Agent Session id) of a delegation admission in progress -> _decline answered it.
         self.session_notices: dict[tuple[str, str], bool] = {}
@@ -3348,8 +3386,36 @@ class Bridge:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
             self.drain_ingress(ingress, retry_now=True)
+        self._retire_relayed_notify_subs()
         self._recover_admissions()
         self.pump_kanban()
+
+    def _retire_relayed_notify_subs(self) -> None:
+        """Drop the undeliverable Linear notify subscriptions earlier releases created.
+
+        Each board is swept once per process; a failed sweep waits (15 s doubling
+        to 1 h, persisted) and retries on a later tick. One INFO line per removed row.
+        """
+        if not callable(getattr(self.kanban, "retire_relayed_notify_subs", None)):
+            return  # Not the native Kanban adapter: there are no core subscriptions to retire.
+        retired = self._notify_subs_retired
+        home = getattr(self.kanban, "board", None) or "default"
+        for board in sorted({home, *self.store.native_boards()} - retired):
+            backoff = f"retire_notify_subs:{board}"
+            if not self.store.backoff_ready(backoff, self.clock()):
+                continue
+            try:
+                adapter = self.kanban if board == home else self.kanban.for_board(board)
+                removed = adapter.retire_relayed_notify_subs()
+            except Exception as exc:  # Reporting is unaffected; core keeps retrying until this succeeds.
+                until = self.store.backoff_fail(backoff, self.clock())
+                diag.warn("notify.retire", "held", diag.exc_reason(exc), exc=type(exc).__name__,
+                          next_s=until - self.clock())
+                continue
+            self.store.backoff_clear(backoff)
+            retired.add(board)
+            for task_id, issue_id in removed:
+                diag.evt("notify.retire", "applied", "bridge_relayed", iss=issue_id, task=task_id)
 
     def _recover_admissions(self) -> None:
         """Use the existing service loop; one unavailable binding holds only itself."""
@@ -3925,6 +3991,7 @@ class Bridge:
         try:
             if ingress is not None:
                 self.drain_ingress(ingress)
+            self._retire_relayed_notify_subs()
             self._recover_admissions()
             self.pump_kanban()
             self.recheck()
