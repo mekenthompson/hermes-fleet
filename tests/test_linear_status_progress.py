@@ -121,8 +121,8 @@ class StatusProgressTests(unittest.TestCase):
         self.assertEqual(result["issue"], before[0]["issue-1"])
         self.assertIn("native", result)
         progress = result["progress"]
-        self.assertEqual([c["id"] for c in progress["comments"]], [f"comment-{i}" for i in range(66, 46, -1)])
-        latest = progress["comments"][0]
+        self.assertEqual([c["id"] for c in progress["thread"]], [f"comment-{i}" for i in range(66, 46, -1)])
+        latest = progress["thread"][0]
         self.assertEqual((latest["at"], latest["who"], latest["user_id"], latest["url"]),
                          (self.clock.iso(66), SELF, SELF, "https://linear.example/comment/66"))
         self.assertIn("Actual client acceptance.", latest["body"])
@@ -139,7 +139,7 @@ class StatusProgressTests(unittest.TestCase):
             "body": "### Verified now\nBackend recovery and reporting passed.\n\n### Remaining\nActual clients and coherent syncing."})
         before = self.snapshot()
         progress = self.invoke()["progress"]
-        current = progress["comments"][0]
+        current = progress["thread"][0]
         self.assertEqual(current["id"], "comment-0")
         self.assertEqual(progress["order"], "newest_first")
         self.assertEqual(current["created_at"], self.clock.iso(0))
@@ -162,7 +162,7 @@ class StatusProgressTests(unittest.TestCase):
         progress = self.invoke()["progress"]
         self.assertTrue(progress["history_complete"], "all six visible comment records were fetched")
         self.assertTrue(progress["bodies_truncated"])
-        current = progress["comments"][0]
+        current = progress["thread"][0]
         self.assertEqual(current["id"], "comment-0")
         self.assertEqual(current["at"], self.clock.iso(100))
         self.assertTrue(current["body_truncated"])
@@ -183,16 +183,16 @@ class StatusProgressTests(unittest.TestCase):
             self.comment(number, f"### Milestone {number}\n\n" + "é" * 5000)
         before = self.snapshot()
         progress = self.invoke()["progress"]
-        self.assertEqual([c["id"] for c in progress["comments"]], [f"comment-{i}" for i in range(7, 3, -1)])
-        self.assertEqual(sum(len(c["body"]) for c in progress["comments"]), chat.PROGRESS_TEXT_LIMIT)
-        self.assertTrue(all(c["body_truncated"] and "\n\n" in c["body"] for c in progress["comments"]))
+        self.assertEqual([c["id"] for c in progress["thread"]], [f"comment-{i}" for i in range(7, 3, -1)])
+        self.assertEqual(sum(len(c["body"]) for c in progress["thread"]), chat.PROGRESS_TEXT_LIMIT)
+        self.assertTrue(all(c["body_truncated"] and "\n\n" in c["body"] for c in progress["thread"]))
         self.assertTrue(progress["truncated"])
         self.assert_read_only(before)
 
     def test_empty_comment_history_is_complete_when_server_confirms_no_next_page(self):
         progress = self.invoke()["progress"]
         self.assertEqual(progress["status"], "available")
-        self.assertEqual(progress["comments"], [])
+        self.assertEqual(progress["thread"], [])
         self.assertTrue(progress["history_complete"])
         self.assertFalse(progress["bodies_truncated"])
 
@@ -207,7 +207,7 @@ class StatusProgressTests(unittest.TestCase):
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(result["issue"]["id"], "issue-1")
                 self.assertEqual(result["progress"]["status"], "unavailable")
-                self.assertNotIn("comments", result["progress"])
+                self.assertNotIn("thread", result["progress"])
                 self.assertEqual(result["progress"]["code"], "rate_limited" if code == 429 else "comments_unavailable")
                 if code == 429:
                     self.assertGreater(result["progress"]["retry_at"], self.clock())
@@ -232,7 +232,7 @@ class StatusProgressTests(unittest.TestCase):
         self.comment(3, "Own app evidence")
         before = self.snapshot()
         result = self.invoke()
-        self.assertEqual([c["id"] for c in result["progress"]["comments"]], ["comment-3", "comment-1"])
+        self.assertEqual([c["id"] for c in result["progress"]["thread"]], ["comment-3", "comment-1"])
         self.assertNotIn("Foreign private", json.dumps(result))
         self.assert_read_only(before)
 
@@ -264,7 +264,7 @@ class StatusProgressTests(unittest.TestCase):
         result = self.invoke(replace(self.context, pinned_board="default", pinned_db_path="/synthetic/default.db"))
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["native"]["status"], "unavailable")
-        self.assertEqual(result["progress"]["comments"][0]["id"], "comment-1")
+        self.assertEqual(result["progress"]["thread"][0]["id"], "comment-1")
         self.assert_read_only(before)
 
     def test_unlinked_retained_stopped_and_completed_reads_never_dispatch(self):
@@ -281,7 +281,7 @@ class StatusProgressTests(unittest.TestCase):
                 with patch.object(self.bridge, "flush", side_effect=AssertionError("status cannot flush effects")):
                     result = self.invoke()
                 self.assertTrue(result["ok"], result)
-                self.assertIn("resume work", result["progress"]["comments"][0]["body"])
+                self.assertIn("resume work", result["progress"]["thread"][0]["body"])
                 self.assert_read_only(before)
 
     def test_wrong_identity_or_untrusted_context_cannot_read_comments(self):
