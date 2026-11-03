@@ -5,6 +5,7 @@ The database records reporting and uncertain delivery. It never grants execution
 from __future__ import annotations
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -14,6 +15,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 from .api import backoff_delay
+from .acceptance import DELIVERY_REFUSAL
 MIN_BACKOFF, MAX_BACKOFF, GIVE_UP_AFTER = 60.0, 3600.0, 86_400.0
 # A guard-deferred outbox row keeps two quick retries (the native state it waits for is usually
 # captured within a tick), then waits 30 s doubling to 30 min instead of re-reading Linear every tick.
@@ -848,6 +850,94 @@ class Store:
                                    "json_extract(payload, '$.terminal')=1 AND "
                                    "json_extract(payload, '$.admission_id') IS NULL LIMIT 1",
                                    (task_id, issue_id, issue_id, state, state)).fetchone())
+    # A Blocked closeout written before unverified acceptance showed In Review: its own message
+    # (acceptance_refusal) names the PR and a receipt class meaning GitHub refused or did not answer.
+    _UNVERIFIED_CLOSEOUT = re.compile(r"could not be verified as ready \((https://github\.com/[A-Za-z0-9_.-]+/"
+                                      r"[A-Za-z0-9_.-]+/pull/[1-9][0-9]*): (auth|infra|pending): ")
+    _CLOSEOUT_HEAD = re.compile(r"/commits/([0-9a-f]{40})/check-runs\)")
+    # The newest status intent for an issue, passing over a Done closeout whose send-time re-verify
+    # refused it (DELIVERY_REFUSAL): GitHub changed its answer, so the wait that Done ended goes on.
+    # A Done refused for any other reason (Linear's) is the issue's last word and ends the wait.
+    _LATEST_LIVE_STATUS = ("SELECT id, state, hold_reason, payload FROM outbox WHERE kind='status' "
+                           "AND json_extract(payload, '$.issue_id')=? AND NOT (state='failed' "
+                           "AND json_extract(payload, '$.state')='done' AND json_extract(payload, '$.terminal')=1 "
+                           "AND substr(COALESCE(json_extract(payload, '$.last_error'), ''), 1, ?)=?) "
+                           "ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1")
+    def acceptance_recheck(self, issue_id: str, task_id: str) -> dict[str, Any] | None:
+        """The closeout of a done task that waits on GitHub rather than on a person, or None.
+
+        ``in_review``: the latest status is the non-terminal In Review that names the completed
+        event (bridge._await_acceptance). ``blocked``: the latest status is a sent terminal Blocked
+        closeout of this task whose message says GitHub refused or did not answer, not yet settled
+        by a recheck. Either way no pending or delivered Done closeout exists for the task (a Done
+        that failed to deliver does not end the wait). Local reads only.
+        """
+        with self._tx() as db:
+            return self._acceptance_recheck(db, issue_id, task_id)
+    @classmethod
+    def _acceptance_recheck(cls, db: sqlite3.Connection, issue_id: str, task_id: str) -> dict[str, Any] | None:
+        latest = db.execute(cls._LATEST_LIVE_STATUS, (issue_id, len(DELIVERY_REFUSAL), DELIVERY_REFUSAL)).fetchone()
+        if (not latest or latest["hold_reason"] is not None
+                or db.execute("SELECT 1 FROM metadata WHERE key=?", (cls._settled_key(latest["id"]),)).fetchone()):
+            return None
+        payload = json.loads(latest["payload"])
+        if (payload.get("task_id") != task_id or payload.get("admission_id")
+                or payload.get("state") not in ("in_review", "blocked")):
+            return None  # The common case (Done, running, ...) ends here without the scan below.
+        if db.execute("SELECT 1 FROM outbox WHERE hold_reason IS NULL AND kind='status' AND state IN ('pending','sent') "
+                      "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.issue_id')=? "
+                      "AND json_extract(payload,'$.state')='done' AND json_extract(payload,'$.terminal')=1 LIMIT 1",
+                      (task_id, issue_id)).fetchone():
+            return None
+        wait = payload.get("acceptance_wait")
+        if payload["state"] == "in_review":
+            if payload.get("terminal") or not isinstance(wait, dict) or type(wait.get("event_id")) is not int:
+                return None
+            return {"kind": "in_review", "status_id": latest["id"], "event_id": wait["event_id"],
+                    "url": wait.get("url") or "", "classification": wait.get("classification") or "",
+                    "head_sha": wait.get("head_sha") or "", "since": wait.get("since", payload.get("enqueued_at"))}
+        source_ms = payload.get("source_ms")
+        if (not payload.get("terminal") or latest["state"] != "sent" or payload.get("acceptance_final")
+                or not isinstance(source_ms, (int, float)) or isinstance(source_ms, bool)):
+            return None  # Only an older build's Blocked qualifies; this build's Blocked is a final answer.
+        texts = db.execute("SELECT COALESCE(json_extract(payload,'$.body'), json_extract(payload,'$.content.body'), '') "
+                           "FROM outbox WHERE hold_reason IS NULL AND json_extract(payload,'$.requires_status_id')=?",
+                           (latest["id"],)).fetchall()
+        for (text,) in texts:
+            found = cls._UNVERIFIED_CLOSEOUT.search(text or "")
+            if found:
+                head = cls._CLOSEOUT_HEAD.search(text)
+                return {"kind": "blocked", "status_id": latest["id"], "source_ms": source_ms, "url": found[1],
+                        "classification": found[2], "head_sha": head[1] if head else ""}
+        return None
+    @staticmethod
+    def _settled_key(status_id: str) -> str:
+        return f"acceptance-recheck-settled:{status_id}"
+    def settle_acceptance_recheck(self, status_id: str) -> None:
+        """This waiting closeout is decided (a definite answer, or the 7-day cap): stop asking about it."""
+        with self._tx() as db:
+            db.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+                       (self._settled_key(status_id), json.dumps({"settled": True})))
+    def finish_acceptance_recheck(self, issue_id: str, recheck: dict[str, Any],
+                                  writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
+        """Write a rechecked closeout, only while ``recheck`` is still this task's latest closeout.
+
+        The completed event was consumed when that closeout was captured, so the cursor is not
+        moved; a retry, a newer status or a Done written meanwhile refuses the write.
+        """
+        status = next((payload for kind, payload in writes if kind == "status"), None)
+        if not status or not status.get("terminal"):
+            return False
+        with self._tx() as db:
+            work = db.execute("SELECT task_id, last_event_id FROM work WHERE issue_id=? AND origin='native'",
+                              (issue_id,)).fetchone()
+            if not work or work["task_id"] != status.get("task_id"):
+                return False
+            current = self._acceptance_recheck(db, issue_id, work["task_id"])
+            if (not current or current["kind"] != recheck.get("kind") or current["status_id"] != recheck.get("status_id")
+                    or (current["kind"] == "in_review" and work["last_event_id"] < current["event_id"])):
+                return False
+            return self.finish(issue_id, writes, at=at)
     def assessment_comment_id(self, issue_id: str, body: str, *, completion: dict | None = None) -> str | None:
         with self._tx() as db:
             self._hold_legacy_outbox(db)

@@ -21,6 +21,7 @@ from .oauth import ReauthorizationRequired
 from .store import Store, advisory
 from . import transport
 from . import diag
+from . import acceptance
 log = logging.getLogger(diag.LOGGER_NAME)
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
@@ -34,6 +35,10 @@ STOP_RETRY_GAP = 600
 ISSUE_RECHECK_GAP = 30.0  # seconds: Issue webhooks for one tracked issue coalesce into at most one read per gap
 PUMP_AUTHORIZED_TTL = 300.0  # seconds: an idle native row re-proves specialist scope at most this often while pumping
 RECHECKED_STATUSES = ("running", "ready", "blocked")  # finished or parked native work is not polled
+# Finished work whose PR GitHub would not let us check is asked again on a widening, persisted gap
+# (2 min doubling to 1 h, jittered), never per tick: a few GitHub reads per issue per hour at most.
+ACCEPTANCE_RECHECK_BASE, ACCEPTANCE_RECHECK_CAP = 120.0, 3600.0
+ACCEPTANCE_MAX_WAIT = 7 * 86400.0  # after a week of no answer, the issue goes to Blocked; nothing rechecks forever
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
 STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
@@ -605,22 +610,54 @@ def acceptance_cause(receipt, url: str = "") -> str:
     else:
         cause = "acceptance verifier returned no receipt"
     return _public(f"{url}: {cause}" if url else cause)[:500]
+_RECEIPT_LABEL = re.compile(r"(^|: |; )(?:auth|infra|pending|failure|missing|stale|closed|unprovable|unknown): ")
+_CHECK_OUTCOME = re.compile(r"(required check [^;:()]{1,100}): [a-z]{1,30} \(conclusion ([a-z_]{1,30})\)")
+def _plain_cause(cause: str) -> str:
+    """The cause as people read it: no receipt class labels, evidence-source tags or check classes."""
+    cause = re.sub(r"; source [a-z]+", "", cause)
+    cause = _CHECK_OUTCOME.sub(lambda m: f"{m[1]} {'has no result' if m[2] == 'unavailable' else 'ended as ' + m[2]}", cause)
+    return _RECEIPT_LABEL.sub(lambda m: m[1], cause)
 def acceptance_refusal(failures: list[str], *, where: str = "chat") -> str:
     cause = _public("; ".join(failures) if failures else "no acceptance receipt")
-    if where == "delivery":
-        return f"PR acceptance on the recorded exact head failed at delivery ({cause})"
+    if where == "delivery":  # an outbox error, read by the recheck (acceptance.DELIVERY_REFUSAL); never shown as is
+        return f"{acceptance.DELIVERY_REFUSAL} ({cause})"
+    cause = _plain_cause(cause)
     if where == "kanban":
         return (f"The work finished, but its pull request could not be verified as ready ({cause}). The issue "
-                "stays open until the PR's required checks pass on its latest commit.")
+                "stays open until that is fixed and the work is completed again.")
     return (f"The pull request could not be verified as ready ({cause}), so leave this issue open until its "
             "required checks pass on its latest commit.")
 def pr_acceptance(url: str, contract: str | None = None) -> dict[str, Any]:
-    """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping."""
+    """Use core's exact-head required-check verifier for every GitHub PR, even without a project mapping.
+
+    A login refused only at the Checks API read is completed from exact-head Actions jobs (acceptance.py).
+    """
     try:
         from hermes_cli.kanban_pr_acceptance import collect_acceptance
-        return collect_acceptance(contract or url, url)
+        receipt = collect_acceptance(contract or url, url)
     except (ImportError, KeyError, TypeError):
         return {}
+    try:
+        return acceptance.settle(receipt, url)
+    except Exception:  # The fallback can only add proof; it never turns a refusal into an acceptance.
+        log.exception("linear: PR acceptance fallback failed")
+        return receipt
+_WAITING_REASON = {
+    "auth": "GitHub refused the agent's request for the pull request's check results",
+    "pending": "the pull request's required checks have not finished yet",
+    "infra": "GitHub did not answer when asked for the pull request's check results",
+}
+def acceptance_waiting(url: str, classification: str) -> str:
+    """The plain In Review sentence for finished work whose PR could not be checked yet."""
+    reason = _WAITING_REASON.get(classification, _WAITING_REASON["infra"])
+    return (f"The work is finished, but {reason}, so it is not confirmed yet ({url}). The issue stays In Review "
+            "and the agent checks again by itself: it moves to Done once the required checks pass on the PR's "
+            "latest commit, or to Blocked if one fails or nothing can be confirmed within 7 days.")
+def acceptance_expired(url: str, classification: str) -> str:
+    """The plain Blocked sentence when a PR's checks could not be confirmed within ACCEPTANCE_MAX_WAIT."""
+    reason = _WAITING_REASON.get(classification, _WAITING_REASON["infra"])
+    return (f"The work is finished, but its pull request's checks could not be confirmed within 7 days ({url}): "
+            f"{reason}. The agent has stopped checking. Confirm the checks, then complete the work again.")
 def relayed_notify_sub(sub: dict) -> bool:
     """A passive ``linear`` subscription with no Agent Session to reply in.
 
@@ -1205,10 +1242,15 @@ class Bridge:
     def _alert_reauthorization(self) -> None:
         diag.warn("auth.reauth_required", "held", "auth_unavailable")
     def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
-                          heads: dict[str, str] | None = None, failures: list[str] | None = None) -> bool:
+                          heads: dict[str, str] | None = None, failures: list[str] | None = None,
+                          unverified: list[tuple[str, str, str]] | None = None) -> bool:
+        """``unverified`` receives (url, class, head) when the refusal is GitHub not answering, else class "".
+
+        ``head`` is the PR head the verifier saw (empty when unknown)."""
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
             failures is not None and failures.append("evidence link is not a pull request")
+            unverified is not None and unverified.append(("", "", ""))
             return False
         if not prs:
             return True
@@ -1217,6 +1259,9 @@ class Bridge:
             if not isinstance(receipt, dict) or receipt.get("ok") is not True or not re.fullmatch(
                     r"[0-9a-f]{40}", str(receipt.get("head_sha") or "")):
                 failures is not None and failures.append(acceptance_cause(receipt if isinstance(receipt, dict) else {}, url))
+                unverified is not None and unverified.append(
+                    (url, receipt["classification"] if acceptance.unverified(receipt) else "",
+                     str(receipt.get("head_sha") or "") if isinstance(receipt, dict) else ""))
                 return False
             if heads is not None: heads[url] = receipt["head_sha"]
         return True
@@ -2759,7 +2804,7 @@ class Bridge:
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
-                for step in (self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
+                for step in (self._recheck_acceptance, self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
                     # These steps read Linear; a refusal or error waits (15 s doubling to 1 h, persisted)
                     # instead of repeating the same reads every tick.
                     backoff = f"{step.__name__}:{issue_id}"
@@ -3032,7 +3077,7 @@ class Bridge:
                              "body": _visible_activity(payload.get("content") or {})})
                 if kind == "activity" else (kind, payload) for kind, payload in writes]
     def _finish_work(self, issue_id: str, writes: list, *, at: float, event_id: int | None = None,
-                     reconcile_request_id: str | None = None) -> bool:
+                     reconcile_request_id: str | None = None, recheck: dict | None = None) -> bool:
         row = self.store.get(issue_id)
         if not row or row.get("origin") != "native" or event_id is None:
             return False
@@ -3056,10 +3101,28 @@ class Bridge:
                     return self.store.reconcile_completion(issue_id, reconcile_request_id, event_id, writes,
                                                            at=at, status_required=status_required)
             return False
+        if recheck is not None:
+            # The completed event was consumed with the earlier unverified closeout. The store
+            # writes this closeout only while that same closeout is still the latest word.
+            self._native_effect_task(issue_id)
+            writes = [(kind, {"write_started": False, **payload}) if kind == "status" else (kind, payload)
+                      for kind, payload in writes]
+            for kind, payload in writes:
+                if kind == "status" and payload.get("terminal") and payload.get("state") == "done":
+                    self._require_completion_report(payload)
+            return self.store.finish_acceptance_recheck(issue_id, recheck, writes, at=at)
         # Cursor and reporting intents commit together, including completion.
         return self._capture_native_event(issue_id, event_id, writes, at=at)
     def _finished(self, row: dict[str, Any], *, event_id: int | None = None,
-                  reconcile_request_id: str | None = None) -> bool | None:
+                  reconcile_request_id: str | None = None, recheck: dict | None = None) -> bool | str | None:
+        """Close out a completed native task: Done with accepted evidence, else Blocked with the reason.
+
+        A PR GitHub could not be asked about (refused, unreachable, checks still running) is not a
+        reason to block: the issue shows In Review (non-terminal) and _recheck_acceptance asks again.
+        With ``recheck`` (that later pass) nothing is captured on the cursor; it returns
+        "unverified" when GitHub still cannot answer and "failed" when an older Blocked closeout
+        stands, so the caller can pace or settle it.
+        """
         if not self.authorize_specialist_effect(row["issue_id"]):
             return
         adapter = self._binding_adapter(row["issue_id"])
@@ -3068,13 +3131,15 @@ class Bridge:
         if task.status == "done" and not latest:
             raise LinearError("Native Done has no completed event to verify", retryable=False)
         if task.status != "done" or (event_id is not None and latest and event_id != max(latest)):
-            if event_id is not None:
+            if event_id is not None and recheck is None:
                 self._capture_native_event(row["issue_id"], event_id, [], at=self.clock())
             return
         contract = task.completion_contract or "local-only"
         raw_summary = adapter.completion_summary(task)
         summary = _project_summary(raw_summary, 4000)
         if not self._completion_scope_matches(row["issue_id"], task, adapter):
+            if recheck is not None:
+                return
             body = ("This stage is finished, but the issue's agreed outcome is not done yet. No new work was "
                     "started; the agent checks what remains before the next step.")
             if summary:
@@ -3087,23 +3152,34 @@ class Bridge:
             return
         evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
         issue_id = row["issue_id"]
-        heads, failures = {}, []
-        accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures)
+        heads, failures, waiting = {}, [], []
+        accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures, unverified=waiting)
         # Paths, secrets and task ids are not a result, however they are shown to people.
         residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", _TASK_ID.sub("", _LOCAL_PATH.sub(
             "", _public(raw_summary or ""))), flags=re.IGNORECASE)).casefold()
         if (not evidence and not (contract == "local-only" and residue and (len(residue) > 1 or not residue.isascii()) and residue not in {"done", "complete", "completed", "ok"})) or not accepted:
+            # GitHub not answering is not a verdict on the work; a failed check or closed PR is.
+            unverified = (bool(evidence) and not accepted and reconcile_request_id is None
+                          and bool(waiting) and all(cls for _url, cls, _head in waiting))
+            if recheck is not None:
+                if unverified:
+                    return "unverified"
+                if recheck.get("kind") == "blocked":
+                    return "failed"  # The Blocked closeout already says why; nothing new to report.
+            elif unverified:
+                return self._await_acceptance(row, event_id, *waiting[-1])
             body = ("The run ended without evidence (a PR, merge, deploy check or findings link), so this "
                     "issue stays unfinished. A new attempt needs to deliver and show that evidence.") if not evidence else acceptance_refusal(failures, where="kanban")
             if not self.authorize_specialist_effect(issue_id): return
-            self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
+            written = self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                     "task_id": row["task_id"], "terminal": True,
-                                                    "owner_issue_id": issue_id}),
+                                                    "owner_issue_id": issue_id, "acceptance_final": True}),
                                          ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                                        "task_id": row["task_id"],
                                                        "terminal": True, "owner_issue_id": issue_id,
-                                                       "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id)
-            return
+                                                       "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id,
+                                        recheck=recheck)
+            return ("failed" if written else None) if recheck is not None else None
         assessment = ""
         reader = getattr(adapter, "issue_comment", None)
         if (callable(reader) and row.get("origin") == "native" and
@@ -3113,15 +3189,24 @@ class Bridge:
             if not assessment:
                 body = "The assessment finished without a recommendation, so it is not complete. A new attempt needs to produce one."
                 if not self.authorize_specialist_effect(issue_id): return
-                self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
+                written = self._finish_work(issue_id, [("status", {"issue_id": issue_id, "state": "blocked",
                                                         "task_id": row["task_id"], "terminal": True,
-                                                        "owner_issue_id": issue_id}),
+                                                        "owner_issue_id": issue_id, "acceptance_final": True}),
                                              ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"],
                                                            "task_id": row["task_id"],
                                                            "terminal": True, "owner_issue_id": issue_id,
-                                                           "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id)
-                return
+                                                           "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id,
+                                  recheck=recheck)
+                return ("failed" if written else None) if recheck is not None else None
         binding = self.store.native_binding(issue_id)
+        moved = [url for url, head in heads.items() if recheck and recheck.get("head_sha")
+                 and url == recheck.get("url") and head != recheck["head_sha"]]
+        if moved:
+            # Never verify a later head silently: say which commit the checks passed on.
+            diag.evt("status.write", "queued", "acceptance_head_moved", iss=issue_id, task=row["task_id"],
+                     sha=heads[moved[0]][:12])
+        head_note = (f"\n\nThe pull request changed after the work finished; its required checks passed on its "
+                     f"latest commit {heads[moved[0]][:12]}." if moved else "")
         completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
                         key=lambda event: event.id)
         completion = {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
@@ -3131,7 +3216,7 @@ class Bridge:
                               "evidence": evidence, "evidence_contract": contract, "pr_heads": heads,
                               "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": "Assessment completed." if assessment else _done_body(summary, evidence)}}),
+                                "content": {"type": "response", "body": ("Assessment completed." if assessment else _done_body(summary, evidence)) + head_note}}),
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,
@@ -3157,7 +3242,117 @@ class Bridge:
         if not self.authorize_specialist_effect(issue_id): return
         return self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock(), event_id=event_id,
-                          reconcile_request_id=reconcile_request_id)
+                          reconcile_request_id=reconcile_request_id, recheck=recheck)
+    def _await_acceptance(self, row: dict[str, Any], event_id: int | None, url: str, classification: str,
+                          head_sha: str = "") -> bool:
+        """Finished work whose PR GitHub could not be asked about yet: In Review, non-terminal, rechecked.
+
+        The completed event is consumed with this status and one plain sentence; the status names
+        the event, the PR and the head the verifier saw, which is what _recheck_acceptance looks
+        for. The first recheck waits one gap; a re-completed task starts its gaps over.
+        """
+        issue_id = row["issue_id"]
+        if event_id is None or not self.authorize_specialist_effect(issue_id):
+            return False
+        now = self.clock()
+        written = self._finish_work(issue_id, [
+            ("status", {"issue_id": issue_id, "state": "in_review", "task_id": row["task_id"],
+                        "acceptance_wait": {"event_id": event_id, "classification": classification, "url": url,
+                                            "head_sha": head_sha, "since": now}}),
+            ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
+                          "content": {"type": "response", "body": acceptance_waiting(url, classification)}})],
+            at=now, event_id=event_id)
+        if written:
+            key = self._acceptance_key(issue_id, row["task_id"])
+            self.store.backoff_clear(key)
+            self.store.backoff_fail(key, now, base=ACCEPTANCE_RECHECK_BASE, cap=ACCEPTANCE_RECHECK_CAP)
+            diag.transition("status.write", "held", "acceptance_unverified", key=("acceptance", issue_id, event_id),
+                            iss=issue_id, task=row["task_id"], evt=event_id, state="in_review")
+        return written
+    @staticmethod
+    def _acceptance_key(issue_id: str, task_id: str) -> str:
+        return f"acceptance_recheck:{issue_id}:{task_id}"
+    def _recheck_acceptance(self, row: dict | None, adapter) -> None:
+        """Ask GitHub again about finished work that is only waiting on GitHub.
+
+        Covers an In Review closeout written by _await_acceptance and, for rows written before it
+        existed, a sent Blocked closeout whose own message says GitHub refused or did not answer.
+        Local reads only until the persisted gap (2 min doubling to 1 h) has passed; then one
+        acceptance pass. Accepted writes Done; a definite failure writes Blocked (or leaves the
+        older Blocked as it is); still unanswered waits for the next gap, and after
+        ACCEPTANCE_MAX_WAIT goes to Blocked (or leaves the older Blocked) and stops. One line per change.
+        """
+        if not row or row.get("origin") != "native":
+            return
+        task = adapter.require_task(row["task_id"])
+        if task.status != "done":
+            return
+        issue_id, key, now = row["issue_id"], self._acceptance_key(row["issue_id"], task.id), self.clock()
+        if not self.store.backoff_ready(key, now):
+            return
+        wait = self.store.acceptance_recheck(issue_id, task.id)
+        if not wait:
+            return
+        completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
+                        key=lambda event: event.id, default=None)
+        if completed is None or row["last_event_id"] < completed.id:
+            return  # Not consumed yet: _finished decides when the pump reaches it.
+        if wait["kind"] == "blocked":
+            created = getattr(completed, "created_at", None)
+            if created is None or wait.get("source_ms") != created * 1000:
+                return  # That Blocked closed out an earlier completion.
+        elif wait.get("event_id") != completed.id:
+            return
+        if not self.store.effect_admitted(issue_id):
+            return
+        marker, fields = ("acceptance", issue_id, completed.id), {"iss": issue_id, "task": task.id, "evt": completed.id}
+        # Backstop for every outcome class: a wait is asked about for at most ACCEPTANCE_MAX_WAIT from
+        # its start. Then In Review goes to Blocked (an older Blocked stands) and the wait is settled
+        # whether or not that write could be queued, so nothing rechecks forever.
+        since = wait.get("since")
+        if not isinstance(since, (int, float)) or isinstance(since, bool):
+            since = float(self.store.first_value(f"acceptance-wait-since:{wait['status_id']}", repr(float(now))))
+        if now - since >= ACCEPTANCE_MAX_WAIT:
+            try:
+                written = self._expire_acceptance(row, completed.id, wait) == "failed" and wait["kind"] == "in_review"
+            finally:
+                self.store.settle_acceptance_recheck(wait["status_id"])
+            diag.transition("status.write", "queued" if written else "skipped", "acceptance_expired", key=marker,
+                            state="blocked", **fields)
+            return
+        # The next gap is taken before asking and kept until a new wait starts: a pass cut short
+        # (Linear budget, an error) or a Done refused at send cannot turn into GitHub reads per tick.
+        until = self.store.backoff_fail(key, now, base=ACCEPTANCE_RECHECK_BASE, cap=ACCEPTANCE_RECHECK_CAP)
+        outcome = self._finished(row, event_id=completed.id, recheck=wait)
+        if outcome == "unverified" or not outcome:
+            diag.transition("status.write", "held", "acceptance_unverified" if outcome else "effect_unresolved",
+                            key=marker, next_s=int(until - now), **fields)
+            return
+        if outcome == "failed":
+            if wait["kind"] == "blocked":
+                self.store.settle_acceptance_recheck(wait["status_id"])
+                diag.transition("status.write", "skipped", "acceptance_failed", key=marker, state="blocked", **fields)
+            else:
+                diag.transition("status.write", "queued", "acceptance_failed", key=marker, state="blocked", **fields)
+            return
+        diag.count("status_q")
+        diag.transition("status.write", "queued", "acceptance_verified", key=marker, state="done", **fields)
+    def _expire_acceptance(self, row: dict[str, Any], event_id: int, wait: dict) -> str | None:
+        """No answer within ACCEPTANCE_MAX_WAIT: In Review becomes Blocked with one sentence; an older
+        Blocked closeout already says so and stands. Returns "failed" once settled."""
+        if wait["kind"] == "blocked":
+            return "failed"
+        issue_id = row["issue_id"]
+        if not self.authorize_specialist_effect(issue_id):
+            return None
+        body = acceptance_expired(wait.get("url") or "", wait.get("classification") or "infra")
+        written = self._finish_work(issue_id, [
+            ("status", {"issue_id": issue_id, "state": "blocked", "task_id": row["task_id"], "terminal": True,
+                        "owner_issue_id": issue_id, "acceptance_final": True}),
+            ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
+                          "terminal": True, "owner_issue_id": issue_id,
+                          "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id, recheck=wait)
+        return "failed" if written else None
     def _report_delegate_allowed(self, issue: dict, payload: dict | None = None) -> bool:
         delegate = (issue.get("delegate") or {}).get("id")
         if delegate == self.api.viewer_id():
@@ -3753,12 +3948,16 @@ class Bridge:
             if payload.get("terminal") and payload.get("state") == "done" and payload.get("pr_heads"):
                 current: dict[str, str] = {}
                 delivery_failures: list[str] = []
+                waiting: list[tuple[str, str, str]] = []
                 if (not self.accepted_evidence(payload["evidence"], payload["evidence_contract"], heads=current,
-                                               failures=delivery_failures)
+                                               failures=delivery_failures, unverified=waiting)
                         or current != payload["pr_heads"]):
                     if payload.get("write_started") or (row["attempts"] and "write_started" not in payload):
                         self._hold_terminal(row, "PR acceptance changed after an uncertain terminal send; reconcile the remote outcome")
-                    raise LinearError(acceptance_refusal(delivery_failures, where="delivery"), retryable=False)
+                    # GitHub not answering now is not a new verdict: retry on the outbox schedule
+                    # (1 min doubling to 1 h). A failed check or a moved head is final.
+                    retry = bool(waiting) and all(cls for _url, cls, _head in waiting)
+                    raise LinearError(acceptance_refusal(delivery_failures, where="delivery"), retryable=retry)
             name, target = self.state_name(issue, payload["state"]), self.state_id(issue, payload["state"])
             current = issue.get("state") or {}
             if (payload["state"] == "in_progress" and current.get("type") == "started" and
