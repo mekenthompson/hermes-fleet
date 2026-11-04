@@ -407,7 +407,11 @@ class ScanHelperTests(unittest.TestCase):
                 self.assertNotIn("anchore/sbom-action@", json.dumps(steps))
                 uses = [step.get("uses", "") for step in steps]
                 self.assertTrue(any(u.startswith("anchore/sbom-action/download-syft@") for u in uses))
-                self.assertTrue(any(u.startswith("aquasecurity/setup-trivy@") for u in uses))
+                install = steps[names.index("Install pinned Trivy")]
+                self.assertNotIn("uses", install)
+                self.assertRegex(install["env"]["TRIVY_SHA256"], r"^[0-9a-f]{64}$")
+                self.assertIn('sha256sum --check --strict', install["run"])
+                self.assertLess(names.index("Install pinned Trivy"), trivy)
         self.assertIn("SYFT_VERSION: v1.51.1", text)
         self.assertIn("TRIVY_VERSION: v0.70.0", text)
 
