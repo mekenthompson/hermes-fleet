@@ -163,7 +163,9 @@ def setup(parser: Any) -> None:
     handoff.add_argument("--from-name", help="Display name of this agent in the reply (default: this profile)")
     handoff.add_argument("--request-id", required=True, help="Caller UUID; repeat it to retry the same handover safely")
     handoff.add_argument("--wait-seconds", type=float, default=90.0, help="How long to wait for the stopped run to end (max 300)")
-    handoff.add_argument("--cancel", action="store_true", help="Resume the work if it is still paused by this request")
+    handoff.add_argument("--cancel", action="store_true",
+                         help="Call this request off: resume the work if it is still paused by this request, "
+                              "and make a hand-off still running for it undo its own Stop")
 
 def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None, origin_api=None) -> int:
     if args.linear_command == "inspect-cleanup":
@@ -185,7 +187,7 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         name = args.from_name if isinstance(args.from_name, str) and handoff._NAME.fullmatch(args.from_name) else None
         if args.cancel:
             result = handoff.cancel(state, args.issue_id, profile, metadata, to=args.to, request_id=args.request_id,
-                                    owner_name=name)
+                                    owner_name=name, wait_seconds=args.wait_seconds)
         else:
             result = handoff.hand_off(state, args.issue_id, profile, origin_settings or {}, metadata, to=args.to,
                                       request_id=args.request_id, owner_name=name, ingress=ingress,

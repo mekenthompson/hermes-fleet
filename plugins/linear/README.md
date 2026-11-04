@@ -285,9 +285,12 @@ publication, and earlier request coordinates and receipts remain intact.
 the old owner stopped and nobody running the work:
 
 1. The requester checks everything it could refuse later (issue open and fully read, its own
-   authorization, executor, board pin and guarded controls, any older local work) before the
-   owner is touched. An issue with no agent delegate is not a takeover (`not_delegated`: use
-   `work_on`); one delegated to this app is plain `work_on`.
+   authorization, executor, board pin and guarded controls) before the owner is touched. Older
+   local work that `work_on` would reuse must be open and runnable (ready or running): a task
+   here that has finished or is paused would leave nobody running the work once the owner
+   stops, so the takeover is refused with the owner untouched. An issue with no agent delegate
+   is not a takeover (`not_delegated`: use `work_on`); one delegated to this app is plain
+   `work_on`. One `take_over` per issue runs at a time on an agent (`takeover_in_progress`).
 2. It runs the owner's own `hermes linear hand-off` through the operator-configured command for
    that delegate (`takeover.agents`, below). No configured command: `takeover_unavailable`,
    nothing changed. The plugin never improvises a route into another profile.
@@ -297,19 +300,42 @@ the old owner stopped and nobody running the work:
    change); pauses the task with one guarded native Stop whose reason is
    `Paused for a handover to <name> [handoff:<request id>]` (never pushed into the recurrence
    fence); waits up to `wait_seconds` for `inspect-cleanup` to prove the stopped run ended; and
-   on failure resumes the task it paused, guarded on the latest event (`state: resumed`). A task
-   already paused for input by someone else is only proven, never changed (`state: unchanged`).
+   on failure resumes the task it paused, guarded on the latest event (`state: resumed`). Any
+   failure after the Stop (an unreadable history or proof included) is rechecked and resumed;
+   when it cannot be resumed (for example an older native's recurrence fence left it in TRIAGE)
+   the reply is `state: stopped` and says an operator needs to resume it, never `unchanged`. A
+   task already paused for input by someone else is only proven, never changed (`state:
+   unchanged`), unless it is paused for a handover to a different agent, which is refused.
+   One hand-off or cancel runs per issue at a time on the owner (a lock beside its state database).
 4. On proof (`state: handed_off`) the requester creates its one native task, whose text says to
    continue from the old owner's progress in the Linear thread, admits it while Linear still shows
-   exactly the old delegate, and replaces that delegate (guarded on it) with this app. If it still
-   cannot start, it calls the owner's `hand-off --cancel`, which resumes the task only while the
-   latest Stop is still this request's own.
+   exactly the old delegate and no person has changed its state, assignee or delegate since the
+   request (the same check as `work_on`; the old delegate app reporting its pause is not a
+   person), and replaces that delegate (guarded on it) with this app.
+5. Anything short of one task ready or running here after the owner was asked (a refusal, an
+   exception, linked work that does not run, or no readable reply from the owner) calls the
+   handover off with the owner's `hand-off --cancel`. Cancel records the call-off first, so a
+   hand-off still running for that request undoes its own Stop instead of reporting a handover
+   nobody continues; then it resumes the task only while the latest Stop is still this request's
+   own.
 
-Repeat a request with the same `id` after an unclear reply (`takeover_uncertain`): the owner
-finds its own Stop by request id and proves it again rather than stopping twice. Linear shows the
-pause as "Paused for a handover to <name>. Nothing is needed from you ...", never "Waiting on you".
-The owner command runs without a shell; output lines before the JSON reply (secret loaders,
-banners) are ignored, and a reply for another issue is not a handover.
+Repeat a request with the same `id` only after `takeover_uncertain` (the owner's reply and its
+call-off were both unknown): the owner finds its own Stop by request id and never stops twice,
+and a request that was called off is never started again, only finished calling off. Any other
+refusal changed nothing; a new attempt uses a new `id`. Linear shows the pause as "Paused for a
+handover to <name>. Nothing is needed from you ...", never "Waiting on you"; only that exact
+guarded reason is worded this way, and any other pause keeps its ordinary wording. Output
+lines before the JSON reply (secret loaders, banners) are ignored, and a reply for another
+issue is not a handover.
+
+The owner command runs without a shell and passes each argument through unchanged; the
+`--issue-json` argument is a JSON object and `--to` may contain spaces. Point `command` at
+something that executes argv as given (`docker exec ...`, a host bridge that forwards argv).
+Never wrap it in `ssh host ...` or `sh -c ...`: both join the arguments into one string and
+re-split it, which breaks the JSON payload. One `take_over` takes at most two owner calls (the
+hand-off and one cancel, each bounded by `wait_seconds` plus a fixed allowance) and one start
+here; `wait_seconds` is capped at 120 so the whole call ends inside the chat client's 420-second
+timeout.
 
 For a manual or older takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder
@@ -466,7 +492,7 @@ plugins:
               delegate_id: example-a-app-user-id
               # Runs Example-A's own hermes CLI; the plugin appends `linear hand-off ...`.
               command: [example-host-bridge, profile, example-a, --, hermes, --profile, default]
-              wait_seconds: 90     # how long Example-A waits for its stopped run to end (max 300)
+              wait_seconds: 90     # how long Example-A waits for its stopped run to end (capped at 120)
 ```
 
 `token_file` credentials with `path` are also supported. OAuth and token caches remain private
@@ -476,7 +502,8 @@ defaults to `<profile home>/linear/state.db`; optional `board` selects the desti
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
 `completion_contracts` retain their existing meanings. `takeover` lists the agents this one may
 [take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
-that runs that agent's own `hermes` CLI in its own profile; invalid entries are dropped and logged.
+that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
+invalid entries are dropped and logged.
 `chat_guard` (default `true`) enables the
 [chat guard](#chat-guard-tracked-work-is-started-not-done-inline).
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,

@@ -112,6 +112,8 @@ REASONS = frozenset({
     "not_bound_here", "task_finished_here", "task_not_handable", "started_other_tasks",
     "controls_unsupported", "changed_during_handoff", "proof_timeout",
     "takeover_unavailable", "takeover_refused", "takeover_uncertain", "not_delegated",
+    "handover_in_progress", "stop_unverified", "takeover_wait_capped", "takeover_in_progress",
+    "local_work_not_runnable", "takeover_not_started",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",

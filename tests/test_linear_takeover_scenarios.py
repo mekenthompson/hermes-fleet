@@ -9,6 +9,7 @@ The owner side itself (stop, proof, resume) is proven in test_linear_origin_hand
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import subprocess
@@ -37,7 +38,7 @@ from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
 from test_linear_chat_entrust_scenarios import ChatAuthority, now_iso
-from test_linear_specialist_authorization import ISSUE, VIEWER
+from test_linear_specialist_authorization import ISSUE, USER, VIEWER
 
 OWNER = str(uuid.UUID(int=0x99, version=4))
 STRANGER = str(uuid.UUID(int=0x77, version=4))
@@ -178,20 +179,148 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertIn("left as it was", reply["message"])
         self.assert_nothing_changed_here()
 
-    def test_unknown_owner_outcome_starts_nothing_and_retry_reuses_the_same_request(self):
+    def test_unknown_owner_outcome_calls_the_handover_off_and_starts_nothing(self):
+        # Blocker 3: the owner may already be paused for this request, so an unknown reply is called off.
         for outcome in (subprocess.TimeoutExpired(["owner"], 120), OSError("no bridge"), "not json at all"):
             with self.subTest(outcome=type(outcome).__name__):
-                owner = OwnerCommand(outcome)
+                owner = OwnerCommand(outcome, not_handed_off("resumed", "handoff_cancelled",
+                                                             "The handover was called off and Atlas's work was resumed."))
                 reply = self.take_over(owner)
                 self.assertFalse(reply["ok"])
-                self.assertEqual(reply["code"], "takeover_uncertain")
-                self.assertIn("same id", reply["message"])
+                self.assertEqual(reply["code"], "takeover_refused")
+                self.assertIn("didn't report back", reply["message"])
+                self.assertIn("Atlas's work was resumed and nothing was handed over", reply["message"])
+                self.assertEqual(reply["handover"]["state"], "resumed")
+                self.assertEqual(["--cancel" in argv for argv, _ in owner.calls], [False, True])
+                cancel = owner.calls[1][0]
+                self.assertEqual(cancel[cancel.index("--request-id") + 1], REQUEST)
                 self.assert_nothing_changed_here()
+
+    def test_unknown_owner_outcome_and_unknown_call_off_say_to_retry_the_same_id(self):
+        owner = OwnerCommand(subprocess.TimeoutExpired(["owner"], 120), OSError("bridge gone"))
+        reply = self.take_over(owner)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], "takeover_uncertain")
+        self.assertIn("same id", reply["message"])
+        self.assertIn("operator", reply["message"])
+        self.assertEqual(len(owner.calls), 2)
+        self.assert_nothing_changed_here()
         # The retry carries the same request id, which the owner recognises on its own Stop.
         owner = OwnerCommand(handed_off(stopped_here=True))
         self.assertTrue(self.take_over(owner)["ok"])
         argv = owner.calls[0][0]
         self.assertEqual(argv[argv.index("--request-id") + 1], REQUEST)
+
+    # -- blocker 1: earlier local work that entrust would reuse but that would not run -------
+    def _own_earlier_task(self, final):
+        """This agent worked the issue earlier while it was undelegated; then a person delegated it to Atlas."""
+        self.authority.issues[ISSUE]["delegate"] = None
+        started = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, self.context))
+        self.assertTrue(started["ok"], started)
+        task_id = self.bridge.store.get(ISSUE)["task_id"]
+        with self.board.conn() as conn:
+            if final == "done":
+                self.board.kb.complete_task(conn, task_id, summary="earlier")
+            else:
+                self.board.kb.block_task(conn, task_id, reason="paused by a person", kind="needs_input")
+        self.bridge.flush()
+        self.authority.issues[ISSUE]["delegate"] = {"id": OWNER, "name": "Atlas"}
+        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
+        return task_id
+
+    def test_earlier_local_work_that_would_not_run_is_refused_before_the_owner_is_asked(self):
+        # The reviewer's repro: a finished or paused local task used to be linked after the owner
+        # stopped, and the reply said "Took over" while nothing ran anywhere.
+        for final, words in (("done", "already finished"), ("paused", "is paused")):
+            with self.subTest(final=final):
+                self.setUp()
+                self._own_earlier_task(final)
+                before = self.tasks()
+                owner = OwnerCommand(handed_off(), not_handed_off("resumed", "handoff_cancelled", "x"))
+                reply = self.take_over(owner)
+                self.assertFalse(reply["ok"], reply)
+                self.assertEqual(reply["code"], "takeover_refused")
+                self.assertIn(words, reply["message"])
+                self.assertIn("Atlas keeps working on OPS-1", reply["message"])
+                self.assertEqual(owner.calls, [])  # Atlas was never asked to stop.
+                self.assertEqual(self.tasks(), before)
+                self.bridge.flush()
+                self.assertEqual(self.delegate(), OWNER)
+
+    def test_nothing_running_here_after_the_proof_calls_the_handover_off(self):
+        # If local work changes between the preflight and the start (here: the preflight is
+        # skipped), "linked but not running" is a failure: the owner is resumed, never left stopped.
+        self._own_earlier_task("done")
+        owner = OwnerCommand(handed_off(), not_handed_off("resumed", "handoff_cancelled",
+                                                          "The handover was called off and Atlas's work was resumed."))
+        with patch.object(Bridge, "takeover_preflight", lambda *a, **k: None):
+            reply = self.take_over(owner)
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("couldn't start here", reply["message"])
+        self.assertIn("Atlas's work was resumed and nothing was handed over", reply["message"])
+        self.assertEqual(["--cancel" in argv for argv, _ in owner.calls], [False, True])
+        self.bridge.flush()
+        self.assertEqual(self.delegate(), OWNER)
+
+    # -- blocker 3: any exception after the proof calls the handover off and still replies ----
+    def test_any_exception_after_the_proof_calls_the_handover_off_and_replies(self):
+        from hermes_fleet_linear_plugin import transport
+        for error in (transport.Uncertain("lost"), KeyError("native"), TypeError("bad"), OSError("disk")):
+            with self.subTest(error=type(error).__name__):
+                self.setUp()
+                owner = OwnerCommand(handed_off(), not_handed_off("resumed", "handoff_cancelled",
+                                                                  "The handover was called off and Atlas's work was resumed."))
+                def broken(*args, **kwargs):
+                    raise error
+                with patch.object(Bridge, "entrust", broken):
+                    reply = self.take_over(owner)
+                self.assertFalse(reply["ok"])
+                self.assertEqual(reply["code"], "takeover_refused")
+                self.assertIn("Atlas's work was resumed and nothing was handed over", reply["message"])
+                self.assertEqual(["--cancel" in argv for argv, _ in owner.calls], [False, True])
+
+    # -- should-fix 7: one take_over per issue at a time --------------------------------------
+    def test_a_second_takeover_of_the_same_issue_waits_for_the_first(self):
+        owner = OwnerCommand(handed_off())
+        with handoff.issue_lock(self.bridge.store.path.parent / "takeover", ISSUE, 0) as held:
+            self.assertTrue(held)
+            reply = self.take_over(owner)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], "takeover_in_progress")
+        self.assertEqual(owner.calls, [])
+        self.assert_nothing_changed_here()
+        self.assertTrue(self.take_over(owner)["ok"])  # Free again once the first one has finished.
+
+    # -- should-fix 9: admission after the proof is checked like work_on's ------------------
+    def _routing_change_at_create(self, actor):
+        """A routing change by ``actor`` lands right after the task is created, before admission."""
+        real = Kanban.create
+        def create(adapter, *args, **kwargs):
+            task = real(adapter, *args, **kwargs)
+            issue = self.authority.issues[ISSUE]
+            moved = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+            issue["updatedAt"] = moved
+            self.authority.history.setdefault(ISSUE, []).append({
+                "createdAt": moved, "actorId": actor, "fromStateId": issue["state"]["id"], "toStateId": "state-todo",
+                "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": {"id": OWNER}, "toDelegate": {"id": OWNER}})
+            return task
+        return patch.object(Kanban, "create", create)
+
+    def test_a_person_moving_the_issue_between_proof_and_admission_wins(self):
+        owner = OwnerCommand(handed_off(), not_handed_off("resumed", "handoff_cancelled",
+                                                          "The handover was called off and Atlas's work was resumed."))
+        with self._routing_change_at_create(USER):
+            reply = self.take_over(owner)
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("stopped, closed or reassigned", reply["message"])
+        self.assertEqual(["--cancel" in argv for argv, _ in owner.calls], [False, True])
+        self.assertNotIn(self.tasks()[0]["status"], ("ready", "running"))
+
+    def test_the_old_delegate_reporting_its_pause_is_not_a_person_moving_it(self):
+        with self._routing_change_at_create(OWNER):
+            reply = self.take_over(OwnerCommand(handed_off()))
+        self.assertTrue(reply["ok"], reply)
+        self.assertIn(self.tasks()[0]["status"], ("ready", "running"))
 
     def test_a_reply_for_another_issue_is_not_a_handover(self):
         reply = self.take_over(OwnerCommand(handed_off(issue_id="another-issue")))
@@ -277,18 +406,14 @@ class TakeoverWording(unittest.TestCase):
                                     "blocked")
         self.assertEqual(kind, "response")
         self.assertEqual(body, "Paused for a handover to Nova. Nothing is needed from you: Nova continues this "
-                               "work once the handover is confirmed, and if it isn't, this agent picks it back up.")
+                               "work once the handover is confirmed; if the handover doesn't complete, the agent or "
+                               "an operator resumes it.")
         self.assertNotIn(REQUEST, body)
-        # OPS-9: an agent's own words for a handover it improvised are a note, not a question.
-        kind, body = _block_message({"kind": "needs_input", "reason": (
-            "Ken requested Nova take over QA-3 (OPS-9). Stopping Atlas run for handoff; "
-            "Nova owns the remainder.")}, "blocked")
-        self.assertEqual(kind, "response")
-        self.assertNotIn("Waiting on you", body)
-        self.assertNotIn("ask the agent to resume", body)
-        self.assertTrue(body.endswith("Nothing is needed from you."), body)
-        # A real question that mentions a handover still asks for the answer.
-        for reason in ("Which account should I hand over to?", "Need the staging password before handing off the deploy",
+        # Should-fix 8: only the exact guarded pause is relabelled. Any other needs-input pause,
+        # even one whose words mention a handover, keeps its ordinary "Waiting on you" wording.
+        for reason in ("Ken requested Nova take over QA-3 (OPS-9). Stopping Atlas run for handoff; Nova owns the remainder.",
+                       handoff.handoff_reason("Nova", REQUEST) + " please",
+                       "Which account should I hand over to?", "Need the staging password before handing off the deploy",
                        "Handover to Atlas pending: confirm the region"):
             with self.subTest(reason=reason):
                 kind, body = _block_message({"kind": "needs_input", "reason": reason}, "blocked")
@@ -305,6 +430,16 @@ class TakeoverSettings(unittest.TestCase):
             {"delegate_id": "nameless", "command": ["x"]}]}, default_name="nova")
         self.assertEqual(set(parsed["agents"]), {OWNER})
         self.assertEqual(parsed["name"], "Nova")
+        # Should-fix 4: a valid but long wait is capped so one take_over ends inside the client timeout.
+        capped = handoff.takeover_settings({"agents": [
+            {"name": "Atlas", "delegate_id": OWNER, "command": OWNER_COMMAND, "wait_seconds": 300}]}, default_name="nova")
+        self.assertEqual(capped["agents"][OWNER]["wait_seconds"], handoff.TAKEOVER_MAX_WAIT_SECONDS)
+        worst = 2 * (handoff.TAKEOVER_MAX_WAIT_SECONDS + handoff.OWNER_CALL_OVERHEAD_SECONDS) + handoff.ENTRUST_BUDGET_SECONDS
+        self.assertLess(worst, handoff.CLIENT_TIMEOUT_SECONDS)
+        seen = []
+        handoff.request(capped["agents"][OWNER], {"id": ISSUE, "identifier": "OPS-1", "url": "u"}, to="Nova",
+                        request_id=REQUEST, run=lambda argv, **options: seen.append(options["timeout"]))
+        self.assertEqual(seen, [handoff.TAKEOVER_MAX_WAIT_SECONDS + handoff.OWNER_CALL_OVERHEAD_SECONDS])
         self.assertEqual(handoff.takeover_settings(None, default_name="nova"), {"name": "nova", "agents": {}})
 
 
