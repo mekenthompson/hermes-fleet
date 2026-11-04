@@ -1,6 +1,6 @@
 """Starting tracked work from chat finds the team and the issue the person named.
 
-Live re-test 4 Nov 2026 (Klanker, ~00:10Z): "track it in Linear (project Fleet QA)". create_issue
+Live re-test 4 Nov 2026 (~00:10Z): "track it in Linear (project Fleet QA)". create_issue
 without a team was refused ("needs title and team"), team KEN listed only KEN's projects, a guessed
 team returned a raw "Entity not found: Team"; Fleet QA is in team HF. Then "Take over QA-10": QA-10
 is the title prefix of HF-622 and status/work_on said "Entity not found: Issue". The refusals logged
