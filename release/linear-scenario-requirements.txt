@@ -44,3 +44,8 @@ typing-inspection==0.4.4 \
 # Native tool_call catalog import from pinned Agent uv.lock (pure Python, no deps).
 snowballstemmer==3.1.1 \
     --hash=sha256:7e207fa178741da09cdee59d3ecec3827ad5f92b1fc5c9ff3755b639f71f5752
+
+# Plugin loader requirement parsing (hermes_cli/plugins_loader.py) from pinned Agent
+# uv.lock; Agent declares packaging for CPython >= 3.14 (pure Python, no deps).
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
