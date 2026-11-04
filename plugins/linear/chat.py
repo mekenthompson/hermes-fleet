@@ -562,7 +562,7 @@ def _entrust_board_pin(bridge: Any, context: Any) -> None:
 
 
 def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, takeover_from: str | None = None,
-             note: str = "", proven: bool = False) -> dict:
+             note: str = "", proven_ms: float | None = None) -> dict:
     _entrust_board_pin(bridge, context)
     def route(current: dict, status: str) -> str:
         # Called inside the issue's lock with the issue version read under it, before admission:
@@ -571,7 +571,8 @@ def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, tak
                               replace_delegate=takeover_from)
     native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record,
                             route_delegate=route, **({"takeover_from": takeover_from, "note": note,
-                                                      "handed_over": takeover_from if proven else None}
+                                                      "handed_over": takeover_from if proven_ms is not None else None,
+                                                      "proven_ms": proven_ms}
                                                      if takeover_from else {}))
     return {"native": native, "routing": native.pop("routing", "held: routing was not checked")}
 
@@ -691,12 +692,20 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
         result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=note)
         return _reply(True, f"{key} was already taken over from {owner}, so {owner} was not asked again. "
                       + _running_here_message(result), issue=_issue_ref(issue), **result)
+    if verdict == "refuse_held":
+        # An earlier takeover from this owner got past its stop: it may still be paused for it.
+        diag.evt("chat.entrust", "refused", "local_work_not_runnable", iss=issue_id)
+        return _reply(False, f"Not taken over: {problem}. Nothing was changed and {owner} was not asked again. If "
+                      f"{owner} is still paused for that earlier handover, say 'resume {key}' to let it continue.",
+                      code="takeover_refused", issue=_issue_ref(issue))
     if verdict != "ask_owner":
         diag.evt("chat.entrust", "refused", "local_work_not_runnable", iss=issue_id)
         return _reply(False, f"Not taken over: {problem}. Nothing was changed and {owner} keeps working on {key}. "
                       "Check status here first.", code="takeover_refused", issue=_issue_ref(issue))
     def paused(why: str, **details: Any) -> str:
         return _paused(bridge, context, issue, owner, name, request_id, why, **details)
+    # This request is the authority for the start: a person's routing change from now on wins.
+    asked_ms = bridge.clock() * 1000
     reply = handoff.request(peer, issue, to=name, request_id=request_id)
     if reply is None:
         return paused(f"{owner} didn't report back on the handover, so nothing was started here.", may=True,
@@ -713,7 +722,7 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
     # failed start leaves it parked, and a retried take_over proves the same pause again.
     with _linear_deadline(bridge, _take_over_budget("start")):
         try:
-            result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=note, proven=True)
+            result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=note, proven_ms=asked_ms)
             native = result["native"]
             failure = native.get("not_started_reason") or ""
             if not failure and native.get("status") not in ("ready", "running"):
@@ -743,6 +752,10 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
                       + _delegate_sentence(routing) + ". Ask again with take_over to retry the Linear update; "
                       f"{owner} is not asked again. Do not also do this work here.",
                       issue=_issue_ref(issue), handover=handover, native=native, routing=routing)
+    if moved == "delegated to this agent":
+        # A person delegated it here by hand; resume_owner only resumes the issue's delegate.
+        return paused(f"{owner} stopped for the handover, but the work couldn't start here ({failure}), and meanwhile "
+                      f"{key} was {moved}.", moved=moved, handover=handover, **(result or {}))
     if moved is not None:
         # Someone delegated the issue elsewhere meanwhile: resuming the owner is not offered.
         return paused(f"{owner} stopped for the handover, but meanwhile {key} was {moved}, so nothing was started "
@@ -760,8 +773,10 @@ def _delegate_now(bridge: Any, issue_id: str, owner_id: str) -> str | None:
         return None
     if delegate is None:
         return "undelegated"
-    if delegate.get("id") in (owner_id, bridge.api.viewer_id()):
+    if delegate.get("id") == owner_id:
         return None
+    if delegate.get("id") == bridge.api.viewer_id():
+        return "delegated to this agent"
     return f"delegated to {delegate.get('name') or 'someone else'}"
 
 
@@ -780,10 +795,13 @@ def _paused(bridge: Any, context: Any, issue: dict, owner: str, name: str, reque
         body = (f"{state} {key} is now {moved}. Nothing resumes {owner} automatically. To let {owner} continue, "
                 f"delegate {key} back to {owner} and ask {name} to 'resume {key}'.")
         ways = f"To let {owner} continue, delegate {key} back to {owner} and say 'resume {key}'."
-    else:
+    elif _retry_possible(bridge, issue_id, issue):
         body = (f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue, or "
                 f"to 'take over {key}' to try again.")
         ways = f"Say 'resume {key}' to let {owner} continue, or 'take over {key}' to try again."
+    else:  # Taking over again would be refused before the owner is asked: only resuming is offered.
+        body = f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue."
+        ways = f"Say 'resume {key}' to let {owner} continue."
     from .bridge import stable_uuid4
     row_id = stable_uuid4("linear-takeover-paused", issue_id, request_id, body)
     try:
@@ -795,6 +813,14 @@ def _paused(bridge: Any, context: Any, issue: dict, owner: str, name: str, reque
     except Exception as exc:  # noqa: BLE001 - the reply still says it
         diag.evt("chat.entrust", "failed", "takeover_notice_unsent", iss=issue_id, exc=type(exc).__name__)
     return _reply(False, f"{why} {state} {ways}", code="takeover_paused", issue=_issue_ref(issue), **details)
+
+
+def _retry_possible(bridge: Any, issue_id: str, issue: dict) -> bool:
+    """Would a new take_over get as far as asking the owner again (its own preflight)?"""
+    try:
+        return bridge.takeover_preflight(issue_id, takeover_from=(issue.get("delegate") or {}).get("id"))[0] == "ask_owner"
+    except Exception:  # noqa: BLE001 - unknown: offer only what is sure to be answered truthfully
+        return False
 
 
 def _resume_owner(bridge: Any, args: dict, context: Any, issue: dict) -> str:

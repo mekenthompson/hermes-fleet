@@ -314,9 +314,11 @@ automatically.
 4. On proof the requester creates its one native task, whose text says to continue from the
    old owner's progress in the Linear thread, and admits it in the same call, while Linear still
    shows exactly the old delegate and no person has changed its state, assignee or delegate since
-   the request (the same check as `work_on`; the old delegate app reporting its pause, moving the
-   issue to Blocked, is not a person). It then replaces that delegate (guarded on it) with this
-   app and subscribes the chat to checkpoints and the result. The old delegate app's pause report
+   this `take_over` asked the owner (the same check as `work_on`; the old delegate app reporting its
+   pause, moving the issue to Blocked, is not a person). Each new `take_over` is the authority for
+   its own start: a change before it does not hold it, a change after it does. It then replaces
+   that delegate (guarded on it) with this app and subscribes the chat to checkpoints and the
+   result. The old delegate app's pause report
    never holds that update; a person's routing change, or the old delegate app reporting a
    resume, does. A held update is retried by delegate recovery.
 5. If anything fails once the owner may be paused (no readable reply, a proof that failed, or a
@@ -324,14 +326,20 @@ automatically.
    a later step failed) means the handover stands: the reply is a success that names the
    unfinished Linear update. Otherwise the reply is `takeover_paused`, and the same words are
    posted on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
-   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." If
-   meanwhile someone delegated the issue to another agent (or removed the delegate), resuming is
-   not offered: the message says who has it now, and that Atlas continues only after the issue is
-   delegated back to it and a person says 'resume HF-9'. That message stays true: a takeover task
+   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." The
+   reason is named plainly (for example a person changing the issue's status, assignee or delegate
+   while the task was being set up). 'take over HF-9' is offered only when a new `take_over` would
+   ask the owner again; after a Stop from Linear, or a start that couldn't be confirmed, only
+   'resume HF-9' is offered, and a later `take_over` refuses without asking the owner, saying
+   Atlas was not asked again and how to resume it if it is still paused. If meanwhile someone
+   delegated the issue to another agent, to this agent by hand, or removed the delegate, resuming
+   is not offered: the message says who has it now, and that Atlas continues only after the issue
+   is delegated back to it and a person says 'resume HF-9'. That message stays true: a takeover task
    is admitted only by the `take_over` call that has just proven the owner's run ended, never
    later by the service, an assignment echo or `work_on`. A task created here whose start failed
    stays parked; saying 'take over HF-9' again proves the owner's pause again (it is never stopped
-   twice) and starts it. An admission that did land before a lost reply or a crash is only
+   twice) and starts it, also when the first start lost to a person's change made before that new
+   request. An admission that did land before a lost reply or a crash is only
    recognised by its native receipt, never repeated.
 6. `resume_owner` is the one supported way to let the owner continue (a person saying "resume
    HF-9"). The owner it resumes is Linear's current delegate, never an earlier one: if the issue
@@ -352,6 +360,9 @@ Known limits, by design rather than more machinery:
   pauses, which is guidance, not a lock). Doing so would run both agents; archive the owner's
   task by hand if that risk matters. A pause a person made before the takeover is proven but
   keeps its original wording.
+- If someone resumes the owner by hand on its own board in the moment between its proof and the
+  start here, on a Linear workflow with no Blocked state (so the owner's resume writes no state
+  change), the start here does not detect it. That window is one call long.
 - The owner recognises a retried handover by the requester's configured `name` in the pause
   reason. Give each agent a distinct `takeover.name`; two requesters with the same name could
   prove each other's pause.

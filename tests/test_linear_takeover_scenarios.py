@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -305,11 +306,103 @@ class TakeoverScenarios(unittest.TestCase):
         with self._routing_change_at_create(USER):
             reply = self.take_over(owner)
         self.assert_paused_message(reply)
-        self.assertIn("stopped, closed or reassigned", reply["message"])
+        self.assertIn("a person changed this issue's status, assignee or delegate in Linear", reply["message"])
         self.assertEqual(len(owner.calls), 1)
         self.assert_nothing_runs_here()
         self.bridge._recover_admissions()  # A person's decision stands: never admitted later either.
         self.assert_nothing_runs_here()
+
+    def later_request(self, seconds=5):
+        """Requests from here on happen ``seconds`` later (after the person's change)."""
+        self.bridge.clock = lambda: time.time() + seconds
+
+    def assert_taken_over_once(self, reply, owner):
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(len(owner.calls), 1)
+        self.assert_never_resumed(owner)
+        (task,) = self.tasks()
+        self.assertIn(task["status"], ("ready", "running"))
+        self.bridge.flush()
+        self.assertEqual(self.delegate(), VIEWER)  # Routing follows the new request too.
+
+    def test_N1_a_retry_after_a_person_moved_the_issue_re_proves_and_starts(self):
+        # The first start lost to a person's change; the user then asks again. That new explicit
+        # request is the authority: the owner proves its pause again and the parked task starts.
+        with self._routing_change_at_create(USER):
+            self.assert_paused_message(self.take_over(OwnerCommand(handed_off())))
+        self.later_request()
+        again = OwnerCommand(handed_off(stopped_here=False))
+        self.assert_taken_over_once(self.take_over(again, id=str(uuid.uuid4())), again)
+
+    def test_N1_a_person_changing_it_after_the_retry_s_proof_still_wins(self):
+        with self._routing_change_at_create(USER):
+            self.take_over(OwnerCommand(handed_off()))
+        self.later_request()
+        issue, real = self.authority.issues[ISSUE], Bridge.entrust
+        def moved_after_proof(bridge, issue_id, **kw):
+            late = datetime.fromtimestamp(bridge.clock() + 1, timezone.utc).isoformat().replace("+00:00", "Z")
+            self.authority.history[ISSUE].append({
+                "createdAt": late, "actorId": USER, "fromStateId": issue["state"]["id"], "toStateId": "state-todo",
+                "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": {"id": OWNER}, "toDelegate": {"id": OWNER}})
+            issue["updatedAt"] = late
+            return real(bridge, issue_id, **kw)
+        again = OwnerCommand(handed_off(stopped_here=False))
+        with patch.object(Bridge, "entrust", moved_after_proof):
+            reply = self.take_over(again, id=str(uuid.uuid4()))
+        self.assertEqual(reply["code"], "takeover_paused", reply)
+        self.assertIn("a person changed this issue's status, assignee or delegate", reply["message"])
+        self.assertIn("Say 'resume OPS-1' to let Atlas continue", reply["message"])
+        self.assert_nothing_runs_here()
+        self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
+
+    def test_N3_a_transient_failure_then_a_person_assigning_it_then_a_retry_starts_once(self):
+        with self._flaky_activation():
+            self.assert_paused_message(self.take_over(OwnerCommand(handed_off())))
+        issue = self.authority.issues[ISSUE]
+        moved = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+        self.authority.history.setdefault(ISSUE, []).append({
+            "createdAt": moved, "actorId": USER, "fromStateId": issue["state"]["id"], "toStateId": issue["state"]["id"],
+            "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": {"id": OWNER}, "toDelegate": {"id": OWNER}})
+        issue["updatedAt"] = moved
+        self.later_request()
+        again = OwnerCommand(handed_off(stopped_here=False))
+        self.assert_taken_over_once(self.take_over(again, id=str(uuid.uuid4())), again)
+        later = OwnerCommand()  # A further retry never asks the owner again.
+        self.assertTrue(self.take_over(later, id=str(uuid.uuid4()))["ok"])
+        self.assertEqual(later.calls, [])
+
+    def test_a_stop_during_the_start_offers_only_resume_and_a_retry_says_so_truthfully(self):
+        # A Stop from Linear supersedes admission for good: taking over again can't start that
+        # task, so it is not offered, and a retry never claims Atlas keeps working.
+        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
+                                              activity_id="stop-1", actor=USER)
+        first = self.take_over(OwnerCommand(handed_off()))
+        self.assertEqual(first["code"], "takeover_paused", first)
+        self.assertIn("someone stopped it in Linear", first["message"])
+        self.assertTrue(first["message"].endswith("Say 'resume OPS-1' to let Atlas continue."), first["message"])
+        self.assertNotIn("take over OPS-1", " ".join(self.notices()))
+        again = OwnerCommand(handed_off(stopped_here=False))
+        retry = self.take_over(again, id=str(uuid.uuid4()))
+        self.assertEqual(retry["code"], "takeover_refused")
+        self.assertEqual(again.calls, [])
+        self.assertNotIn("keeps working", retry["message"])
+        self.assertIn("If Atlas is still paused for that earlier handover, say 'resume OPS-1'", retry["message"])
+        self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
+        self.assert_nothing_runs_here()
+
+    def test_delegated_to_this_agent_by_hand_after_a_failed_start_is_told_truthfully(self):
+        owner = OwnerCommand(handed_off())
+        def broken(*args, **kwargs):
+            self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER, "name": "Nova"}
+            raise OSError("disk")
+        with patch.object(Bridge, "entrust", broken):
+            reply = self.take_over(owner)
+        self.assertEqual(reply["code"], "takeover_paused")
+        self.assertIn("meanwhile OPS-1 was delegated to this agent", reply["message"])
+        self.assertIn("To let Atlas continue, delegate OPS-1 back to Atlas and say 'resume OPS-1'.", reply["message"])
+        self.assertEqual(self.resume_owner(OwnerCommand(RESUMED))["code"], "resume_refused")  # As the reply says.
+        self.authority.issues[ISSUE]["delegate"] = {"id": OWNER, "name": "Atlas"}
+        self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
 
     def test_someone_re_delegating_after_the_proof_wins_and_the_owner_stays_paused(self):
         owner = OwnerCommand(handed_off())
