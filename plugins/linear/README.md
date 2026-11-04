@@ -22,7 +22,7 @@ API is required. The plugin is disabled by default.
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
-| `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches are refused as `ambiguous_project` with `Team / Project` choices; no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
+| `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
 | `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
 | `create_issue` or `work_on` with `record_done: true`, `summary`, optional `evidence` links | Link work already finished in chat and close it: the native task is created parked and completed with that evidence in one call, never runnable; verified completion sets Done with the closing summary. Refused when the issue already has native work. |
@@ -191,14 +191,19 @@ The ordinary chat `status` action accepts compact shorthand with a letter-only t
 (`ABC123` becomes `ABC-123`) before the same exact-result and scope checks. UUIDs and
 digit-bearing team keys are not guessed.
 
-An issue can also be named by its title prefix: when Linear has no issue with the given key,
-one bounded search (25 most recently updated issues whose title contains it, inside identity
-scope) looks for titles that start with it followed by `:` or a space, so `QA-10` finds HF-622
-"QA-10: list the 10 most recent commits". `status`, `work_on`, `track` and `followup` use a
-single match and the reply starts with `QA-10 is HF-622` (`resolved_issue` carries both).
-Several matches are refused as `ambiguous_issue` with choices, none as `not_found`. Other
-mutations (`add_comment`, `update_description`, `delegate_self`) name the match
-(`issue_alias`) but need the exact key. Specialist scope never title-searches.
+An issue can also be named by its title prefix. Only a key-shaped ref (`QA-10`, never free
+text such as `login`) that Linear has no issue for is looked up: one bounded search (the 25
+most recently updated issues whose title starts with it, ignoring case, inside identity scope)
+keeps titles where it is followed by `:` or a space, so `QA-10` finds HF-622 "QA-10: list the
+10 most recent commits" but not "QA-100: ...". The expected miss is logged at DEBUG, not as a
+GraphQL ERROR. `status`, `work_on`, `track` and `followup` use a single match and the reply
+starts with `QA-10 is HF-622` (`resolved_issue` carries both and the state). Several matches
+are refused as `ambiguous_issue` with choices (key, title, team, state), none as `not_found`.
+`work_on`, `track` and `followup` never act on a completed or canceled match (`alias_closed`,
+shown as a choice with its state; `status` still reads it) or on a search page that was cut off
+(full page or more pages: `ambiguous_issue`). Other mutations (`add_comment`,
+`update_description`, `delegate_self`) name the match (`issue_alias`) but need the exact key.
+Specialist scope never title-searches.
 
 On hosts with guarded native admission, a proven pristine create-and-park stage reports
 that preparation is awaiting admission without asking for human input. Reporting does not
@@ -503,7 +508,8 @@ happened. A WARNING repeats at most once per 15 minutes per issue and reason, an
 carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Each
 `linear` tool call logs one `tool.result` line whose `reason` is the reply's code
 (`request_refused`, `project_required`, `ambiguous_project`, `unknown_team`, `not_found`,
-`ambiguous_issue`, `issue_alias`, ...); identical results are not collapsed. Per-issue
+`ambiguous_issue`, `issue_alias`, `alias_closed`, ...); identical results are not collapsed, and
+these lines count toward the same hourly INFO cap as every other line. Per-issue
 INFO stops for the rest of the hour at the cap (200 lines per hour in total), and a single
 `diag.throttled` WARNING records that it happened. `service.start` records the plugin `ver`, its
 source `sha` and, when visible, the git `commit`.

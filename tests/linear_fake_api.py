@@ -124,10 +124,12 @@ class FakeLinear:
         return team
 
     def add_project(self, project_id: str, name: str, team_ids: list[str], *, slug: str = "",
-                    completed: bool = False) -> dict:
+                    completed: bool = False, archived: bool = False) -> dict:
+        # Archived projects are returned too (with archivedAt), the worst case: the client must drop them.
         project = {"id": project_id, "name": name, "slugId": slug or project_id[-6:], "team_ids": list(team_ids),
                    "completedAt": "2026-10-01T00:00:00Z" if completed else None, "canceledAt": None,
-                   "archivedAt": None, "updatedAt": self.clock.iso(len(self.projects))}
+                   "archivedAt": "2026-11-04T01:15:28Z" if archived else None,
+                   "updatedAt": self.clock.iso(len(self.projects))}
         self.projects.append(project)
         return project
 
@@ -244,15 +246,18 @@ class FakeLinear:
         if query.startswith(("query LinearDirectory ", "query LinearDirectoryProjects")):
             return 200, {"data": self._directory(query, variables)}
         if "query IssueTitleSearch" in query:
-            # Linear's containsIgnoreCase title filter, newest update first, one bounded page.
+            # Linear's startsWithIgnoreCase (or containsIgnoreCase) title filter, newest update first, one page.
             wanted = variables["q"].casefold()
+            prefix = "startsWithIgnoreCase" in query
             count = int(re.search(r"issues\(first: (\d+)", query)[1])
-            found = sorted((i for i in self.issues.values() if wanted in i["title"].casefold()),
-                           key=lambda i: i["updatedAt"], reverse=True)[:count]
+            found = sorted((i for i in self.issues.values()
+                            if (i["title"].casefold().startswith(wanted) if prefix else wanted in i["title"].casefold())),
+                           key=lambda i: i["updatedAt"], reverse=True)
             return 200, {"data": {"issues": {"nodes": [
                 {"id": i["id"], "identifier": i["identifier"], "title": i["title"], "updatedAt": i["updatedAt"],
+                 "state": {"name": i["state"]["name"], "type": i["state"]["type"]},
                  "team": {"id": i["team"]["id"], "key": i["team"]["key"]}, "project": i.get("project")}
-                for i in found]}}}
+                for i in found[:count]], "pageInfo": {"hasNextPage": len(found) > count}}}}
         if "issues(" in query:
             # Delegated-and-started listing in id order; the cursor is the last node, as in Linear.
             matches = [json.loads(json.dumps(i)) for _, i in sorted(self.issues.items())

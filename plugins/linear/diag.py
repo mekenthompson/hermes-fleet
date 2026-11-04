@@ -114,7 +114,7 @@ REASONS = frozenset({
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",
     "context_or_service_unavailable", "delivery_uncertain", "project_required", "ambiguous_project",
-    "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias",
+    "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
     # retired Linear notify subscriptions (the bridge relays those events itself)
     "bridge_relayed",
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)

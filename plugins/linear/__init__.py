@@ -436,11 +436,12 @@ class BoundLinearAPI(LinearAPI):
     def issues_by_title(self, text):
         """Title matches inside identity scope; none under specialist scope (exact keys only there)."""
         if self.specialist_scope is not None:
-            return []
+            return [], False
         teams_allowed, projects_allowed = set(self.identity.get("teams") or ()), set(self.identity.get("projects") or ())
-        return [issue for issue in super().issues_by_title(text)
+        issues, more = super().issues_by_title(text)
+        return [issue for issue in issues
                 if (not teams_allowed or {(issue.get("team") or {}).get("id"), (issue.get("team") or {}).get("key")} & teams_allowed)
-                and (not projects_allowed or (issue.get("project") or {}).get("id") in projects_allowed)]
+                and (not projects_allowed or (issue.get("project") or {}).get("id") in projects_allowed)], more
 
     def create_project(self, client_id, name, team_ids, *, description=None):
         if self.specialist_scope is not None:

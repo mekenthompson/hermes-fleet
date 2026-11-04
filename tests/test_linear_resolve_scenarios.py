@@ -44,6 +44,9 @@ class ResolveRemote(FakeLinear):
     def _apply(self, query, variables):
         if "IdentityBinding" in query:
             return 200, {"data": {"viewer": {"id": SELF}, "organization": {"id": "org-1"}}}
+        if query.startswith("query Issue(") and not (self.issues.get(variables["id"]) or any(
+                issue["identifier"] == variables["id"] for issue in self.issues.values())):
+            return 200, not_found("Issue")  # Linear answers a missing key with an error, not null
         if query.startswith("query Team("):
             team = self._team(variables["id"])
             return (200, {"data": {"team": {"id": team["id"], "key": team["key"]}}}) if team else (200, not_found("Team"))
@@ -161,7 +164,7 @@ class ProjectLedTeamTests(ResolveBase):
         self.assertEqual(reply["code"], "ambiguous_project")
         self.assertEqual(sorted((c["team"], c["project"]) for c in reply["choices"]),
                          [("HF", "Roadmap"), ("KEN", "Roadmap")])
-        self.assertIn("HF / Roadmap", reply["message"])
+        self.assertIn("Hermes Fleet (HF) / Roadmap", reply["message"])
         self.assertEqual(self.remote.created, [])
 
     def test_wrong_team_and_an_ambiguous_project_returns_choices(self) -> None:
@@ -249,6 +252,61 @@ class ProjectLedTeamTests(ResolveBase):
                          ("team-hf", "proj-fleet-qa"))
 
 
+class DuplicateProjectAcrossTeamsTests(ResolveBase):
+    """Live 4 Nov 2026: two active "Fleet QA" projects, in HF (d0bfc6915e80, HF-621..623) and in the
+    household team (45b007ad5677, created 2 Nov). No profile has a home team, so nobody guesses."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remote.projects = [p for p in self.remote.projects if p["id"] != "proj-fleet-qa"]
+        self.remote.add_project("proj-fleet-qa-hf", "Fleet QA", ["team-hf"], slug="d0bfc6915e80")
+        self.remote.add_team("team-life", "LIFE", "Life")
+        self.remote.add_project("proj-fleet-qa-life", "Fleet QA", ["team-life"], slug="45b007ad5677")
+
+    def test_no_team_asks_the_user_by_team_name_and_creates_nothing(self) -> None:
+        reply = self.create(project="Fleet QA", start_work=True)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], "ambiguous_project")
+        self.assertEqual(sorted((c["team"], c["team_name"]) for c in reply["choices"]),
+                         [("HF", "Hermes Fleet"), ("LIFE", "Life")])
+        self.assertIn("Do not guess", reply["message"])
+        self.assertIn("clarify", reply["message"])
+        self.assertRegex(reply["message"], r'"(Hermes Fleet or Life|Life or Hermes Fleet)\?"')
+        self.assertNotIn("do not ask the user", reply["message"].casefold())
+        self.assertEqual(self.remote.created, [])
+
+    def test_the_team_the_user_names_picks_its_project(self) -> None:
+        for team, project in (("HF", "proj-fleet-qa-hf"), ("LIFE", "proj-fleet-qa-life"), ("hermes fleet", "proj-fleet-qa-hf")):
+            with self.subTest(team=team):
+                reply = self.create(project="Fleet QA", team=team)
+                self.assertTrue(reply["ok"], reply)
+                self.assertEqual(self.remote.created[-1]["projectId"], project)
+
+    def test_once_the_household_copy_is_archived_fleet_qa_resolves_to_hf(self) -> None:
+        # Live 4 Nov 2026 01:15:28Z: the stray household "Fleet QA" was archived.
+        self.remote.projects = [p for p in self.remote.projects if p["id"] != "proj-fleet-qa-life"]
+        self.remote.add_project("proj-fleet-qa-life", "Fleet QA", ["team-life"], slug="45b007ad5677", archived=True)
+        reply = self.create(project="Fleet QA")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.remote.created[-1]["projectId"], "proj-fleet-qa-hf")
+        self.assertIn("is in team HF", reply["message"])
+        self.assertEqual(self.create(project="https://linear.app/x/project/fleet-qa-45b007ad5677/overview")["code"],
+                         "project_required")  # an archived project is not resolvable even by its URL
+        listed = {row["team"]: row["projects"] for row in self.create()["teams"]}
+        self.assertEqual(listed["LIFE"], [])
+
+    def test_a_team_owning_neither_still_asks(self) -> None:
+        self.assertEqual(self.create(project="Fleet QA", team="KEN")["code"], "ambiguous_project")
+        self.assertEqual(self.remote.created, [])
+
+    def test_a_pasted_project_url_is_exact(self) -> None:
+        for url in ("https://linear.app/x/project/fleet-qa-45b007ad5677/overview",
+                    "https://linear.app/x/project/fleet-qa-d0bfc6915e80/issues/"):
+            with self.subTest(url=url):
+                self.assertTrue(self.create(project=url)["ok"])
+        self.assertEqual([c["projectId"] for c in self.remote.created], ["proj-fleet-qa-life", "proj-fleet-qa-hf"])
+
+
 class TitleAliasTests(ResolveBase):
     def setUp(self) -> None:
         super().setUp()
@@ -276,7 +334,8 @@ class TitleAliasTests(ResolveBase):
             reply = self.call(action="work_on", issue="QA-10")
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(started, ["HF-622"])
-        self.assertIn("QA-10 is HF-622", reply["message"])
+        self.assertTrue(reply["message"].startswith("QA-10 is HF-622"))
+        self.assertEqual(reply["resolved_issue"]["from"], "QA-10")
         self.assertEqual(reply["issue"]["identifier"], "HF-622")
 
     def test_the_guards_suggested_call_now_works(self) -> None:
@@ -287,11 +346,54 @@ class TitleAliasTests(ResolveBase):
                                                         "routing": "queued"}):
             self.assertTrue(self.call(**suggested)["ok"])
 
+    def test_a_closed_single_match_is_shown_but_never_started(self) -> None:
+        self.remote.set_state("issue-622", "Done")
+        started = []
+        with patch.object(chat, "_entrust", lambda bridge, issue, *a: started.append(issue) or {}):
+            for action in ("work_on", "track", "followup"):
+                with self.subTest(action=action):
+                    reply = self.call(action=action, issue="QA-10", task_id="t_0a1b2c3d", body="go",
+                                      id=str(uuid.uuid4()))
+                    self.assertEqual(reply["code"], "alias_closed")
+                    self.assertIn("which is Done", reply["message"])
+                    self.assertEqual(reply["choices"][0]["state"], "Done")
+        self.assertEqual(started, [])
+        status = self.call(action="status", issue="QA-10")
+        self.assertTrue(status["ok"], status)
+        self.assertEqual(status["resolved_issue"]["state"], "Done")
+
+    def test_free_text_is_never_title_searched(self) -> None:
+        self.remote.add_issue("issue-login", "HF-650", title="login broken", team={"id": "team-hf", "key": "HF"})
+        for action in ("work_on", "track", "followup", "status"):
+            with self.subTest(action=action):
+                reply = self.call(action=action, issue="login", task_id="t_0a1b2c3d", body="go", id=str(uuid.uuid4()))
+                self.assertEqual(reply["code"], "not_found")
+        self.assertEqual(self.requests("query IssueTitleSearch"), 0)
+
+    def test_a_cut_off_search_page_never_starts_work(self) -> None:
+        for n in range(3):
+            self.remote.add_issue(f"issue-x{n}", f"HF-80{n}", title=f"QA-3{n} other", team={"id": "team-hf", "key": "HF"})
+        self.clock.now += 60  # the newest update: first on the cut-off page
+        self.remote.add_issue("issue-qa3", "HF-803", title="QA-3: the one", team={"id": "team-hf", "key": "HF"})
+        with patch.object(api_module, "TITLE_SEARCH_PAGE", 2), patch.object(chat, "_entrust") as entrust:
+            reply = self.call(action="work_on", issue="QA-3")
+            self.assertEqual(reply["code"], "ambiguous_issue")
+            self.assertIn("cut off", reply["message"])
+            entrust.assert_not_called()
+
+    def test_an_expected_miss_is_not_logged_as_an_error(self) -> None:
+        with self.assertLogs(diag.LOGGER_NAME, level="DEBUG") as logs:
+            self.call(action="status", issue="QA-10")
+        self.assertFalse([line for line in logs.output if line.startswith("ERROR")])
+        self.assertTrue(any("expected miss" in line for line in logs.output))
+
     def test_ambiguous_alias_returns_choices(self) -> None:
         reply = self.call(action="status", issue="QA-11")
         self.assertFalse(reply["ok"])
         self.assertEqual(reply["code"], "ambiguous_issue")
         self.assertEqual(sorted(choice["issue"] for choice in reply["choices"]), ["HF-610", "HF-611"])
+        self.assertEqual({choice["state"] for choice in reply["choices"]}, {"Todo"})
+        self.assertIn("clarify", reply["message"])
 
     def test_no_match_is_a_plain_not_found(self) -> None:
         for ref in ("QA-99", "QA-1"):
@@ -319,7 +421,7 @@ class TitleAliasTests(ResolveBase):
 
     def test_specialist_scope_resolves_exact_keys_only(self) -> None:
         with patch.object(self.api, "specialist_scope", {"all_teams": True}):
-            self.assertEqual(self.api.issues_by_title("QA-10"), [])
+            self.assertEqual(self.api.issues_by_title("QA-10"), ([], False))
         self.assertEqual(self.requests("query IssueTitleSearch"), 0)
 
 

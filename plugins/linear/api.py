@@ -96,7 +96,7 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
         raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
     raise LinearError(f"Linear {mutation} response did not confirm success")
 
-def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
+def _graphql_rejection(errors: Any, request_kind: str = "graphql", *, expected_missing: bool = False) -> str:
     """Keep bounded, redacted GraphQL detail beside the stable error prefix."""
     parts: list[str] = []
     entries = errors if isinstance(errors, list) else []
@@ -111,6 +111,9 @@ def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
         safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", code) else ""
         if safe_code == "INPUT_ERROR" and isinstance(message, str) and message.startswith("conflict on insert of"):
             diag.evt("api.result", "deduped", "duplicate_create", code=safe_code)  # idempotent create replay, not an error
+        elif expected_missing and isinstance(message, str) and message.startswith("Entity not found"):
+            # A lookup the caller expects may miss (a title alias such as "QA-10"); its fallback decides.
+            logging.getLogger(diag.LOGGER_NAME).debug("linear: expected miss request_kind=%s message=%s", request_kind, text)
         else:
             logging.getLogger(diag.LOGGER_NAME).error("linear: GraphQL error request_kind=%s message=%s code=%s", request_kind, text, safe_code)
         if text and safe_code:
@@ -330,6 +333,7 @@ class LinearAPI:
         self._viewer: str | None = None
         self._activities_refused_until = 0.0  # Linear refused the internal Issue.agentSessions selection
         self._mutation_guard = threading.local()
+        self._expected_missing = threading.local()
         self._priority = threading.local()
         self.budget: dict[str, dict[str, float]] = {}
         self._budget_level = "ok"
@@ -388,6 +392,13 @@ class LinearAPI:
             report = log.info if level == "ok" else log.warning
             report("linear: shared request budget %s (%.0f%% left until %.0f)", level, fraction * 100, reset)
             self._budget_level = level
+    @contextmanager
+    def expected_missing(self):
+        """Reads in this block may legitimately find nothing: "Entity not found" logs at DEBUG, not ERROR."""
+        previous = getattr(self._expected_missing, "on", False)
+        self._expected_missing.on = True
+        try: yield
+        finally: self._expected_missing.on = previous
     @contextmanager
     def guarded_mutation(self, guard):
         previous = getattr(self._mutation_guard, "callback", None)
@@ -514,7 +525,8 @@ class LinearAPI:
         if errors:
             request_kind = "mutation" if query.lstrip().startswith("mutation") else "query"
             duplicate_check = request_kind == "mutation" and "mutation Create(" in query
-            raise LinearError(_graphql_rejection(errors, request_kind),
+            raise LinearError(_graphql_rejection(errors, request_kind,
+                                                 expected_missing=getattr(self._expected_missing, "on", False)),
                               errors=errors if duplicate_check else None, retryable=False)
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
@@ -811,16 +823,20 @@ class LinearAPI:
         directory = {"teams": teams, "projects": projects, "complete": complete}
         self._directory = (self.clock(), directory)
         return directory
-    def issues_by_title(self, text: str) -> list[dict[str, Any]]:
-        """Recent issues (newest update first, one bounded page) whose title contains ``text``, ignoring case."""
+    def issues_by_title(self, text: str) -> tuple[list[dict[str, Any]], bool]:
+        """(recent issues whose title starts with ``text`` ignoring case, newest update first; more may exist).
+
+        One bounded page; "more" is True when Linear has another page or the page is full."""
         data = self.graphql("query IssueTitleSearch($q: String!) { issues(first: %d, orderBy: updatedAt, "
-                            "filter: { title: { containsIgnoreCase: $q } }) { nodes { id identifier title updatedAt "
-                            "team { id key } project { id } } } }" % TITLE_SEARCH_PAGE, {"q": text})
+                            "filter: { title: { startsWithIgnoreCase: $q } }) { nodes { id identifier title updatedAt "
+                            "state { name type } team { id key } project { id } } pageInfo { hasNextPage } } }"
+                            % TITLE_SEARCH_PAGE, {"q": text})
         issues = data.get("issues")
         if not isinstance(issues, dict) or not isinstance(issues.get("nodes"), list):
             raise LinearError("Linear issue search unavailable")
+        more = (issues.get("pageInfo") or {}).get("hasNextPage") is not False or len(issues["nodes"]) >= TITLE_SEARCH_PAGE
         return [node for node in issues["nodes"] if isinstance(node, dict) and isinstance(node.get("identifier"), str)
-                and isinstance(node.get("title"), str)]
+                and isinstance(node.get("title"), str)], more
     def create_project(self, client_id: str, name: str, team_ids: list[str], *,
                        description: str | None = None) -> dict[str, Any]:
         """Create a project as the authenticated app. Never sets a lead."""

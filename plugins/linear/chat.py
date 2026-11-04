@@ -1,5 +1,6 @@
 """Linear records and native task links; execution stays in Hermes Kanban."""
 from __future__ import annotations
+import contextlib
 import json
 import re
 import time
@@ -285,9 +286,13 @@ def _find_team(directory: dict, team: str) -> dict | None:
                  (row["key"].casefold(), row["name"].casefold())), None)
 
 
+_PROJECT_URL_TAIL = re.compile(r"/(?:overview|issues|updates|documents|activity)$", re.I)
+
+
 def _find_projects(directory: dict, project: str) -> list[dict]:
     """Active projects named ``project``: exact id, name or URL slug (``fleet-qa-1a2b3c``), ignoring case."""
-    wanted = project.strip().rstrip("/").rsplit("/", 1)[-1].casefold()
+    # A pasted URL: https://linear.app/<org>/project/fleet-qa-d0bfc6915e80/overview
+    wanted = _PROJECT_URL_TAIL.sub("", project.strip().rstrip("/")).rsplit("/", 1)[-1].casefold()
     return [row for row in directory["projects"] if project == row["id"] or project.casefold() == row["name"].casefold()
             or (row["slug"] and (wanted == row["slug"].casefold() or wanted.endswith("-" + row["slug"].casefold())))]
 
@@ -354,12 +359,17 @@ def _project_led(bridge: Any, project: str, team: str = "", *, team_unknown: boo
         note += f", not {team}" if team and not team_unknown else (f" (no team {team!r} is visible)" if team else "")
         return owner["id"], row["id"], note + "; the issue goes there.", ""
     if options:
+        # Same-named projects in different teams (live: "Fleet QA" in HF and in a household team). Which
+        # one is meant is the user's call; a guess can file work into the wrong team.
         choices = [{"team": owner["key"], "team_name": owner["name"], "project": row["name"], "project_id": row["id"]}
                    for owner, row in options[:LIST_CHOICES]]
-        lines = "; ".join(f"{choice['team']} / {choice['project']}" for choice in choices)
-        return None, None, "", _reply(False, f"Several active projects match {project!r} ({lines}). Pick the team and "
-                                      "project that fit the work and retry with both." + _DESTINATION_TIP,
-                                      code="ambiguous_project", choices=choices)
+        lines = "; ".join(f"{choice['team_name'] or choice['team']} ({choice['team']}) / {choice['project']}"
+                          for choice in choices)
+        names = " or ".join(dict.fromkeys(choice["team_name"] or choice["team"] for choice in choices))
+        return None, None, "", _reply(False, f"Several active projects match {project!r}: {lines}. Do not guess. Unless "
+                                      "the user already named the team, ask them with clarify which team's project "
+                                      f"they mean, by team name (\"{names}?\"), then retry with that team's key. "
+                                      "Nothing was created.", code="ambiguous_project", choices=choices)
     if _UUID_SHAPE.fullmatch(project) and team and not team_unknown:
         return team, project, "", ""  # An exact id outside the listed pages; creation still verifies it.
     if team_unknown:
@@ -620,32 +630,51 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
     return _reply(True, "Linked issues.", relation=bridge.api.link_issue(issue, related, relation))
 
 # An issue named by its title prefix: "QA-10" for HF-622 "QA-10: list the 10 most recent commits".
-# Read, start and steer actions use the single match and say so; other edits need the exact key.
+# Only key-shaped refs are aliases; free text ("login") is never title-searched. Read, start and
+# steer actions use one certain, open match and say so; other edits need the exact key.
 ALIAS_ACTIONS = frozenset({"status", "work_on", "track", "followup"})
-_ALIAS_MAX = 120
+START_ACTIONS = frozenset({"work_on", "track", "followup"})
+_KEY_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[0-9]+")
+_CLOSED_TYPES = frozenset({"completed", "canceled"})
 
 
 def _not_found(exc: LinearError) -> bool:
     return not isinstance(exc, RateLimited) and not exc.retryable and "not found" in str(exc).casefold()
 
 
-def _title_matches(bridge: Any, ref: str) -> list[dict]:
-    """Issues whose title starts with ``ref`` then ":" or a space (or is exactly it), newest update first."""
+def _title_matches(bridge: Any, ref: str) -> tuple[list[dict], bool]:
+    """(issues whose title starts with ``ref`` then ":" or a space, or is exactly it, newest update first;
+    whether the bounded search page may have left out others)."""
     search = getattr(bridge.api, "issues_by_title", None)
-    if not callable(search) or not 2 <= len(ref) <= _ALIAS_MAX:
-        return []
+    if not callable(search):
+        return [], False
+    found, more = search(ref)
     wanted = ref.casefold()
-    return [issue for issue in search(ref) if issue["title"].casefold() == wanted
-            or (issue["title"].casefold().startswith(wanted) and issue["title"][len(ref):len(ref) + 1] in (":", " "))]
+    return [issue for issue in found if issue["title"].casefold() == wanted
+            or (issue["title"].casefold().startswith(wanted) and issue["title"][len(ref):len(ref) + 1] in (":", " "))], more
+
+
+def _expected_missing(bridge: Any):
+    quiet = getattr(bridge.api, "expected_missing", None)
+    return quiet() if callable(quiet) else contextlib.nullcontext()
+
+
+def _choice(item: dict) -> dict:
+    state = item.get("state") if isinstance(item.get("state"), dict) else {}
+    return {"issue": item["identifier"], "title": item["title"][:120], "team": (item.get("team") or {}).get("key"),
+            "state": state.get("name"), "state_type": state.get("type")}
 
 
 def _lookup_issue(bridge: Any, ref: str, action: str) -> tuple[Any, dict | None]:
     """(issue, resolved alias or None), or (refusal reply, None).
 
-    ``ref`` is read as an exact identifier or id first; only when Linear has no such issue does a
-    bounded title search resolve it, and only to exactly one issue. Ids are never title-searched."""
+    ``ref`` is read as an exact identifier or id first. Only a key-shaped ref ("QA-10") that Linear
+    has no issue for is then looked up as a title prefix, and only one certain match is used:
+    start actions never act on a closed issue or on a search page that may have left others out."""
+    aliasable = bool(_KEY_SHAPE.fullmatch(ref))
     try:
-        issue = bridge.api.issue(ref)
+        with _expected_missing(bridge) if aliasable else contextlib.nullcontext():
+            issue = bridge.api.issue(ref)
     except LinearError as exc:
         if not _not_found(exc):
             raise
@@ -653,24 +682,31 @@ def _lookup_issue(bridge: Any, ref: str, action: str) -> tuple[Any, dict | None]
         if not isinstance(issue, dict) or ref not in (issue.get("id"), issue.get("identifier")):
             raise LinearError("Linear issue resolution did not match the requested issue.")
         return issue, None
-    searched = not _UUID_SHAPE.fullmatch(ref)
     try:
-        matches = _title_matches(bridge, ref) if searched else []
+        matches, more = _title_matches(bridge, ref) if aliasable else ([], False)
     except RateLimited:
         raise
     except LinearError:
-        matches, searched = [], False
+        matches, more, aliasable = [], False, False
     if not matches:
         return _reply(False, f"No Linear issue {ref!r}: it is not an issue key or id this app can read"
-                      + (", and no recent issue title starts with it." if searched else ".")
+                      + (", and no recent issue title starts with it." if aliasable else ".")
                       + " Check the key, or ask the user which issue they mean.", code="not_found"), None
-    choices = [{"issue": item["identifier"], "title": item["title"][:120], "team": (item.get("team") or {}).get("key")}
-               for item in matches[:LIST_CHOICES]]
+    choices = [_choice(item) for item in matches[:LIST_CHOICES]]
+    listed = "; ".join(f"{c['issue']} \"{c['title']}\" ({c['state'] or 'state unknown'})" for c in choices)
     if len(matches) > 1:
-        lines = "; ".join(f"{choice['issue']} \"{choice['title']}\"" for choice in choices)
-        return _reply(False, f"{ref!r} matches several issue titles ({lines}). Pick the one the user means and retry "
-                      "with its key.", code="ambiguous_issue", choices=choices), None
+        return _reply(False, f"{ref!r} matches several issue titles ({listed}). Do not guess: pick the one the user "
+                      "clearly means, or ask them with clarify, then retry with its key.",
+                      code="ambiguous_issue", choices=choices), None
     resolved = choices[0]
+    if action in START_ACTIONS and more:
+        return _reply(False, f"{ref} looks like {resolved['issue']} (\"{resolved['title']}\"), but the title search "
+                      "was cut off, so other issues may also start with it. Nothing was started. Confirm with the user "
+                      f"(clarify), then retry with the exact key.", code="ambiguous_issue", choices=choices), None
+    if action in START_ACTIONS and resolved["state_type"] in _CLOSED_TYPES:
+        return _reply(False, f"{ref} is {resolved['issue']} (\"{resolved['title']}\"), which is {resolved['state']}. "
+                      "Nothing was started. If the user wants this closed issue worked on again, confirm with them "
+                      f"(clarify), then retry with {resolved['issue']}.", code="alias_closed", choices=choices), None
     if action not in ALIAS_ACTIONS:
         return _reply(False, f"{ref} is {resolved['issue']} (\"{resolved['title']}\"). Retry with issue "
                       f"{resolved['issue']}: {action} needs the exact key.", code="issue_alias",
@@ -726,8 +762,9 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         if not ref:
             raise ValueError(f"{action} needs an issue identifier.")
         if action == "status" and not re.fullmatch(r"[0-9a-fA-F]{32}", ref):
-            # A read-only lexical alias, never fuzzy search or mutation authority.
-            # Digit-bearing team keys need their explicit separator.
+            # A read-only lexical alias that grants no mutation authority. Digit-bearing team keys
+            # need their explicit separator. A key-shaped ref Linear does not know may still be a
+            # title prefix ("QA-10"); _lookup_issue decides that, never for free text.
             compact = re.fullmatch(r"([A-Za-z]+)([1-9][0-9]*)", ref)
             if compact:
                 ref = f"{compact[1].upper()}-{compact[2]}"
