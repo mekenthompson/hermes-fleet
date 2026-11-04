@@ -127,9 +127,26 @@ jobs:
           python-version: "3.13"
 
       - name: Install pinned Trivy
-        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
-        with:
-          version: ${{ env.TRIVY_VERSION }}
+        # setup-trivy's installer downloads from get.trivy.dev, which returns NXDOMAIN
+        # (2026-11-04). Install the exact GitHub release asset and verify its pinned
+        # sha256 instead; bump TRIVY_SHA256 together with TRIVY_VERSION.
+        env:
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          set -euo pipefail
+          version="${TRIVY_VERSION#v}"
+          if [ "$version" != "0.70.0" ]; then
+            echo "TRIVY_SHA256 is pinned for 0.70.0; update it with TRIVY_VERSION" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/trivy-bin"
+          mkdir -p "$dir"
+          curl --fail --location --silent --show-error --retry 3 -o "$RUNNER_TEMP/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/trivy" --version
 
       - name: Install pinned Syft
         id: syft
@@ -448,9 +465,26 @@ jobs:
           python-version: "3.13"
 
       - name: Install pinned Trivy
-        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
-        with:
-          version: ${{ env.TRIVY_VERSION }}
+        # setup-trivy's installer downloads from get.trivy.dev, which returns NXDOMAIN
+        # (2026-11-04). Install the exact GitHub release asset and verify its pinned
+        # sha256 instead; bump TRIVY_SHA256 together with TRIVY_VERSION.
+        env:
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          set -euo pipefail
+          version="${TRIVY_VERSION#v}"
+          if [ "$version" != "0.70.0" ]; then
+            echo "TRIVY_SHA256 is pinned for 0.70.0; update it with TRIVY_VERSION" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/trivy-bin"
+          mkdir -p "$dir"
+          curl --fail --location --silent --show-error --retry 3 -o "$RUNNER_TEMP/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/trivy" --version
 
       - name: Install pinned Syft
         id: syft
