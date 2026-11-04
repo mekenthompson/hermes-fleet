@@ -383,10 +383,6 @@ RESTART = "[Linear] The gateway restarted while you were working on a Linear iss
 
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SettingsAllowlistTests(unittest.TestCase):
     def test_every_service_setting_the_bridge_reads_is_loaded_from_config(self) -> None:
         # The service builds its settings only from plugin.SETTINGS; a key the bridge reads but the
@@ -396,3 +392,7 @@ class SettingsAllowlistTests(unittest.TestCase):
             read |= set(re.findall(r'settings\.get\("([a-z_]+)"', (PLUGIN / name).read_text()))
         self.assertTrue({"takeover", "states", "board"} <= read)
         self.assertEqual(sorted(read - set(plugin.SETTINGS)), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
