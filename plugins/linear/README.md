@@ -285,10 +285,14 @@ publication, and earlier request coordinates and receipts remain intact.
 the old owner stopped and nobody running the work:
 
 1. The requester checks everything it could refuse later (issue open and fully read, its own
-   authorization, executor, board pin and guarded controls) before the owner is touched. Older
-   local work that `work_on` would reuse must be open and runnable (ready or running): a task
-   here that has finished or is paused would leave nobody running the work once the owner
-   stops, so the takeover is refused with the owner untouched. An issue with no agent delegate
+   authorization, executor, board pin and guarded controls) before the owner is touched. The
+   invariant: while a task for the issue is ready or running here, the owner is never asked for
+   anything (a hand-off it cannot prove, and a call-off, both resume its work). So a task here
+   from an earlier takeover from the same delegate means the takeover already happened: the
+   reply says so and only the Linear delegate update is retried, whatever the request `id`. Any
+   other local work refuses with the owner untouched: running work (a person decides which
+   agent continues), and finished or paused work (it would leave nobody running the work once
+   the owner stops). An issue with no agent delegate
    is not a takeover (`not_delegated`: use `work_on`); one delegated to this app is plain
    `work_on`. One `take_over` per issue runs at a time on an agent (`takeover_in_progress`).
 2. It runs the owner's own `hermes linear hand-off` through the operator-configured command for
@@ -306,18 +310,34 @@ the old owner stopped and nobody running the work:
    the reply is `state: stopped` and says an operator needs to resume it, never `unchanged`. A
    task already paused for input by someone else is only proven, never changed (`state:
    unchanged`), unless it is paused for a handover to a different agent, which is refused.
-   One hand-off or cancel runs per issue at a time on the owner (a lock beside its state database).
+   A handover pause is held by the request that made it, until a later request for the same
+   agent proves that same pause and hands it over; only the holder's cancel resumes it, so a
+   late cancel or retry of an older request never resumes work a newer one handed over. A pause
+   whose holder was called off but never finished (its cancel timed out) is resumed by the next
+   hand-off (`state: resumed`, try again) instead of being proven again.
+   One hand-off or cancel runs per issue at a time on the owner (a lock beside its state
+   database); a hand-off waits at most 10 seconds for it, a cancel up to `wait_seconds` plus 30.
 4. On proof (`state: handed_off`) the requester creates its one native task, whose text says to
    continue from the old owner's progress in the Linear thread, admits it while Linear still shows
    exactly the old delegate and no person has changed its state, assignee or delegate since the
    request (the same check as `work_on`; the old delegate app reporting its pause is not a
    person), and replaces that delegate (guarded on it) with this app.
-5. Anything short of one task ready or running here after the owner was asked (a refusal, an
-   exception, linked work that does not run, or no readable reply from the owner) calls the
-   handover off with the owner's `hand-off --cancel`. Cancel records the call-off first, so a
-   hand-off still running for that request undoes its own Stop instead of reporting a handover
-   nobody continues; then it resumes the task only while the latest Stop is still this request's
-   own.
+   The old delegate app's own writes (its pause comment, its status) never hold that update;
+   a person's routing change does. A held update is retried by delegate recovery.
+5. After the owner was asked, what runs here decides, not where a step failed. A task ready or
+   running here (admitted before a later step such as the chat subscription failed) means the
+   handover stands: the reply is a success that names the unfinished Linear update, and the
+   owner is not called off. Otherwise (a refusal, an exception, linked work that does not run,
+   or no readable reply from the owner) the handover is called off with the owner's
+   `hand-off --cancel`. Cancel records the call-off first, so a hand-off still running for that
+   request undoes its own Stop instead of reporting a handover nobody continues; then it
+   resumes the task only while this request still holds its pause. When this side can't read
+   what runs here, it neither calls off nor claims success (`takeover_uncertain`).
+6. A take_over that asked the owner but never reached a final answer (the service stopped in
+   between, or the reply was `takeover_uncertain`) leaves a record beside the state database.
+   The bridge finishes it in the background with the same rule: a task ready or running here
+   means the handover stands; otherwise it calls the request off, backing off while the owner
+   can't be reached. Call-off records on the owner are removed after 30 days.
 
 Repeat a request with the same `id` only after `takeover_uncertain` (the owner's reply and its
 call-off were both unknown): the owner finds its own Stop by request id and never stops twice,
@@ -332,10 +352,12 @@ The owner command runs without a shell and passes each argument through unchange
 `--issue-json` argument is a JSON object and `--to` may contain spaces. Point `command` at
 something that executes argv as given (`docker exec ...`, a host bridge that forwards argv).
 Never wrap it in `ssh host ...` or `sh -c ...`: both join the arguments into one string and
-re-split it, which breaks the JSON payload. One `take_over` takes at most two owner calls (the
-hand-off and one cancel, each bounded by `wait_seconds` plus a fixed allowance) and one start
-here; `wait_seconds` is capped at 120 so the whole call ends inside the chat client's 420-second
-timeout.
+re-split it, which breaks the JSON payload. One `take_over` takes this side's Linear
+reads before the owner is asked (a 40-second Linear deadline), at most two owner calls (the
+hand-off and one cancel, each bounded by a `wait_seconds` plus 60 second subprocess timeout)
+and one start here (a 60-second Linear deadline; a Linear request that could not finish inside
+a deadline is not started). `wait_seconds` is capped at 120, so the whole call ends inside the
+chat client's 480-second timeout.
 
 For a manual or older takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder

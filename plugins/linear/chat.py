@@ -2,6 +2,7 @@
 from __future__ import annotations
 import contextlib
 import json
+import os
 import re
 import time
 import uuid
@@ -526,7 +527,8 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
             row_id = bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=current,
                 expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
                 expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester,
-                **({"recorded_done": True} if recorded_done else {}))
+                **({"recorded_done": True} if recorded_done else {}),
+                **({"replaces_delegate": current} if current is not None and current == replace_delegate else {}))
             # A retried request returns its earlier row: only a still-pending one is on its way.
             current = bridge.store.outbox_row(row_id) or {}
             on_its_way = (current.get("state") == "pending" and not current.get("hold_reason")
@@ -618,11 +620,13 @@ def _take_over(bridge: Any, args: dict, context: Any, issue: dict) -> str:
 
     Ends in exactly one of two states: the old delegate's run is stopped, proven ended, and this
     agent continues the work as its one native task (replacing exactly that delegate); or nothing
-    changed and the reply says why in plain words. Every refusal this agent can make is checked
-    before the other agent is asked to stop, including earlier local work that entrust would
-    reuse but that would not run. After the owner is asked, anything short of one task ready or
-    running here (a refusal, an exception, an unknown owner reply) calls the handover off, which
-    resumes the other agent's work. One take_over per issue runs at a time on this agent."""
+    changed and the reply says why in plain words. One invariant keeps it there: while a task
+    for this issue is ready or running here, the old delegate is never asked for anything (a
+    hand-off that cannot be proven resumes its work, and so does a call-off), so both agents
+    never run it; and once the old delegate may be paused for this request, anything short of a
+    task ready or running here calls the handover off, so nobody running it never lasts. Every
+    refusal this agent can make is checked before the other agent is asked to stop. One
+    take_over per issue runs at a time on this agent."""
     from . import handoff
     issue_id, key = issue["id"], issue.get("identifier") or issue["id"]
     if context.delegated_child:
@@ -666,16 +670,44 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
                       peer: dict, name: str) -> str:
     from . import handoff
     issue_id = issue["id"]
+    note = TAKEOVER_NOTE.format(owner=owner)
     # Everything this side could refuse after the stop is refused before it, with the other agent untouched.
     _entrust_board_pin(bridge, context)
     if not getattr(bridge.kanban, "guarded_controls", False):
         return _reply(False, "This agent's version can't start handed-over work safely, so nothing was changed and "
                       f"{owner} keeps working on it.", code="takeover_refused", issue=_issue_ref(issue))
-    problem = bridge.takeover_preflight(issue_id, takeover_from=owner_id)
-    if problem:
+    verdict, problem = bridge.takeover_preflight(issue_id, takeover_from=owner_id)
+    if verdict == "already_here":
+        # A takeover from this delegate already finished here (its task is admitted and running):
+        # the owner is never asked again, whatever the request id. Only Linear routing is retried.
+        diag.evt("chat.entrust", "skipped", "takeover_already_here", iss=issue_id)
+        _clear_unfinished(bridge, issue_id)
+        result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=note)
+        return _reply(True, f"{key} was already taken over from {owner}, so {owner} was not asked again. "
+                      + _running_here_message(result), issue=_issue_ref(issue), **result)
+    if verdict != "ask_owner":
         diag.evt("chat.entrust", "refused", "local_work_not_runnable", iss=issue_id)
         return _reply(False, f"Not taken over: {problem}. Nothing was changed and {owner} keeps working on {key}. "
                       "Check status here first.", code="takeover_refused", issue=_issue_ref(issue))
+    # From the moment the owner is asked until a final answer, a record says this takeover is
+    # unfinished. If this process stops in between, or the answer is uncertain, the bridge
+    # finishes it later (resolve_unfinished_takeovers): never the owner stopped with nobody running.
+    try:
+        _record_unfinished(bridge, issue, request_id, owner_id, name)
+    except OSError as exc:
+        diag.evt("chat.entrust", "refused", "takeover_unavailable", iss=issue_id, exc=type(exc).__name__)
+        return _reply(False, f"Not taken over: this agent couldn't record the handover safely, so {owner} was not "
+                      f"asked and nothing was changed. Try again.", code="takeover_refused", issue=_issue_ref(issue))
+    answer = _take_over_asking(bridge, context, issue, key, request_id, owner_id, owner, peer, name, note)
+    if json.loads(answer).get("code") != "takeover_uncertain":
+        _clear_unfinished(bridge, issue_id)
+    return answer
+
+
+def _take_over_asking(bridge: Any, context: Any, issue: dict, key: str, request_id: str, owner_id: str, owner: str,
+                      peer: dict, name: str, note: str) -> str:
+    from . import handoff
+    issue_id = issue["id"]
 
     def call_off(why: str, *, result: dict | None = None, handover: dict | None = None) -> str:
         """The owner may be paused for this request and nothing runs here: call the handover off."""
@@ -687,8 +719,7 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
         elif state == "unchanged":
             after, code = f"{owner}'s work was left as it was and nothing was handed over.", "takeover_refused"
         else:
-            after, code = (f"{owner}'s work may still be paused: ask again with the same id to finish calling the "
-                           f"handover off, or an operator needs to resume it on {owner}'s board."), "takeover_uncertain"
+            after, code = _ASK_AGAIN.format(owner=owner), "takeover_uncertain"
         diag.evt("chat.entrust", "applied" if code == "takeover_refused" else "failed", "takeover_not_started",
                  iss=issue_id)
         return _reply(False, f"{why} {after}", code=code, issue=_issue_ref(issue), handover=handover, **(result or {}))
@@ -699,27 +730,127 @@ def _take_over_locked(bridge: Any, context: Any, issue: dict, key: str, request_
                         "was called off.")
     handover = {"from": owner, "state": reply["state"], "stopped_here": reply.get("stopped_here")}
     if not reply["handed_off"]:
+        if reply["state"] == "stopped":
+            # The owner says its work may still be paused for this request: never "nothing changed".
+            return _reply(False, f"Not taken over. {reply['message']} {_ASK_AGAIN.format(owner=owner)}",
+                          code="takeover_uncertain", issue=_issue_ref(issue), handover=handover)
         return _reply(False, f"Not taken over. {reply['message']}", code="takeover_refused",
                       issue=_issue_ref(issue), handover=handover)
     failure, result = "", None
     try:
-        result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=TAKEOVER_NOTE.format(owner=owner))
+        with _linear_deadline(bridge, _take_over_budget("start")):
+            result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=note)
         native = result["native"]
         failure = native.get("not_started_reason") or ""
         if not failure and native.get("status") not in ("ready", "running"):
             # Linked work that is not open and runnable: nobody would be running the work.
             failure = _local_work_problem(native.get("status"))
-        if not failure:
-            message = f"Took over {key} from {owner}: its run stopped and is confirmed finished. " + _entrust_message(result)
     except (LinearError, transport.Unavailable, ValueError) as exc:
         failure = str(exc).rstrip(".")
     except Exception as exc:  # noqa: BLE001 - the owner is paused for us: never leave it with nobody running
         diag.evt("chat.entrust", "failed", "exception", iss=issue_id, exc=type(exc).__name__)
         failure = "this agent hit an unexpected error while starting it"
-    if failure:
-        return call_off(f"{owner} stopped for the handover, but the work couldn't start here ({failure}).",
-                        result=result, handover=handover)
-    return _reply(True, message, issue=_issue_ref(issue), handover=handover, **result)
+    if not failure:
+        return _reply(True, f"Took over {key} from {owner}: its run stopped and is confirmed finished. "
+                      + _entrust_message(result), issue=_issue_ref(issue), handover=handover, **result)
+    # The start failed somewhere. What runs here now decides, not where it failed: a task that is
+    # ready or running here (admitted before a later step failed) is never left running beside a
+    # resumed owner, so the handover is not called off; it stands, and only routing is unfinished.
+    try:
+        local = bridge.takeover_local_status(issue_id)
+    except Exception as exc:  # noqa: BLE001 - unknown here: neither resume the owner nor claim success
+        diag.evt("chat.entrust", "failed", "takeover_local_unknown", iss=issue_id, exc=type(exc).__name__)
+        return _reply(False, f"{owner} stopped for the handover, but this agent couldn't confirm whether the work "
+                      f"started here ({failure}). {_ASK_AGAIN.format(owner=owner)}", code="takeover_uncertain",
+                      issue=_issue_ref(issue), handover=handover, **(result or {}))
+    if local in ("ready", "running"):
+        diag.evt("chat.entrust", "applied", "takeover_routing_unfinished", iss=issue_id)
+        native = (result or {}).get("native") or {"issue_id": issue_id, "status": local}
+        routing = (result or {}).get("routing") or "held: " + failure
+        return _reply(True, f"Took over {key} from {owner}: its run stopped and is confirmed finished, and one task "
+                      f"on this agent now carries out the work. Finishing the setup hit a problem ({failure}): "
+                      + _delegate_sentence(routing) + ". Ask again with take_over to retry the Linear update; "
+                      f"{owner} is not asked again. Do not also do this work here.",
+                      issue=_issue_ref(issue), handover=handover, native=native, routing=routing)
+    return call_off(f"{owner} stopped for the handover, but the work couldn't start here ({failure}).",
+                    result=result, handover=handover)
+
+
+def _unfinished_path(bridge: Any, issue_id: str):
+    from . import handoff
+    return bridge.store.path.parent / "takeover" / (handoff._digest("unfinished", issue_id) + ".inflight.json")
+
+
+def _record_unfinished(bridge: Any, issue: dict, request_id: str, owner_id: str, name: str) -> None:
+    path = _unfinished_path(bridge, issue["id"])
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    with open(os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        json.dump({"issue": _issue_ref(issue), "request_id": request_id, "owner_id": owner_id, "to": name}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def _clear_unfinished(bridge: Any, issue_id: str) -> None:
+    try:
+        _unfinished_path(bridge, issue_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        diag.evt("chat.entrust", "failed", "takeover_resolve_failed", iss=issue_id, exc=type(exc).__name__)
+
+
+def resolve_unfinished_takeovers(bridge: Any) -> None:
+    """Finish each take_over that asked its owner but never reached a final answer: the process
+    stopped in between, or the answer was uncertain. Same invariant as take_over itself: while a
+    task for the issue is ready or running here, the handover stands and the owner is never asked
+    anything; otherwise the request is called off, which resumes the owner's work if it is still
+    paused for it. Skips an issue whose take_over is running now; failures back off."""
+    from . import handoff
+    directory = bridge.store.path.parent / "takeover"
+    for path in sorted(directory.glob("*.inflight.json")):
+        try:
+            record = json.loads(path.read_text())
+            issue_id = record["issue"]["id"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        backoff = f"takeover-resolve:{issue_id}"
+        if not bridge.store.backoff_ready(backoff, bridge.clock()):
+            continue
+        with handoff.issue_lock(directory, issue_id, 0) as free:
+            if not free or not path.exists():
+                continue
+            try:
+                if bridge.takeover_local_status(issue_id) in ("ready", "running"):
+                    outcome = "stands"
+                else:
+                    peer = (getattr(bridge, "takeover", None) or {}).get("agents", {}).get(record["owner_id"])
+                    undo = handoff.request(peer, record["issue"], to=record["to"], request_id=record["request_id"],
+                                           cancel=True) if peer else None
+                    outcome = (undo or {}).get("state")
+            except Exception as exc:  # noqa: BLE001 - unknown: try again later
+                diag.evt("chat.entrust", "failed", "takeover_resolve_failed", iss=issue_id, exc=type(exc).__name__)
+                outcome = None
+            if outcome in ("stands", "resumed", "unchanged"):
+                _clear_unfinished(bridge, issue_id)
+                bridge.store.backoff_clear(backoff)
+                diag.evt("chat.entrust", "applied", "takeover_resolved", iss=issue_id, result=outcome)
+            else:
+                bridge.store.backoff_fail(backoff, bridge.clock())
+                diag.evt("chat.entrust", "held", "takeover_unresolved", iss=issue_id)
+
+
+_ASK_AGAIN = ("{owner}'s work may still be paused: ask again with the same id to finish the handover or call it "
+              "off, or an operator needs to resume it on {owner}'s board.")
+
+
+def _running_here_message(result: dict) -> str:
+    native = result["native"]
+    if native.get("status") in ("ready", "running"):
+        return ("One native task on this agent carries out this work: " + _delegate_sentence(result.get("routing") or "")
+                + ". Do not also do this work here.")
+    return _entrust_message(result)
 
 
 def _local_work_problem(status: str | None) -> str:
@@ -872,7 +1003,19 @@ def _resolved_reply(reply: str, ref: str, resolved: dict) -> str:
 
 def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     started = time.monotonic()
-    return diag.tool_result(args, _scoped_handle(bridge, args, context), started)
+    with _linear_deadline(bridge, _take_over_budget("before_owner") if args.get("action") == "take_over" else None):
+        return diag.tool_result(args, _scoped_handle(bridge, args, context), started)
+
+
+def _take_over_budget(phase: str) -> float:
+    from . import handoff
+    return {"before_owner": handoff.BEFORE_OWNER_BUDGET_SECONDS, "start": handoff.ENTRUST_BUDGET_SECONDS}[phase]
+
+
+def _linear_deadline(bridge: Any, seconds: float | None):
+    """Bound this request's Linear calls (take_over promises its caller an answer in time)."""
+    deadline = getattr(getattr(bridge, "api", None), "deadline", None)
+    return deadline(seconds) if seconds is not None and callable(deadline) else contextlib.nullcontext()
 
 
 def _scoped_handle(bridge: Any, args: dict[str, Any], context: Any) -> str:

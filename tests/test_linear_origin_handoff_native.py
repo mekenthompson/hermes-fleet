@@ -22,6 +22,8 @@ URL = "https://linear.example/issue/ABC-1"
 META = {"id": "issue-one", "identifier": "ABC-1", "url": URL}
 MARKER = "Linear issue ABC-1: " + URL
 REQUEST = "6f2c9e4a-3b1d-4c7e-9a52-8d0e1f7b4c63"
+R2 = "0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b"
+R3 = "3d4e5f6a-7b8c-4d9e-8f0a-1b2c3d4e5f6a"
 
 
 def load_tests(loader, tests, pattern):
@@ -318,7 +320,7 @@ class Handoff(base.OriginScenarios):
     async def test_handoff_busy_issue_lock_changes_nothing(self):
         await self.running_issue()
         before = self.snapshot()
-        with patch.object(handoff, "LOCK_SLACK_SECONDS", 0), \
+        with patch.object(handoff, "HANDOFF_LOCK_SECONDS", 0), \
                 handoff.issue_lock(handoff._handoff_dir(self.linear_state), "issue-one", 0) as held:
             self.assertTrue(held)
             result = await self.hand_off()
@@ -350,6 +352,78 @@ class Handoff(base.OriginScenarios):
         self.assertEqual(result["state"], "resumed", result)
         self.assertIn("called off before it finished", result["message"])
         self.assertEqual(self.status(), "ready")
+
+    # -- review r2 B: only the request holding a pause may resume it ---------------------------
+    async def test_handoff_an_older_request_never_resumes_a_pause_a_later_request_handed_over(self):
+        await self.running_issue()
+        first = await self.hand_off()  # R1 stops and proves; its requester never finished (no call-off).
+        self.assertTrue(first["handed_off"], first)
+        later = await self.hand_off(request_id=R2)  # R2 proves R1's pause: Nova continues under R2.
+        self.assertTrue(later["handed_off"], later)
+        self.assertFalse(later["stopped_here"])
+        self.assertEqual(later["stop_event_id"], first["stop_event_id"])
+        self.assertEqual(len(self.delivered), 1)  # Never stopped twice.
+        before = self.snapshot()
+        late_cancel = await self.hand_off(cancel=True)  # R1's requester comes back and calls R1 off.
+        self.assertEqual(late_cancel["state"], "unchanged", late_cancel)
+        self.assertIn("different handover request", late_cancel["message"])
+        retry = await self.hand_off()  # And retries R1 as told after takeover_uncertain.
+        self.assertEqual((retry["handed_off"], retry["state"]), (False, "unchanged"), retry)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.status(), "blocked")  # Still handed over to Nova: never both running.
+        # R2 holds the pause: R2 calling off (its start failed) resumes it, so nobody is left stopped.
+        undone = await self.hand_off(request_id=R2, cancel=True)
+        self.assertEqual(undone["state"], "resumed", undone)
+        self.assertEqual(self.status(), "ready")
+
+    async def test_handoff_a_called_off_pause_is_finished_before_a_new_request_proves_it(self):
+        # The reviewer's sequence: R1 stops and proves; R1's call-off is recorded but its cancel
+        # hit a busy lock. R2 must not prove that pause (R1's retry would then resume it beside
+        # Nova); it finishes R1's call-off instead, and a fresh request takes over cleanly.
+        await self.running_issue()
+        self.assertTrue((await self.hand_off())["handed_off"])
+        handoff._call_off(self.linear_state, REQUEST)
+        r2 = await self.hand_off(request_id=R2)
+        self.assertEqual((r2["handed_off"], r2["state"], r2["reason"]), (False, "resumed", "earlier_handover_called_off"))
+        self.assertIn("Try again", r2["message"])
+        self.assertEqual(self.status(), "ready")
+        retry = await self.hand_off()  # R1 retried: never stops, never resumes anything.
+        self.assertEqual((retry["handed_off"], retry["state"]), (False, "unchanged"), retry)
+        self.assertEqual(self.status(), "ready")
+        r3 = await self.hand_off(request_id=R3)
+        self.assertTrue(r3["handed_off"], r3)
+        self.assertTrue(r3["stopped_here"])
+        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")  # R1 can't touch R3's pause.
+        self.assertEqual(self.status(), "blocked")
+
+    # -- review r2 E: budgets and call-off records ----------------------------------------------
+    async def test_handoff_waits_only_briefly_for_a_busy_issue_lock(self):
+        import time
+        await self.running_issue()
+        with patch.object(handoff, "HANDOFF_LOCK_SECONDS", 0.5), \
+                handoff.issue_lock(handoff._handoff_dir(self.linear_state), "issue-one", 0):
+            started = time.monotonic()
+            result = await self.hand_off(wait_seconds=30)
+            elapsed = time.monotonic() - started
+            self.assertEqual(result["reason"], "handover_in_progress")
+            self.assertLess(elapsed, 5)  # Not the wait plus slack: the requester's timeout always outlasts it.
+            handoff._call_off(self.linear_state, REQUEST)
+            busy = await self.hand_off(wait_seconds=30)
+        self.assertEqual(busy["state"], "stopped")
+        self.assertIn("puts Atlas's work back by itself", busy["message"])
+
+    async def test_handoff_old_call_off_records_are_removed(self):
+        await self.running_issue()
+        directory = handoff._handoff_dir(self.linear_state)
+        handoff._call_off(self.linear_state, R2)
+        stale = handoff._called_off_path(self.linear_state, R2)
+        past = __import__("time").time() - handoff.CALLED_OFF_TTL_SECONDS - 60
+        os.utime(stale, (past, past))
+        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")
+        self.assertFalse(stale.exists())
+        self.assertTrue(handoff._called_off_path(self.linear_state, REQUEST).exists())
+        self.assertEqual(sorted(path.name for path in directory.glob("*.cancelled")),
+                         [handoff._called_off_path(self.linear_state, REQUEST).name])
 
     # -- the requester and the real owner hand-off together -------------------------------------
     async def requester(self):
@@ -405,12 +479,12 @@ class Handoff(base.OriginScenarios):
                 return subprocess.CompletedProcess(argv, 255, "Connection to atlas closed by remote host.\n", "")
             return subprocess.CompletedProcess(argv, rc, "1Password: applied 3 secrets\n" + out.getvalue(), "")
         self.delivered = []
-        def take_over():
+        def take_over(request_id=REQUEST):
             with self.nova_kanban, patch.object(subprocess, "run", owner_cli), \
                     patch.object(runtime_session_store, "_worker_process", False), \
                     patch.object(kanban_process_stop, "request_native_stop",
                                  lambda conn, task_id, event_id: self.delivered.append((task_id, event_id))):
-                return json.loads(chat.handle(self.nova, {"action": "take_over", "issue": ISSUE, "id": REQUEST},
+                return json.loads(chat.handle(self.nova, {"action": "take_over", "issue": ISSUE, "id": request_id},
                                               self.nova_context))
         self.take_over = take_over
 
@@ -486,6 +560,35 @@ class Handoff(base.OriginScenarios):
         self.assertIn("called off earlier", again["message"])
         self.assertEqual(self.status(), "ready")
         self.assertEqual(len([event for event in self.owner_events() if event.kind == "blocked"]), 1)
+
+
+    async def test_handoff_with_requester_failure_after_admission_keeps_the_real_owner_paused(self):
+        # Review r2 A against the real owner: Nova's task was admitted, then its chat subscription
+        # failed. Atlas must stay paused (never both running); Nova runs the one task.
+        from hermes_fleet_linear_plugin.bridge import Kanban
+        await self.requester()
+        def boom(*args, **kwargs):
+            raise OSError("notify db locked")
+        with patch.object(Kanban, "subscribe_origin", boom):
+            reply = await asyncio.to_thread(self.take_over)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual([call[-1] == "--cancel" for call in self.owner_calls], [False])
+        self.assertEqual(self.status(), "blocked")
+        (task,) = self.nova_tasks()
+        self.assertIn(task["status"], ("ready", "running"))
+
+    async def test_handoff_with_requester_running_task_never_reaches_the_real_owner_again(self):
+        # Review r2 B against the real owner: after the takeover, retries of the same or another
+        # request (Linear still shows Atlas until routing flushes) never reach Atlas.
+        await self.requester()
+        self.assertTrue((await asyncio.to_thread(self.take_over))["ok"])
+        calls = list(self.owner_calls)
+        for request in (REQUEST, R2):
+            reply = await asyncio.to_thread(self.take_over, request)
+            self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.owner_calls, calls)
+        self.assertEqual(self.status(), "blocked")
+        self.assertEqual(len(self.nova_tasks()), 1)
 
 
 if __name__ == "__main__":

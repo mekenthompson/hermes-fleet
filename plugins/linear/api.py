@@ -167,10 +167,13 @@ def verify_webhook(secret: bytes, body: bytes, signature: str, now_ms: float, ma
         return False
     return abs(now_ms - stamp) <= max_skew_ms
 
+REQUEST_TIMEOUT_SECONDS = 20.0  # One Linear HTTP request; a deadline never starts one it cannot finish.
+
+
 def _http(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:  # nosec B310: configured https endpoint
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # nosec B310: configured https endpoint
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read() or b""
@@ -335,6 +338,7 @@ class LinearAPI:
         self._mutation_guard = threading.local()
         self._expected_missing = threading.local()
         self._priority = threading.local()
+        self._deadline = threading.local()
         self.budget: dict[str, dict[str, float]] = {}
         self._budget_level = "ok"
         self._directory: tuple[float, dict[str, Any]] | None = None
@@ -347,6 +351,24 @@ class LinearAPI:
         self._priority.level = level if previous is None else max(previous, level, key=PRIORITIES.index)
         try: yield
         finally: self._priority.level = previous
+    @contextmanager
+    def deadline(self, seconds: float):
+        """Requests made in this block (on this thread) must finish within ``seconds``: a request
+        that could not finish in time (each may take REQUEST_TIMEOUT_SECONDS) is not started and
+        raises a retryable LinearError instead. A nested block replaces the outer deadline for its
+        duration. Used where a caller has promised its own caller an answer in bounded time."""
+        previous = getattr(self._deadline, "at", None)
+        self._deadline.at = time.monotonic() + max(0.0, float(seconds))
+        try: yield
+        finally: self._deadline.at = previous
+    def _deadline_left(self) -> float | None:
+        at = getattr(self._deadline, "at", None)
+        if at is None:
+            return None
+        left = at - time.monotonic()
+        if left < REQUEST_TIMEOUT_SECONDS:
+            raise LinearError("Linear is answering too slowly to finish this in time")
+        return left
     def budget_remaining(self) -> tuple[float, float]:
         """(lowest remaining fraction across Linear's hourly budgets, when that budget resets)."""
         now, fraction, reset = self.clock(), 1.0, 0.0
@@ -465,8 +487,16 @@ class LinearAPI:
     def _graphql(self, query: str, variables: dict[str, Any] | None = None, *,
                  token_provider: Callable[[], str] | None = None,
                  verify_credential: Callable[[Callable[[], str]], tuple[Callable[[], str], str]] | None = None) -> dict[str, Any]:
-        with self._request_lock:
+        left = self._deadline_left()
+        if left is None:
+            with self._request_lock:
+                return self._request(query, variables, token_provider=token_provider, verify_credential=verify_credential)
+        if not self._request_lock.acquire(timeout=max(0.0, left - REQUEST_TIMEOUT_SECONDS)):
+            raise LinearError("Linear is answering too slowly to finish this in time")
+        try:
             return self._request(query, variables, token_provider=token_provider, verify_credential=verify_credential)
+        finally:
+            self._request_lock.release()
     def _request(self, query, variables, *, token_provider, verify_credential):
         if self.clock() < self._pause_state():
             raise RateLimited(self.paused_until)
@@ -480,6 +510,7 @@ class LinearAPI:
                 provider, credential = verify_credential(provider)
             if self.clock() < self.paused_until:
                 raise RateLimited(self.paused_until)
+            self._deadline_left()  # A credential refresh retry is a second request: it must fit too.
             try:
                 headers = {"Content-Type": "application/json",
                            "Authorization": "Bearer " + (credential if credential is not None else provider())}
