@@ -106,7 +106,12 @@ REASONS = frozenset({
     "worker_identity_unreadable",
     # takeover cleanup: a worker from another instance of this host (restart/reboot)
     "old_worker_alive", "old_gateway_alive", "worker_instance_not_earlier", "old_instance_unproven",
-    "restart_proof_unsupported",
+    "restart_proof_unsupported", "issue_metadata_required",
+    # agent-to-agent takeover (handoff.py owner side, chat.py take_over requester side)
+    "handed_off", "handoff_resumed", "handoff_unchanged", "handoff_stuck", "handoff_cancelled",
+    "not_bound_here", "task_finished_here", "task_not_handable", "started_other_tasks",
+    "controls_unsupported", "changed_during_handoff", "proof_timeout",
+    "takeover_unavailable", "takeover_refused", "takeover_uncertain", "not_delegated",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",

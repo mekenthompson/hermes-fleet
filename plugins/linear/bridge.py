@@ -567,10 +567,25 @@ def _stopped_sentence(reason: str) -> str:
         elif not re.search(r"(?i)\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b", sentence):
             kept.append(_sentence(sentence))
     return " ".join(kept + [until or "It stays stopped until someone asks the agent to resume."]).strip()
+# The guarded pause a takeover writes (handoff.HANDOFF_REASON), and a handover described in an
+# agent's own words ("Stopping Atlas run for handoff; Nova owns the remainder"). Neither asks
+# the reader for anything, so neither reads as "Waiting on you".
+_HANDOFF_PAUSE = re.compile(r"Paused for a handover to (?P<to>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}) "
+                            r"\[handoff:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\]")
+_HANDOVER_WORDS = re.compile(r"(?i)\b(?:tak(?:e|es|ing)|took)\s+(?:it\s+|this\s+)?over\b|\btakeover\b|"
+                             r"\bhand(?:ed|ing|s)?[\s-]?(?:off|over)\b|\bhandover\b")
+_ASKS_READER = re.compile(r"(?i)\?|\bneed|\bwait(?:ing|s)? (?:on|for)\b|\bplease\b|\bconfirm|\bdecid|\bapprov|"
+                          r"\brequir|\bblocked (?:on|by)\b|\bcan(?:'|no)t\b|\bunable\b|\bmissing\b")
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
     kind = payload.get("kind")
     internal = kind in {"capability", "transient"}  # Malformed native kinds fail this event, scoped.
+    raw = str(payload.get("reason") or "").strip()
+    handoff = _HANDOFF_PAUSE.fullmatch(raw)
+    if handoff and kind == "needs_input":
+        to = handoff.group("to")
+        return "response", (f"Paused for a handover to {to}. Nothing is needed from you: {to} continues this work "
+                            "once the handover is confirmed, and if it isn't, this agent picks it back up.")
     if task_status == "triage":
         return "error", ("Paused after the same problem came back several times. An operator needs to check "
                          "the task on the agent's board before work continues.")
@@ -581,6 +596,9 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     if kind != "dependency" and _STOP_REASON.search(reason) and "?" not in reason:
         # A person stopped or handed off this work: nothing is being asked of the reader.
         return "response", _stopped_sentence(reason)
+    if kind == "needs_input" and _HANDOVER_WORDS.search(reason) and not _ASKS_READER.search(reason):
+        # Paused so another agent can take the work over: a note to people, not a question for them.
+        return "response", _sentence(f"Paused for a handover: {reason}") + " Nothing is needed from you."
     if kind == "dependency":
         return "thought", _sentence(f"Waiting for a dependency: {reason or 'earlier work must finish first'}") + \
             " Work continues when it is done."
@@ -1140,6 +1158,8 @@ class Bridge:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.clock = store, api, kanban, profile, clock
         self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
+        from .handoff import takeover_settings
+        self.takeover = takeover_settings(settings.get("takeover"), default_name=self.ingress_profile)
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
         self.states = {"todo": "Todo", "in_progress": "In Progress", "in_review": "In Review", "done": "Done",
@@ -1850,6 +1870,7 @@ class Bridge:
         # The chat request authorized this creation; Linear routing to this app follows it,
         # unless someone has since delegated the issue elsewhere.
         from_chat = payload.get("origin") == "chat"
+        takeover_from = payload.get("takeover_from") if from_chat and not payload.get("record_done") else None
         key = f"activate:{issue_id}:{row['task_id']}"
         prior = self.store.native_intent(key)
         if prior and prior.get("state") in ("applied", "reconcile"):
@@ -1879,7 +1900,8 @@ class Bridge:
         delegate_id = (issue.get("delegate") or {}).get("id")
         if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
                 (delegate_id != self.api.viewer_id() and not (
-                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload, issue))) or
+                    (from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload, issue))
+                    or (takeover_from is not None and delegate_id == takeover_from))) or
                 (issue.get("state") or {}).get("type") in CLOSED):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission",
                                                  **({"chat_superseded": True} if from_chat else {})})
@@ -2068,7 +2090,8 @@ class Bridge:
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
 
     def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None,
-                route_delegate: Callable[[dict, str], str] | None = None) -> dict:
+                route_delegate: Callable[[dict, str], str] | None = None, takeover_from: str | None = None,
+                note: str = "") -> dict:
         """Chat-requested work through the same guarded native admission a Linear assignment uses.
 
         The chat request is the authority, as a delegation is for _start. One native task per
@@ -2080,8 +2103,26 @@ class Bridge:
         after admission (admission writes nothing to Linear), with the issue version read under
         that lock: no tick write can land between that read and the queued delegate, and the
         status writes that follow from the work are queued after it. Work that was not admitted
-        gets no delegate. Its result is returned as "routing".
+        gets no delegate. Its result is returned as "routing". takeover_from and note are for
+        take_over: the delegate whose work a verified handover ended, and a line for the new task
+        saying where to continue from.
         """
+        with self.lock(issue_id):
+            issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
+            if row is not None:
+                return self._entrust_bound(row, route, record_done, route_delegate, issue)
+            if self.store.native_intent(f"create:{issue_id}") is None:
+                existing = self.kanban.discover(issue)
+                if existing:
+                    return self._entrust_existing(issue, existing, route, record_done, route_delegate)
+            return self._entrust_create(issue, route, record_done, route_delegate, note=note, takeover_from=takeover_from)
+
+    def entrust_checks(self, issue_id: str, *, takeover_from: str | None = None) -> tuple[dict, dict | None]:
+        """Every refusal entrust can make before it writes anything: (current issue, own binding or None).
+
+        take_over runs these before asking the old delegate to stop, so a request this agent would
+        refuse anyway never stops anyone. ``takeover_from`` is the delegate whose work a verified
+        handover just ended; that delegate alone is not a reason to refuse."""
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
             raise LinearError("This agent starts work from a Linear assignment, not from chat", retryable=False)
@@ -2092,23 +2133,18 @@ class Bridge:
                 raise LinearError("Native executor profile is unverified", retryable=False)
             issue = self._effect_issue(issue_id)
             delegate_id = (issue.get("delegate") or {}).get("id")
-            if delegate_id is not None and delegate_id != self.api.viewer_id():
+            if delegate_id is not None and delegate_id not in (self.api.viewer_id(), takeover_from):
                 # Another agent is delegate: its assignment owns the work. Nothing is created or bound.
                 diag.evt("chat.entrust", "refused", "delegated_elsewhere", iss=issue_id)
-                raise LinearError("This issue is delegated to another agent, so nothing was started here; "
-                                  "it needs to be handed over first", retryable=False)
+                raise LinearError("This issue is delegated to another agent, so nothing was started here and that "
+                                  "agent was not touched. To move the work here, use take_over: it stops that agent's "
+                                  "run, confirms it has ended, and continues here as one task", retryable=False)
             row = self.store.get(issue_id)
-            if row is not None:
-                if row.get("origin") != "native":
-                    raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
-                return self._entrust_bound(row, route, record_done, route_delegate, issue)
-            if (issue.get("state") or {}).get("type") in CLOSED:
+            if row is not None and row.get("origin") != "native":
+                raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
+            if row is None and (issue.get("state") or {}).get("type") in CLOSED:
                 raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
-            if self.store.native_intent(f"create:{issue_id}") is None:
-                existing = self.kanban.discover(issue)
-                if existing:
-                    return self._entrust_existing(issue, existing, route, record_done, route_delegate)
-            return self._entrust_create(issue, route, record_done, route_delegate)
+            return issue, row
 
     def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None,
                           route_delegate=None) -> dict:
@@ -2143,17 +2179,22 @@ class Bridge:
         adapter.subscribe(task.id, issue["id"], issue=issue)
         return self._entrust_bound(self.store.get(issue["id"]), route, None, route_delegate, issue)
 
-    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None) -> dict:
+    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None,
+                        note: str = "", takeover_from: str | None = None) -> dict:
         issue_id, key = issue["id"], f"linear:{issue['id']}"
         project = (issue.get("project") or {}).get("id")
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{issue.get('identifier') or issue_id}: {issue.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=issue.get("identifier") or issue_id, url=issue.get("url") or "",
-                                            context=issue.get("description") or ""),
+                                            context="\n\n".join(part for part in (note, issue.get("description") or "") if part)),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
                    "initial_status": "blocked", "activation": "native-event-guard-v1",
                    "source_ms": self.clock() * 1000, "origin": "chat", "record_done": bool(record_done)}
+        if takeover_from:
+            # The old delegate whose run a verified handover ended: admission may proceed while
+            # Linear still shows exactly that delegate, never anyone else.
+            payload["takeover_from"] = takeover_from
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:

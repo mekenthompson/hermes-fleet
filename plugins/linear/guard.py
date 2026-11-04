@@ -2,7 +2,7 @@
 
 When a person's chat message asks the agent to do work tied to Linear, the turn gets a short
 inspection allowance. After it, only coordination tools run until the turn starts or binds
-tracked work through the ``linear`` tool (``work_on``, ``create_issue`` with
+tracked work through the ``linear`` tool (``work_on``, ``take_over``, ``create_issue`` with
 ``start_work``, or ``track``). A native worker then does the job, Linear shows it In
 Progress, and Stop, restart, takeover and steering have something to follow.
 
@@ -56,7 +56,7 @@ COORDINATION_TOOLS = frozenset({
 COORDINATION_PREFIXES = ("kanban_", "a2a_")
 
 # A successful result of one of these releases the turn: tracked work exists.
-_START_ACTIONS = frozenset({"work_on", "track"})
+_START_ACTIONS = frozenset({"work_on", "take_over", "track"})
 
 # -- what the person typed ----------------------------------------------------
 # Core wraps the typed text (pinned Agent b81aa0b0):
@@ -290,7 +290,11 @@ def block_message(key: str, used: int, elapsed: float) -> str:
         'for new work call {"action": "create_issue", "title": ..., "project": ..., "start_work": true, '
         '"id": "<new UUIDv4>"} (the project picks its team; add "team" only to choose between same-named '
         'projects). One native worker then does the job, Linear shows it In Progress, and '
-        "progress and the result come back to this chat. If the start is refused, tell the user why. If the user "
+        "progress and the result come back to this chat. To take over an issue another agent is working on "
+        f'(Linear shows that agent as delegate), call {{"action": "take_over", "issue": "{issue}", "id": '
+        '"<new UUIDv4>"} instead: it stops that agent\'s run, confirms it has ended and continues here as one task, '
+        "or changes nothing and says why; work_on never starts a worker next to another agent's. Never stop "
+        "another agent's task yourself with kanban or host commands. If the start is refused, tell the user why. If the user "
         "did not ask for the work to be done now (a status question or a discussion), answer with what you "
         "already have, or ask with clarify: inspecting and discussing work does not transfer execution. "
         "If this session has no linear tool, answer with what you have and say that tracked work isn't "

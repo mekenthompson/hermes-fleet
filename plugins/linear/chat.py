@@ -55,6 +55,12 @@ SCHEMA = {
         "Linear status follows the work, and checkpoints and the result come back to this chat. "
         "The task's worker does the work; do not also do it in this chat. Leave start_work false for a note or "
         "an issue someone else will pick up. Repeating work_on or start_work never starts a second task. "
+        "work_on refuses an issue delegated to another agent and never starts a worker next to theirs. "
+        "When the user asks you to take over an issue another agent is working on (Linear shows that agent as "
+        "delegate), call take_over with issue and a new UUID id: in one step it asks that agent to stop, waits for "
+        "proof its run has ended, then continues the work here as one native task with this app as delegate, or "
+        "changes nothing and says why. Never stop or edit another agent's tasks yourself with kanban or host "
+        "commands. Reuse the same id to retry after an unclear result; it never stops the other agent twice. "
         "For work you already finished in this chat, use record_done=true with summary and evidence links: "
         "the issue is linked and closed with that evidence and nothing runs again. "
         "Reuse the same UUID id and content after a lost mutation response. "
@@ -63,8 +69,8 @@ SCHEMA = {
         "Short one-sentence updates are fine. Setup or monitoring verified is not an unresolved outcome completed. "
         "Formatting tips are advisory: preserve authored content, code and links; never silently rewrite it."),
     "parameters": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "work_on", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
-        "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123. status, work_on, track and followup also accept a title prefix (QA-10 for an issue titled 'QA-10: ...'): one match is used and the reply names its key; several are returned as choices. Other mutations require the exact identifier or id."},
+        "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "work_on", "take_over", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
+        "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123. status, work_on, take_over, track and followup also accept a title prefix (QA-10 for an issue titled 'QA-10: ...'): one match is used and the reply names its key; several are returned as choices. Other mutations require the exact identifier or id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile; an undelegated issue queues this app as Linear delegate."},
         "completion_scope": {"type": "string", "enum": ["outcome", "progress"], "description": "track: outcome (default) can complete the agreed issue; progress reports an internal stage without closing it. Choose after inspecting acceptance; no execution grant."},
         "reconcile_complete": {"type": "boolean", "description": "track with replace and outcome only: deliberately reconcile an already completed entire outcome after inspecting acceptance/evidence. Reuses this UUID; no native execution or historical progress replay. Queued reporting is not confirmed delivery."},
@@ -73,7 +79,7 @@ SCHEMA = {
         "expected_binding_revision": {"type": "string", "description": "track with replace or delegate_self: exact native.binding_revision from a fresh status read."},
         "expected_delegate_id": {"type": ["string", "null"], "description": "delegate_self: exact current issue.delegate.id, or null if undelegated."},
         "expected_updated_at": {"type": "string", "description": "delegate_self: exact issue.updatedAt from a fresh status read; optimistic preflight, not remote compare-and-swap."},
-        "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
+        "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, take_over, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"},
         "team": {"type": "string", "description": "Team key. create_issue: optional when project names an active project; the project picks its team. A team that does not own the named project is corrected and the reply says so."},
         "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
@@ -492,11 +498,17 @@ def _linear_coordinates(context: Any) -> tuple[str | None, str | None]:
     return context.thread_id, (context.message_id if context.message_id != context.thread_id else None)
 
 
-def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, recorded_done: bool = False) -> str:
-    """Queue this app as Linear delegate for undelegated linked work; never touches the assignee."""
+def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, recorded_done: bool = False,
+                   replace_delegate: str | None = None) -> str:
+    """Queue this app as Linear delegate for undelegated linked work; never touches the assignee.
+
+    replace_delegate (take_over only): the delegate whose work a verified handover just ended. Only
+    that exact delegate is replaced, guarded on the issue version read under the issue lock."""
     issue_id = issue["id"]
-    routing = "already_delegated" if (issue.get("delegate") or {}).get("id") == bridge.api.viewer_id() else "held"
-    if (not context.delegated_child and issue.get("delegate") is None
+    current = (issue.get("delegate") or {}).get("id")
+    routing = "already_delegated" if current == bridge.api.viewer_id() else "held"
+    replaceable = current is None or (replace_delegate is not None and current == replace_delegate)
+    if (not context.delegated_child and replaceable
             and (recorded_done or native["status"] not in ("done", "archived"))):
         revision = bridge.store.binding_revision(issue_id)
         route_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-track:{issue_id}:{revision}"))
@@ -510,7 +522,7 @@ def _route_to_self(bridge: Any, issue: dict, native: dict, context: Any, *, reco
                 return HELD[outlook]
         try:
             requester = _content_requester(bridge, issue_id, prior, *_linear_coordinates(context))
-            row_id = bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=None,
+            row_id = bridge.queue_delegate_self(issue_id, route_id, expected_delegate_id=current,
                 expected_updated_at=(prior or {}).get("payload", {}).get("expected_updated_at", issue["updatedAt"]),
                 expected_binding_revision=revision, caller_context=context.to_wire(), requester=requester,
                 **({"recorded_done": True} if recorded_done else {}))
@@ -536,17 +548,23 @@ def _held(bridge: Any, issue_id: str, detail: str) -> str:
     return HELD.get(outlook, f"held: {detail}")
 
 
-def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any) -> dict:
+def _entrust_board_pin(bridge: Any, context: Any) -> None:
     if context.pinned_db_path:
         _, path = transport.native_board_target(bridge.kanban.board or "default")
         if path != context.pinned_db_path:
             raise LinearError("New work starts on this agent's creation board, outside the caller's native board pin.")
+
+
+def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, takeover_from: str | None = None,
+             note: str = "") -> dict:
+    _entrust_board_pin(bridge, context)
     def route(current: dict, status: str) -> str:
         # Called inside the issue's lock with the issue version read under it, before admission:
         # a tick flush cannot move updatedAt between that read and this delegate's preflight.
-        return _route_to_self(bridge, current, {"status": status}, context, recorded_done=bool(record))
+        return _route_to_self(bridge, current, {"status": status}, context, recorded_done=bool(record),
+                              replace_delegate=takeover_from)
     native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record,
-                            route_delegate=route)
+                            route_delegate=route, **({"takeover_from": takeover_from, "note": note} if takeover_from else {}))
     return {"native": native, "routing": native.pop("routing", "held: routing was not checked")}
 
 
@@ -584,6 +602,85 @@ def _entrust_message(result: dict) -> str:
                 "its updates now also come back to this chat.")
     return ("One native task now carries out this work: its worker does it, " + _delegate_sentence(routing)
             + ", and checkpoints and the result come back to this chat. Do not also do this work here.")
+
+
+TAKEOVER_NOTE = ("{owner} worked on this issue before and stopped so this agent could take it over. Its progress is "
+                 "in the Linear thread: continue from where it stopped and do not repeat anything it already posted.")
+
+
+def _issue_ref(issue: dict) -> dict:
+    return {"id": issue["id"], "identifier": issue.get("identifier"), "url": issue.get("url")}
+
+
+def _take_over(bridge: Any, args: dict, context: Any, issue: dict) -> str:
+    """Take over an issue another agent is delegate for, in one deterministic step.
+
+    Ends in exactly one of two states: the old delegate's run is stopped, proven ended, and this
+    agent continues the work as its one native task (replacing exactly that delegate); or nothing
+    changed and the reply says why in plain words. Every refusal this agent can make is checked
+    before the other agent is asked to stop. If this side still cannot start after a proven stop,
+    the other agent's work is resumed."""
+    from . import handoff
+    issue_id, key = issue["id"], issue.get("identifier") or issue["id"]
+    if context.delegated_child:
+        return _reply(False, "Native delegated children cannot start work; return the request to the parent agent.",
+                      code="native_scope_refused")
+    request_id = _uuid(args.get("id"))
+    delegate = issue.get("delegate") or {}
+    owner_id = delegate.get("id")
+    if owner_id is None:
+        return _reply(False, f"No other agent is working on {key} (it has no agent delegate), so there is nothing to "
+                      "take over and nothing was changed. Use work_on to start it here.", code="not_delegated",
+                      issue=_issue_ref(issue))
+    if owner_id == bridge.api.viewer_id():
+        # Already this agent's: exactly work_on, which reuses existing work and never starts a second task.
+        result = _entrust(bridge, issue, None, context)
+        return _reply(not result["native"].get("not_started_reason"),
+                      "This agent is already the delegate. " + _entrust_message(result), issue=_issue_ref(issue), **result)
+    settings = getattr(bridge, "takeover", None) or {"name": bridge.profile, "agents": {}}
+    peer = settings["agents"].get(owner_id)
+    owner = (peer or {}).get("name") or delegate.get("name") or "the other agent"
+    if peer is None:
+        return _reply(False, f"{key} is delegated to {owner}, and taking over from {owner} isn't set up on this agent, so "
+                      f"nothing was changed and {owner} keeps working on it. Ask {owner} to hand it over, or ask an "
+                      f"operator to set up takeover from {owner}.", code="takeover_unavailable", issue=_issue_ref(issue))
+    if (issue.get("state") or {}).get("type") in _CLOSED_TYPES:
+        return _reply(False, f"{key} is closed, so nothing was taken over and nothing was changed.",
+                      code="takeover_refused", issue=_issue_ref(issue))
+    if not (isinstance(issue.get("identifier"), str) and isinstance(issue.get("url"), str) and issue["url"]):
+        return _reply(False, f"{key} couldn't be read completely from Linear, so nothing was changed. Try again.",
+                      code="takeover_refused", issue=_issue_ref(issue))
+    # Everything this side could refuse after the stop is refused before it, with the other agent untouched.
+    _entrust_board_pin(bridge, context)
+    bridge.entrust_checks(issue_id, takeover_from=owner_id)
+    if not getattr(bridge.kanban, "guarded_controls", False):
+        return _reply(False, "This agent's version can't start handed-over work safely, so nothing was changed and "
+                      f"{owner} keeps working on it.", code="takeover_refused", issue=_issue_ref(issue))
+    reply = handoff.request(peer, issue, to=settings["name"], request_id=request_id)
+    if reply is None:
+        return _reply(False, f"{owner} didn't report back on the handover, so its result is unknown and nothing was "
+                      f"started here. Ask again with the same id: it continues this same handover and never stops "
+                      f"{owner} twice.", code="takeover_uncertain", issue=_issue_ref(issue))
+    handover = {"from": owner, "state": reply["state"], "stopped_here": reply.get("stopped_here")}
+    if not reply["handed_off"]:
+        return _reply(False, f"Not taken over. {reply['message']}", code="takeover_refused",
+                      issue=_issue_ref(issue), handover=handover)
+    failure, result = "", None
+    try:
+        result = _entrust(bridge, issue, None, context, takeover_from=owner_id, note=TAKEOVER_NOTE.format(owner=owner))
+        failure = result["native"].get("not_started_reason") or ""
+    except (LinearError, transport.Unavailable, ValueError) as exc:
+        failure = str(exc).rstrip(".")
+    if failure:
+        undo = handoff.request(peer, issue, to=settings["name"], request_id=request_id, cancel=True)
+        handover["state"] = (undo or {}).get("state", "unknown")
+        after = (f"{owner}'s work was resumed and nothing was handed over." if handover["state"] == "resumed" else
+                 f"{owner}'s work could not be resumed automatically: ask again with the same id, or an operator needs "
+                 f"to resume it on {owner}'s board.")
+        return _reply(False, f"{owner} stopped for the handover, but the work couldn't start here ({failure}). {after}",
+                      code="takeover_refused", issue=_issue_ref(issue), handover=handover, **(result or {}))
+    return _reply(True, f"Took over {key} from {owner}: its run stopped and is confirmed finished. "
+                  + _entrust_message(result), issue=_issue_ref(issue), handover=handover, **result)
 
 
 def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
@@ -632,8 +729,8 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
 # An issue named by its title prefix: "QA-10" for HF-622 "QA-10: list the 10 most recent commits".
 # Only key-shaped refs are aliases; free text ("login") is never title-searched. Read, start and
 # steer actions use one certain, open match and say so; other edits need the exact key.
-ALIAS_ACTIONS = frozenset({"status", "work_on", "track", "followup"})
-START_ACTIONS = frozenset({"work_on", "track", "followup"})
+ALIAS_ACTIONS = frozenset({"status", "work_on", "take_over", "track", "followup"})
+START_ACTIONS = frozenset({"work_on", "take_over", "track", "followup"})
 _KEY_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[0-9]+")
 _CLOSED_TYPES = frozenset({"completed", "canceled"})
 
@@ -798,6 +895,8 @@ def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, 
             return _reply(False, "Specialist authorization is fenced or unavailable.", code="authorization_unavailable")
         if action in {"track", "followup", "delegate_self"}:
             _check_native_route(bridge, action, issue_id, context)
+        if action == "take_over":
+            return _take_over(bridge, args, context, issue)
         if action == "work_on":
             _, record = _entrust_request(args, action, context)
             result = _entrust(bridge, issue, record, context)
