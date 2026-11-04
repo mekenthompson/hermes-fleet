@@ -405,6 +405,26 @@ def project_input(bridge, event) -> NativeInput | None:
     )
 
 
+def _session_work_live(bridge, issue_id, session_id) -> bool:
+    """Is tracked native work this same Agent Session started still unfinished?
+
+    Linear completes a session on a ``response`` activity, while the bridge keeps
+    posting that work's checkpoints, Started/heartbeat and its own Done there. A
+    chat reply then goes out as a ``thought`` so the panel stays open until the
+    work's own closeout. Unreadable or unbound work keeps the plain response.
+    """
+    row = bridge.store.get(issue_id)
+    if not row or row.get("origin") != "native" or row.get("owner_ref") != session_id or not row.get("task_id"):
+        return False
+    try:
+        _, task = bridge._native_task(issue_id)
+    except RateLimited:
+        raise
+    except Exception:
+        return False
+    return getattr(task, "status", None) not in (None, "done", "archived")
+
+
 def queue_reply(bridge, issue_id, session_id, message_id, body):
     """Queue an independent reply with one immutable remote create identity.
 
@@ -428,9 +448,11 @@ def queue_reply(bridge, issue_id, session_id, message_id, body):
         raise LinearError("Linear reply session changed its issue", retryable=False)
     digest = hashlib.sha256(raw.encode()).hexdigest()
     row_id = stable_uuid4("native-reply", bridge.profile, issue_id, session_id, message_id, digest)
+    # Same words either way; a thought only keeps live work's session from reading "Finished".
+    kind = "thought" if _session_work_live(bridge, issue_id, session_id) else "response"
     payload = {
         "id": row_id, "issue_id": issue_id, "session_id": session_id,
-        "content": {"type": "response", "body": body},
+        "content": {"type": kind, "body": body},
         "content_action": True, "unlinked_content": True, "native_reply_version": 1,
         "requester_sessions": {issue_id: session_id},
         **({"requester_activities": {issue_id: activity_id}} if activity_id else {}),

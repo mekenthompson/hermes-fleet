@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import uuid
 import time
+import urllib.parse
 from collections import defaultdict
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime
@@ -142,18 +143,48 @@ How to work this task:
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 
+ISSUE_MARKER = re.compile(r"Linear issue ([^\s:]+): (https?://\S+)")
+ISSUE_URL_PATH = re.compile(r"(?P<prefix>(?:/[^/]+)*)/issue/(?P<ident>[^/]+)(?:/[^/]*)?/?")
+
+def issue_url_identity(url) -> tuple[str, str, str, str] | None:
+    """A Linear issue URL as (scheme, host, workspace path, IDENTIFIER), or None.
+
+    Linear derives the trailing slug from the title, so a rename changes the URL
+    but not the issue it names; the slug is never identity. Any other change
+    (host, workspace, identifier, query or fragment) names something else.
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    path = ISSUE_URL_PATH.fullmatch(parts.path)
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc or parts.query or parts.fragment or not path:
+        return None
+    return parts.scheme.lower(), parts.netloc.lower(), path["prefix"], path["ident"].upper()
+
 def task_issue_scope(task, issue: dict) -> tuple[bool, bool]:
     """Resolve all complete explicit lines as (matching, conflicting).
 
-    Canonical ID/identifier aliases and repeated identical lines share scope.
+    Canonical ID/identifier aliases and repeated identical lines share scope;
+    so do the URLs of one issue before and after a title edit (slug only).
     Incidental references do not assert ownership of native work.
     """
     markers = {line.strip() for line in (getattr(task, "body", None) or "").splitlines()
-               if re.fullmatch(r"Linear issue [^\s:]+: https?://\S+", line.strip())}
+               if ISSUE_MARKER.fullmatch(line.strip())}
     url = issue.get("url")
-    allowed = ({f"Linear issue {ref}: {url}" for ref in (issue["id"], issue.get("identifier")) if ref}
-               if isinstance(url, str) and url else set())
-    return bool(markers & allowed), bool(markers - allowed)
+    refs = {ref for ref in (issue["id"], issue.get("identifier")) if ref}
+    current = issue_url_identity(url)
+    if current is not None and issue.get("identifier") and current[3] != str(issue["identifier"]).upper():
+        current = None  # Linear's own URL disagrees with its identifier: only an exact line matches.
+    def matches(line: str) -> bool:
+        ref, marker_url = ISSUE_MARKER.fullmatch(line).groups()
+        if ref not in refs or not isinstance(url, str) or not url:
+            return False
+        return marker_url == url or (current is not None and issue_url_identity(marker_url) == current)
+    matching = {line for line in markers if matches(line)}
+    return bool(matching), bool(markers - matching)
 
 def task_issue_link(task, issue: dict) -> bool:
     """A consistent explicit issue link, not execution authority."""

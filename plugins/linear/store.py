@@ -51,12 +51,16 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
-ADVISORY = ("(kind = 'activity' AND (json_extract(payload, '$.content.type') IN ('thought', 'action') OR "
+# A chat reply to a person is never advisory, even when it is posted as a thought so live
+# tracked work keeps its session open: it keeps reply delivery (retry, alert) either way.
+ADVISORY = ("(kind = 'activity' AND ((json_extract(payload, '$.content.type') IN ('thought', 'action') AND "
+            "json_extract(payload, '$.native_reply_version') IS NULL) OR "
             "COALESCE(json_extract(payload, '$.one_try'), 0) = 1))")
 def advisory(row: dict[str, Any]) -> bool:
     """A thought, action or decline reply changes no issue: it gets one try and never alerts, revives or fences."""
     payload = row["payload"]
-    return row["kind"] == "activity" and ((payload.get("content") or {}).get("type") in ("thought", "action")
+    return row["kind"] == "activity" and (((payload.get("content") or {}).get("type") in ("thought", "action")
+                                           and payload.get("native_reply_version") is None)
                                           or payload.get("one_try") is True)
 
 
@@ -124,7 +128,7 @@ class Store:
                 and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
                 and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
-                and content.get("type") in ("response", "error") and isinstance(content.get("body"), str))
+                and content.get("type") in ("response", "error", "thought") and isinstance(content.get("body"), str))
     @staticmethod
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1

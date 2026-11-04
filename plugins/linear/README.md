@@ -420,8 +420,10 @@ worker or access to another profile's private state. A conflicting configured pr
 completion contract requires acceptance reconciliation; reuse cannot downgrade it.
 Incidental issue mentions are not links.
 Automatic binding rechecks all explicit issue lines on the freshly read native task.
-Repeated matching lines and canonical ID/identifier aliases share one scope; distinct
-explicit issue markers hold automatic or manual linking, replacement and follow-up delivery.
+Repeated matching lines and canonical ID/identifier aliases share one scope, and so do
+an issue's URLs before and after a title edit: Linear derives the trailing URL slug from
+the title, so only the host, workspace and `/issue/<IDENT>` path name the issue. Distinct
+explicit issue markers (another identifier, workspace or host) hold automatic or manual linking, replacement and follow-up delivery.
 Follow-up delivery also holds any newly stopped task;
 marker-free manually tracked work retains its authorized reporting binding. Validation
 reflects the last native observation before the existing write boundary; native concurrency
@@ -757,7 +759,11 @@ Provider retries preserve original actor, Activity, Agent Session, text and sour
 time. Inbox acknowledgment follows committed native acceptance, including exact
 retry reconciliation. Structured Stop reaches native conversation control and the
 linked task; an accepted control receipt does not prove physical cleanup. Replies
-remain queued until the existing scoped sender confirms publication. Prior uncertain
+remain queued until the existing scoped sender confirms publication. Linear completes an
+Agent Session on a `response`, so while tracked native work this same session started is
+unfinished, a reply goes out as a `thought` with the same text and the work's own closeout
+completes the session; otherwise it stays a `response`. Either way it keeps reply delivery
+(retries and failure reporting), not a thought's single try. Prior uncertain
 effects stay held while unrelated authorized discussion continues.
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
