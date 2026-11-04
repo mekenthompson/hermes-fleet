@@ -307,7 +307,8 @@ class FakeReplyBridge:
         self.queued = []
         self.api = SimpleNamespace(requester_session=lambda *a, **k: nullcontext(),
                                    agent_session=lambda session_id: {"issue": {"id": ISSUE}})
-        self.store = SimpleNamespace(enqueue=lambda kind, payload, at: self.queued.append(payload) or payload["id"])
+        self.store = SimpleNamespace(enqueue=lambda kind, payload, at: self.queued.append(payload) or payload["id"],
+                                     get=lambda issue_id: None)  # No tracked work: a plain response.
 
     def _effect_issue(self, issue_id):
         return {"id": issue_id}
