@@ -311,32 +311,50 @@ automatically.
    task paused by someone else is only proven, never changed (`state: unchanged`); one paused for
    a handover to a different agent is refused. One hand-off or resume runs per issue at a time on
    the owner (a lock beside its state database, waited on for at most 10 seconds).
-4. On proof the requester records the handover as proven, creates its one native task, whose
-   text says to continue from the old owner's progress in the Linear thread, and admits it while
-   Linear still shows exactly the old delegate and no person has changed its state, assignee or
-   delegate since the request (the same check as `work_on`; the old delegate app reporting its
-   pause, moving the issue to Blocked, is not a person). It then replaces that delegate (guarded
-   on it) with this app. The old delegate app's own writes never hold that update; a person's
-   routing change does. A held update is retried by delegate recovery.
+4. On proof the requester creates its one native task, whose text says to continue from the
+   old owner's progress in the Linear thread, and admits it in the same call, while Linear still
+   shows exactly the old delegate and no person has changed its state, assignee or delegate since
+   the request (the same check as `work_on`; the old delegate app reporting its pause, moving the
+   issue to Blocked, is not a person). It then replaces that delegate (guarded on it) with this
+   app and subscribes the chat to checkpoints and the result. The old delegate app's pause report
+   never holds that update; a person's routing change, or the old delegate app reporting a
+   resume, does. A held update is retried by delegate recovery.
 5. If anything fails once the owner may be paused (no readable reply, a proof that failed, or a
    start here that failed), what runs here decides. A task ready or running here (admitted before
    a later step failed) means the handover stands: the reply is a success that names the
    unfinished Linear update. Otherwise the reply is `takeover_paused`, and the same words are
    posted on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
-   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." A
-   takeover task created here but not yet admitted may still be admitted later by the service
-   (after a crash or a transient error): that completes the takeover, because the owner is still
-   paused for it and nothing resumes it by itself.
+   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." If
+   meanwhile someone delegated the issue to another agent (or removed the delegate), resuming is
+   not offered: the message says who has it now, and that Atlas continues only after the issue is
+   delegated back to it and a person says 'resume HF-9'. That message stays true: a takeover task
+   is admitted only by the `take_over` call that has just proven the owner's run ended, never
+   later by the service, an assignment echo or `work_on`. A task created here whose start failed
+   stays parked; saying 'take over HF-9' again proves the owner's pause again (it is never stopped
+   twice) and starts it. An admission that did land before a lost reply or a crash is only
+   recognised by its native receipt, never repeated.
 6. `resume_owner` is the one supported way to let the owner continue (a person saying "resume
-   HF-9"). Under the same lock admission takes, it first makes sure nothing runs here: it refuses
-   while this agent runs or ran the work (`resume_refused`), and otherwise marks the handover
-   returned, so this agent's takeover task can no longer be admitted until a new handover is
-   proven. Then it runs the owner's `hand-off --resume`, which lifts only that exact guarded
-   handover pause for this agent, guarded on its latest event. A lost reply is
-   `resume_uncertain`: nothing starts here, and asking again is safe. A person resuming the owner
-   directly on its board is not the supported path; even then, once the owner's app reports the
-   resume in Linear (moving the issue out of Blocked), a late admission here refuses instead of
-   running beside it.
+   HF-9"). The owner it resumes is Linear's current delegate, never an earlier one: if the issue
+   is now delegated to someone else, or to nobody, it refuses (`resume_refused`) and changes
+   nothing. It also refuses while this agent runs or ran the work. Otherwise it runs the owner's
+   `hand-off --resume`, which lifts only that exact guarded handover pause for this agent,
+   guarded on its latest event. A lost reply is `resume_uncertain`: nothing starts here, and
+   asking again is safe. A parked takeover task here never starts after a resume; only a new
+   `take_over` (which asks the owner to stop again) starts it.
+
+Known limits, by design rather than more machinery:
+
+- After a successful takeover the owner's task stays paused on the owner's board for good; it is
+  not closed, because the owner's app would report that ending on the issue under this agent, and
+  closing it would take a second cross-agent step that can itself fail. Nothing
+  in this flow resumes it, but a person or the owner's own orchestrator could still resume it
+  with native Kanban controls (the owner's tool text forbids `kanban unblock` for handover
+  pauses, which is guidance, not a lock). Doing so would run both agents; archive the owner's
+  task by hand if that risk matters. A pause a person made before the takeover is proven but
+  keeps its original wording.
+- The owner recognises a retried handover by the requester's configured `name` in the pause
+  reason. Give each agent a distinct `takeover.name`; two requesters with the same name could
+  prove each other's pause.
 
 The owner's Linear thread shows the pause as "Paused for a handover to <name>. Nothing is needed
 from you ...", never "Waiting on you"; only that exact guarded reason is worded this way, and

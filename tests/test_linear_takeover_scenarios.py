@@ -6,7 +6,8 @@ owner command, simulated here by a recorded runner that returns what the owner's
 (replacing exactly the old delegate), with nothing changed and a plain reason, or with the owner
 left paused and a plain message (in the reply and on the issue) naming the two ways on. Two
 agents never run the work: nothing resumes the owner except a person's resume_owner, which is
-refused while the work runs here and stops this agent's takeover task from starting later.
+refused while the work runs here or the issue is delegated elsewhere, and a takeover task is
+admitted only by the take_over call that has just proven the handover, never later.
 The owner side itself (stop, proof, resume) is proven in test_linear_origin_handoff_native.py.
 """
 from __future__ import annotations
@@ -326,6 +327,24 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertEqual(reply["code"], "takeover_paused")
         self.assertEqual(len(owner.calls), 1)
         self.assertEqual(self.tasks(), [])
+        # M3 (r4): the reply and the issue say so truthfully, and resuming Atlas is not offered.
+        self.assertEqual(reply["message"], "Atlas stopped for the handover, but meanwhile OPS-1 was delegated to "
+                         "Vega, so nothing was started here. Atlas's work on OPS-1 is paused for a handover to Nova "
+                         "that didn't complete. To let Atlas continue, delegate OPS-1 back to Atlas and say "
+                         "'resume OPS-1'.")
+        self.assertEqual(self.notices(), ["Atlas's work on OPS-1 is paused for a handover to Nova that didn't "
+                                          "complete. OPS-1 is now delegated to Vega. Nothing resumes Atlas "
+                                          "automatically. To let Atlas continue, delegate OPS-1 back to Atlas and "
+                                          "ask Nova to 'resume OPS-1'."])
+        # A person asking to resume anyway is refused while Vega is the delegate: Atlas never runs beside it.
+        resume = OwnerCommand(RESUMED)
+        refused = self.resume_owner(resume)
+        self.assertEqual(refused["code"], "resume_refused")
+        self.assertIn("OPS-1 is delegated to Vega", refused["message"])
+        self.assertEqual(resume.calls, [])
+        # Delegated back to Atlas, the resume goes through.
+        self.authority.issues[ISSUE]["delegate"] = {"id": OWNER, "name": "Atlas"}
+        self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
 
     def test_the_start_here_runs_under_a_linear_deadline(self):
         owner = OwnerCommand(handed_off())
@@ -336,35 +355,8 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertEqual(len(owner.calls), 1)
         self.assert_nothing_runs_here()
 
-    # -- a start that failed after the proof is admitted later: good, and never beside the owner
-    def _late_admission(self, patcher):
-        """repro3 X1/X2: the first admission attempt fails, so take_over reports the owner paused."""
-        owner = OwnerCommand(handed_off())
-        with patcher:
-            reply = self.take_over(owner)
-        self.assert_paused_message(reply)
-        (task,) = self.tasks()
-        self.assertEqual(task["status"], "blocked")
-        # A later service tick admits it: the owner is still paused by the proven handover, so this
-        # is the takeover completing. Nothing ever asked the owner to resume, so both can't run.
-        later = OwnerCommand()
-        with patch.object(subprocess, "run", later):
-            self.bridge._recover_admissions()
-            self.bridge.flush()
-            self.bridge.pump_kanban()
-            self.bridge.flush()
-        self.assertIn(self.tasks()[0]["status"], ("ready", "running"))
-        self.assertEqual(self.delegate(), VIEWER)
-        self.assertEqual(later.calls, [])
-        self.assert_never_resumed(owner, later)
-        # And a person's resume is now refused: this agent runs it.
-        resume = OwnerCommand(RESUMED)
-        refused = self.resume_owner(resume)
-        self.assertEqual(refused["code"], "resume_refused")
-        self.assertIn("already running it", refused["message"])
-        self.assertEqual(resume.calls, [])
-
-    def test_X1_admission_read_failing_once_is_admitted_later(self):
+    # -- a start that failed after the proof is never admitted later; take_over again proves anew --
+    def _flaky_admission_read(self):
         from hermes_fleet_linear_plugin.api import LinearError
         import traceback
         real, failed = Bridge._effect_issue, []
@@ -373,18 +365,77 @@ class TakeoverScenarios(unittest.TestCase):
                 failed.append(True)
                 raise LinearError("Linear is answering too slowly to finish this in time")
             return real(bridge, issue_id, *a, **k)
-        self._late_admission(patch.object(Bridge, "_effect_issue", flaky))
+        return patch.object(Bridge, "_effect_issue", flaky)
 
-    def test_X2_native_activation_failing_once_is_admitted_later(self):
+    def _flaky_activation(self):
         real, failed = Kanban.activate, []
         def flaky(adapter, *a, **k):
             if not failed:
                 failed.append(True)
                 raise OSError("database is locked")
             return real(adapter, *a, **k)
-        self._late_admission(patch.object(Kanban, "activate", flaky))
+        return patch.object(Kanban, "activate", flaky)
 
-    def test_X3_service_stopping_after_create_is_admitted_later_and_the_owner_never_asked_again(self):
+    def _never_admitted_late(self, patcher):
+        """M1/M2 (r4): the first admission attempt fails, so take_over reports the owner paused.
+        That stays true: no service tick admits the task later. Taking over again re-proves the
+        same pause (the owner is asked once more, never resumed) and starts it, subscribed here."""
+        owner = OwnerCommand(handed_off())
+        with patcher:
+            self.assert_paused_message(self.take_over(owner))
+        (task,) = self.tasks()
+        self.assertEqual(task["status"], "blocked")
+        later = OwnerCommand()
+        with patch.object(subprocess, "run", later):
+            self.bridge._recover_admissions()
+            self.bridge.tick()
+        self.assert_nothing_runs_here()
+        self.assertEqual(self.delegate(), OWNER)
+        self.assertEqual(later.calls, [])
+        self.assertEqual(len(self.notices()), 1)  # The one paused message, still true.
+        subscribed = []
+        real = Kanban.subscribe_origin
+        def record(adapter, task_id, route):
+            subscribed.append(task_id)
+            return real(adapter, task_id, route)
+        again = OwnerCommand(handed_off(stopped_here=False))
+        with patch.object(Kanban, "subscribe_origin", record):
+            reply = self.take_over(again, id=str(uuid.uuid4()))
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(len(again.calls), 1)
+        (task,) = self.tasks()
+        self.assertIn(task["status"], ("ready", "running"))
+        self.assertEqual(subscribed, [task["id"]])  # Checkpoints and the result come back to this chat.
+        self.bridge.flush()
+        self.assertEqual(self.delegate(), VIEWER)
+        self.assert_never_resumed(owner, later, again)
+
+    def test_M1_admission_read_failing_once_is_never_admitted_later(self):
+        self._never_admitted_late(self._flaky_admission_read())
+
+    def test_X2_native_activation_failing_once_is_never_admitted_later(self):
+        self._never_admitted_late(self._flaky_activation())
+
+    def test_M2_owner_resumed_on_its_board_without_a_blocked_state_never_runs_beside_this_agent(self):
+        # Linear's default workflow has no Blocked state, so the owner's pause and resume reports
+        # write no state change. A person then resumes Atlas directly on its board (its app only
+        # comments). Nothing here admits the parked takeover task beside it.
+        team = self.authority.issues[ISSUE].setdefault("team", {})
+        nodes = (team.get("states") or {}).get("nodes") or []
+        team["states"] = {"nodes": [node for node in nodes if str(node.get("name")).lower() != "blocked"]}
+        self.assertIsNone(self.bridge.state_id(self.authority.issues[ISSUE], "blocked"))
+        owner = OwnerCommand(handed_off())
+        with self._flaky_activation():
+            self.assert_paused_message(self.take_over(owner))
+        self.authority.issues[ISSUE]["updatedAt"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
+        self.bridge._recover_admissions()
+        self.bridge.tick()
+        self.assert_nothing_runs_here()
+        self.assertEqual(self.delegate(), OWNER)
+        self.assert_never_resumed(owner)
+
+    def test_X3_service_stopping_after_create_is_never_admitted_later(self):
         class Stopped(BaseException):
             pass
         def stopped(*a, **k):
@@ -395,9 +446,30 @@ class TakeoverScenarios(unittest.TestCase):
         later = OwnerCommand()
         with patch.object(subprocess, "run", later):
             self.bridge.tick()
-        self.assertIn(self.tasks()[0]["status"], ("ready", "running"))
+        self.assert_nothing_runs_here()
         self.assertEqual(later.calls, [])
-        self.assert_never_resumed(owner)
+        again = OwnerCommand(handed_off(stopped_here=False))
+        self.assertTrue(self.take_over(again, id=str(uuid.uuid4()))["ok"])
+        self.assertIn(self.tasks()[0]["status"], ("ready", "running"))
+        self.assert_never_resumed(owner, later, again)
+
+    def test_a_landed_admission_whose_reply_was_lost_is_recognised_not_repeated(self):
+        # The native activation commits, then its reply is lost: the task runs here, so the
+        # handover stands. A later tick only records the receipt; it never activates again.
+        real = Kanban.activate
+        def lost(adapter, *a, **k):
+            real(adapter, *a, **k)
+            raise OSError("reply lost")
+        with patch.object(Kanban, "activate", lost):
+            reply = self.take_over(OwnerCommand(handed_off()))
+        self.assertTrue(reply["ok"], reply)
+        self.assertIn("routing", reply)
+        self.bridge._recover_admissions()
+        task_id = self.tasks()[0]["id"]
+        self.assertTrue(self.bridge.store.native_intent(f"activate:{ISSUE}:{task_id}")["accepted"])
+        self.bridge.pump_kanban()
+        self.bridge.flush()
+        self.assertEqual(self.delegate(), VIEWER)
 
     def test_r3b_a_new_request_after_an_uncertain_one_never_leaves_the_owner_stopped_by_surprise(self):
         # G: R1's reply was lost (Atlas may be paused); R2 with a new id is a plain retry. Whatever
@@ -431,16 +503,10 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertEqual(argv[argv.index("--to") + 1], "Nova")
         self.assertEqual(self.tasks(), [])
 
-    def test_resume_returns_a_pending_takeover_task_so_it_is_never_admitted_beside_the_owner(self):
-        # The start failed after the proof, so this agent's task waits for a later admission. A
-        # person resumes Atlas: that task can no longer start, until a new handover is proven.
-        real, failed = Kanban.activate, []
-        def flaky(adapter, *a, **k):
-            if not failed:
-                failed.append(True)
-                raise OSError("database is locked")
-            return real(adapter, *a, **k)
-        with patch.object(Kanban, "activate", flaky):
+    def test_a_parked_takeover_task_is_never_admitted_beside_a_resumed_owner(self):
+        # The start failed after the proof, so this agent's task stays parked. A person resumes
+        # Atlas: nothing starts here, until take_over proves a new handover.
+        with self._flaky_activation():
             self.assert_paused_message(self.take_over(OwnerCommand(handed_off())))
         self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
         self.bridge._recover_admissions()
@@ -464,30 +530,17 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertIn(self.tasks()[0]["status"], ("ready", "running"))
 
     def test_an_uncertain_resume_still_keeps_this_agent_from_starting(self):
-        real, failed = Kanban.activate, []
-        def flaky(adapter, *a, **k):
-            if not failed:
-                failed.append(True)
-                raise OSError("database is locked")
-            return real(adapter, *a, **k)
-        with patch.object(Kanban, "activate", flaky):
+        with self._flaky_activation():
             self.take_over(OwnerCommand(handed_off()))
         reply = self.resume_owner(OwnerCommand(OSError("bridge gone")))
         self.assertEqual(reply["code"], "resume_uncertain")
         self.bridge._recover_admissions()
         self.assert_nothing_runs_here()
 
-    def test_the_owner_reporting_a_resume_in_linear_stops_a_late_admission(self):
+    def test_the_owner_reporting_a_resume_in_linear_never_leads_to_a_late_admission(self):
         # A person resumed Atlas directly on its own board (not the supported resume_owner): Atlas's
-        # app moves the issue out of Blocked. A late admission here then refuses instead of
-        # running beside it; Atlas's own pause report (into Blocked) never does.
-        real, failed = Kanban.activate, []
-        def flaky(adapter, *a, **k):
-            if not failed:
-                failed.append(True)
-                raise OSError("database is locked")
-            return real(adapter, *a, **k)
-        with patch.object(Kanban, "activate", flaky):
+        # app moves the issue out of Blocked. Nothing here admits the parked task beside it.
+        with self._flaky_activation():
             self.take_over(OwnerCommand(handed_off()))
         issue = self.authority.issues[ISSUE]
         for to_state in ("state-blocked", "state-todo"):  # Atlas's pause report, then its resume report.
@@ -720,7 +773,8 @@ class TakeoverWording(unittest.TestCase):
         self.assertEqual(kind, "response")
         self.assertEqual(body, "Paused for a handover to Nova. Nothing is needed from you: Nova continues this "
                                "work once the handover is confirmed. If it doesn't complete, Nova says so here and "
-                               "this work stays paused until someone asks Nova to resume it or to take it over again.")
+                               "this work stays paused until someone asks Nova to let this agent continue or to "
+                               "take it over again.")
         self.assertNotIn(REQUEST, body)
         # Should-fix 8: only the exact guarded pause is relabelled. Any other needs-input pause,
         # even one whose words mention a handover, keeps its ordinary "Waiting on you" wording.
