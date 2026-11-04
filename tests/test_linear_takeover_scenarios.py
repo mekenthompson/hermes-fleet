@@ -384,6 +384,21 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertIn("reopen OPS-1, then say 'take over OPS-1' again", first["message"])
         self.assertNotIn("'take over OPS-1' to try again", first["message"])
 
+    def test_closed_plus_a_start_that_cant_be_retried_offers_only_resume(self):
+        # Closed at the same time as a failure a retry can't recover from ("native work changed
+        # after creation"): reopening and taking over again would be refused, so it isn't offered.
+        real = Kanban.create
+        def create(adapter, *args, **kwargs):
+            task = real(adapter, *args, **kwargs)
+            self.authority.issues[ISSUE]["state"] = {"id": "state-done", "name": "Done", "type": "completed"}
+            return task
+        with patch.object(Kanban, "create", create), patch.object(Kanban, "initial_activation_event", lambda *a, **k: None):
+            first = self.take_over(OwnerCommand(handed_off()))
+        self.assertEqual(first["code"], "takeover_paused", first)
+        self.assertIn("OPS-1 is closed.", first["message"])
+        self.assertIn("Say 'resume OPS-1' to let", first["message"])
+        self.assertNotIn("take over OPS-1", first["message"])
+
     def test_N3_a_transient_failure_then_a_person_assigning_it_then_a_retry_starts_once(self):
         with self._flaky_activation():
             self.assert_paused_message(self.take_over(OwnerCommand(handed_off())))

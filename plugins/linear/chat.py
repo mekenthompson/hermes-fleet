@@ -795,17 +795,23 @@ def _paused(bridge: Any, context: Any, issue: dict, owner: str, name: str, reque
         body = (f"{state} {key} is now {moved}. Nothing resumes {owner} automatically. To let {owner} continue, "
                 f"delegate {key} back to {owner} and ask {name} to 'resume {key}'.")
         ways = f"To let {owner} continue, delegate {key} back to {owner} and say 'resume {key}'."
-    elif _closed_now(bridge, issue_id):  # A take_over is refused while it is closed: reopening comes first.
-        body = (f"{state} {key} is closed. Nothing resumes it automatically. Ask {name} to 'resume {key}' to let "
-                f"{owner} continue, or reopen {key}, then ask {name} to 'take over {key}' again.")
-        ways = f"Say 'resume {key}' to let {owner} continue, or reopen {key}, then say 'take over {key}' again."
-    elif _retry_possible(bridge, issue_id, issue):
-        body = (f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue, or "
-                f"to 'take over {key}' to try again.")
-        ways = f"Say 'resume {key}' to let {owner} continue, or 'take over {key}' to try again."
-    else:  # Taking over again would be refused before the owner is asked: only resuming is offered.
-        body = f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue."
-        ways = f"Say 'resume {key}' to let {owner} continue."
+    else:
+        # A take_over is refused while the issue is closed, so reopening comes first; and taking over
+        # again (after reopening or not) is offered only when it would get as far as asking the owner.
+        closed, retry = _closed_now(bridge, issue_id), _retry_possible(bridge, issue_id, issue)
+        is_closed = f" {key} is closed." if closed else ""
+        if closed and retry:
+            body = (f"{state}{is_closed} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let "
+                    f"{owner} continue, or reopen {key}, then ask {name} to 'take over {key}' again.")
+            ways = f"Say 'resume {key}' to let {owner} continue, or reopen {key}, then say 'take over {key}' again."
+        elif retry:
+            body = (f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue, "
+                    f"or to 'take over {key}' to try again.")
+            ways = f"Say 'resume {key}' to let {owner} continue, or 'take over {key}' to try again."
+        else:  # Taking over again would be refused before the owner is asked: only resuming is offered.
+            body = (f"{state}{is_closed} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let "
+                    f"{owner} continue.")
+            ways = f"{is_closed.lstrip()} Say 'resume {key}' to let {owner} continue.".lstrip()
     from .bridge import stable_uuid4
     row_id = stable_uuid4("linear-takeover-paused", issue_id, request_id, body)
     try:
