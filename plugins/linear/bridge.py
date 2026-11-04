@@ -519,11 +519,33 @@ def _existing_work_notice(status: str | None) -> str:
         return "Earlier work on this issue has already finished, so nothing new was started."
     return ("This issue already has paused work, so nothing new was started. Ask the agent to resume it "
             "when ready.")
+def _local_work_problem(status: str | None) -> str:
+    """Why earlier work on this agent's board would leave nobody running a taken-over issue."""
+    if status in ("done", "archived"):
+        return "this agent's earlier work on this issue has already finished, so taking over would start nothing here"
+    if status in ("blocked", "triage"):
+        return "this agent's earlier work on this issue is paused, so taking over would start nothing here"
+    return "this agent's earlier work on this issue is waiting on something else, so taking over would start nothing here"
+
+
+def _takeover_readmittable(activation: dict) -> bool:
+    """A takeover admission refused only because a person changed routing, or the issue was
+    closed, before a new take_over's proof: that newer explicit request may admit it (and is
+    checked again from its own proof). A Stop, or an unverified start, is never retried."""
+    return (activation.get("state") == "reconcile" and not activation.get("accepted")
+            and activation.get("superseded_by") in ("person", "closed"))
+
+
 def _not_started_reason(activation: dict) -> str:
     """Plain words for why a chat-created task was parked instead of admitted."""
     reason = activation.get("reason") or ""
     if not activation:
         return "this agent's board can't start work safely right now"
+    superseded = {"person": "a person changed this issue's status, assignee or delegate in Linear while the task "
+                            "was being set up", "stop": "someone stopped it in Linear while the task was being set up",
+                  "closed": "the issue was closed while the task was being set up"}
+    if activation.get("superseded_by") in superseded:
+        return superseded[activation["superseded_by"]]
     if reason.startswith("Stop, closure or reassignment"):
         return "the issue was stopped, closed or reassigned while the task was being set up"
     if reason.startswith("Native work changed"):
@@ -567,10 +589,22 @@ def _stopped_sentence(reason: str) -> str:
         elif not re.search(r"(?i)\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b", sentence):
             kept.append(_sentence(sentence))
     return " ".join(kept + [until or "It stays stopped until someone asks the agent to resume."]).strip()
+# The guarded pause a takeover writes (handoff.HANDOFF_REASON, matched exactly). It asks the
+# reader for nothing, so it never reads as "Waiting on you". Any other pause, even one whose
+# words mention a handover, keeps its ordinary wording.
+_HANDOFF_PAUSE = re.compile(r"Paused for a handover to (?P<to>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}) "
+                            r"\[handoff:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\]")
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
     kind = payload.get("kind")
     internal = kind in {"capability", "transient"}  # Malformed native kinds fail this event, scoped.
+    raw = str(payload.get("reason") or "").strip()
+    handoff = _HANDOFF_PAUSE.fullmatch(raw)
+    if handoff and kind == "needs_input":
+        to = handoff.group("to")
+        return "response", (f"Paused for a handover to {to}. Nothing is needed from you: {to} continues this work "
+                            f"once the handover is confirmed. If it doesn't complete, {to} says so here and this work "
+                            f"stays paused until someone asks {to} to let this agent continue or to take it over again.")
     if task_status == "triage":
         return "error", ("Paused after the same problem came back several times. An operator needs to check "
                          "the task on the agent's board before work continues.")
@@ -1140,6 +1174,8 @@ class Bridge:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.clock = store, api, kanban, profile, clock
         self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
+        from .handoff import takeover_settings
+        self.takeover = takeover_settings(settings.get("takeover"), default_name=self.ingress_profile)
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
         self.states = {"todo": "Todo", "in_progress": "In Progress", "in_review": "In Review", "done": "Done",
@@ -1816,11 +1852,15 @@ class Bridge:
             self.activity(issue_id, session_id, "thought", "Task created but not started yet. It starts once the agent's board activates it; no worker is running.")
         return True
 
-    def _assignment_activation(self, row: dict | None) -> bool:
+    def _assignment_activation(self, row: dict | None, *, handed_over: str | None = None,
+                               proven_ms: float | None = None) -> bool:
         """Finish only this version's authorized admission with a native event CAS.
 
         The existing intent stores delivery progress, not another worker claim.
         Legacy parked tasks and already settled admissions are never auto-resumed.
+        ``handed_over`` is the old delegate whose run the calling take_over has just proven ended:
+        a takeover's task is admitted only then, never later (see below). ``proven_ms`` is when
+        that proof arrived: a person's routing change after it wins, an earlier one does not.
         """
         if not row or row.get("origin") != "native":
             return False
@@ -1850,9 +1890,13 @@ class Bridge:
         # The chat request authorized this creation; Linear routing to this app follows it,
         # unless someone has since delegated the issue elsewhere.
         from_chat = payload.get("origin") == "chat"
+        takeover_from = payload.get("takeover_from") if from_chat and not payload.get("record_done") else None
         key = f"activate:{issue_id}:{row['task_id']}"
         prior = self.store.native_intent(key)
-        if prior and prior.get("state") in ("applied", "reconcile"):
+        proven = bool(takeover_from) and handed_over == takeover_from
+        # A newer proven take_over may retry an admission only a person's change or a closure refused.
+        readmit = proven and bool(prior) and _takeover_readmittable(prior)
+        if prior and prior.get("state") in ("applied", "reconcile") and not readmit:
             self._pending_assignment_stop(row)
             return True
         adapter = self._binding_adapter(issue_id)
@@ -1861,6 +1905,16 @@ class Bridge:
                 binding["profile"] != payload["profile"] or binding["board"] != payload["board"]):
             return False
         if not getattr(adapter, "guarded_controls", False):
+            return False
+        if takeover_from and handed_over != takeover_from:
+            # Never admitted late (by recovery, an assignment echo or work_on): by then the old
+            # delegate may be running again. Only the take_over call that has just proven its run
+            # ended admits this task; a retried take_over proves the same pause again. An admission
+            # that already landed (a lost reply, a crash) is only recognised by its receipt.
+            if prior and adapter.activation_receipt(row["task_id"], prior["payload"]["expected_event_id"]):
+                self.store.native_intent_settle(key, {"state": "applied", "accepted": True, "owned_activation": True})
+                self._pending_assignment_stop(row)
+                return True
             return False
         token = prior["payload"]["expected_event_id"] if prior else adapter.initial_activation_event(row["task_id"])
         request = {"kind": "activate", "issue_id": issue_id, "task_id": row["task_id"],
@@ -1877,11 +1931,16 @@ class Bridge:
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         issue = self._effect_issue(issue_id)
         delegate_id = (issue.get("delegate") or {}).get("id")
-        if ((stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"])) or
+        # A proven take_over is a new explicit request: only changes after its own proof win.
+        since = float(proven_ms) if proven and proven_ms is not None else float(payload["source_ms"])
+        stopped = bool(stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"]))
+        closed = (issue.get("state") or {}).get("type") in CLOSED
+        if (stopped or closed or
                 (delegate_id != self.api.viewer_id() and not (
-                    from_chat and delegate_id is None and self._chat_admission_allowed(issue_id, payload, issue))) or
-                (issue.get("state") or {}).get("type") in CLOSED):
+                    (from_chat and delegate_id in (None, takeover_from)
+                     and self._chat_admission_allowed(issue_id, payload, issue, since=since))))):
             self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission",
+                                                 "superseded_by": "stop" if stopped else "closed" if closed else "person",
                                                  **({"chat_superseded": True} if from_chat else {})})
             if from_chat and self.store.drop_unsent_delegate(issue_id, row["task_id"], at=self.clock()):
                 # Parked chat work is not shown as worked on: its delegate, queued before admission, never goes out.
@@ -1902,7 +1961,11 @@ class Bridge:
             accepted = adapter.activation_receipt(row["task_id"], token, events)
             owned_activation = accepted
         self.store.native_intent_settle(key, {"state": "applied" if accepted else "reconcile",
-                                             "accepted": accepted, "owned_activation": owned_activation})
+                                             "accepted": accepted, "owned_activation": owned_activation,
+                                             **({"proven_ms": since} if proven else {}),
+                                             **({"superseded_by": None, "chat_superseded": False,
+                                                 "reason": None if accepted else "Native activation unverified"}
+                                                if readmit else {})})
         diag.evt("claim.decision", "routed" if accepted else "skipped", "-" if accepted else "activation_unverified", iss=issue_id, task=row["task_id"])
         self._pending_assignment_stop(row)
         task = adapter.require_task(row["task_id"])
@@ -1914,17 +1977,24 @@ class Bridge:
                           f"Linked to the agent's task, which is currently {task.status}. Nothing new was started.")
         return True
 
-    def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict) -> bool:
-        """May chat-started admission proceed while Linear shows no delegate yet?
+    def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict, *, since: float | None = None) -> bool:
+        """May chat-started admission proceed while Linear shows no delegate yet (or, for take_over,
+        still shows exactly the old delegate whose run a verified handover ended)?
 
         Only when no person changed state, assignee or delegate since the chat request: someone
         reassigning or undelegating it wins, however late admission resumes (after a crash, or
         while our delegate write is pending or held). The history read is skipped only when
-        Linear has not moved since the request.
+        Linear has not moved since the request. For take_over the old delegate app reporting its
+        pause (moving the issue to Blocked) is not a person's decision; any other move by it (it
+        reporting that someone resumed it) is, so a late admission never runs beside it.
+        ``since``: the request's time when not the creation's (a proven take_over's own proof).
         """
-        if iso_ms(issue.get("updatedAt")) <= float(payload["source_ms"]):
+        since = float(payload["source_ms"]) if since is None else since
+        if iso_ms(issue.get("updatedAt")) <= since:
             return True
-        if self._human_routing_changed(issue_id, float(payload["source_ms"])):
+        old = payload.get("takeover_from")
+        if self._human_routing_changed(issue_id, since,
+                                       pause_of=(old, self.state_id(issue, "blocked")) if isinstance(old, str) and old else None):
             diag.evt("claim.decision", "skipped", "human_routing_change", iss=issue_id)
             return False
         return True
@@ -1948,10 +2018,14 @@ class Bridge:
             issue = issue or self._effect_issue(issue_id)
             if (issue.get("state") or {}).get("type") in CLOSED:
                 return "closed"
-            if issue.get("delegate") is not None:
+            old = self._takeover_replaces(issue_id, row.get("task_id"))
+            if issue.get("delegate") is not None and (old is None or issue["delegate"].get("id") != old):
                 return "unknown"
             created = self.store.native_intent(f"create:{issue_id}") or {}
             since = float(created["payload"]["source_ms"])
+            if old is not None:  # Admitted by a later proven take_over: that request is the authority.
+                activation = self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}
+                since = max(since, float(activation.get("proven_ms") or 0))
             viewer = self.api.viewer_id()
             if iso_ms(issue.get("updatedAt")) <= since:
                 nodes, complete = [], True  # Nothing moved since the request: no history read.
@@ -1962,7 +2036,7 @@ class Bridge:
                 except LinearError:
                     return "unprovable"
             human = [node for node in nodes if iso_ms(node.get("createdAt")) > since and self._routed(node)
-                     and node.get("actorId") != viewer]
+                     and node.get("actorId") not in (viewer, old)]
             if any((node.get("fromDelegate") or {}).get("id") == viewer and not node.get("toDelegate") for node in human):
                 return "removed"
             if not complete:
@@ -1977,6 +2051,19 @@ class Bridge:
             return "retry"
         except LinearError:
             return "unknown"
+
+    def _takeover_replaces(self, issue_id: str, task_id: str | None) -> str | None:
+        """The old delegate a take_over replaced, when this binding is that takeover's own task and
+        it was admitted after the verified handover; else None. Routing for such a task may replace
+        exactly that delegate, and that delegate app's own writes are not a person's decision."""
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        payload = created.get("payload") or {}
+        old = payload.get("takeover_from")
+        if not (isinstance(old, str) and old and created.get("state") == "applied" and task_id
+                and created.get("task_id") == task_id and payload.get("origin") == "chat"
+                and not payload.get("record_done")):
+            return None
+        return old if (self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}).get("accepted") else None
 
     def _chat_started(self, row: dict | None) -> bool:
         """This store's bound task was created here from a chat request (the create intent applied to it)."""
@@ -2068,7 +2155,8 @@ class Bridge:
         return {"issue_id": issue_id, "task_id": task.id, "status": task.status}
 
     def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None,
-                route_delegate: Callable[[dict, str], str] | None = None) -> dict:
+                route_delegate: Callable[[dict, str], str] | None = None, takeover_from: str | None = None,
+                note: str = "", handed_over: str | None = None, proven_ms: float | None = None) -> dict:
         """Chat-requested work through the same guarded native admission a Linear assignment uses.
 
         The chat request is the authority, as a delegation is for _start. One native task per
@@ -2080,8 +2168,29 @@ class Bridge:
         after admission (admission writes nothing to Linear), with the issue version read under
         that lock: no tick write can land between that read and the queued delegate, and the
         status writes that follow from the work are queued after it. Work that was not admitted
-        gets no delegate. Its result is returned as "routing".
+        gets no delegate. Its result is returned as "routing". takeover_from, note and handed_over
+        are for take_over: the delegate whose work a verified handover ended, a line for the new
+        task saying where to continue from, and (only right after this call's proof) that same
+        delegate again, which alone lets the takeover task be admitted.
         """
+        with self.lock(issue_id):
+            issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
+            if row is not None:
+                return self._entrust_bound(row, route, record_done, route_delegate, issue, handed_over=handed_over,
+                                           proven_ms=proven_ms)
+            if self.store.native_intent(f"create:{issue_id}") is None:
+                existing = self.kanban.discover(issue)
+                if existing:
+                    return self._entrust_existing(issue, existing, route, record_done, route_delegate)
+            return self._entrust_create(issue, route, record_done, route_delegate, note=note, takeover_from=takeover_from,
+                                        handed_over=handed_over, proven_ms=proven_ms)
+
+    def entrust_checks(self, issue_id: str, *, takeover_from: str | None = None) -> tuple[dict, dict | None]:
+        """Every refusal entrust can make before it writes anything: (current issue, own binding or None).
+
+        take_over runs these before asking the old delegate to stop, so a request this agent would
+        refuse anyway never stops anyone. ``takeover_from`` is the delegate whose work a verified
+        handover just ended; that delegate alone is not a reason to refuse."""
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             # Specialist reporting needs a bound requester session: work starts from a Linear assignment.
             raise LinearError("This agent starts work from a Linear assignment, not from chat", retryable=False)
@@ -2092,29 +2201,102 @@ class Bridge:
                 raise LinearError("Native executor profile is unverified", retryable=False)
             issue = self._effect_issue(issue_id)
             delegate_id = (issue.get("delegate") or {}).get("id")
-            if delegate_id is not None and delegate_id != self.api.viewer_id():
+            if delegate_id is not None and delegate_id not in (self.api.viewer_id(), takeover_from):
                 # Another agent is delegate: its assignment owns the work. Nothing is created or bound.
                 diag.evt("chat.entrust", "refused", "delegated_elsewhere", iss=issue_id)
-                raise LinearError("This issue is delegated to another agent, so nothing was started here; "
-                                  "it needs to be handed over first", retryable=False)
+                raise LinearError("This issue is delegated to another agent, so nothing was started here and that "
+                                  "agent was not touched. To move the work here, use take_over: it stops that agent's "
+                                  "run, confirms it has ended, and continues here as one task", retryable=False)
+            row = self.store.get(issue_id)
+            if row is not None and row.get("origin") != "native":
+                raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
+            if row is None and (issue.get("state") or {}).get("type") in CLOSED:
+                raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
+            return issue, row
+
+    def takeover_preflight(self, issue_id: str, *, takeover_from: str) -> tuple[str, str | None]:
+        """take_over's checks before the old delegate is asked anything: ("ask_owner", None) when,
+        after a verified handover, entrust would leave exactly one task here ready or running;
+        ("already_here", None) when a takeover from that delegate already finished here (this
+        agent's task for it is admitted and ready or running) and only Linear routing may be
+        left; ("refuse_held", plain words) when an earlier takeover from that delegate left
+        something here that a new one can't start (so the delegate may still be paused for it);
+        otherwise ("refuse", plain words). Raises entrust's own refusals (LinearError) as
+        entrust_checks does.
+
+        While a task for this issue is ready or running here, the old delegate is never asked
+        for anything. An existing local task is reused by entrust, never replaced; one that is
+        not open and runnable would leave nobody running the work once the old delegate stops."""
+        with self.lock(issue_id):
+            issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
+            if row is not None:
+                task = self._binding_adapter(issue_id).require_task(row["task_id"])
+                created = self.store.native_intent(f"create:{issue_id}") or {}
+                payload = created.get("payload") or {}
+                from_this_takeover = (created.get("state") == "applied" and created.get("task_id") == task.id
+                                      and payload.get("origin") == "chat" and payload.get("takeover_from") == takeover_from
+                                      and not payload.get("record_done"))
+                activation = self.store.native_intent(f"activate:{issue_id}:{task.id}")
+                if task.status in ("ready", "running"):
+                    # Admitted (or admitted with its receipt not yet recorded, which entrust settles):
+                    # an admission refused as superseded that someone resumed since is not ours to route.
+                    if from_this_takeover and activation is not None and activation.get("state") != "reconcile":
+                        return "already_here", None
+                    return "refuse", ("this agent already has work running on this issue, so the other agent was not "
+                                      "asked to stop; a person needs to decide which one continues")
+                if task.status == "blocked" and from_this_takeover:
+                    activation = activation or {}
+                    if activation.get("state") in (None, "attempting") or _takeover_readmittable(activation):
+                        return "ask_owner", None  # This takeover's own parked task: admission follows a new proof.
+                    if activation.get("superseded_by") == "stop":
+                        return "refuse_held", ("someone stopped this agent's earlier takeover of it in Linear, so that "
+                                               "task won't be started here")
+                    return "refuse_held", ("this agent's earlier takeover task for it couldn't be confirmed to start, "
+                                           "so an operator needs to check it before it is started")
+                return "refuse", _local_work_problem(task.status)
+            created = self.store.native_intent(f"create:{issue_id}")
+            if created is not None:
+                return ("refuse_held" if (created.get("payload") or {}).get("takeover_from") == takeover_from else "refuse",
+                        "an earlier start of this work here didn't finish setting up and needs a check first")
+            existing = self.kanban.discover(issue)
+            if not existing:
+                return "ask_owner", None
+            try:
+                _, task = self._existing_task(issue, existing)
+            except LinearError as exc:
+                return "refuse", str(exc).rstrip(".")[:1].lower() + str(exc).rstrip(".")[1:]
+            if task.status in ("ready", "running"):
+                return "refuse", ("this agent already has work running on this issue, so the other agent was not "
+                                  "asked to stop; a person needs to decide which one continues")
+            return "refuse", _local_work_problem(task.status)
+
+    def takeover_local_status(self, issue_id: str) -> str | None:
+        """The status of this agent's bound task for the issue (None when nothing is bound)."""
+        with self.lock(issue_id):
+            row = self.store.get(issue_id)
+            if row is None or row.get("origin") != "native":
+                return None
+            return self._binding_adapter(issue_id).require_task(row["task_id"]).status
+
+    def takeover_resume_problem(self, issue_id: str) -> str | None:
+        """Before a person's resume of the old delegate: plain words for why it must not be resumed
+        (work for the issue runs or ran here), else None. A takeover task here that was never
+        admitted stays parked: only a take_over call that has just proven a handover admits it."""
+        with self.lock(issue_id):
             row = self.store.get(issue_id)
             if row is not None:
-                if row.get("origin") != "native":
-                    raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
-                return self._entrust_bound(row, route, record_done, route_delegate, issue)
-            if (issue.get("state") or {}).get("type") in CLOSED:
-                raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
-            if self.store.native_intent(f"create:{issue_id}") is None:
-                existing = self.kanban.discover(issue)
-                if existing:
-                    return self._entrust_existing(issue, existing, route, record_done, route_delegate)
-            return self._entrust_create(issue, route, record_done, route_delegate)
+                task = (self._binding_adapter(issue_id).require_task(row["task_id"])
+                        if row.get("origin") == "native" else None)
+                activation = self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}
+                if task is None or task.status != "blocked" or activation.get("accepted"):
+                    status = getattr(task, "status", None)
+                    return ("this agent is already running it" if status in ("ready", "running") else
+                            "this agent's work on it has already finished" if status in ("done", "archived") else
+                            "this agent already has work linked to it")
+            return None
 
-    def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None,
-                          route_delegate=None) -> dict:
-        """Link the one native task already pointing at this issue; its execution state is unchanged."""
-        if record_done:
-            raise LinearError("A native task already points at this issue; read status instead of recording it as done", retryable=False)
+    def _existing_task(self, issue: dict, existing: list):
+        """The one native task already pointing at this issue that entrust may link, or LinearError."""
         if len(existing) != 1:
             raise LinearError("More than one task already points at this issue, so no new one was started; decide which one continues", retryable=False)
         adapter, task = existing[0]
@@ -2135,6 +2317,14 @@ class Bridge:
             raise LinearError("Existing work on this issue was set up with a different definition of done, so "
                               "nothing new was started and nothing was stopped; the two need lining up first",
                               retryable=False)
+        return adapter, task
+
+    def _entrust_existing(self, issue: dict, existing: list, route: dict | None, record_done: dict | None,
+                          route_delegate=None) -> dict:
+        """Link the one native task already pointing at this issue; its execution state is unchanged."""
+        if record_done:
+            raise LinearError("A native task already points at this issue; read status instead of recording it as done", retryable=False)
+        adapter, task = self._existing_task(issue, existing)
         if not self.store.bind_native(issue["id"], task.id, adapter.executor_profile, adapter.board or "default",
                                      project_id=(issue.get("project") or {}).get("id"),
                                      completion_scope=self._completion_scope(adapter, task, "progress"),
@@ -2143,17 +2333,23 @@ class Bridge:
         adapter.subscribe(task.id, issue["id"], issue=issue)
         return self._entrust_bound(self.store.get(issue["id"]), route, None, route_delegate, issue)
 
-    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None) -> dict:
+    def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None,
+                        note: str = "", takeover_from: str | None = None, handed_over: str | None = None,
+                        proven_ms: float | None = None) -> dict:
         issue_id, key = issue["id"], f"linear:{issue['id']}"
         project = (issue.get("project") or {}).get("id")
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{issue.get('identifier') or issue_id}: {issue.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=issue.get("identifier") or issue_id, url=issue.get("url") or "",
-                                            context=issue.get("description") or ""),
+                                            context="\n\n".join(part for part in (note, issue.get("description") or "") if part)),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
                    "initial_status": "blocked", "activation": "native-event-guard-v1",
                    "source_ms": self.clock() * 1000, "origin": "chat", "record_done": bool(record_done)}
+        if takeover_from:
+            # The old delegate whose run a verified handover ended: admission may proceed while
+            # Linear still shows exactly that delegate, never anyone else.
+            payload["takeover_from"] = takeover_from
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
@@ -2184,7 +2380,8 @@ class Bridge:
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
         self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
         self.kanban.subscribe(task.id, issue_id, issue=issue)
-        return self._entrust_bound(self.store.get(issue_id), route, record_done, route_delegate, issue)
+        return self._entrust_bound(self.store.get(issue_id), route, record_done, route_delegate, issue,
+                                   handed_over=handed_over, proven_ms=proven_ms)
 
     def _recorded_done(self, issue_id: str, task_id: str) -> bool:
         created = self.store.native_intent(f"create:{issue_id}") or {}
@@ -2193,7 +2390,8 @@ class Bridge:
                 and payload.get("origin") == "chat" and payload.get("record_done") is True)
 
     def _entrust_bound(self, row: dict, route: dict | None, record_done: dict | None,
-                       route_delegate=None, issue: dict | None = None) -> dict:
+                       route_delegate=None, issue: dict | None = None, handed_over: str | None = None,
+                       proven_ms: float | None = None) -> dict:
         """Continue the one bound task: admit our own parked creation, or report what exists."""
         issue_id, task_id = row["issue_id"], row["task_id"]
         adapter = self._binding_adapter(issue_id)
@@ -2215,7 +2413,7 @@ class Bridge:
             raise LinearError("This issue is being recorded as already done from chat; repeat that request "
                               "to finish it. Nothing was started", retryable=False)
         if ours:
-            self._assignment_activation(row)  # Idempotent: an applied admission is never repeated.
+            self._assignment_activation(row, handed_over=handed_over, proven_ms=proven_ms)  # Idempotent: never repeated.
         task = adapter.require_task(task_id)
         activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
         routing = None
@@ -2454,8 +2652,13 @@ class Bridge:
                 "binding_revision": revision, "completion_scope": binding.get("completion_scope")}
     def queue_delegate_self(self, issue_id: str, request_id: str, *, expected_delegate_id: str | None,
                             expected_updated_at: str, expected_binding_revision: str,
-                            caller_context: dict, requester: dict, recorded_done: bool = False) -> str:
-        """Change only Linear routing, after the caller has inspected native work."""
+                            caller_context: dict, requester: dict, recorded_done: bool = False,
+                            replaces_delegate: str | None = None) -> str:
+        """Change only Linear routing, after the caller has inspected native work.
+
+        replaces_delegate (take_over): the old delegate this app replaces; it must also be the
+        expected delegate. Its own pause report (moving the issue to Blocked) does not hold routing;
+        any other routing change by it (reporting a resume) does."""
         with self.lock(issue_id):
             prior = self.store.outbox_row(request_id)
             binding = self.store.native_binding(issue_id)
@@ -2467,7 +2670,9 @@ class Bridge:
                        "expected_updated_at": expected_updated_at, "expected_binding_revision": expected_binding_revision,
                        "native_binding": binding, "task_id": (binding or {}).get("task_id"),
                        "caller_context": caller_context, **requester,
-                       **({"recorded_done": True} if recorded_done else {})}
+                       **({"recorded_done": True} if recorded_done else {}),
+                       **({"replaces_delegate": replaces_delegate}
+                          if replaces_delegate and replaces_delegate == expected_delegate_id else {})}
             if not prior:
                 self._delegate_preflight(payload)
             row_id = self.store.enqueue("delegate", payload, at=self.clock())
@@ -2491,23 +2696,34 @@ class Bridge:
             raise LinearError("Native work has ended or changed; inspect its history", retryable=False)
         if (issue.get("state") or {}).get("type") in CLOSED:
             raise LinearError("Issue is closed; no routing change was made", retryable=False)
+        old = payload.get("replaces_delegate")
+        old = old if isinstance(old, str) and old and old == payload["expected_delegate_id"] else None
         if (issue.get("delegate") or {}).get("id") != payload["expected_delegate_id"] or (
                 issue.get("updatedAt") != payload["expected_updated_at"] and (
-                    not payload.get("recovered_binding") or
-                    self._human_routing_changed(issue_id, iso_ms(payload["expected_updated_at"])))):
+                    not (payload.get("recovered_binding") or old) or
+                    self._human_routing_changed(issue_id, iso_ms(payload["expected_updated_at"]),
+                                                pause_of=(old, self.state_id(issue, "blocked")) if old else None))):
             raise LinearError("Linear changed; read current status before routing work", retryable=False)
         return issue
-    def _human_routing_changed(self, issue_id: str, since_ms: float) -> bool:
+    def _human_routing_changed(self, issue_id: str, since_ms: float, *,
+                               pause_of: tuple[str, str | None] | None = None) -> bool:
         """Did anyone but this app change state, assignee or delegate after since_ms?
 
         Comments, attachments, labels and our own writes move updatedAt but
         are not a human decision about who works on the issue or its status.
         History is read page by page back to since_ms; an unprovable answer
         (more than HISTORY_PAGES pages newer than since_ms) counts as changed.
+        ``pause_of`` (actor, Blocked state id) ignores only that app moving the issue to Blocked,
+        with no assignee or delegate change: its own pause report, never its resume.
         """
         viewer = self.api.viewer_id()
+        def pause_report(node):
+            return (pause_of is not None and pause_of[1] is not None and node.get("actorId") == pause_of[0]
+                    and node.get("toStateId") == pause_of[1] and node.get("fromAssigneeId") == node.get("toAssigneeId")
+                    and (node.get("fromDelegate") or {}).get("id") == (node.get("toDelegate") or {}).get("id"))
         def human(node):
-            return iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") != viewer
+            return (iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") != viewer
+                    and not pause_report(node))
         nodes, complete = self._routing_scan(issue_id, lambda page: any(human(node) for node in page) or any(
             iso_ms(node.get("createdAt")) <= since_ms for node in page))
         # Every node is checked against the fence; no reliance on Linear's ordering within what was read.
@@ -2875,6 +3091,11 @@ class Bridge:
             return self._log_delegate(row, "no_human_fence")  # No provable fence for a human change: leave routing alone.
         if not self.store.effect_admitted(issue_id):
             return self._log_delegate(row, "effect_unresolved", quiet=True)  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
+        created_for = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {})
+        old = self._takeover_replaces(issue_id, task.id)
+        if created_for.get("takeover_from") and self._chat_started(row) and old is None:
+            # A takeover's task that was never admitted: routing follows its admission, if any.
+            return self._log_delegate(row, "takeover_not_admitted", quiet=True)
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
         if (retry_chat or self._chat_started(row)) and not superseded:
@@ -2883,13 +3104,21 @@ class Bridge:
             # resumed later counts from its claim: the change that parked it came before that.
             requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
             claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
-        route = (issue.get("delegate") is None and "delegate" in issue
+            if old is not None:  # Admitted by a later proven take_over: that request is the authority.
+                activation = self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}
+                claim_ms = max(claim_ms, float(activation.get("proven_ms") or 0))
+        # A takeover's admitted task replaces exactly the old delegate, whose own pause report is not a person's.
+        current = (issue.get("delegate") or {}).get("id")
+        replacing = old is not None and current == old
+        route = ((issue.get("delegate") is None or replacing) and "delegate" in issue
                  and (issue.get("state") or {}).get("type") not in CLOSED
                  and (iso_ms(issue.get("updatedAt")) <= claim_ms
-                      or not self._human_routing_changed(issue_id, claim_ms)))
+                      or not self._human_routing_changed(
+                          issue_id, claim_ms, pause_of=(old, self.state_id(issue, "blocked")) if replacing else None)))
         payload = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-binding-recovery:{issue_id}:{revision}")),
                    "issue_id": issue_id, "delegate_routing_version": 1, "write_started": False,
-                   "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": None,
+                   "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": current if replacing else None,
+                   **({"replaces_delegate": old} if replacing else {}),
                    "expected_updated_at": issue.get("updatedAt"), "expected_binding_revision": revision,
                    "native_binding": binding, "task_id": task.id,
                    "recovered_binding": {"task_id": task.id, "binding_revision": revision}}
@@ -2900,7 +3129,7 @@ class Bridge:
                 raise LinearError("Delegate recovery was not queued; retrying later")  # pump backs off
             return self._log_delegate(row, "chat_route_retry" if retry_chat else "binding_recovery", outcome="queued")
         # A human-chosen delegate, later human edit or closed issue wins for this revision: record once.
-        reason = ("human_delegate" if issue.get("delegate") is not None else
+        reason = ("human_delegate" if issue.get("delegate") is not None and not replacing else
                   "issue_closed" if (issue.get("state") or {}).get("type") in CLOSED else "human_edit")
         self._log_delegate(row, reason)
         _, first = self.store.native_intent_prepare(key, {"issue_id": issue_id, "task_id": task.id,

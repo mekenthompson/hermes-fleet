@@ -503,7 +503,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertTrue(reply["native"]["created_from_chat"])
         self.assertFalse(reply["native"]["admitted"])
         self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
-        self.assertIn("stopped, closed or reassigned", reply["message"])
+        self.assertIn("someone stopped it in Linear", reply["message"])
         self.assertNotIn("Do not also do this work here", reply["message"])
         task_id = reply["native"]["task_id"]
         self.assertEqual(self.board.get(task_id).status, "blocked")

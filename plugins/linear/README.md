@@ -25,6 +25,7 @@ API is required. The plugin is disabled by default.
 | `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
 | `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
+| `take_over` with `issue`, UUIDv4 `id` | Take over an issue another agent is delegate for, in one step (see [Take over from another agent](#take-over-from-another-agent)). Ends with the other agent's run stopped, proven ended and this agent continuing as one task with this app as delegate, or with nothing changed and a plain reason. `work_on` refuses an issue delegated elsewhere and points here. |
 | `create_issue` or `work_on` with `record_done: true`, `summary`, optional `evidence` links | Link work already finished in chat and close it: the native task is created parked and completed with that evidence in one call, never runnable; verified completion sets Done with the closing summary. Refused when the issue already has native work. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
@@ -117,9 +118,10 @@ An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
 `tool_describe` and `tool_call` is blocked. Those tools never count toward the allowance, so
 the lookups that start tracked work (`linear` status, `create_issue`, `work_on`, `track`) and
 `clarify` always run. The block message names the exact `work_on` (a title prefix such as
-`QA-10` resolves) / `create_issue` + `start_work` call (the project picks its team), and says that a status question or discussion is answered
+`QA-10` resolves) / `create_issue` + `start_work` call (the project picks its team), names `take_over` for an issue
+another agent is working on (and says never to stop another agent's task with kanban or host commands), and says that a status question or discussion is answered
 with what the agent has (or `clarify`), since inspection and discussion do not transfer
-execution. A successful `work_on`, `track` or `create_issue` with `start_work` releases the
+execution. A successful `work_on`, `take_over`, `track` or `create_issue` with `start_work` releases the
 turn, as does the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`,
 `released`, `skipped`); an exception inside the guard is logged at most hourly and the call
 proceeds.
@@ -277,7 +279,111 @@ does not satisfy that delivery. Reusing its exact historical acknowledgement gra
 recipient authority. Held uncertain comments require exact readback rather than a duplicate
 publication, and earlier request coordinates and receipts remain intact.
 
-For an explicit chat takeover, first inspect the current owner and native work, coordinate
+### Take over from another agent
+
+"Take over HF-9 from Atlas" is one `take_over` call on the requesting agent. The rule: two
+agents never run the same work. When a handover can't complete after the owner stopped, the
+owner stays paused and the user and the Linear issue are told so plainly; nothing resumes it
+automatically.
+
+1. The requester checks everything it could refuse later (issue open and fully read, its own
+   authorization, executor, board pin and guarded controls) before the owner is touched. While a
+   task for the issue is ready or running here, the owner is never asked for anything: a task
+   here from an earlier takeover from the same delegate means the takeover already happened, so
+   the reply says so and only the Linear delegate update is retried, whatever the request `id`.
+   Any other local work refuses with the owner untouched: running work (a person decides which
+   agent continues), and finished or paused work (it would leave nobody running the work once
+   the owner stops). An issue with no agent delegate is not a takeover (`not_delegated`: use
+   `work_on`); one delegated to this app is plain `work_on`. One `take_over` or `resume_owner`
+   per issue runs at a time on an agent (`takeover_in_progress`).
+2. It runs the owner's own `hermes linear hand-off` through the operator-configured command for
+   that delegate (`takeover.agents`, below). No configured command: `takeover_unavailable`,
+   nothing changed. The plugin never improvises a route into another profile.
+3. The owner, in code: refuses before stopping anything when the proof cannot hold (no
+   reporting link here, not exactly one task, issue scope conflict, started tasks still open,
+   no guarded controls or native Stop getter, and the parts of `inspect-cleanup` a Stop cannot
+   change); pauses the task with one guarded native Stop whose reason is
+   `Paused for a handover to <name> [handoff:<request id>]` (never pushed into the recurrence
+   fence); and waits up to `wait_seconds` for `inspect-cleanup` to prove the stopped run ended
+   (`state: handed_off`). It never resumes anything by itself: if the proof fails, the work stays
+   paused (`state: paused`, with a plain reason). A task already paused for a handover to the same
+   agent (a retry with the same `id`, or a new request) is proven again, never stopped twice. A
+   task paused by someone else is only proven, never changed (`state: unchanged`); one paused for
+   a handover to a different agent is refused. One hand-off or resume runs per issue at a time on
+   the owner (a lock beside its state database, waited on for at most 10 seconds).
+4. On proof the requester creates its one native task, whose text says to continue from the
+   old owner's progress in the Linear thread, and admits it in the same call, while Linear still
+   shows exactly the old delegate and no person has changed its state, assignee or delegate since
+   this `take_over` asked the owner (the same check as `work_on`; the old delegate app reporting its
+   pause, moving the issue to Blocked, is not a person). Each new `take_over` is the authority for
+   its own start: a change before it does not hold it, a change after it does. It then replaces
+   that delegate (guarded on it) with this app and subscribes the chat to checkpoints and the
+   result. The old delegate app's pause report
+   never holds that update; a person's routing change, or the old delegate app reporting a
+   resume, does. A held update is retried by delegate recovery.
+5. If anything fails once the owner may be paused (no readable reply, a proof that failed, or a
+   start here that failed), what runs here decides. A task ready or running here (admitted before
+   a later step failed) means the handover stands: the reply is a success that names the
+   unfinished Linear update. Otherwise the reply is `takeover_paused`, and the same words are
+   posted on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
+   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." The
+   reason is named plainly (for example a person changing the issue's status, assignee or delegate
+   while the task was being set up). 'take over HF-9' is offered only when a new `take_over` would
+   ask the owner again; after a Stop from Linear, or a start that couldn't be confirmed, only
+   'resume HF-9' is offered, and a later `take_over` refuses without asking the owner, saying
+   Atlas was not asked again and how to resume it if it is still paused. If meanwhile someone
+   delegated the issue to another agent, to this agent by hand, or removed the delegate, resuming
+   is not offered: the message says who has it now, and that Atlas continues only after the issue
+   is delegated back to it and a person says 'resume HF-9'. That message stays true: a takeover task
+   is admitted only by the `take_over` call that has just proven the owner's run ended, never
+   later by the service, an assignment echo or `work_on`. A task created here whose start failed
+   stays parked; saying 'take over HF-9' again proves the owner's pause again (it is never stopped
+   twice) and starts it, also when the first start lost to a person's change made before that new
+   request. An admission that did land before a lost reply or a crash is only
+   recognised by its native receipt, never repeated.
+6. `resume_owner` is the one supported way to let the owner continue (a person saying "resume
+   HF-9"). The owner it resumes is Linear's current delegate, never an earlier one: if the issue
+   is now delegated to someone else, or to nobody, it refuses (`resume_refused`) and changes
+   nothing. It also refuses while this agent runs or ran the work. Otherwise it runs the owner's
+   `hand-off --resume`, which lifts only that exact guarded handover pause for this agent,
+   guarded on its latest event. A lost reply is `resume_uncertain`: nothing starts here, and
+   asking again is safe. A parked takeover task here never starts after a resume; only a new
+   `take_over` (which asks the owner to stop again) starts it.
+
+Known limits, by design rather than more machinery:
+
+- After a successful takeover the owner's task stays paused on the owner's board for good; it is
+  not closed, because the owner's app would report that ending on the issue under this agent, and
+  closing it would take a second cross-agent step that can itself fail. Nothing
+  in this flow resumes it, but a person or the owner's own orchestrator could still resume it
+  with native Kanban controls (the owner's tool text forbids `kanban unblock` for handover
+  pauses, which is guidance, not a lock). Doing so would run both agents; archive the owner's
+  task by hand if that risk matters. A pause a person made before the takeover is proven but
+  keeps its original wording.
+- If someone resumes the owner by hand on its own board in the moment between its proof and the
+  start here, on a Linear workflow with no Blocked state (so the owner's resume writes no state
+  change), the start here does not detect it. That window is one call long.
+- The owner recognises a retried handover by the requester's configured `name` in the pause
+  reason. Give each agent a distinct `takeover.name`; two requesters with the same name could
+  prove each other's pause.
+
+The owner's Linear thread shows the pause as "Paused for a handover to <name>. Nothing is needed
+from you ...", never "Waiting on you"; only that exact guarded reason is worded this way, and
+any other pause keeps its ordinary wording. Output lines before the JSON reply (secret loaders,
+banners) are ignored, and a reply for another issue is not a handover.
+
+The owner command runs without a shell and passes each argument through unchanged; the
+`--issue-json` argument is a JSON object and `--to` may contain spaces. Point `command` at
+something that executes argv as given (`docker exec ...`, a host bridge that forwards argv).
+Never wrap it in `ssh host ...` or `sh -c ...`: both join the arguments into one string and
+re-split it, which breaks the JSON payload. One `take_over` takes this side's Linear reads
+before the owner is asked (a 40-second Linear deadline), one owner call (bounded by a
+`wait_seconds` plus 60 second subprocess timeout) and one start here (a 60-second Linear
+deadline; a Linear request that could not finish inside a deadline is not started).
+`wait_seconds` is capped at 120, so the whole call ends inside the chat client's 300-second
+timeout.
+
+For a manual or older takeover, first inspect the current owner and native work, coordinate
 its Stop and verify cleanup, then link the existing task or a deliberately created remainder
 on the receiving agent. Read `status` and pass its exact binding revision, delegate ID
 (including null) and issue timestamp to `delegate_self`. Confirm Linear delivery before
@@ -425,6 +531,14 @@ plugins:
           blocked: Blocked
         ingress_database: /opt/data/workspace/linear/ingress.db
         recheck_minutes: 5
+        takeover:                  # optional; without it take_over refuses and changes nothing
+          name: Example-B          # how this agent is named to the agent it takes over from
+          agents:
+            - name: Example-A
+              delegate_id: example-a-app-user-id
+              # Runs Example-A's own hermes CLI; the plugin appends `linear hand-off ...`.
+              command: [example-host-bridge, profile, example-a, --, hermes, --profile, default]
+              wait_seconds: 90     # how long Example-A waits for its stopped run to end (capped at 120)
 ```
 
 `token_file` credentials with `path` are also supported. OAuth and token caches remain private
@@ -432,7 +546,11 @@ profile state. The immutable viewer/workspace binding is revalidated on requests
 `identity.teams` and `identity.projects` restrict issue access and writes. `state_database`
 defaults to `<profile home>/linear/state.db`; optional `board` selects the destination for
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
-`completion_contracts` retain their existing meanings. `chat_guard` (default `true`) enables the
+`completion_contracts` retain their existing meanings. `takeover` lists the agents this one may
+[take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
+that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
+invalid entries are dropped and logged.
+`chat_guard` (default `true`) enables the
 [chat guard](#chat-guard-tracked-work-is-started-not-done-inline).
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
@@ -787,6 +905,12 @@ the owner-only command inside the old work's fixed approved deployment:
 ```sh
 hermes --profile default linear inspect-cleanup <issue-id> --expected-stop-event-id <stop-event-id>
 ```
+
+The selector can be the issue id or its key (`OPS-9`) when `--issue-json` carries the issue's
+`id`, `identifier` and `url`. Tasks the bridge creates name their issue by key and link, so
+without that link a marker can be neither matched nor refuted: the hold is `issue_metadata_required`
+(with a `needed` sentence), never a scope conflict. A key without `--issue-json` is held the
+same way, because native records are keyed by issue id.
 
 Use the latest native `blocked` or `block_loop_detected` pause event as the anchor;
 a later `worker_result` is settlement evidence, not the pause. A needs-input

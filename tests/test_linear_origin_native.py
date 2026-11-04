@@ -1466,8 +1466,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                         body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
             return found
         with patch.object(Kanban, "discover", change_after_discovery):
-            evidence = await self.cleanup_inspected()
+            evidence = await self.cleanup_inspected(
+                metadata={"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue/ABC-1"})
         self.assertEqual(evidence["reason"], "native_task_issue_scope_conflict")
+        # Without the issue's own link the same marker is unproved discovery data, named as such.
+        self.assertEqual((await self.cleanup_inspected())["reason"], "issue_metadata_required")
 
     async def test_cleanup_task_scope_and_binding_changes_during_owner_receipt_are_unknown(self):
         from hermes_cli import kanban_db as kb
@@ -1478,7 +1481,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(kb.edit_task(self.board, self.task_id,
                 body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2"))
         self.before_rpc = conflict
-        self.assertEqual((await self.cleanup_inspected())["reason"], "native_task_issue_scope_conflict")
+        metadata = {"id": "issue-one", "identifier": "ABC-1", "url": "https://linear.example/issue/ABC-1"}
+        self.assertEqual((await self.cleanup_inspected(metadata=metadata))["reason"], "native_task_issue_scope_conflict")
         self.assertTrue(kb.edit_task(self.board, self.task_id, body="Authorized marker-free manual task"))
         def same_scope_edit(_method, _params):
             self.before_rpc = None

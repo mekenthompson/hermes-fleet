@@ -155,6 +155,17 @@ def setup(parser: Any) -> None:
     cleanup.add_argument("--expected-stop-event-id", required=True, type=int,
                          help="Latest native blocked or block_loop_detected pause event, not a later worker-result event")
     cleanup.add_argument("--issue-json", help="Optional independently inspected issue id/identifier/url for native marker discovery; grants no permission")
+    handoff = sub.add_parser("hand-off", help="Stop this profile's work on one issue for a takeover and prove it ended, "
+                                              "or change nothing; run by the requesting agent's take_over")
+    handoff.add_argument("issue_id")
+    handoff.add_argument("--issue-json", required=True, help="The issue's id, identifier and url from a fresh Linear read")
+    handoff.add_argument("--to", required=True, help="Display name of the agent taking over")
+    handoff.add_argument("--from-name", help="Display name of this agent in the reply (default: this profile)")
+    handoff.add_argument("--request-id", required=True, help="Caller UUID; repeat it to retry the same handover safely")
+    handoff.add_argument("--wait-seconds", type=float, default=90.0, help="How long to wait for the stopped run to end (max 300)")
+    handoff.add_argument("--resume", action="store_true",
+                         help="A person's explicit resume: let this profile continue work paused for a handover "
+                              "to --to that didn't complete. Never resumes any other pause")
 
 def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings: dict | None = None, origin_api=None) -> int:
     if args.linear_command == "inspect-cleanup":
@@ -167,6 +178,22 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
                                  ingress=ingress)
         print(json.dumps(result))
         return 0 if result["quiescence_proven"] else 1
+    if args.linear_command == "hand-off":
+        from . import handoff
+        try:
+            metadata = json.loads(args.issue_json)
+        except ValueError:
+            metadata = {}  # Refused as an incomplete selector before anything is read or changed.
+        name = args.from_name if isinstance(args.from_name, str) and handoff._NAME.fullmatch(args.from_name) else None
+        if args.resume:
+            result = handoff.resume(state, args.issue_id, profile, metadata, to=args.to, request_id=args.request_id,
+                                    owner_name=name)
+        else:
+            result = handoff.hand_off(state, args.issue_id, profile, origin_settings or {}, metadata, to=args.to,
+                                      request_id=args.request_id, owner_name=name, ingress=ingress,
+                                      wait_seconds=args.wait_seconds)
+        print(json.dumps(result))
+        return 0 if result.get("handed_off") or result.get("state") == "resumed" else 1
     if args.linear_command in {"inspect-origin", "inspect-work"}:
         from . import origin, work
         from .transport import Unavailable

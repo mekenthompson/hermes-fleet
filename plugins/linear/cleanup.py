@@ -6,6 +6,7 @@ from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path
 import sqlite3
@@ -47,7 +48,12 @@ HOLD_FACTS = {
                                   "whether the earlier attempt is still running. Check again shortly.",
     "restart_proof_unsupported": "This agent's version cannot yet confirm that work from before a restart has ended. "
                                  "Update the agent, then check again.",
+    "issue_metadata_required": "The check needs the issue's id, key and link to match the task to it. Pass them with "
+                               "--issue-json from a fresh Linear status read, then check again.",
 }
+
+# A Linear issue key ("ABC-12"). The selector names the issue; only its UUID keys native records.
+_ISSUE_KEY = re.compile(r"[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,8}")
 
 # Optional host lifecycle evidence. Core's own restart proof (attempt_instance_replaced)
 # comes first; this host receipt is read only when that proof does not hold, which in
@@ -581,6 +587,11 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
         try:
             require_task_issue_scope(selected[0], metadata or {"id": issue})
         except LinearError as exc:
+            # Bridge-created tasks name their issue by key and link. Without the issue's own
+            # link those lines can be neither matched nor refuted: that is missing discovery
+            # data, not a conflict, and it stays unknown either way.
+            if not (metadata or {}).get("url"):
+                raise Unknown("issue_metadata_required") from exc
             raise Unknown("native_task_issue_scope_conflict") from exc
         # A readable key may still be excluded by SQLite's BLOB/TEXT equality
         # while native row construction identifies it as this task. Validate
@@ -763,8 +774,12 @@ def inspect(state: Path, issue: str, binding_profile: str, stop_id: int, setting
         _require(not is_delegated_child_process_context() and not is_worker_process(), "owner_cli_required")
         _require(isinstance(issue, str) and 0 < len(issue) <= 1024 and type(stop_id) is int and stop_id > 0, "invalid_cleanup_selector")
         if metadata is not None:
-            _require(isinstance(metadata, dict) and metadata.get("id") == issue and set(metadata) <= {"id", "identifier", "url"}
+            _require(isinstance(metadata, dict) and issue in (metadata.get("id"), metadata.get("identifier"))
+                     and isinstance(metadata.get("id"), str) and set(metadata) <= {"id", "identifier", "url"}
                      and all(isinstance(v, str) and 0 < len(v) <= 4096 for v in metadata.values()), "invalid_issue_discovery_metadata")
+            issue = metadata["id"]  # A key selector ("ABC-12") names the same issue; native records use its id.
+        elif _ISSUE_KEY.fullmatch(issue):
+            raise Unknown("issue_metadata_required")  # Native records are keyed by issue id, never by its key.
         home = Path(get_hermes_home()).resolve(strict=True)
         try:
             asyncio.get_running_loop()
