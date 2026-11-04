@@ -631,6 +631,17 @@ class Store:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-intent:{key}",)).fetchone()
         return json.loads(row[0]) if row else None
+    # take_over: the latest handover for an issue. "proven" (the old delegate proved its run
+    # ended, so this agent's takeover task may be admitted) or "returned" (a person resumed the
+    # old delegate instead, so it may not, until a new handover is proven).
+    def handover(self, issue_id: str) -> dict[str, Any] | None:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (f"takeover-handover:{issue_id}",)).fetchone()
+        return json.loads(row[0]) if row else None
+    def set_handover(self, issue_id: str, record: dict[str, Any]) -> None:
+        with self._tx() as db:
+            db.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                       (f"takeover-handover:{issue_id}", json.dumps(record)))
     def record_unbound_stop(self, issue_id: str, source_ms: float, *, session_id: str,
                             activity_id: str, actor: str) -> dict[str, Any]:
         """Keep the newest authenticated Stop even across independent service instances."""

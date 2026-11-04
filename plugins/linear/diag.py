@@ -108,14 +108,13 @@ REASONS = frozenset({
     "old_worker_alive", "old_gateway_alive", "worker_instance_not_earlier", "old_instance_unproven",
     "restart_proof_unsupported", "issue_metadata_required",
     # agent-to-agent takeover (handoff.py owner side, chat.py take_over requester side)
-    "handed_off", "handoff_resumed", "handoff_unchanged", "handoff_stuck", "handoff_cancelled",
+    "handed_off", "handoff_resumed", "handoff_unchanged", "handoff_busy",
     "not_bound_here", "task_finished_here", "task_not_handable", "started_other_tasks",
     "controls_unsupported", "changed_during_handoff", "proof_timeout",
-    "takeover_unavailable", "takeover_refused", "takeover_uncertain", "not_delegated",
+    "takeover_unavailable", "takeover_refused", "takeover_paused", "takeover_notice_unsent", "not_delegated",
     "handover_in_progress", "stop_unverified", "takeover_wait_capped", "takeover_in_progress",
-    "local_work_not_runnable", "takeover_not_started", "takeover_not_admitted", "takeover_already_here",
-    "takeover_routing_unfinished", "takeover_local_unknown", "holder_unrecorded", "earlier_handover_called_off",
-    "takeover_resolve_failed", "takeover_resolved", "takeover_unresolved",
+    "local_work_not_runnable", "takeover_not_admitted", "takeover_already_here",
+    "takeover_routing_unfinished", "takeover_local_unknown", "resume_refused", "resume_uncertain",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",

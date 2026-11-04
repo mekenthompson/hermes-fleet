@@ -1,9 +1,11 @@
 """Owner side of a takeover against the pinned native owner, Kanban and receipts.
 
 ``handoff.hand_off`` runs in the profile that owns the work. It refuses before stopping
-anything when the proof cannot hold, stops with one guarded native Stop, proves the stopped
-work ended with the existing cleanup inspection, and resumes what it stopped when the proof
-fails. A stop made outside this flow (a raw CLI block) is only proven, never changed.
+anything when the proof cannot hold, stops with one guarded native Stop, and proves the stopped
+work ended with the existing cleanup inspection. It never resumes anything by itself: when the
+proof fails the work stays paused and the reply says so; only ``handoff.resume`` (a person's
+explicit resume) lifts a handover pause. A stop made outside this flow (a raw CLI block) is only
+proven, never changed.
 """
 import asyncio
 import contextlib
@@ -77,7 +79,7 @@ class Handoff(base.OriginScenarios):
         from hermes_cli import kanban_db as kb
         return kb.get_task(self.board, self.task_id).status
 
-    async def hand_off(self, *, issue="issue-one", metadata=META, request_id=REQUEST, wait_seconds=0, cancel=False,
+    async def hand_off(self, *, issue="issue-one", metadata=META, request_id=REQUEST, wait_seconds=0, resume=False,
                        to="Nova", **extra):
         from agent import runtime_session_store
         from hermes_cli import kanban_process_stop
@@ -86,9 +88,9 @@ class Handoff(base.OriginScenarios):
         self.delivered = getattr(self, "delivered", [])
         with patch.object(runtime_session_store, "_worker_process", False), \
                 patch.object(kanban_process_stop, "request_native_stop", delivered):
-            if cancel:
-                return await asyncio.to_thread(handoff.cancel, self.linear_state, issue, "default", metadata,
-                                               to=to, request_id=request_id, owner_name="Atlas", wait_seconds=0)
+            if resume:
+                return await asyncio.to_thread(handoff.resume, self.linear_state, issue, "default", metadata,
+                                               to=to, request_id=request_id, owner_name="Atlas")
             return await asyncio.to_thread(handoff.hand_off, self.linear_state, issue, "default", self.settings,
                                            metadata, to=to, request_id=request_id, owner_name="Atlas",
                                            wait_seconds=wait_seconds, sleep=lambda seconds: None, **extra)
@@ -126,35 +128,55 @@ class Handoff(base.OriginScenarios):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(len(self.delivered), 1)
 
-    async def test_handoff_cancel_resumes_only_its_own_pause(self):
+    async def test_handoff_resume_lifts_only_a_handover_pause_for_that_agent(self):
         from hermes_cli import kanban_db as kb
         await self.running_issue()
         self.assertTrue((await self.hand_off())["handed_off"])
-        other = await self.hand_off(request_id="0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b", cancel=True)
+        other = await self.hand_off(to="Vega", resume=True)
         self.assertEqual(other["state"], "unchanged")
+        self.assertIn("isn't paused for a handover to Vega", other["message"])
         self.assertEqual(self.status(), "blocked")
-        undone = await self.hand_off(cancel=True)
-        self.assertEqual(undone["state"], "resumed", undone)
+        resumed = await self.hand_off(request_id=R2, resume=True)
+        self.assertEqual(resumed["state"], "resumed", resumed)
         self.assertEqual(self.status(), "ready")
-        resumed = kb.list_events(self.board, self.task_id)[-1]
-        self.assertEqual(resumed.kind, "unblocked")
-        self.assertEqual(resumed.payload["request_id"], handoff.resume_request_id(REQUEST))
-        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")  # Nothing left to undo.
+        event = kb.list_events(self.board, self.task_id)[-1]
+        self.assertEqual(event.kind, "unblocked")
+        self.assertEqual(event.payload["request_id"], handoff.resume_request_id(R2))
+        before = self.snapshot()
+        self.assertEqual((await self.hand_off(request_id=R2, resume=True))["state"], "resumed")  # Repeat: same answer.
+        self.assertEqual((await self.hand_off(request_id=R3, resume=True))["state"], "unchanged")  # Nothing paused.
+        self.assertEqual(self.snapshot(), before)
 
-    # -- (b) the proof fails: the owner is left running ---------------------------------------
-    async def test_handoff_failed_proof_resumes_the_owner_it_stopped(self):
+    async def test_handoff_resume_never_lifts_a_persons_pause(self):
+        from hermes_cli import kanban_db as kb
+        await self.stopped_issue()
+        kb.edit_task(self.board, self.task_id, body=MARKER)
+        before = self.snapshot()
+        result = await self.hand_off(resume=True)
+        self.assertEqual(result["state"], "unchanged")
+        self.assertEqual(self.snapshot(), before)
+
+    # -- (b) the proof fails: the owner stays paused, and says so -------------------------------
+    async def test_handoff_failed_proof_leaves_the_owner_paused_and_never_resumes_it(self):
         from hermes_cli import kanban_db as kb
         await self.running_issue(settle=False)  # The attempt's native admission never settles.
         result = await self.hand_off()
         self.assertFalse(result["handed_off"])
-        self.assertEqual(result["state"], "resumed", result)
-        self.assertEqual(result["reason"], "proof_timeout")
-        self.assertIn("couldn't be confirmed safe", result["message"])
-        self.assertIn("Atlas's work was resumed and nothing was handed over", result["message"])
-        self.assertNotIn("native_", result["message"])
-        self.assertEqual(self.status(), "ready")  # Runnable again; never left stopped with nobody on it.
+        self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
+        self.assertEqual(result["message"], "Atlas's work is paused for a handover to Nova that didn't complete: its "
+                                            "run did not finish winding down in time. Nothing was resumed automatically.")
+        self.assertEqual(result["why"], "its run did not finish winding down in time.")
+        self.assertEqual(self.status(), "blocked")
+        # Retries, with the same id or a new one for the same agent, prove the same pause: never a
+        # second Stop, never a resume.
+        for request_id in (REQUEST, R2):
+            again = await self.hand_off(request_id=request_id)
+            self.assertEqual(again["state"], "paused", again)
         kinds = [event.kind for event in kb.list_events(self.board, self.task_id)]
-        self.assertEqual(kinds[-2:], ["blocked", "unblocked"])
+        self.assertEqual(kinds.count("blocked"), 1)
+        self.assertNotIn("unblocked", kinds)
+        self.assertEqual(len(self.delivered), 1)
+        self.assertEqual(self.status(), "blocked")
 
     async def test_handoff_refuses_before_stopping_when_proof_cannot_hold(self):
         await self.running_issue(body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
@@ -263,8 +285,8 @@ class Handoff(base.OriginScenarios):
         self.assertTrue(reply["handed_off"])
         self.assertIn("Atlas's work stopped", reply["message"])
 
-    # -- blocker 2: a failure after the Stop is rechecked and resumed, never "unchanged" -------
-    async def test_handoff_unreadable_history_after_the_stop_resumes_never_unchanged(self):
+    # -- a failure right after the Stop: paused (maybe), never "unchanged" and never resumed ------
+    async def test_handoff_unreadable_history_after_the_stop_is_reported_paused(self):
         from hermes_fleet_linear_plugin.bridge import Kanban
         await self.running_issue()
         armed, real_block, real_history = [], handoff._block, Kanban.history
@@ -280,28 +302,12 @@ class Handoff(base.OriginScenarios):
         with patch.object(handoff, "_block", block), patch.object(Kanban, "history", history):
             result = await self.hand_off()
         self.assertFalse(result["handed_off"])
-        self.assertEqual(result["state"], "resumed", result)
+        self.assertEqual((result["state"], result["reason"]), ("paused", "stop_unverified"), result)
         self.assertIn("couldn't be checked after it was asked to stop", result["message"])
-        self.assertIn("Atlas's work was resumed", result["message"])
-        self.assertEqual(self.status(), "ready")
-
-    # -- should-fix 6: our own Stop in TRIAGE is not "someone else acted" ------------------------
-    async def test_handoff_own_stop_left_in_triage_is_reported_for_an_operator(self):
-        from hermes_cli import kanban_db as kb
-        await self.running_issue(settle=False)  # The proof never holds, so the Stop must be undone.
-        real_block = handoff._block
-        def block(adapter, task, reason, expected):
-            changed = real_block(adapter, task, reason, expected)
-            # As an older native's recurrence fence would leave it (this runs on the owner's thread).
-            with adapter.conn() as conn, kb.write_txn(conn):
-                conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (self.task_id,))
-            return changed
-        with patch.object(handoff, "_block", block):
-            result = await self.hand_off()
-        self.assertEqual(self.status(), "triage")
-        self.assertEqual(result["state"], "stopped", result)
-        self.assertIn("an operator needs to resume it", result["message"])
-        self.assertNotIn("Someone resumed", result["message"])
+        self.assertEqual(self.status(), "blocked")
+        retry = await self.hand_off()  # Its own Stop, found by request id: proven, never stopped twice.
+        self.assertTrue(retry["handed_off"], retry)
+        self.assertEqual(len(self.delivered), 1)
 
     # -- should-fix 7: never prove another agent's handover pause for a second agent -----------
     async def test_handoff_pause_for_another_agent_is_never_proven_for_this_one(self):
@@ -314,7 +320,7 @@ class Handoff(base.OriginScenarios):
         result = await self.hand_off()
         self.assertEqual((result["handed_off"], result["state"], result["reason"]),
                          (False, "unchanged", "handover_in_progress"))
-        self.assertIn("already being handed over to another agent", result["message"])
+        self.assertIn("already paused for a handover to another agent", result["message"])
         self.assertEqual(self.snapshot(), before)
 
     async def test_handoff_busy_issue_lock_changes_nothing(self):
@@ -324,106 +330,20 @@ class Handoff(base.OriginScenarios):
                 handoff.issue_lock(handoff._handoff_dir(self.linear_state), "issue-one", 0) as held:
             self.assertTrue(held)
             result = await self.hand_off()
-        self.assertEqual((result["state"], result["reason"]), ("unchanged", "handover_in_progress"))
+        self.assertEqual((result["state"], result["reason"]), ("unchanged", "handoff_busy"))
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.delivered, [])
 
-    # -- calling a request off: before it ran, and while its proof was still running ------------
-    async def test_handoff_called_off_request_never_stops_anything(self):
+    # -- G: a new request never wipes or resumes an earlier one's pause --------------------------
+    async def test_handoff_a_new_request_for_the_same_agent_proves_the_earlier_pause(self):
         await self.running_issue()
-        before = self.snapshot()
-        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")
-        result = await self.hand_off()  # A late or repeated hand-off for the called-off request.
-        self.assertEqual((result["handed_off"], result["state"]), (False, "unchanged"))
-        self.assertIn("called off earlier", result["message"])
-        self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.delivered, [])
-
-    async def test_handoff_called_off_while_proving_undoes_its_own_stop(self):
-        await self.running_issue()
-        calls = []
-        def inspect(*args, **kwargs):
-            calls.append(args)
-            if len(calls) == 2:  # The proof after the Stop: the requester gave up waiting and called it off.
-                handoff._call_off(self.linear_state, REQUEST)
-            return cleanup.inspect(*args, **kwargs)
-        result = await self.hand_off(inspect_cleanup=inspect)
-        self.assertFalse(result["handed_off"])
-        self.assertEqual(result["state"], "resumed", result)
-        self.assertIn("called off before it finished", result["message"])
-        self.assertEqual(self.status(), "ready")
-
-    # -- review r2 B: only the request holding a pause may resume it ---------------------------
-    async def test_handoff_an_older_request_never_resumes_a_pause_a_later_request_handed_over(self):
-        await self.running_issue()
-        first = await self.hand_off()  # R1 stops and proves; its requester never finished (no call-off).
+        first = await self.hand_off()
         self.assertTrue(first["handed_off"], first)
-        later = await self.hand_off(request_id=R2)  # R2 proves R1's pause: Nova continues under R2.
+        later = await self.hand_off(request_id=R2)
         self.assertTrue(later["handed_off"], later)
-        self.assertFalse(later["stopped_here"])
         self.assertEqual(later["stop_event_id"], first["stop_event_id"])
         self.assertEqual(len(self.delivered), 1)  # Never stopped twice.
-        before = self.snapshot()
-        late_cancel = await self.hand_off(cancel=True)  # R1's requester comes back and calls R1 off.
-        self.assertEqual(late_cancel["state"], "unchanged", late_cancel)
-        self.assertIn("different handover request", late_cancel["message"])
-        retry = await self.hand_off()  # And retries R1 as told after takeover_uncertain.
-        self.assertEqual((retry["handed_off"], retry["state"]), (False, "unchanged"), retry)
-        self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.status(), "blocked")  # Still handed over to Nova: never both running.
-        # R2 holds the pause: R2 calling off (its start failed) resumes it, so nobody is left stopped.
-        undone = await self.hand_off(request_id=R2, cancel=True)
-        self.assertEqual(undone["state"], "resumed", undone)
-        self.assertEqual(self.status(), "ready")
-
-    async def test_handoff_a_called_off_pause_is_finished_before_a_new_request_proves_it(self):
-        # The reviewer's sequence: R1 stops and proves; R1's call-off is recorded but its cancel
-        # hit a busy lock. R2 must not prove that pause (R1's retry would then resume it beside
-        # Nova); it finishes R1's call-off instead, and a fresh request takes over cleanly.
-        await self.running_issue()
-        self.assertTrue((await self.hand_off())["handed_off"])
-        handoff._call_off(self.linear_state, REQUEST)
-        r2 = await self.hand_off(request_id=R2)
-        self.assertEqual((r2["handed_off"], r2["state"], r2["reason"]), (False, "resumed", "earlier_handover_called_off"))
-        self.assertIn("Try again", r2["message"])
-        self.assertEqual(self.status(), "ready")
-        retry = await self.hand_off()  # R1 retried: never stops, never resumes anything.
-        self.assertEqual((retry["handed_off"], retry["state"]), (False, "unchanged"), retry)
-        self.assertEqual(self.status(), "ready")
-        r3 = await self.hand_off(request_id=R3)
-        self.assertTrue(r3["handed_off"], r3)
-        self.assertTrue(r3["stopped_here"])
-        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")  # R1 can't touch R3's pause.
-        self.assertEqual(self.status(), "blocked")
-
-    # -- review r2 E: budgets and call-off records ----------------------------------------------
-    async def test_handoff_waits_only_briefly_for_a_busy_issue_lock(self):
-        import time
-        await self.running_issue()
-        with patch.object(handoff, "HANDOFF_LOCK_SECONDS", 0.5), \
-                handoff.issue_lock(handoff._handoff_dir(self.linear_state), "issue-one", 0):
-            started = time.monotonic()
-            result = await self.hand_off(wait_seconds=30)
-            elapsed = time.monotonic() - started
-            self.assertEqual(result["reason"], "handover_in_progress")
-            self.assertLess(elapsed, 5)  # Not the wait plus slack: the requester's timeout always outlasts it.
-            handoff._call_off(self.linear_state, REQUEST)
-            busy = await self.hand_off(wait_seconds=30)
-        self.assertEqual(busy["state"], "stopped")
-        self.assertIn("puts Atlas's work back by itself", busy["message"])
-
-    async def test_handoff_old_call_off_records_are_removed(self):
-        await self.running_issue()
-        directory = handoff._handoff_dir(self.linear_state)
-        handoff._call_off(self.linear_state, R2)
-        stale = handoff._called_off_path(self.linear_state, R2)
-        past = __import__("time").time() - handoff.CALLED_OFF_TTL_SECONDS - 60
-        os.utime(stale, (past, past))
-        self.assertEqual((await self.hand_off(cancel=True))["state"], "unchanged")
-        self.assertFalse(stale.exists())
-        self.assertTrue(handoff._called_off_path(self.linear_state, REQUEST).exists())
-        self.assertEqual(sorted(path.name for path in directory.glob("*.cancelled")),
-                         [handoff._called_off_path(self.linear_state, REQUEST).name])
+        self.assertEqual(self.status(), "blocked")  # And nothing resumed it.
 
     # -- the requester and the real owner hand-off together -------------------------------------
     async def requester(self):
@@ -475,18 +395,19 @@ class Handoff(base.OriginScenarios):
             with patch.dict(os.environ, {}), contextlib.redirect_stdout(out):
                 os.environ.pop("HERMES_KANBAN_HOME", None)  # Atlas's own home and board.
                 rc = ops.run(args, self.linear_state, self.home / "unused", "default", origin_settings=self.settings)
-            if self.lose_reply and not args.cancel:
+            if self.lose_reply and not args.resume:
                 return subprocess.CompletedProcess(argv, 255, "Connection to atlas closed by remote host.\n", "")
             return subprocess.CompletedProcess(argv, rc, "1Password: applied 3 secrets\n" + out.getvalue(), "")
         self.delivered = []
-        def take_over(request_id=REQUEST):
+        def take_over(request_id=REQUEST, action="take_over"):
             with self.nova_kanban, patch.object(subprocess, "run", owner_cli), \
                     patch.object(runtime_session_store, "_worker_process", False), \
                     patch.object(kanban_process_stop, "request_native_stop",
                                  lambda conn, task_id, event_id: self.delivered.append((task_id, event_id))):
-                return json.loads(chat.handle(self.nova, {"action": "take_over", "issue": ISSUE, "id": request_id},
+                return json.loads(chat.handle(self.nova, {"action": action, "issue": ISSUE, "id": request_id},
                                               self.nova_context))
         self.take_over = take_over
+        self.resume_owner = lambda request_id=R3: take_over(request_id, "resume_owner")
 
     def nova_tasks(self):
         with self.nova_kanban, self.nova_board_adapter.conn() as conn:
@@ -517,7 +438,7 @@ class Handoff(base.OriginScenarios):
             self.nova.flush()
         self.assertEqual(self.authority_linear.issues[self.ISSUE]["delegate"]["id"], self.nova.api.viewer_id())
 
-    async def test_handoff_with_requester_failure_after_proof_resumes_the_real_owner(self):
+    async def test_handoff_with_requester_failure_after_proof_leaves_the_real_owner_paused_until_resumed(self):
         from datetime import datetime, timedelta, timezone
         from hermes_fleet_linear_plugin.bridge import Kanban
         from test_linear_specialist_authorization import USER
@@ -536,35 +457,44 @@ class Handoff(base.OriginScenarios):
         with patch.object(Kanban, "create", create):
             reply = await asyncio.to_thread(self.take_over)
         self.assertFalse(reply["ok"], reply)
-        self.assertIn("Atlas's work was resumed and nothing was handed over", reply["message"])
-        self.assertEqual([call[-1] == "--cancel" for call in self.owner_calls], [False, True])
-        # Atlas runs again; Nova runs nothing. Never stopped with nobody running.
+        self.assertEqual(reply["code"], "takeover_paused")
+        self.assertIn("Atlas's work on OPS-1 is paused for a handover to Nova that didn't complete", reply["message"])
+        self.assertIn("Say 'resume OPS-1' to let Atlas continue", reply["message"])
+        self.assertEqual([call[:2] for call in self.owner_calls], [["linear", "hand-off"]])
+        # Atlas stays paused, Nova runs nothing: never both, and nothing resumes Atlas by itself.
+        self.assertEqual(self.status(), "blocked")
+        self.assertTrue(all(task["status"] not in ("ready", "running") for task in self.nova_tasks()))
+        # The person says "resume OPS-1": Atlas continues, and Nova's task can no longer start.
+        resumed = await asyncio.to_thread(self.resume_owner)
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertEqual(self.owner_calls[-1][-1], "--resume")
         self.assertEqual(self.status(), "ready")
-        self.assertEqual([event.kind for event in self.owner_events()][-2:], ["blocked", "unblocked"])
+        with self.nova_kanban:
+            self.nova._recover_admissions()
         self.assertTrue(all(task["status"] not in ("ready", "running") for task in self.nova_tasks()))
 
-    async def test_handoff_with_requester_lost_owner_reply_is_called_off_and_the_real_owner_resumes(self):
+    async def test_handoff_with_requester_lost_owner_reply_leaves_the_real_owner_paused_and_a_retry_finishes(self):
         await self.requester()
         self.lose_reply = True  # Atlas stopped and proved it, but its reply never reached Nova.
         reply = await asyncio.to_thread(self.take_over)
         self.assertFalse(reply["ok"], reply)
-        self.assertEqual(reply["code"], "takeover_refused")
+        self.assertEqual(reply["code"], "takeover_paused")
         self.assertIn("didn't report back", reply["message"])
-        self.assertIn("Atlas's work was resumed and nothing was handed over", reply["message"])
-        self.assertEqual(self.status(), "ready")
+        self.assertIn("may be paused", reply["message"])
+        self.assertEqual(self.status(), "blocked")
         self.assertEqual(self.nova_tasks(), [])
-        # Repeating the same request finishes calling it off: Atlas is never stopped again.
+        # "Take over OPS-1" again (a new id): Atlas proves the same pause, Nova runs the one task.
         self.lose_reply = False
-        again = await asyncio.to_thread(self.take_over)
-        self.assertFalse(again["ok"])
-        self.assertIn("called off earlier", again["message"])
-        self.assertEqual(self.status(), "ready")
+        again = await asyncio.to_thread(self.take_over, R2)
+        self.assertTrue(again["ok"], again)
         self.assertEqual(len([event for event in self.owner_events() if event.kind == "blocked"]), 1)
-
+        (task,) = self.nova_tasks()
+        self.assertIn(task["status"], ("ready", "running"))
+        self.assertEqual(self.status(), "blocked")
 
     async def test_handoff_with_requester_failure_after_admission_keeps_the_real_owner_paused(self):
-        # Review r2 A against the real owner: Nova's task was admitted, then its chat subscription
-        # failed. Atlas must stay paused (never both running); Nova runs the one task.
+        # Nova's task was admitted, then its chat subscription failed. Atlas stays paused (never
+        # both running); Nova runs the one task.
         from hermes_fleet_linear_plugin.bridge import Kanban
         await self.requester()
         def boom(*args, **kwargs):
@@ -572,14 +502,17 @@ class Handoff(base.OriginScenarios):
         with patch.object(Kanban, "subscribe_origin", boom):
             reply = await asyncio.to_thread(self.take_over)
         self.assertTrue(reply["ok"], reply)
-        self.assertEqual([call[-1] == "--cancel" for call in self.owner_calls], [False])
+        self.assertEqual([call[:2] for call in self.owner_calls], [["linear", "hand-off"]])
         self.assertEqual(self.status(), "blocked")
         (task,) = self.nova_tasks()
         self.assertIn(task["status"], ("ready", "running"))
+        refused = await asyncio.to_thread(self.resume_owner)  # A person's resume can't run Atlas beside it.
+        self.assertEqual(refused["code"], "resume_refused")
+        self.assertEqual(self.status(), "blocked")
 
     async def test_handoff_with_requester_running_task_never_reaches_the_real_owner_again(self):
-        # Review r2 B against the real owner: after the takeover, retries of the same or another
-        # request (Linear still shows Atlas until routing flushes) never reach Atlas.
+        # After the takeover, retries of the same or another request (Linear still shows Atlas
+        # until routing flushes) never reach Atlas.
         await self.requester()
         self.assertTrue((await asyncio.to_thread(self.take_over))["ok"])
         calls = list(self.owner_calls)

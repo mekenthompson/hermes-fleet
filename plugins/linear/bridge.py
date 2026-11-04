@@ -590,8 +590,8 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     if handoff and kind == "needs_input":
         to = handoff.group("to")
         return "response", (f"Paused for a handover to {to}. Nothing is needed from you: {to} continues this work "
-                            "once the handover is confirmed; if the handover doesn't complete, the agent or an "
-                            "operator resumes it.")
+                            f"once the handover is confirmed. If it doesn't complete, {to} says so here and this work "
+                            f"stays paused until someone asks {to} to resume it or to take it over again.")
     if task_status == "triage":
         return "error", ("Paused after the same problem came back several times. An operator needs to check "
                          "the task on the agent's board before work continues.")
@@ -1879,6 +1879,11 @@ class Bridge:
         if prior and prior.get("state") in ("applied", "reconcile"):
             self._pending_assignment_stop(row)
             return True
+        handover = self.store.handover(issue_id) or {}
+        if takeover_from and (handover.get("state") != "proven" or handover.get("from") != takeover_from):
+            # A takeover's task runs only while the old delegate is paused by a proven handover. A
+            # person resuming the old delegate (resume_owner) returns it; a new proof restores it.
+            return False
         adapter = self._binding_adapter(issue_id)
         binding = self.store.native_binding(issue_id)
         if (not binding or binding["task_id"] != row["task_id"] or
@@ -1946,14 +1951,15 @@ class Bridge:
         Only when no person changed state, assignee or delegate since the chat request: someone
         reassigning or undelegating it wins, however late admission resumes (after a crash, or
         while our delegate write is pending or held). The history read is skipped only when
-        Linear has not moved since the request. For take_over the old delegate app's own writes
-        (it reporting its pause) are not a person's decision.
+        Linear has not moved since the request. For take_over the old delegate app reporting its
+        pause (moving the issue to Blocked) is not a person's decision; any other move by it (it
+        reporting that someone resumed it) is, so a late admission never runs beside it.
         """
         if iso_ms(issue.get("updatedAt")) <= float(payload["source_ms"]):
             return True
         old = payload.get("takeover_from")
         if self._human_routing_changed(issue_id, float(payload["source_ms"]),
-                                       ignore_actors=(old,) if isinstance(old, str) and old else ()):
+                                       pause_of=(old, self.state_id(issue, "blocked")) if isinstance(old, str) and old else None):
             diag.evt("claim.decision", "skipped", "human_routing_change", iss=issue_id)
             return False
         return True
@@ -2175,11 +2181,9 @@ class Bridge:
         left; otherwise ("refuse", plain words). Raises entrust's own refusals (LinearError) as
         entrust_checks does.
 
-        The invariant: while a task for this issue is ready or running here, the old delegate
-        is never asked for anything (a hand-off that cannot be proven resumes its work, and so
-        does a call-off), so both agents can never end up running it. An existing local task is
-        reused by entrust, never replaced; one that is not open and runnable would leave nobody
-        running the work once the old delegate stops."""
+        While a task for this issue is ready or running here, the old delegate is never asked
+        for anything. An existing local task is reused by entrust, never replaced; one that is
+        not open and runnable would leave nobody running the work once the old delegate stops."""
         with self.lock(issue_id):
             issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
             if row is not None:
@@ -2197,7 +2201,7 @@ class Bridge:
                         return "already_here", None
                     return "refuse", ("this agent already has work running on this issue, so the other agent was not "
                                       "asked to stop; a person needs to decide which one continues")
-                if task.status == "blocked" and from_this_takeover and activation is None:
+                if task.status == "blocked" and from_this_takeover and (activation or {}).get("state") in (None, "attempting"):
                     return "ask_owner", None  # This takeover's own creation, not yet admitted: admission follows the proof.
                 return "refuse", _local_work_problem(task.status)
             if self.store.native_intent(f"create:{issue_id}") is not None:
@@ -2215,14 +2219,35 @@ class Bridge:
             return "refuse", _local_work_problem(task.status)
 
     def takeover_local_status(self, issue_id: str) -> str | None:
-        """The status of this agent's bound task for the issue (None when nothing is bound). Native
-        reads only: take_over asks this after a failed start, and never calls the handover off
-        (which resumes the old delegate) while it says ready or running."""
+        """The status of this agent's bound task for the issue (None when nothing is bound)."""
         with self.lock(issue_id):
             row = self.store.get(issue_id)
             if row is None or row.get("origin") != "native":
                 return None
             return self._binding_adapter(issue_id).require_task(row["task_id"]).status
+
+    def takeover_proven(self, issue_id: str, takeover_from: str, request_id: str) -> None:
+        """The old delegate proved its run ended for this handover: this agent's takeover task may run."""
+        with self.lock(issue_id):
+            self.store.set_handover(issue_id, {"state": "proven", "from": takeover_from, "request_id": request_id})
+
+    def takeover_give_back(self, issue_id: str, takeover_from: str) -> str | None:
+        """Before a person's resume of the old delegate: None once this agent's takeover task can
+        no longer start (it is returned, under the same lock admission takes), or plain words for
+        why the old delegate must not be resumed (work for the issue runs or ran here)."""
+        with self.lock(issue_id):
+            row = self.store.get(issue_id)
+            if row is not None:
+                task = (self._binding_adapter(issue_id).require_task(row["task_id"])
+                        if row.get("origin") == "native" else None)
+                activation = self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}
+                if task is None or task.status != "blocked" or activation.get("accepted"):
+                    status = getattr(task, "status", None)
+                    return ("this agent is already running it" if status in ("ready", "running") else
+                            "this agent's work on it has already finished" if status in ("done", "archived") else
+                            "this agent already has work linked to it")
+            self.store.set_handover(issue_id, {"state": "returned", "from": takeover_from})
+            return None
 
     def _existing_task(self, issue: dict, existing: list):
         """The one native task already pointing at this issue that entrust may link, or LinearError."""
@@ -2630,7 +2655,8 @@ class Bridge:
                                                 ignore_actors=(old,) if old else ()))):
             raise LinearError("Linear changed; read current status before routing work", retryable=False)
         return issue
-    def _human_routing_changed(self, issue_id: str, since_ms: float, *, ignore_actors: tuple = ()) -> bool:
+    def _human_routing_changed(self, issue_id: str, since_ms: float, *, ignore_actors: tuple = (),
+                               pause_of: tuple[str, str | None] | None = None) -> bool:
         """Did anyone but this app change state, assignee or delegate after since_ms?
 
         Comments, attachments, labels and our own writes move updatedAt but
@@ -2638,10 +2664,17 @@ class Bridge:
         History is read page by page back to since_ms; an unprovable answer
         (more than HISTORY_PAGES pages newer than since_ms) counts as changed.
         ``ignore_actors`` names other app users whose writes are not a person's decision.
+        ``pause_of`` (actor, Blocked state id) ignores only that app moving the issue to Blocked,
+        with no assignee or delegate change: its own pause report, never its resume.
         """
         mine = {self.api.viewer_id(), *ignore_actors}
+        def pause_report(node):
+            return (pause_of is not None and pause_of[1] is not None and node.get("actorId") == pause_of[0]
+                    and node.get("toStateId") == pause_of[1] and node.get("fromAssigneeId") == node.get("toAssigneeId")
+                    and (node.get("fromDelegate") or {}).get("id") == (node.get("toDelegate") or {}).get("id"))
         def human(node):
-            return iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") not in mine
+            return (iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") not in mine
+                    and not pause_report(node))
         nodes, complete = self._routing_scan(issue_id, lambda page: any(human(node) for node in page) or any(
             iso_ms(node.get("createdAt")) <= since_ms for node in page))
         # Every node is checked against the fence; no reliance on Linear's ordering within what was read.
@@ -3012,7 +3045,7 @@ class Bridge:
         created_for = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {})
         old = self._takeover_replaces(issue_id, task.id)
         if created_for.get("takeover_from") and self._chat_started(row) and old is None:
-            # A takeover's task that was never admitted (the handover was called off): no decision yet.
+            # A takeover's task that was never admitted: routing follows its admission, if any.
             return self._log_delegate(row, "takeover_not_admitted", quiet=True)
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
@@ -4328,25 +4361,6 @@ class Bridge:
                             diag.evt("ingress.parked", "failed", "invalid_payload", level=logging.ERROR, evt=delivery)
                 db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
                            "AND delivery_id = ?", (status, agent, delivery))
-    def _resolve_takeovers(self) -> None:
-        """Finish take_overs that ended uncertain or whose process stopped after asking the old
-        delegate (chat.resolve_unfinished_takeovers), in one background thread: the owner call
-        can take minutes and must not hold up the tick."""
-        directory = self.store.path.parent / "takeover"
-        if not directory.is_dir() or not any(directory.glob("*.inflight.json")):
-            return
-        running = getattr(self, "_takeover_resolver", None)
-        if running is not None and running.is_alive():
-            return
-        from .chat import resolve_unfinished_takeovers
-        def run():
-            try:
-                resolve_unfinished_takeovers(self)
-            except Exception as exc:  # noqa: BLE001 - retried on a later tick
-                diag.warn("chat.entrust", "failed", "takeover_resolve_failed", exc=type(exc).__name__)
-        self._takeover_resolver = threading.Thread(target=run, name="linear-takeover-resolve", daemon=True)
-        self._takeover_resolver.start()
-
     def tick(self, ingress: Path | None = None) -> None:
         started = time.monotonic()
         try:
@@ -4356,7 +4370,6 @@ class Bridge:
             self._recover_admissions()
             self.pump_kanban()
             self.recheck()
-            self._resolve_takeovers()
         except Throttled:
             # Budget nearly spent: reads wait for the reset, but queued writes still go out.
             diag.evt("api.result", "held", "budget_deferred", kind="tick")

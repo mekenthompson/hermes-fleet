@@ -297,9 +297,9 @@ class Server:
 def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
     # Only capture_context() at the registered tool boundary produces this snapshot.
     validated = NativeContext.from_wire(context.to_wire(), home, context.profile)
-    # take_over waits for the other agent's run to wind down; its worst case (two owner calls with
+    # take_over waits for the other agent's run to wind down; its worst case (one owner call with
     # the capped wait, plus one start here) is worked out in handoff and stays below this.
-    if args.get('action') == 'take_over':
+    if args.get('action') in ('take_over', 'resume_owner'):
         from .handoff import CLIENT_TIMEOUT_SECONDS
         timeout = CLIENT_TIMEOUT_SECONDS
     else:

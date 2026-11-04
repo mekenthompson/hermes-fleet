@@ -1,4 +1,4 @@
-"""Owner side of an agent-to-agent takeover: stop, prove, then hand over or put things back.
+"""Owner side of an agent-to-agent takeover: stop, prove, hand over. Nothing resumes by itself.
 
 ``hermes linear hand-off`` runs inside the profile that owns the work (the old delegate),
 started by the requester's ``take_over`` through the operator-configured owner command.
@@ -7,24 +7,20 @@ In one call, in code, it:
 1. checks everything that can be checked before touching the work (the issue's reporting
    link, the one native task, its issue scope, guarded controls, the native Stop getter and
    any tasks it started) and refuses with nothing changed if any of them fails;
-2. pauses the task with one guarded native Stop whose reason names the handover;
+2. pauses the task with one guarded native Stop whose reason names the handover and carries
+   the request id;
 3. waits for the existing cleanup proof (``cleanup.inspect``) to show the stopped work has
-   fully ended;
-4. on proof, reports ``handed_off`` with the evidence; the requester then continues the work
-   as its one tracked task. Without proof it resumes the task it paused (guarded on the
-   event it last saw), so the work never ends up stopped with nobody running it.
+   fully ended, and reports ``handed_off`` with the evidence.
 
-A task that is already paused for input (for example by an earlier, uncoordinated stop) is
-not stopped again: only the proof runs, and a failed proof leaves it exactly as it was.
-Repeating the call with the same request id is safe: the Stop carries that id, so a retry
-after a lost reply proves the same Stop instead of stopping twice. ``cancel`` calls a request
-off, for a requester that could not start its side or never heard back: it records the call-off
-first (a hand-off still running for that request then undoes its own Stop instead of reporting
-a handover nobody continues) and resumes the task only while the latest Stop is still this
-request's own. One hand-off or cancel runs per issue at a time (a file lock beside the state
-database). A task already paused for a handover to a different agent is never proven for
-another one. Nothing here grants permission; the requester's chat request is the authority,
-exactly as for ``work_on``.
+Two agents never run the same work, so nothing here ever resumes the task by itself. When the
+proof fails after the pause, the work stays paused (``state: paused``) and the reply says so
+plainly; only a person resumes it, through ``--resume`` (the requester's ``resume_owner``), or
+retries the takeover. A task already paused for a handover to the same agent is proven again,
+never stopped twice, so retrying with the same request id (or a new one) is safe. A pause made
+outside this flow (a person's Stop) is only proven, never changed, and a pause for a handover
+to a different agent is never proven for this one. One hand-off or resume runs per issue at a
+time (a file lock beside the state database). Nothing here grants permission; the requester's
+chat request is the authority, exactly as for ``work_on``.
 """
 from __future__ import annotations
 
@@ -52,25 +48,18 @@ DEFAULT_WAIT_SECONDS = 90.0
 MAX_WAIT_SECONDS = 300.0  # What the owner CLI accepts; a takeover entry is capped lower, below.
 POLL_SECONDS = 2.0
 LOCK_POLL_SECONDS = 0.2
-# Budgets. A hand-off never waits long for the issue lock (another step holds it for at most
-# about one proof wait; a busy lock is a plain "try again"), so the owner's reply always comes
-# within the wait plus OWNER_CALL_OVERHEAD_SECONDS: the lock wait, the checks before the Stop,
-# the Stop, one last proof read past the wait and the resume. A --cancel waits up to the wait
-# plus LOCK_SLACK_SECONDS for a hand-off still running for the same request to finish (which
-# then undoes its own Stop), and its own work fits in the rest of the overhead.
+# Budgets. The owner waits at most HANDOFF_LOCK_SECONDS for the issue lock (a busy lock is a
+# plain "try again"), so its reply comes within the proof wait plus OWNER_CALL_OVERHEAD_SECONDS.
+# One take_over is this side's Linear reads before the owner is asked (a Linear deadline), one
+# owner call (the subprocess timeout) and one start here (its own Linear deadline); the chat
+# client always outlasts that sum.
 HANDOFF_LOCK_SECONDS = 10.0
-LOCK_SLACK_SECONDS = 30.0
 OWNER_CALL_OVERHEAD_SECONDS = 60.0
-# One take_over, worked out from the capped wait so the chat client always outlasts the
-# server's own worst case: this side's Linear reads before the owner is asked (bounded by a
-# Linear deadline), at most two owner calls (hand-off, then one --cancel, each bounded by the
-# subprocess timeout), and one start here (bounded by its own Linear deadline).
 TAKEOVER_MAX_WAIT_SECONDS = 120.0
 BEFORE_OWNER_BUDGET_SECONDS = 40.0
 ENTRUST_BUDGET_SECONDS = 60.0
-CLIENT_TIMEOUT_SECONDS = (BEFORE_OWNER_BUDGET_SECONDS + 2 * (TAKEOVER_MAX_WAIT_SECONDS + OWNER_CALL_OVERHEAD_SECONDS)
+CLIENT_TIMEOUT_SECONDS = (BEFORE_OWNER_BUDGET_SECONDS + TAKEOVER_MAX_WAIT_SECONDS + OWNER_CALL_OVERHEAD_SECONDS
                           + ENTRUST_BUDGET_SECONDS + 20.0)
-CALLED_OFF_TTL_SECONDS = 30 * 86400.0  # A request id is retried within minutes; its call-off record is kept a month.
 STOPPABLE = ("running", "ready")
 PAUSED = ("blocked", "triage")
 # Cleanup holds that clear by themselves while a stopped worker winds down. Every other hold
@@ -91,12 +80,13 @@ REFUSALS = {
                          "a review), so it was left as it is.",
     "started_other_tasks": "{owner}'s work on this issue started other tasks that are still open, so it was left "
                            "running; those need to finish or be stopped first.",
-    "controls_unsupported": "{owner}'s version can't stop and resume work safely for a handover, so nothing was "
-                            "changed.",
+    "controls_unsupported": "{owner}'s version can't stop work safely for a handover, so nothing was changed.",
     "changed_during_handoff": "{owner}'s work changed while the handover was being set up, so nothing was changed. "
                               "Try again.",
-    "handover_in_progress": "{owner}'s work is already being handed over to another agent, so it was left as it is. "
-                            "Try again once that handover has finished or been called off.",
+    "handover_in_progress": "{owner}'s work is already paused for a handover to another agent, so it was left as "
+                            "it is.",
+    "handoff_busy": "{owner} is already handling a handover step for this issue, so nothing more was changed. "
+                    "Try again shortly.",
 }
 
 
@@ -108,10 +98,21 @@ def resume_request_id(request_id: str) -> str:
     return "linear:" + hashlib.sha256(f"handoff-resume:{request_id}".encode()).hexdigest()
 
 
-def _refuse(reason: str, owner: str, **extra: Any) -> dict:
+def _unchanged(reason: str, message: str) -> dict:
+    return {"handed_off": False, "state": "unchanged", "reason": reason, "message": message, "permission_granted": False}
+
+
+def _refuse(reason: str, owner: str) -> dict:
     diag.evt("handoff.decision", "refused", reason)
-    return {"handed_off": False, "state": "unchanged", "reason": reason,
-            "message": REFUSALS[reason].format(owner=owner), "permission_granted": False, **extra}
+    return _unchanged(reason, REFUSALS[reason].format(owner=owner))
+
+
+def _paused(reason: str, owner: str, to: str, why: str) -> dict:
+    """The work stays paused for this handover; nothing resumes it by itself."""
+    diag.evt("handoff.decision", "held", reason)
+    return {"handed_off": False, "state": "paused", "reason": reason, "permission_granted": False, "why": why,
+            "message": f"{owner}'s work is paused for a handover to {to} that didn't complete: {why} "
+                       f"Nothing was resumed automatically."}
 
 
 # Plain facts for the holds people meet most often in a handover; cleanup.HOLD_FACTS has the rest.
@@ -123,27 +124,21 @@ HOLD_FACTS = {
     "issue_scope_fenced": "earlier changes on this issue are held for a check.",
     "native_stop_checkpoint_unsupported": "that agent's version can't confirm a stop has finished.",
     "invalid_cleanup_selector": "the request did not name the issue completely.",
+    "cleanup_evidence_unavailable": "its work couldn't be checked.",
 }
 
 
-def _hold_message(reason: str, owner: str) -> str:
-    fact = HOLD_FACTS.get(reason) or cleanup.HOLD_FACTS.get(reason)
-    if not fact:
-        return "The handover couldn't be confirmed safe."
-    return "The handover couldn't be confirmed safe: " + fact[0].lower() + fact[1:]
+def _fact(reason: str) -> str:
+    fact = HOLD_FACTS.get(reason) or cleanup.HOLD_FACTS.get(reason) or "it couldn't be confirmed safe."
+    return fact[0].lower() + fact[1:]
+
+
+def _hold_message(reason: str) -> str:
+    return "The handover couldn't be confirmed safe: " + _fact(reason)
 
 
 def _stops(events: list) -> list:
     return [event for event in events if event.kind in ("blocked", "block_loop_detected")]
-
-
-def _own_stop(events: list, reason: str):
-    """This request's Stop, when it is the latest Stop and nothing resumed or finished the task after it."""
-    stops = _stops(events)
-    if not stops or (stops[-1].payload or {}).get("reason") != reason:
-        return None
-    later = [event for event in events if event.id > stops[-1].id and event.kind in ("unblocked", "completed", "archived")]
-    return None if later else stops[-1]
 
 
 def _live_stop(events: list):
@@ -153,6 +148,13 @@ def _live_stop(events: list):
         return None
     later = [event for event in events if event.id > stops[-1].id and event.kind in ("unblocked", "completed", "archived")]
     return None if later else stops[-1]
+
+
+def _handover_to(stop) -> str | None:
+    """The agent a Stop paused the work for, when it is this flow's exact guarded handover pause."""
+    payload = (stop.payload or {}) if stop is not None else {}
+    made = HANDOFF_PATTERN.fullmatch(str(payload.get("reason") or "")) if payload.get("kind") == "needs_input" else None
+    return made.group("to") if made else None
 
 
 def _started_open(adapter, task_id: str) -> bool:
@@ -189,32 +191,6 @@ def _would_fence(adapter, task) -> bool:
         return False
     previous = (task.block_recurrences or 0) if task.block_kind == "needs_input" else 0
     return previous + 1 >= int(getattr(adapter.kb, "BLOCK_RECURRENCE_LIMIT", 1))
-
-
-def _resume(adapter, task_id: str, request_id: str, holds: Callable[[Any], bool]) -> str:
-    """Resume the pause this request holds (``holds(stop)``; see _holder): "resumed"; "absent"
-    when this request never held a pause of this task; "not_ours" when anyone acted on it since,
-    or a later request holds it now (their decision stands); "failed" when it is still this
-    request's pause but cannot be resumed here (for example our own Stop left it in TRIAGE,
-    which only an operator lifts). Guarded on the latest event; repeated reads absorb late
-    worker events (the exit result arrives after the Stop)."""
-    label = resume_request_id(request_id)
-    for _ in range(4):
-        events = adapter.history(task_id, 0)
-        if any(event.kind == "unblocked" and (event.payload or {}).get("request_id") == label for event in events):
-            return "resumed"
-        stop = _live_stop(events)
-        if stop is None or not holds(stop):
-            return "not_ours" if stop is not None or any(holds(event) for event in _stops(events)) else "absent"
-        status = adapter.require_task(task_id).status
-        if status == "triage":
-            return "failed"
-        if status != "blocked":
-            return "not_ours"
-        with adapter.conn() as conn:
-            if adapter.kb.unblock_task(conn, task_id, expected_event_id=events[-1].id, request_id=label):
-                return "resumed"
-    return "failed"
 
 
 def _context(state: Path, issue: str, metadata: Any, request_id: Any, to: Any):
@@ -275,142 +251,36 @@ def issue_lock(directory: Path, issue_id: str, timeout: float):
         os.close(fd)
 
 
-def _called_off_path(state: Path, request_id: str) -> Path:
-    return _handoff_dir(state) / (_digest("called-off", request_id) + ".cancelled")
-
-
-def _call_off(state: Path, request_id: str) -> None:
-    """Record that this request was called off. Written before cancel waits for the issue lock,
-    so a hand-off still running for the same request undoes its own Stop instead of reporting a
-    handover nobody will continue, and a later hand-off with this id never stops anything.
-    Records older than CALLED_OFF_TTL_SECONDS are removed here (best effort)."""
-    path = _called_off_path(state, request_id)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
-    cutoff = time.time() - CALLED_OFF_TTL_SECONDS
-    for old in path.parent.glob("*.cancelled"):
-        try:
-            if old != path and old.stat().st_mtime < cutoff:
-                old.unlink()
-        except OSError:
-            pass
-
-
-def _is_called_off(state: Path, request_id: str) -> bool:
-    return _called_off_path(state, request_id).exists()
-
-
-# Who may resume a handover pause. A pause is held by the request that made it, until a later
-# request for the same agent proves that same pause and reports it handed over: from then on
-# that later request alone holds it. Only the holder's call-off resumes the pause, so a retry
-# (or a late call-off) of an older request never resumes work a newer request handed over.
-# Pauses this flow did not make (a person's Stop) are held by nobody and never resumed here.
-def _holder_path(state: Path, issue_id: str) -> Path:
-    return _handoff_dir(state) / (_digest("holder", issue_id) + ".json")
-
-
-def _holder(state: Path, issue_id: str, task_id: str, stop) -> str | None:
-    """The request id that holds this Stop, or None."""
+def _checked(state: Path, issue: str, metadata: Any, request_id: Any, to: Any, owner: str, step: Callable) -> dict:
+    """Validate the request, take the owner's issue lock, then run ``step(context)``."""
     try:
-        record = json.loads(_holder_path(state, issue_id).read_text())
-    except FileNotFoundError:
-        record = None
-    if (isinstance(record, dict) and record.get("task_id") == task_id
-            and record.get("stop_event_id") == stop.id and isinstance(record.get("request_id"), str)):
-        return record["request_id"]
-    payload = stop.payload or {}
-    made = HANDOFF_PATTERN.fullmatch(str(payload.get("reason") or "")) if payload.get("kind") == "needs_input" else None
-    return made.group("request_id") if made else None
-
-
-def _hold(state: Path, issue_id: str, task_id: str, stop_id: int, request_id: str) -> None:
-    """Record that ``request_id`` now holds this Stop (atomic replace; caller holds the issue lock)."""
-    path = _holder_path(state, issue_id)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump({"task_id": task_id, "stop_event_id": stop_id, "request_id": request_id}, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
-
-
-def _holds(state: Path, issue_id: str, task_id: str, request_id: str) -> Callable[[Any], bool]:
-    return lambda stop: _holder(state, issue_id, task_id, stop) == request_id
-
-
-def _unchanged(reason: str, message: str) -> dict:
-    return {"handed_off": False, "state": "unchanged", "reason": reason, "message": message, "permission_granted": False}
-
-
-def _stuck(owner: str, reason: str, prefix: str = "") -> dict:
-    return {"handed_off": False, "state": "stopped", "reason": reason, "permission_granted": False,
-            "message": prefix + f"{owner}'s work is paused and could not be resumed automatically: an operator "
-                                f"needs to resume it on {owner}'s board."}
-
-
-def _undo(adapter, task_id: str, request_id: str, holds: Callable[[Any], bool], held: str, owner: str,
-          prefix: str) -> dict:
-    """Put back the Stop this request made. Whatever goes wrong, never report "unchanged" for
-    work this request may have paused: "resumed", "unchanged" only when this request's Stop is
-    provably absent or someone acted on it since, otherwise "stopped" (an operator resumes it)."""
-    try:
-        resumed = _resume(adapter, task_id, request_id, holds)
-    except Exception as exc:  # noqa: BLE001 - every failure here leaves the pause in place
-        diag.evt("handoff.decision", "failed", "handoff_stuck", exc=type(exc).__name__)
-        resumed = "failed"
-    if resumed == "absent":
-        diag.evt("handoff.decision", "refused", "changed_during_handoff", task=task_id)
-        return _unchanged("changed_during_handoff", prefix + f"{owner}'s work was left as it was, and nothing was "
-                                                             "handed over.")
-    if resumed == "not_ours":
-        diag.evt("handoff.decision", "skipped", "changed_during_handoff", task=task_id)
-        return _unchanged("changed_during_handoff", prefix + f"Someone resumed, stopped or took over {owner}'s work "
-                                                             "during the handover, so it was left as they set it, and "
-                                                             "nothing was handed over.")
-    if resumed == "resumed":
-        diag.evt("handoff.decision", "applied", "handoff_resumed", task=task_id)
-        return {"handed_off": False, "state": "resumed", "reason": held, "permission_granted": False,
-                "message": prefix + f"{owner}'s work was resumed and nothing was handed over."}
-    diag.evt("handoff.decision", "failed", "handoff_stuck", task=task_id)
-    return _stuck(owner, held, prefix)
+        context = _context(state, issue, metadata, request_id, to)
+    except Unknown as exc:
+        diag.evt("handoff.decision", "refused", str(exc))
+        return _unchanged(str(exc), _hold_message(str(exc)) + " Nothing was changed.")
+    except Exception as exc:  # noqa: BLE001 - nothing has been read or changed yet
+        diag.evt("handoff.decision", "refused", "cleanup_evidence_unavailable", exc=type(exc).__name__)
+        return _unchanged("cleanup_evidence_unavailable", f"{owner}'s work couldn't be checked, so nothing was changed.")
+    with issue_lock(_handoff_dir(state), metadata["id"], HANDOFF_LOCK_SECONDS) as held:
+        if not held:
+            return _refuse("handoff_busy", owner)
+        return step(context)
 
 
 def hand_off(state: Path, issue: str, binding_profile: str, settings: dict, metadata: dict, *, to: str, request_id: str,
              owner_name: str | None = None, ingress: Path | None = None, wait_seconds: float = DEFAULT_WAIT_SECONDS,
              clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
              inspect_cleanup: Callable[..., dict] = cleanup.inspect) -> dict:
-    """Hand this profile's work on one issue to ``to``, or change nothing and say why.
+    """Hand this profile's work on one issue to ``to``: "handed_off", "unchanged" (nothing was
+    changed) or "paused" (the work is paused for this handover, which didn't complete).
 
     ``binding_profile`` is the deployment profile the cleanup proof scopes to; ``owner_name``
-    only words the reply. One hand-off or cancel runs per issue at a time."""
+    only words the reply."""
     owner = owner_name or binding_profile
-    try:
-        context = _context(state, issue, metadata, request_id, to)
-        wait = max(0.0, min(float(wait_seconds), MAX_WAIT_SECONDS))
-    except Unknown as exc:
-        diag.evt("handoff.decision", "refused", str(exc))
-        return _unchanged(str(exc), _hold_message(str(exc), owner) + " Nothing was changed.")
-    except Exception as exc:  # noqa: BLE001 - nothing has been read or changed yet
-        diag.evt("handoff.decision", "refused", "cleanup_evidence_unavailable", exc=type(exc).__name__)
-        return _unchanged("cleanup_evidence_unavailable", f"{owner}'s work couldn't be checked, so nothing was changed.")
-    with issue_lock(_handoff_dir(state), metadata["id"], HANDOFF_LOCK_SECONDS) as held:
-        if not held:
-            if _is_called_off(state, request_id):
-                return _stuck(owner, "handover_in_progress", _BEING_CALLED_OFF.format(owner=owner))
-            return _refuse("handover_in_progress", owner)
-        if _is_called_off(state, request_id):
-            # A retry of a request that was called off finishes calling it off; it never stops anything.
-            return _cancel_locked(state, binding_profile, metadata, context, to=to, request_id=request_id, owner=owner,
-                                  prefix="This handover was called off earlier, so it was not started again. ")
-        return _hand_off_locked(state, binding_profile, settings, metadata, context, to=to, request_id=request_id,
-                                owner=owner, ingress=ingress, wait=wait, clock=clock, sleep=sleep,
-                                inspect_cleanup=inspect_cleanup)
-
-
-_BEING_CALLED_OFF = ("The handover is being called off while {owner}'s last step for it finishes; that step puts "
-                     "{owner}'s work back by itself. ")
+    wait = max(0.0, min(float(wait_seconds), MAX_WAIT_SECONDS))
+    return _checked(state, issue, metadata, request_id, to, owner, lambda context: _hand_off_locked(
+        state, binding_profile, settings, metadata, context, to=to, request_id=request_id, owner=owner,
+        ingress=ingress, wait=wait, clock=clock, sleep=sleep, inspect_cleanup=inspect_cleanup))
 
 
 def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata: dict, context, *, to: str,
@@ -420,7 +290,6 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
     home, native_profile = context
     issue_id = metadata["id"]
     reason = handoff_reason(to, request_id)
-    stop_now = adopt = False
     try:
         bound = cleanup._binding(state, issue_id, native_profile)
         if bound is None:
@@ -440,11 +309,14 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             raise Unknown("native_task_issue_scope_conflict")
         events = adapter.history(task.id, 0)
         live = _live_stop(events)
-        holder = _holder(state, issue_id, task.id, live) if live is not None else None
-        stopped_here = False
-        if holder == request_id:
-            # A retry after a lost reply: prove the same Stop, never stop twice.
-            stop_id, stopped_here = live.id, (live.payload or {}).get("reason") == reason
+        for_to = _handover_to(live) == to
+        if live is not None and _handover_to(live) is not None and not for_to:
+            # Paused for another agent's handover: proving it here would let two agents continue it.
+            return _refuse("handover_in_progress", owner)
+        if for_to:
+            # Already paused for a handover to this same agent (a retry, or an earlier request
+            # that didn't complete): prove that pause, never stop twice.
+            stop_id, ours = live.id, True
         elif task.status in ("done", "archived"):
             return _refuse("task_finished_here", owner)
         elif task.status in PAUSED:
@@ -452,24 +324,7 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             if (task.block_kind != "needs_input" or task.current_run_id is not None or not stops
                     or (stops[-1].payload or {}).get("kind") != "needs_input"):
                 return _refuse("task_not_handable", owner)
-            other = HANDOFF_PATTERN.fullmatch(str((stops[-1].payload or {}).get("reason") or ""))
-            if other and holder is not None and _is_called_off(state, holder):
-                # An earlier handover of this pause was called off but never finished (its call-off
-                # timed out): finish it, so the work is never left paused with nobody to run it.
-                result = _cancel_locked(state, binding_profile, metadata, context, to=to, request_id=holder,
-                                        owner=owner, prefix="")
-                if result["state"] == "resumed":
-                    return {**result, "reason": "earlier_handover_called_off",
-                            "message": f"An earlier handover of {owner}'s work had been called off, so {owner}'s work "
-                                       "was resumed and nothing was handed over. Try again to take it over."}
-                return result
-            if other and other.group("to") != to:
-                # Paused for another agent's handover: proving that pause here would let two agents
-                # continue the same work. That handover finishes or is called off first.
-                return _refuse("handover_in_progress", owner)
-            # Already paused: prove that Stop, change nothing. A handover pause for this same agent
-            # (an earlier request whose requester never finished) is taken over on proof.
-            stop_id, adopt = stops[-1].id, bool(other)
+            stop_id, ours = stops[-1].id, False  # A person's pause: prove it, change nothing.
         elif task.status not in STOPPABLE:
             return _refuse("task_not_handable", owner)
         else:
@@ -481,18 +336,17 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             preflight = inspect_cleanup(state, issue_id, binding_profile, events[-1].id, settings, metadata, ingress=ingress)
             if preflight.get("reason") not in ("task_not_currently_stopped", "stop_event_changed"):
                 raise Unknown(preflight.get("reason") or "cleanup_evidence_unavailable")
-            stop_now = True
+            stop_id = None
     except Unknown as exc:
         diag.evt("handoff.decision", "refused", str(exc))
-        return _unchanged(str(exc), _hold_message(str(exc), owner) + " Nothing was changed.")
+        return _unchanged(str(exc), _hold_message(str(exc)) + " Nothing was changed.")
     except Exception as exc:  # noqa: BLE001 - nothing has been stopped yet
         diag.evt("handoff.decision", "refused", "cleanup_evidence_unavailable", exc=type(exc).__name__)
         return _unchanged("cleanup_evidence_unavailable", f"{owner}'s work couldn't be checked, so nothing was changed.")
 
     task_id = bound["task_id"]
-    holds = _holds(state, issue_id, task_id, request_id)
-    if stop_now:
-        # From here on the work may be paused: every failure rechecks and resumes, never "unchanged" blindly.
+    if stop_id is None:
+        # The one guarded Stop. From here on the work may be paused: nothing ever resumes it here.
         try:
             _block(adapter, task, reason, events[-1].id)
         except Exception as exc:  # noqa: BLE001
@@ -503,14 +357,17 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             after = adapter.history(task_id, 0)
         except Exception as exc:  # noqa: BLE001
             diag.evt("handoff.decision", "held", "stop_unverified", exc=type(exc).__name__)
-            return _undo(adapter, task_id, request_id, holds, "cleanup_evidence_unavailable", owner,
-                         f"{owner}'s work couldn't be checked after it was asked to stop. ")
-        mine = _own_stop(after, reason)
-        if mine is None:
+            return _paused("stop_unverified", owner, to, "its work couldn't be checked after it was asked to stop, "
+                                                        "so it may be paused.")
+        live = _live_stop(after)
+        if live is None or (live.payload or {}).get("reason") != reason:
             if not any((stop.payload or {}).get("reason") == reason for stop in _stops(after)):
                 return _refuse("changed_during_handoff", owner)  # The guarded Stop never landed.
-            return _undo(adapter, task_id, request_id, holds, "changed_during_handoff", owner, "")
-        stop_id, stopped_here = mine.id, True
+            diag.evt("handoff.decision", "skipped", "changed_during_handoff", task=task_id)
+            return _unchanged("changed_during_handoff", f"Someone resumed, stopped or finished {owner}'s work during "
+                                                        "the handover, so it was left as they set it, and nothing was "
+                                                        "handed over.")
+        stop_id, ours = live.id, True
         diag.evt("handoff.decision", "stopped", "-", task=task_id, evt=stop_id)
 
     # Prove the stopped work has ended. Only holds that clear while a worker winds down are waited on.
@@ -522,21 +379,9 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             diag.evt("handoff.decision", "held", "cleanup_evidence_unavailable", exc=type(exc).__name__)
             proof = {"quiescence_proven": False, "reason": "cleanup_evidence_unavailable"}
         if proof.get("quiescence_proven") is True:
-            if _is_called_off(state, request_id):
-                # Called off while this proof ran (the requester gave up waiting): nobody will continue it.
-                return _cancel_locked(state, binding_profile, metadata, context, to=to, request_id=request_id,
-                                      owner=owner, prefix="The handover was called off before it finished. ")
-            if adopt:
-                try:
-                    _hold(state, issue_id, task_id, stop_id, request_id)
-                except Exception as exc:  # noqa: BLE001 - unrecorded, the older request could still resume it
-                    diag.evt("handoff.decision", "refused", "holder_unrecorded", exc=type(exc).__name__)
-                    return _unchanged("cleanup_evidence_unavailable", f"{owner}'s work is paused for an earlier "
-                                      "handover request and this one couldn't be recorded, so it was left as it was, "
-                                      "and nothing was handed over.")
             diag.evt("handoff.decision", "applied", "handed_off", task=task_id, evt=stop_id)
             return {"handed_off": True, "state": "handed_off", "issue_id": issue_id, "task_id": task_id,
-                    "board": bound["board"], "stop_event_id": stop_id, "stopped_here": stopped_here,
+                    "board": bound["board"], "stop_event_id": stop_id, "stopped_here": ours,
                     "evidence_digest": proof.get("evidence_digest"), "to": to, "permission_granted": False,
                     "message": f"{owner}'s work stopped and is confirmed finished; {to} can continue it."}
         held = proof.get("reason") or "cleanup_evidence_unavailable"
@@ -544,63 +389,52 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             break
         sleep(POLL_SECONDS)
     held = "proof_timeout" if held in TRANSIENT else held
-    message = _hold_message(held, owner)
-    if not stopped_here:
+    if not ours:
         diag.evt("handoff.decision", "refused", "handoff_unchanged", task=task_id, evt=stop_id)
-        return _unchanged(held, message + f" {owner}'s work was left as it was, and nothing was handed over.")
-    return _undo(adapter, task_id, request_id, holds, held, owner, message + " ")
+        return _unchanged(held, _hold_message(held) + f" {owner}'s work was left as it was, and nothing was handed over.")
+    return _paused(held, owner, to, _fact(held))
 
 
-def cancel(state: Path, issue: str, binding_profile: str, metadata: dict, *, to: str, request_id: str,
-           owner_name: str | None = None, wait_seconds: float = DEFAULT_WAIT_SECONDS) -> dict:
-    """Call this request off: resume the task only while this request still holds its pause.
+def resume(state: Path, issue: str, binding_profile: str, metadata: dict, *, to: str, request_id: str,
+           owner_name: str | None = None) -> dict:
+    """A person's explicit resume of work paused for a handover to ``to`` that didn't complete:
+    "resumed", or "unchanged" when the work is not paused for that handover (nothing touched).
 
-    The request is recorded as called off first, so a hand-off for it that is still running (the
-    requester gave up waiting) undoes its own Stop, and repeating it never stops anything."""
+    Only this flow's exact guarded handover pause for ``to`` is resumed, guarded on the latest
+    event; any other pause is a person's to lift. Repeating it with the same request id is safe."""
     owner = owner_name or binding_profile
-    try:
-        context = _context(state, issue, metadata, request_id, to)
-        wait = max(0.0, min(float(wait_seconds), MAX_WAIT_SECONDS))
-        _call_off(state, request_id)
-    except Unknown as exc:
-        return _unchanged(str(exc), _hold_message(str(exc), owner) + " Nothing was changed.")
-    except Exception as exc:  # noqa: BLE001
-        diag.evt("handoff.decision", "failed", "handoff_stuck", exc=type(exc).__name__)
-        return _stuck(owner, "handoff_stuck")
-    with issue_lock(_handoff_dir(state), metadata["id"], wait + LOCK_SLACK_SECONDS) as held:
-        if not held:
-            # A hand-off is still running; it sees the call-off and undoes its own Stop. A retry confirms.
-            diag.evt("handoff.decision", "held", "handover_in_progress")
-            return _stuck(owner, "handover_in_progress", _BEING_CALLED_OFF.format(owner=owner))
-        return _cancel_locked(state, binding_profile, metadata, context, to=to, request_id=request_id, owner=owner)
 
+    def step(context) -> dict:
+        home, native_profile = context
+        label = resume_request_id(request_id)
+        try:
+            bound = cleanup._binding(state, metadata["id"], native_profile)
+            if bound is None:
+                return _refuse("not_bound_here", owner)
+            adapter = _adapter(home, bound["board"], native_profile)
+            for _ in range(3):  # Late worker events (its exit result) can land between the read and the unblock.
+                events = adapter.history(bound["task_id"], 0)
+                if any(event.kind == "unblocked" and (event.payload or {}).get("request_id") == label for event in events):
+                    break
+                live = _live_stop(events)
+                if _handover_to(live) != to or adapter.require_task(bound["task_id"]).status != "blocked":
+                    diag.evt("handoff.decision", "skipped", "handoff_unchanged", task=bound["task_id"])
+                    return _unchanged("handoff_unchanged", f"{owner}'s work on this issue isn't paused for a handover "
+                                                           f"to {to}, so it was left as it is.")
+                with adapter.conn() as conn:
+                    if adapter.kb.unblock_task(conn, bound["task_id"], expected_event_id=events[-1].id, request_id=label):
+                        break
+            else:
+                return _refuse("changed_during_handoff", owner)
+        except Exception as exc:  # noqa: BLE001 - unknown: the work stays as it is
+            diag.evt("handoff.decision", "failed", "cleanup_evidence_unavailable", exc=type(exc).__name__)
+            return _unchanged("cleanup_evidence_unavailable", f"{owner}'s work couldn't be checked, so it was left as "
+                                                              "it is. Try again.")
+        diag.evt("handoff.decision", "applied", "handoff_resumed", task=bound["task_id"])
+        return {"handed_off": False, "state": "resumed", "reason": "handoff_resumed", "permission_granted": False,
+                "message": f"{owner} continues its work on this issue."}
 
-def _cancel_locked(state: Path, binding_profile: str, metadata: dict, context, *, to: str, request_id: str,
-                   owner: str, prefix: str = "") -> dict:
-    home, native_profile = context
-    try:
-        bound = cleanup._binding(state, metadata["id"], native_profile)
-        if bound is None:
-            return _refuse("not_bound_here", owner)
-        adapter = _adapter(home, bound["board"], native_profile)
-        live = _live_stop(adapter.history(bound["task_id"], 0))
-        holder = _holder(state, metadata["id"], bound["task_id"], live) if live is not None else None
-        if holder != request_id:
-            diag.evt("handoff.decision", "skipped", "handoff_unchanged", task=bound["task_id"])
-            if holder is not None:
-                return _unchanged("handoff_unchanged", prefix + f"{owner}'s work is paused for a different handover "
-                                                                "request, so this one left it as it is.")
-            return _unchanged("handoff_unchanged", prefix + f"{owner}'s work is not paused by this handover, so it "
-                                                            "was left as it is.")
-    except Exception as exc:  # noqa: BLE001
-        diag.evt("handoff.decision", "failed", "handoff_stuck", exc=type(exc).__name__)
-        return _stuck(owner, "handoff_stuck", prefix)
-    result = _undo(adapter, bound["task_id"], request_id, _holds(state, metadata["id"], bound["task_id"], request_id),
-                   "handoff_cancelled", owner, prefix)
-    if result["state"] == "resumed":
-        diag.evt("handoff.decision", "applied", "handoff_cancelled", task=bound["task_id"])
-        result["message"] = prefix + f"The handover was called off and {owner}'s work was resumed."
-    return result
+    return _checked(state, issue, metadata, request_id, to, owner, step)
 
 
 # -- requester side -------------------------------------------------------------------------
@@ -608,7 +442,7 @@ def _cancel_locked(state: Path, binding_profile: str, metadata: dict, context, *
 # owner's own ``hermes ... linear hand-off`` (for example a host bridge into its container).
 # The plugin never invents that route: an agent with no configured command for the current
 # delegate refuses before anything changes.
-_STATES = frozenset({"handed_off", "unchanged", "resumed", "stopped"})
+_STATES = frozenset({"handed_off", "unchanged", "paused", "resumed"})
 
 
 def takeover_settings(raw: Any, *, default_name: str) -> dict:
@@ -638,19 +472,19 @@ def takeover_settings(raw: Any, *, default_name: str) -> dict:
     return {"name": name, "agents": agents}
 
 
-def request(peer: dict, issue: dict, *, to: str, request_id: str, cancel: bool = False,
+def request(peer: dict, issue: dict, *, to: str, request_id: str, resume: bool = False,
             run: Callable[..., Any] | None = None) -> dict | None:
-    """Run the owner's hand-off (or its --cancel) and return its reply, or None when the outcome is
-    unknown. Never raises: an unknown outcome is for the caller to call off."""
+    """Run the owner's hand-off (or its --resume) and return its reply, or None when the outcome
+    is unknown. Never raises."""
     import subprocess
     run = run or subprocess.run
     metadata = {key: issue[key] for key in ("id", "identifier", "url")}
     argv = [*peer["command"], "linear", "hand-off", issue["id"], "--issue-json", json.dumps(metadata),
             "--to", to, "--from-name", peer["name"], "--request-id", request_id,
-            "--wait-seconds", str(int(peer["wait_seconds"]))] + (["--cancel"] if cancel else [])
+            "--wait-seconds", str(int(peer["wait_seconds"]))] + (["--resume"] if resume else [])
     try:
         done = run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False,
-                   timeout=peer["wait_seconds"] + OWNER_CALL_OVERHEAD_SECONDS)
+                   timeout=(0 if resume else peer["wait_seconds"]) + OWNER_CALL_OVERHEAD_SECONDS)
     except Exception:  # noqa: BLE001 - timeouts, a missing bridge, anything: the outcome is unknown
         return None
     # Bridges can print their own lines (secret loaders, banners) before the reply.
