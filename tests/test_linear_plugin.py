@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import tempfile
 import time
@@ -380,6 +381,17 @@ class ConnectOAuthTests(unittest.TestCase):
 RESTART = "[Linear] The gateway restarted while you were working on a Linear issue."
 
 
+
+
+class SettingsAllowlistTests(unittest.TestCase):
+    def test_every_service_setting_the_bridge_reads_is_loaded_from_config(self) -> None:
+        # The service builds its settings only from plugin.SETTINGS; a key the bridge reads but the
+        # allowlist omits is silently never loaded (takeover was, so take_over always refused).
+        read = set()
+        for name in ("__init__.py", "bridge.py"):
+            read |= set(re.findall(r'settings\.get\("([a-z_]+)"', (PLUGIN / name).read_text()))
+        self.assertTrue({"takeover", "states", "board"} <= read)
+        self.assertEqual(sorted(read - set(plugin.SETTINGS)), [])
 
 
 if __name__ == "__main__":
