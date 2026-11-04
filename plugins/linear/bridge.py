@@ -3104,6 +3104,9 @@ class Bridge:
             # resumed later counts from its claim: the change that parked it came before that.
             requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
             claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
+            if old is not None:  # Admitted by a later proven take_over: that request is the authority.
+                activation = self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}
+                claim_ms = max(claim_ms, float(activation.get("proven_ms") or 0))
         # A takeover's admitted task replaces exactly the old delegate, whose own pause report is not a person's.
         current = (issue.get("delegate") or {}).get("id")
         replacing = old is not None and current == old

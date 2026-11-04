@@ -355,6 +355,35 @@ class TakeoverScenarios(unittest.TestCase):
         self.assert_nothing_runs_here()
         self.assertTrue(self.resume_owner(OwnerCommand(RESUMED))["ok"])
 
+    def test_N1_a_retry_whose_routing_is_held_is_routed_by_recovery_from_the_retry_s_proof(self):
+        # The person's change before the retry is not a reason for recovery to leave Atlas the delegate.
+        from hermes_fleet_linear_plugin.api import LinearError
+        with self._routing_change_at_create(USER):
+            self.take_over(OwnerCommand(handed_off()))
+        self.later_request()
+        def unavailable(*args, **kwargs):
+            raise LinearError("Linear unreachable (network error)")
+        with patch.object(Bridge, "queue_delegate_self", unavailable):
+            reply = self.take_over(OwnerCommand(handed_off(stopped_here=False)), id=str(uuid.uuid4()))
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["routing"], "held: will retry automatically")
+        self.bridge.flush()
+        self.bridge.pump_kanban()
+        self.bridge.flush()
+        self.assertEqual(self.delegate(), VIEWER)
+
+    def test_closed_during_the_start_offers_reopening_before_taking_over_again(self):
+        real = Kanban.create
+        def create(adapter, *args, **kwargs):
+            task = real(adapter, *args, **kwargs)
+            self.authority.issues[ISSUE]["state"] = {"id": "state-done", "name": "Done", "type": "completed"}
+            return task
+        with patch.object(Kanban, "create", create):
+            first = self.take_over(OwnerCommand(handed_off()))
+        self.assertEqual(first["code"], "takeover_paused", first)
+        self.assertIn("reopen OPS-1, then say 'take over OPS-1' again", first["message"])
+        self.assertNotIn("'take over OPS-1' to try again", first["message"])
+
     def test_N3_a_transient_failure_then_a_person_assigning_it_then_a_retry_starts_once(self):
         with self._flaky_activation():
             self.assert_paused_message(self.take_over(OwnerCommand(handed_off())))

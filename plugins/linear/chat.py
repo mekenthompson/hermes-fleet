@@ -795,6 +795,10 @@ def _paused(bridge: Any, context: Any, issue: dict, owner: str, name: str, reque
         body = (f"{state} {key} is now {moved}. Nothing resumes {owner} automatically. To let {owner} continue, "
                 f"delegate {key} back to {owner} and ask {name} to 'resume {key}'.")
         ways = f"To let {owner} continue, delegate {key} back to {owner} and say 'resume {key}'."
+    elif _closed_now(bridge, issue_id):  # A take_over is refused while it is closed: reopening comes first.
+        body = (f"{state} {key} is closed. Nothing resumes it automatically. Ask {name} to 'resume {key}' to let "
+                f"{owner} continue, or reopen {key}, then ask {name} to 'take over {key}' again.")
+        ways = f"Say 'resume {key}' to let {owner} continue, or reopen {key}, then say 'take over {key}' again."
     elif _retry_possible(bridge, issue_id, issue):
         body = (f"{state} Nothing resumes it automatically. Ask {name} to 'resume {key}' to let {owner} continue, or "
                 f"to 'take over {key}' to try again.")
@@ -813,6 +817,14 @@ def _paused(bridge: Any, context: Any, issue: dict, owner: str, name: str, reque
     except Exception as exc:  # noqa: BLE001 - the reply still says it
         diag.evt("chat.entrust", "failed", "takeover_notice_unsent", iss=issue_id, exc=type(exc).__name__)
     return _reply(False, f"{why} {state} {ways}", code="takeover_paused", issue=_issue_ref(issue), **details)
+
+
+def _closed_now(bridge: Any, issue_id: str) -> bool:
+    """Is the issue closed in Linear now (a fresh read)? Unknown counts as not closed."""
+    try:
+        return (bridge._effect_issue(issue_id).get("state") or {}).get("type") in _CLOSED_TYPES
+    except Exception:  # noqa: BLE001 - unknown: the retry offer below decides
+        return False
 
 
 def _retry_possible(bridge: Any, issue_id: str, issue: dict) -> bool:
