@@ -46,6 +46,15 @@ ACTIVITY_FIELDS = ("agentSessions(first: %d, orderBy: updatedAt) { nodes { id ap
                    "user { id name } content { %s ... on AgentActivityActionContent { type action parameter result } } } "
                    "pageInfo { hasNextPage } } } pageInfo { hasNextPage } }"
                    % (ACTIVITY_SESSIONS, ACTIVITY_PAGE, ", ".join('"%s"' % kind for kind in ACTIVITY_TYPES), _ACTIVITY_BODY))
+# create_issue resolves a named project to its team from one cached directory of the teams and
+# active projects this app can see (one request, about 1,400 complexity points per page), reused
+# for DIRECTORY_TTL; a miss refetches a directory older than DIRECTORY_MISS_REFRESH once.
+DIRECTORY_TTL, DIRECTORY_MISS_REFRESH = 600.0, 60.0
+DIRECTORY_PROJECT_PAGES = 3  # 100 projects per page, most recently updated first
+DIRECTORY_FIELDS = ("nodes { id name slugId completedAt canceledAt archivedAt teams(first: 10) { nodes { id } } } "
+                    "pageInfo { hasNextPage endCursor }")
+# An issue named by its title prefix ("QA-10" for "QA-10: list the commits"): one bounded search.
+TITLE_SEARCH_PAGE = 25
 ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id } assignee { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type position } } }"""
@@ -87,7 +96,7 @@ def _require_mutation_success(data: dict[str, Any], mutation: str) -> None:
         raise LinearError(f"Linear {mutation} rejected the mutation", retryable=False)
     raise LinearError(f"Linear {mutation} response did not confirm success")
 
-def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
+def _graphql_rejection(errors: Any, request_kind: str = "graphql", *, expected_missing: bool = False) -> str:
     """Keep bounded, redacted GraphQL detail beside the stable error prefix."""
     parts: list[str] = []
     entries = errors if isinstance(errors, list) else []
@@ -102,6 +111,9 @@ def _graphql_rejection(errors: Any, request_kind: str = "graphql") -> str:
         safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", code) else ""
         if safe_code == "INPUT_ERROR" and isinstance(message, str) and message.startswith("conflict on insert of"):
             diag.evt("api.result", "deduped", "duplicate_create", code=safe_code)  # idempotent create replay, not an error
+        elif expected_missing and isinstance(message, str) and message.startswith("Entity not found"):
+            # A lookup the caller expects may miss (a title alias such as "QA-10"); its fallback decides.
+            logging.getLogger(diag.LOGGER_NAME).debug("linear: expected miss request_kind=%s message=%s", request_kind, text)
         else:
             logging.getLogger(diag.LOGGER_NAME).error("linear: GraphQL error request_kind=%s message=%s code=%s", request_kind, text, safe_code)
         if text and safe_code:
@@ -321,9 +333,11 @@ class LinearAPI:
         self._viewer: str | None = None
         self._activities_refused_until = 0.0  # Linear refused the internal Issue.agentSessions selection
         self._mutation_guard = threading.local()
+        self._expected_missing = threading.local()
         self._priority = threading.local()
         self.budget: dict[str, dict[str, float]] = {}
         self._budget_level = "ok"
+        self._directory: tuple[float, dict[str, Any]] | None = None
     @contextmanager
     def priority(self, level: str):
         """Mark requests made in this block: optional work yields first when the shared budget runs low."""
@@ -378,6 +392,13 @@ class LinearAPI:
             report = log.info if level == "ok" else log.warning
             report("linear: shared request budget %s (%.0f%% left until %.0f)", level, fraction * 100, reset)
             self._budget_level = level
+    @contextmanager
+    def expected_missing(self):
+        """Reads in this block may legitimately find nothing: "Entity not found" logs at DEBUG, not ERROR."""
+        previous = getattr(self._expected_missing, "on", False)
+        self._expected_missing.on = True
+        try: yield
+        finally: self._expected_missing.on = previous
     @contextmanager
     def guarded_mutation(self, guard):
         previous = getattr(self._mutation_guard, "callback", None)
@@ -504,7 +525,8 @@ class LinearAPI:
         if errors:
             request_kind = "mutation" if query.lstrip().startswith("mutation") else "query"
             duplicate_check = request_kind == "mutation" and "mutation Create(" in query
-            raise LinearError(_graphql_rejection(errors, request_kind),
+            raise LinearError(_graphql_rejection(errors, request_kind,
+                                                 expected_missing=getattr(self._expected_missing, "on", False)),
                               errors=errors if duplicate_check else None, retryable=False)
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
@@ -754,6 +776,67 @@ class LinearAPI:
         return [{"id": node["id"], "name": node["name"]} for node in nodes
                 if isinstance(node, dict) and isinstance(node.get("id"), str) and isinstance(node.get("name"), str)
                 and not (node.get("completedAt") or node.get("canceledAt") or node.get("archivedAt"))]
+    def workspace_directory(self, *, max_age: float = DIRECTORY_TTL) -> dict[str, Any]:
+        """Teams and active projects this app can see, cached for ``max_age`` seconds.
+
+        ``{"teams": [{id, key, name}], "projects": [{id, name, slug, team_ids}], "complete": bool}``;
+        complete is False when either listing had more pages than were read."""
+        cached = self._directory
+        if cached is not None and self.clock() - cached[0] < max_age:
+            return cached[1]
+        data = self.graphql("query LinearDirectory { teams(first: 100) { nodes { id key name } pageInfo { hasNextPage } } "
+                            "projects(first: 100, orderBy: updatedAt) { %s } }" % DIRECTORY_FIELDS)
+        teams_page, projects_page = data.get("teams"), data.get("projects")
+        if (not isinstance(teams_page, dict) or not isinstance(teams_page.get("nodes"), list)
+                or not isinstance(projects_page, dict)):
+            raise LinearError("Linear team and project directory unavailable")
+        teams = [{"id": node["id"], "key": node["key"], "name": node.get("name") if isinstance(node.get("name"), str) else ""}
+                 for node in teams_page["nodes"] if isinstance(node, dict)
+                 and isinstance(node.get("id"), str) and isinstance(node.get("key"), str)]
+        complete = (teams_page.get("pageInfo") or {}).get("hasNextPage") is False
+        projects: list[dict[str, Any]] = []
+        for page_number in range(DIRECTORY_PROJECT_PAGES):
+            nodes = projects_page.get("nodes")
+            if not isinstance(nodes, list):
+                raise LinearError("Linear team and project directory unavailable")
+            for node in nodes:
+                if (not isinstance(node, dict) or not isinstance(node.get("id"), str) or not isinstance(node.get("name"), str)
+                        or node.get("completedAt") or node.get("canceledAt") or node.get("archivedAt")):
+                    continue
+                team_nodes = (node.get("teams") or {}).get("nodes") if isinstance(node.get("teams"), dict) else None
+                projects.append({"id": node["id"], "name": node["name"],
+                                 "slug": node.get("slugId") if isinstance(node.get("slugId"), str) else "",
+                                 "team_ids": [team["id"] for team in team_nodes or []
+                                              if isinstance(team, dict) and isinstance(team.get("id"), str)]})
+            info = projects_page.get("pageInfo") or {}
+            cursor = info.get("endCursor")
+            if info.get("hasNextPage") is not True:
+                break
+            if page_number + 1 == DIRECTORY_PROJECT_PAGES or not isinstance(cursor, str) or not cursor:
+                complete = False
+                break
+            projects_page = self.graphql("query LinearDirectoryProjects($after: String) { projects(first: 100, "
+                                         "after: $after, orderBy: updatedAt) { %s } }" % DIRECTORY_FIELDS,
+                                         {"after": cursor}).get("projects")
+            if not isinstance(projects_page, dict):
+                raise LinearError("Linear team and project directory unavailable")
+        directory = {"teams": teams, "projects": projects, "complete": complete}
+        self._directory = (self.clock(), directory)
+        return directory
+    def issues_by_title(self, text: str) -> tuple[list[dict[str, Any]], bool]:
+        """(recent issues whose title starts with ``text`` ignoring case, newest update first; more may exist).
+
+        One bounded page; "more" is True when Linear has another page or the page is full."""
+        data = self.graphql("query IssueTitleSearch($q: String!) { issues(first: %d, orderBy: updatedAt, "
+                            "filter: { title: { startsWithIgnoreCase: $q } }) { nodes { id identifier title updatedAt "
+                            "state { name type } team { id key } project { id } } pageInfo { hasNextPage } } }"
+                            % TITLE_SEARCH_PAGE, {"q": text})
+        issues = data.get("issues")
+        if not isinstance(issues, dict) or not isinstance(issues.get("nodes"), list):
+            raise LinearError("Linear issue search unavailable")
+        more = (issues.get("pageInfo") or {}).get("hasNextPage") is not False or len(issues["nodes"]) >= TITLE_SEARCH_PAGE
+        return [node for node in issues["nodes"] if isinstance(node, dict) and isinstance(node.get("identifier"), str)
+                and isinstance(node.get("title"), str)], more
     def create_project(self, client_id: str, name: str, team_ids: list[str], *,
                        description: str | None = None) -> dict[str, Any]:
         """Create a project as the authenticated app. Never sets a lead."""
@@ -761,6 +844,7 @@ class LinearAPI:
         if description is not None:
             fields["description"] = description
         replayed = self._create("projectCreate", "ProjectCreateInput", fields)
+        self._directory = None  # the new project must resolve by name on the next create_issue
         project = self._read_created(
             "query CreatedProject($id: String!) { project(id: $id) { id name url lead { id } teams { nodes { id key } } } }",
             "project", client_id)

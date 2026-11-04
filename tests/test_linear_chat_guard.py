@@ -273,6 +273,35 @@ class GuardHookTests(unittest.TestCase):
                 self.assertIsNone(self.call(tool))
         self.assertEqual(sum("outcome=blocked" in line for line in self._lines()), 1)
 
+    def test_starting_tracked_work_never_spends_or_hits_the_allowance(self) -> None:
+        # Live 4 Nov 2026: the lookups needed to start tracked work (project/team, which issue
+        # "QA-10" is) and asking the user must stay available; real work tools stay blocked.
+        self.turn(RESEARCH_CASE)
+        lookups = [("linear", {"action": action}) for action in ("status", "create_issue", "work_on", "track")]
+        lookups.append(("clarify", {"question": "Which team owns Fleet QA?"}))
+        for _ in range(3):
+            for tool, args in lookups:
+                self.assertIsNone(self.call(tool, args=args))
+        self.spend()  # the whole allowance is still there for inspection tools
+        for tool in ("terminal", "execute_code", "web_search", "web_extract", "browser_navigate", "write_file",
+                     "patch"):
+            with self.subTest(tool=tool):
+                self.assertIsNotNone(self.call(tool))
+        for tool, args in lookups:
+            with self.subTest(tool=tool, args=args):
+                self.assertIsNone(self.call(tool, args=args))
+        self.clock.now += guard.GRACE_SECONDS * 5  # the time allowance does not close them either
+        for tool, args in lookups:
+            self.assertIsNone(self.call(tool, args=args))
+        self.assertIsNotNone(self.call("terminal"))
+
+    def test_block_message_says_title_prefixes_and_project_only_creates_work(self) -> None:
+        message = guard.block_message("QA-10", 6, 72)
+        self.assertIn('{"action": "work_on", "issue": "QA-10"}', message)
+        self.assertIn("title prefix", message)
+        self.assertIn("the project picks its team", message)
+        self.assertNotIn('"team": ...', message)
+
     def test_takeover_releases_on_the_real_work_on_reply(self) -> None:
         self.turn(TAKEOVER_CASE)
         self.spend()

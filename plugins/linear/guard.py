@@ -286,9 +286,10 @@ def block_message(key: str, used: int, elapsed: float) -> str:
         "Blocked: this chat asked for Linear-tracked work, and this turn has used its inspection allowance "
         f"({used} tool calls, {int(elapsed)}s). Do not do the work in this chat turn. If the user wants the work "
         "done now, start tracked work first with the linear tool: for an existing issue call "
-        f'{{"action": "work_on", "issue": "{issue}"}}; for new work call '
-        '{"action": "create_issue", "title": ..., "team": ..., "project": ..., "start_work": true, '
-        '"id": "<new UUIDv4>"}. One native worker then does the job, Linear shows it In Progress, and '
+        f'{{"action": "work_on", "issue": "{issue}"}} (a title prefix such as "QA-10" resolves to its key); '
+        'for new work call {"action": "create_issue", "title": ..., "project": ..., "start_work": true, '
+        '"id": "<new UUIDv4>"} (the project picks its team; add "team" only to choose between same-named '
+        'projects). One native worker then does the job, Linear shows it In Progress, and '
         "progress and the result come back to this chat. If the start is refused, tell the user why. If the user "
         "did not ask for the work to be done now (a status question or a discussion), answer with what you "
         "already have, or ask with clarify: inspecting and discussing work does not transfer execution. "

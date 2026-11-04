@@ -89,6 +89,9 @@ class FakeLinear:
         self.comment_updates_issue = False
         self.activity_updates_issue = False
         self.rate_limited_until = 0.0
+        # The team/project directory (LinearDirectory): teams by id, active and finished projects.
+        self.teams: list[dict] = [{"id": "team-1", "key": "ABC", "name": "Alpha"}]
+        self.projects: list[dict] = []
         self.lock = threading.Lock()
         fake = self
 
@@ -115,13 +118,30 @@ class FakeLinear:
         self.server.shutdown()
         self.server.server_close()
 
-    def add_issue(self, issue_id: str, identifier: str, *, project: str | None = "proj-1") -> dict:
-        issue = {"id": issue_id, "identifier": identifier, "title": f"Title of {identifier}",
+    def add_team(self, team_id: str, key: str, name: str) -> dict:
+        team = {"id": team_id, "key": key, "name": name}
+        self.teams.append(team)
+        return team
+
+    def add_project(self, project_id: str, name: str, team_ids: list[str], *, slug: str = "",
+                    completed: bool = False, archived: bool = False) -> dict:
+        # Archived projects are returned too (with archivedAt), the worst case: the client must drop them.
+        project = {"id": project_id, "name": name, "slugId": slug or project_id[-6:], "team_ids": list(team_ids),
+                   "completedAt": "2026-10-01T00:00:00Z" if completed else None, "canceledAt": None,
+                   "archivedAt": "2026-11-04T01:15:28Z" if archived else None,
+                   "updatedAt": self.clock.iso(len(self.projects))}
+        self.projects.append(project)
+        return project
+
+    def add_issue(self, issue_id: str, identifier: str, *, project: str | None = "proj-1",
+                  title: str | None = None, team: dict | None = None) -> dict:
+        team = team or {"id": "team-1", "key": "ABC"}
+        issue = {"id": issue_id, "identifier": identifier, "title": title or f"Title of {identifier}",
                  "description": "Synthetic issue body", "url": f"https://linear.example/issue/{identifier}",
                  "updatedAt": self.clock.iso(), "delegate": None, "assignee": None, "creator": {"id": "human-1"},
                  "state": dict(STATES[0]),
                  "project": {"id": project} if project else None,
-                 "team": {"id": "team-1", "key": "ABC", "states": {"nodes": STATES}}}
+                 "team": {"id": team["id"], "key": team["key"], "states": {"nodes": STATES}}}
         self.issues[issue_id] = issue
         return issue
 
@@ -223,6 +243,21 @@ class FakeLinear:
                         (mutation == "agentActivityCreate" and self.activity_updates_issue)):
                     self.issues[fields["issueId"]]["updatedAt"] = self.clock.iso()
                 return 200, {"data": {mutation: {"success": True}}}
+        if query.startswith(("query LinearDirectory ", "query LinearDirectoryProjects")):
+            return 200, {"data": self._directory(query, variables)}
+        if "query IssueTitleSearch" in query:
+            # Linear's startsWithIgnoreCase (or containsIgnoreCase) title filter, newest update first, one page.
+            wanted = variables["q"].casefold()
+            prefix = "startsWithIgnoreCase" in query
+            count = int(re.search(r"issues\(first: (\d+)", query)[1])
+            found = sorted((i for i in self.issues.values()
+                            if (i["title"].casefold().startswith(wanted) if prefix else wanted in i["title"].casefold())),
+                           key=lambda i: i["updatedAt"], reverse=True)
+            return 200, {"data": {"issues": {"nodes": [
+                {"id": i["id"], "identifier": i["identifier"], "title": i["title"], "updatedAt": i["updatedAt"],
+                 "state": {"name": i["state"]["name"], "type": i["state"]["type"]},
+                 "team": {"id": i["team"]["id"], "key": i["team"]["key"]}, "project": i.get("project")}
+                for i in found[:count]], "pageInfo": {"hasNextPage": len(found) > count}}}}
         if "issues(" in query:
             # Delegated-and-started listing in id order; the cursor is the last node, as in Linear.
             matches = [json.loads(json.dumps(i)) for _, i in sorted(self.issues.items())
@@ -264,6 +299,20 @@ class FakeLinear:
                 issue["agentSessions"] = self._agent_sessions(issue["id"], query)
             return 200, {"data": {"issue": issue}}
         return 400, {"errors": [{"message": "unsupported", "extensions": {"code": "INVALID_INPUT"}}]}
+
+    def _directory(self, query: str, variables: dict) -> dict:
+        """teams(first: 100) and projects(first: N, after) newest update first, as Linear pages them."""
+        ordered = sorted(self.projects, key=lambda p: p["updatedAt"], reverse=True)
+        count = int(re.search(r"projects\(first: (\d+)", query)[1])
+        start = int(variables.get("after") or 0)
+        page = ordered[start:start + count]
+        projects = {"nodes": [{**{k: v for k, v in p.items() if k not in ("team_ids", "updatedAt")},
+                               "teams": {"nodes": [{"id": t} for t in p["team_ids"]]}} for p in page],
+                    "pageInfo": {"hasNextPage": len(ordered) > start + count, "endCursor": str(start + count)}}
+        data = {"projects": projects}
+        if "teams(first:" in query.split("projects(")[0]:
+            data["teams"] = {"nodes": [dict(t) for t in self.teams], "pageInfo": {"hasNextPage": False}}
+        return data
 
     def _agent_sessions(self, issue_id: str, query: str) -> dict:
         """Issue.agentSessions { activities }: sessions by latest activity, activities newest first.

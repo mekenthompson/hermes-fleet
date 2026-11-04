@@ -473,6 +473,23 @@ class ReasonCoverageTests(unittest.TestCase):
         self.assertTrue(reasons)
         self.assertEqual(sorted(code for code in reasons if code not in diag.REASONS and "." not in code), [])
 
+    def test_every_tool_reply_code_logs_by_name(self) -> None:
+        # Live 4 Nov 2026: create_issue refusals logged reason=? (project_required was not in the set).
+        codes = set()
+        for name in ("chat.py", "__init__.py"):
+            codes |= set(re.findall(r'code="([a-z0-9_]+)"', (ROOT / "plugins/linear" / name).read_text()))
+        self.assertIn("project_required", codes)
+        self.assertEqual(sorted(code for code in codes if code not in diag.REASONS), [])
+
+    def test_each_tool_result_logs_its_own_line(self) -> None:
+        diag.reset()
+        with self.assertLogs(diag.LOGGER_NAME, level="INFO") as logs:
+            for _ in range(3):
+                diag.tool_result({"action": "create_issue"}, '{"ok": false, "code": "request_refused"}')
+            diag.tool_result({"action": "status", "issue": "QA-10"}, '{"ok": false, "code": "request_refused"}')
+        self.assertEqual(len(logs.output), 4)
+        self.assertTrue(all("reason=request_refused" in line for line in logs.output))
+
     def test_cleanup_hold_reasons_log_by_name(self) -> None:
         # Every takeover-cleanup hold names its code in the log line, never "?".
         tree = ast.parse((ROOT / "plugins/linear/cleanup.py").read_text())
