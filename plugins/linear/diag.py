@@ -113,7 +113,8 @@ REASONS = frozenset({
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",
-    "context_or_service_unavailable", "delivery_uncertain",
+    "context_or_service_unavailable", "delivery_uncertain", "project_required", "ambiguous_project",
+    "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias",
     # retired Linear notify subscriptions (the bridge relays those events itself)
     "bridge_relayed",
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
@@ -310,6 +311,8 @@ def render(action: str, outcome: str, reason: str = "-", **fields: Any) -> str:
 
 
 def _limit_key(action: str, outcome: str, reason: str, level: int, fields: dict[str, Any]) -> tuple | None:
+    if action == "tool.result":
+        return None  # one line per tool call: each is a distinct result, never a re-evaluated decision
     subject = fields.get("iss") or fields.get("evt") or fields.get("row") or fields.get("task")
     if level >= logging.WARNING:
         return ("w", action, outcome, reason, str(subject))
@@ -603,6 +606,9 @@ def tool_result(args: Any, reply: str, started: float | None = None) -> str:
     args = args if isinstance(args, dict) else {}
     action, ok = args.get("action"), parsed.get("ok") is True
     ref = args.get("issue") if isinstance(args.get("issue"), str) else ""
+    resolved = parsed.get("resolved_issue") if isinstance(parsed, dict) else None
+    if isinstance(resolved, dict) and isinstance(resolved.get("issue"), str):
+        ref = resolved["issue"]  # a title alias ("QA-10") logs as the key it resolved to
     fields = {"kind": action if isinstance(action, str) else None,
               "issue": ref if FIELDS["issue"].fullmatch(ref) else None,
               "iss": ref if not FIELDS["issue"].fullmatch(ref) else None}

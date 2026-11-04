@@ -418,6 +418,30 @@ class BoundLinearAPI(LinearAPI):
         allowed = self.identity.get("projects")
         return [project for project in projects if not allowed or project["id"] in allowed]
 
+    def workspace_directory(self, **kwargs):
+        """The teams and active projects this app can see, narrowed to identity.teams/projects."""
+        if self.specialist_scope is not None:
+            raise LinearError("Issue creation is outside specialist scope", retryable=False)
+        directory = super().workspace_directory(**kwargs)
+        teams_allowed, projects_allowed = set(self.identity.get("teams") or ()), set(self.identity.get("projects") or ())
+        teams = [team for team in directory["teams"] if not teams_allowed or {team["id"], team["key"]} & teams_allowed]
+        visible = {team["id"] for team in teams}
+        projects = []
+        for project in directory["projects"]:
+            team_ids = [team_id for team_id in project["team_ids"] if team_id in visible]
+            if team_ids and (not projects_allowed or project["id"] in projects_allowed):
+                projects.append({**project, "team_ids": team_ids})
+        return {**directory, "teams": teams, "projects": projects}
+
+    def issues_by_title(self, text):
+        """Title matches inside identity scope; none under specialist scope (exact keys only there)."""
+        if self.specialist_scope is not None:
+            return []
+        teams_allowed, projects_allowed = set(self.identity.get("teams") or ()), set(self.identity.get("projects") or ())
+        return [issue for issue in super().issues_by_title(text)
+                if (not teams_allowed or {(issue.get("team") or {}).get("id"), (issue.get("team") or {}).get("key")} & teams_allowed)
+                and (not projects_allowed or (issue.get("project") or {}).get("id") in projects_allowed)]
+
     def create_project(self, client_id, name, team_ids, *, description=None):
         if self.specialist_scope is not None:
             raise LinearError("Project creation is outside specialist scope", retryable=False)

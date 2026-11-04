@@ -63,7 +63,7 @@ SCHEMA = {
         "Formatting tips are advisory: preserve authored content, code and links; never silently rewrite it."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "work_on", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
-        "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123; mutations require the exact identifier or id."},
+        "issue": {"type": "string", "description": "Existing Linear identifier or exact issue id. Status also accepts compact letter-only team shorthand such as ABC123. status, work_on, track and followup also accept a title prefix (QA-10 for an issue titled 'QA-10: ...'): one match is used and the reply names its key; several are returned as choices. Other mutations require the exact identifier or id."},
         "task_id": {"type": "string", "description": "track: existing native task assigned to this profile; an undelegated issue queues this app as Linear delegate."},
         "completion_scope": {"type": "string", "enum": ["outcome", "progress"], "description": "track: outcome (default) can complete the agreed issue; progress reports an internal stage without closing it. Choose after inspecting acceptance; no execution grant."},
         "reconcile_complete": {"type": "boolean", "description": "track with replace and outcome only: deliberately reconcile an already completed entire outcome after inspecting acceptance/evidence. Reuses this UUID; no native execution or historical progress replay. Queued reporting is not confirmed delivery."},
@@ -73,10 +73,11 @@ SCHEMA = {
         "expected_delegate_id": {"type": ["string", "null"], "description": "delegate_self: exact current issue.delegate.id, or null if undelegated."},
         "expected_updated_at": {"type": "string", "description": "delegate_self: exact issue.updatedAt from a fresh status read; optimistic preflight, not remote compare-and-swap."},
         "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
-        "title": {"type": "string"}, "name": {"type": "string"}, "team": {"type": "string"},
+        "title": {"type": "string"}, "name": {"type": "string"},
+        "team": {"type": "string", "description": "Team key. create_issue: optional when project names an active project; the project picks its team. A team that does not own the named project is corrected and the reply says so."},
         "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
-        "project": {"type": "string", "description": "create_issue: project id or exact project name. Required unless parent has a project, which is then used. If unsure, omit it: the reply lists the team's active projects; pick the one that fits the work and retry. Use \"none\" only when the work fits no project. Never ask the user for project ids."},
+        "project": {"type": "string", "description": "create_issue: project id, exact project name or URL slug, in any team this app can see. Required unless parent has a project, which is then used. If unsure, omit it: the reply lists the active projects; pick the one that fits the work and retry. Use \"none\" only when the work fits no project. Never ask the user for project ids."},
         "start_work": {"type": "boolean", "description": "create_issue: true when the user asked for a longer outcome to be carried out now; starts one native task, delegates the issue to this app and reports back to this chat. false (default) for a quick note or someone else's issue. work_on always starts."},
         "record_done": {"type": "boolean", "description": "create_issue or work_on: link and close work already finished in this chat; requires summary. Nothing is started or re-run."},
         "summary": {"type": "string", "description": "record_done: what was delivered and what remains, for the closing Linear summary."},
@@ -263,31 +264,171 @@ def _stored_differently(created: dict) -> str:
             " Do not create it again. Read it and edit it only if the difference matters.")
 
 
-def _issue_project(bridge: Any, team: str, project: str, parent: str | None) -> tuple[str | None, str]:
-    """Every new issue lands in a project: the one named, the parent's, or an explicit "none"."""
-    if project.casefold() == "none":
-        return None, ""
-    if not project and parent:
-        inherited = ((bridge.api.issue(parent) or {}).get("project") or {}).get("id")
-        if inherited:
-            return inherited, ""
-    active = bridge.api.team_projects(team)
+LIST_TEAMS, LIST_PROJECTS, LIST_CHOICES = 20, 15, 10
+_UUID_SHAPE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}")
+_DESTINATION_TIP = (" Decide from the conversation and retry; do not ask the user for ids. "
+                    "Use project \"none\" (with a team) only when the work fits no project.")
+
+
+def _directory(bridge: Any, *, fresh: bool = False) -> dict:
+    """The cached team/project directory; ``fresh`` refetches one older than the miss window."""
+    from .api import DIRECTORY_MISS_REFRESH, DIRECTORY_TTL
+    read = getattr(bridge.api, "workspace_directory", None)
+    if not callable(read):
+        raise LinearError("The Linear team and project directory is unavailable here.", retryable=False)
+    return read(max_age=DIRECTORY_MISS_REFRESH if fresh else DIRECTORY_TTL)
+
+
+def _find_team(directory: dict, team: str) -> dict | None:
+    wanted = team.casefold()
+    return next((row for row in directory["teams"] if team == row["id"] or wanted in
+                 (row["key"].casefold(), row["name"].casefold())), None)
+
+
+def _find_projects(directory: dict, project: str) -> list[dict]:
+    """Active projects named ``project``: exact id, name or URL slug (``fleet-qa-1a2b3c``), ignoring case."""
+    wanted = project.strip().rstrip("/").rsplit("/", 1)[-1].casefold()
+    return [row for row in directory["projects"] if project == row["id"] or project.casefold() == row["name"].casefold()
+            or (row["slug"] and (wanted == row["slug"].casefold() or wanted.endswith("-" + row["slug"].casefold())))]
+
+
+def _team_listing(directory: dict) -> list[dict]:
+    """Accessible teams with their active project names, bounded."""
+    names: dict[str, list[str]] = {}
+    for project in directory["projects"]:
+        for team_id in project["team_ids"]:
+            names.setdefault(team_id, []).append(project["name"])
+    rows = sorted(directory["teams"], key=lambda row: row["key"])[:LIST_TEAMS]
+    return [{"team": row["key"], "name": row["name"], "projects": sorted(names.get(row["id"], []))[:LIST_PROJECTS]}
+            for row in rows]
+
+
+def _team_keys(directory: dict) -> str:
+    keys = sorted(row["key"] for row in directory["teams"])
+    shown = ", ".join(keys[:LIST_TEAMS]) or "none"
+    return shown + (f" and {len(keys) - LIST_TEAMS} more" if len(keys) > LIST_TEAMS else "")
+
+
+def _unknown_team(directory: dict, team: str, extra: str = "") -> str:
+    return _reply(False, f"No Linear team {team!r} is visible to this app.{extra} Teams it can use: "
+                  f"{_team_keys(directory)}. Retry with one of these team keys, or omit team and name the project: "
+                  "the project picks its team.", code="unknown_team", teams=_team_listing(directory))
+
+
+def _team_lookup(bridge: Any, team: str) -> tuple[dict | None, dict | None]:
+    """(team row, directory) for ``team`` by id, key or name in any case, refetching a stale miss once.
+
+    The directory is None when it cannot be read; then nothing is concluded about the team."""
+    try:
+        directory = _directory(bridge)
+        if _find_team(directory, team) is None:
+            directory = _directory(bridge, fresh=True)
+    except LinearError:  # including a rate limit: the caller goes on, or re-raises its own failure
+        return None, None
+    return _find_team(directory, team), directory
+
+
+def _missing_team(directory: dict | None, row: dict | None) -> bool:
+    """Surely not a team this app can see: the full directory was read and does not list it."""
+    return directory is not None and row is None and directory["complete"]
+
+
+def _project_led(bridge: Any, project: str, team: str = "", *, team_unknown: bool = False,
+                 team_projects: list | None = None) -> tuple[str | None, str | None, str, str]:
+    """Resolve a named project across every team this app can see: (team id, project id, note, refusal)."""
+    directory = _directory(bridge)
+    found = _find_projects(directory, project)
+    if not found:
+        directory = _directory(bridge, fresh=True)
+        found = _find_projects(directory, project)
+    teams = {row["id"]: row for row in directory["teams"]}
+    options = [(teams[team_id], row) for row in found for team_id in row["team_ids"] if team_id in teams]
+    given = _find_team(directory, team) if team and not team_unknown else None
+    if given is not None and any(owner["id"] == given["id"] for owner, _ in options):
+        options = [option for option in options if option[0]["id"] == given["id"]]
+    if len(options) == 1:
+        owner, row = options[0]
+        if given is not None and owner["id"] == given["id"]:
+            return owner["id"], row["id"], "", ""
+        note = f"Project {row['name']!r} is in team {owner['key']}"
+        note += f", not {team}" if team and not team_unknown else (f" (no team {team!r} is visible)" if team else "")
+        return owner["id"], row["id"], note + "; the issue goes there.", ""
+    if options:
+        choices = [{"team": owner["key"], "team_name": owner["name"], "project": row["name"], "project_id": row["id"]}
+                   for owner, row in options[:LIST_CHOICES]]
+        lines = "; ".join(f"{choice['team']} / {choice['project']}" for choice in choices)
+        return None, None, "", _reply(False, f"Several active projects match {project!r} ({lines}). Pick the team and "
+                                      "project that fit the work and retry with both." + _DESTINATION_TIP,
+                                      code="ambiguous_project", choices=choices)
+    if _UUID_SHAPE.fullmatch(project) and team and not team_unknown:
+        return team, project, "", ""  # An exact id outside the listed pages; creation still verifies it.
+    if team_unknown:
+        return None, None, "", _unknown_team(directory, team, f" No active project matches {project!r} either.")
+    where = "this team or any other team this app can see" if team else "any team this app can see"
+    details: dict[str, Any] = {"teams": _team_listing(directory)}
+    if team_projects is not None:
+        details["projects"] = team_projects
+    return None, None, "", _reply(False, f"No single active project in {where} matches {project!r}. Choose the team "
+                                  "and project from these lists that fit the work and retry with its id or exact name."
+                                  + _DESTINATION_TIP, code="project_required", **details)
+
+
+def _issue_destination(bridge: Any, team: str, project: str, parent: str | None) -> tuple[str | None, str | None, str, str]:
+    """Where a new issue lands: (team, project id or None, note for the reply, refusal reply or "").
+
+    Every new issue lands in a project: the one named, the parent's, or an explicit "none". A named
+    project also picks the team when team is omitted or does not own it."""
+    none = project.casefold() == "none"
+    if parent and (not team or not project):
+        parent_issue = bridge.api.issue(parent) or {}
+        if not team:
+            team = (parent_issue.get("team") or {}).get("id") or ""
+        inherited = (parent_issue.get("project") or {}).get("id")
+        if not project and inherited and team:
+            return team, inherited, "", ""
+    if not team:
+        if project and not none:
+            return _project_led(bridge, project)
+        directory = _directory(bridge)
+        if none:
+            return None, None, "", _reply(False, "project \"none\" needs a team. Teams this app can use: "
+                                          f"{_team_keys(directory)}.", code="team_required", teams=_team_listing(directory))
+        return None, None, "", _reply(False, "A new issue needs a project so it shows up in the right Linear view, and "
+                                      "the project picks its team. Choose the one from this list that fits the work "
+                                      "and retry with project (team is optional)." + _DESTINATION_TIP,
+                                      code="project_required", teams=_team_listing(directory))
+    if none:
+        row, directory = _team_lookup(bridge, team)
+        if _missing_team(directory, row):
+            return None, None, "", _unknown_team(directory, team)
+        return (row["id"] if row else team), None, "", ""
+    try:
+        active = bridge.api.team_projects(team)
+    except RateLimited:
+        raise
+    except LinearError:
+        row, directory = _team_lookup(bridge, team)
+        if _missing_team(directory, row):
+            if project:
+                return _project_led(bridge, project, team, team_unknown=True)
+            return None, None, "", _unknown_team(directory, team)
+        if row is None or row["id"] == team:
+            raise
+        team = row["id"]  # named by key or name in another case ("hf", "Hermes Fleet")
+        active = bridge.api.team_projects(team)
     if project:
         matches = [item["id"] for item in active
                    if project == item["id"] or project.casefold() == item["name"].casefold()]
         if len(matches) == 1:
-            return matches[0], ""
-        try:
-            if not matches and str(uuid.UUID(project)) == project.lower():
-                return project, ""  # An exact id outside the listed page; creation still verifies it.
-        except ValueError:
-            pass
-        message = f"No single active project in this team matches {project!r}."
+            return team, matches[0], "", ""
+        if not matches:
+            return _project_led(bridge, project, team, team_projects=active)
+        message = f"Several active projects in this team are named {project!r}."
     else:
         message = "A new issue needs a project so it shows up in the right Linear view."
-    return None, _reply(False, message + " Choose the project from this list that fits the work and retry with "
-                        "its id or exact name, or project \"none\" if it fits none. Decide from the conversation; "
-                        "do not ask the user for ids.", code="project_required", projects=active)
+    return None, None, "", _reply(False, message + " Choose the project from this list that fits the work and retry with "
+                                  "its id or exact name, or project \"none\" if it fits none. Decide from the conversation; "
+                                  "do not ask the user for ids.", code="project_required", projects=active)
 
 
 def _entrust_request(args: dict, action: str, context: Any) -> tuple[bool, dict | None]:
@@ -438,24 +579,33 @@ def _entrust_message(result: dict) -> str:
 def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
     if action == "create_issue":
         client_id, title, team = _uuid(args.get("id")), _text(args, "title"), _text(args, "team")
-        if not title or not team:
-            raise ValueError("create_issue needs title and team.")
+        if not title:
+            raise ValueError("create_issue needs a title.")
         parent = _text(args, "parent") or None
         entrust, record = _entrust_request(args, action, context)
-        project_id, refusal = _issue_project(bridge, team, _text(args, "project"), parent)
+        team, project_id, note, refusal = _issue_destination(bridge, team, _text(args, "project"), parent)
         if refusal:
             return refusal
-        created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
-                                          project_id=project_id, parent_id=parent)
+        note = note + " " if note else ""
+        try:
+            created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
+                                              project_id=project_id, parent_id=parent)
+        except RateLimited:
+            raise
+        except LinearError as exc:
+            row, directory = _team_lookup(bridge, team) if "team" in str(exc).casefold() else (None, None)
+            if not _missing_team(directory, row):
+                raise
+            return _unknown_team(directory, team)
         if not entrust:
-            return _reply(True, "Created an undelegated issue." + _stored_differently(created)
+            return _reply(True, note + "Created an undelegated issue." + _stored_differently(created)
                           + _formatting_tip(args.get("description")), issue=created)
         if not bridge.authorize_specialist_effect(created["id"]):
-            return _reply(False, "Created the issue, but specialist authorization is fenced, so no work was started.",
+            return _reply(False, note + "Created the issue, but specialist authorization is fenced, so no work was started.",
                           code="authorization_unavailable", issue=created)
         # The readback carries no issue version; routing needs the current one.
         result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
-        return _reply(not result["native"].get("not_started_reason"), "Created the issue. " + _entrust_message(result) + _stored_differently(created)
+        return _reply(not result["native"].get("not_started_reason"), note + "Created the issue. " + _entrust_message(result) + _stored_differently(created)
                       + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
@@ -468,6 +618,80 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
     if not issue or not related or relation not in {"blocks", "blocked_by", "related"}:
         raise ValueError("link_issue needs issue, related, and a supported relation.")
     return _reply(True, "Linked issues.", relation=bridge.api.link_issue(issue, related, relation))
+
+# An issue named by its title prefix: "QA-10" for HF-622 "QA-10: list the 10 most recent commits".
+# Read, start and steer actions use the single match and say so; other edits need the exact key.
+ALIAS_ACTIONS = frozenset({"status", "work_on", "track", "followup"})
+_ALIAS_MAX = 120
+
+
+def _not_found(exc: LinearError) -> bool:
+    return not isinstance(exc, RateLimited) and not exc.retryable and "not found" in str(exc).casefold()
+
+
+def _title_matches(bridge: Any, ref: str) -> list[dict]:
+    """Issues whose title starts with ``ref`` then ":" or a space (or is exactly it), newest update first."""
+    search = getattr(bridge.api, "issues_by_title", None)
+    if not callable(search) or not 2 <= len(ref) <= _ALIAS_MAX:
+        return []
+    wanted = ref.casefold()
+    return [issue for issue in search(ref) if issue["title"].casefold() == wanted
+            or (issue["title"].casefold().startswith(wanted) and issue["title"][len(ref):len(ref) + 1] in (":", " "))]
+
+
+def _lookup_issue(bridge: Any, ref: str, action: str) -> tuple[Any, dict | None]:
+    """(issue, resolved alias or None), or (refusal reply, None).
+
+    ``ref`` is read as an exact identifier or id first; only when Linear has no such issue does a
+    bounded title search resolve it, and only to exactly one issue. Ids are never title-searched."""
+    try:
+        issue = bridge.api.issue(ref)
+    except LinearError as exc:
+        if not _not_found(exc):
+            raise
+    else:
+        if not isinstance(issue, dict) or ref not in (issue.get("id"), issue.get("identifier")):
+            raise LinearError("Linear issue resolution did not match the requested issue.")
+        return issue, None
+    searched = not _UUID_SHAPE.fullmatch(ref)
+    try:
+        matches = _title_matches(bridge, ref) if searched else []
+    except RateLimited:
+        raise
+    except LinearError:
+        matches, searched = [], False
+    if not matches:
+        return _reply(False, f"No Linear issue {ref!r}: it is not an issue key or id this app can read"
+                      + (", and no recent issue title starts with it." if searched else ".")
+                      + " Check the key, or ask the user which issue they mean.", code="not_found"), None
+    choices = [{"issue": item["identifier"], "title": item["title"][:120], "team": (item.get("team") or {}).get("key")}
+               for item in matches[:LIST_CHOICES]]
+    if len(matches) > 1:
+        lines = "; ".join(f"{choice['issue']} \"{choice['title']}\"" for choice in choices)
+        return _reply(False, f"{ref!r} matches several issue titles ({lines}). Pick the one the user means and retry "
+                      "with its key.", code="ambiguous_issue", choices=choices), None
+    resolved = choices[0]
+    if action not in ALIAS_ACTIONS:
+        return _reply(False, f"{ref} is {resolved['issue']} (\"{resolved['title']}\"). Retry with issue "
+                      f"{resolved['issue']}: {action} needs the exact key.", code="issue_alias",
+                      resolved_issue=resolved), None
+    issue = bridge.api.issue(resolved["issue"])
+    if not isinstance(issue, dict) or issue.get("identifier") != resolved["issue"]:
+        raise LinearError("Linear issue resolution did not match the requested issue.")
+    return issue, resolved
+
+
+def _resolved_reply(reply: str, ref: str, resolved: dict) -> str:
+    """State the resolved key at the front of the reply ("QA-10 is HF-622 ...")."""
+    try:
+        parsed = json.loads(reply)
+    except ValueError:
+        return reply
+    note = f"{ref} is {resolved['issue']} (\"{resolved['title']}\"). "
+    parsed["message"] = note + str(parsed.get("message") or "")
+    parsed["resolved_issue"] = {"from": ref, **resolved}
+    return json.dumps(parsed)
+
 
 def handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     started = time.monotonic()
@@ -507,9 +731,18 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
             compact = re.fullmatch(r"([A-Za-z]+)([1-9][0-9]*)", ref)
             if compact:
                 ref = f"{compact[1].upper()}-{compact[2]}"
-        issue = bridge.api.issue(ref)
-        if not isinstance(issue, dict) or ref not in (issue.get("id"), issue.get("identifier")):
-            raise LinearError("Linear issue resolution did not match the requested issue.")
+        issue, resolved = _lookup_issue(bridge, ref, action)
+        if isinstance(issue, str):
+            return issue
+        if resolved:
+            return _resolved_reply(_issue_action(bridge, args, action, context, issue), ref, resolved)
+        return _issue_action(bridge, args, action, context, issue)
+    except (ValueError, LinearError, transport.Unavailable) as exc:
+        return _reply(False, str(exc), code="request_refused")
+
+
+def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, issue: Any) -> str:
+    try:
         issue_id = issue["id"]
         if action == "status":
             try:

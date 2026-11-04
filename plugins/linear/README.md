@@ -22,7 +22,7 @@ API is required. The plugin is disabled by default.
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Add an operator instruction to active linked native work. Stopped and completed work requires a current native action. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
-| `create_issue` with UUIDv4 `id`, `title`, `team` and `project` | Create an undelegated issue; optional description/parent. `project` is a project id or exact name; without it the parent's project is used. With neither, nothing is created and the reply lists the team's active projects so the agent can choose one itself; `project: "none"` is the explicit opt-out. |
+| `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches are refused as `ambiguous_project` with `Team / Project` choices; no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
 | `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
 | `create_issue` or `work_on` with `record_done: true`, `summary`, optional `evidence` links | Link work already finished in chat and close it: the native task is created parked and completed with that evidence in one call, never runnable; verified completion sets Done with the closing summary. Refused when the issue already has native work. |
@@ -114,8 +114,10 @@ It *arms* a turn only when all of these hold:
 An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
 `GRACE_SECONDS` (60 s, counted from the first one). After that, every tool except `linear`,
 `linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search`,
-`tool_describe` and `tool_call` is blocked. The block message names the exact `work_on` /
-`create_issue` + `start_work` call, and says that a status question or discussion is answered
+`tool_describe` and `tool_call` is blocked. Those tools never count toward the allowance, so
+the lookups that start tracked work (`linear` status, `create_issue`, `work_on`, `track`) and
+`clarify` always run. The block message names the exact `work_on` (a title prefix such as
+`QA-10` resolves) / `create_issue` + `start_work` call (the project picks its team), and says that a status question or discussion is answered
 with what the agent has (or `clarify`), since inspection and discussion do not transfer
 execution. A successful `work_on`, `track` or `create_issue` with `start_work` releases the
 turn, as does the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`,
@@ -186,9 +188,17 @@ completed work as remaining. Keep current progress and remaining checklists cons
 label retained earlier checkpoints historical.
 
 The ordinary chat `status` action accepts compact shorthand with a letter-only team key
-(`ABC123` becomes `ABC-123`) before the same exact-result and scope checks. It performs no
-fuzzy search. UUIDs and digit-bearing team keys are not guessed; use the exact identifier
-for those cases and all mutations.
+(`ABC123` becomes `ABC-123`) before the same exact-result and scope checks. UUIDs and
+digit-bearing team keys are not guessed.
+
+An issue can also be named by its title prefix: when Linear has no issue with the given key,
+one bounded search (25 most recently updated issues whose title contains it, inside identity
+scope) looks for titles that start with it followed by `:` or a space, so `QA-10` finds HF-622
+"QA-10: list the 10 most recent commits". `status`, `work_on`, `track` and `followup` use a
+single match and the reply starts with `QA-10 is HF-622` (`resolved_issue` carries both).
+Several matches are refused as `ambiguous_issue` with choices, none as `not_found`. Other
+mutations (`add_comment`, `update_description`, `delegate_self`) name the match
+(`issue_alias`) but need the exact key. Specialist scope never title-searches.
 
 On hosts with guarded native admission, a proven pristine create-and-park stage reports
 that preparation is awaiting admission without asking for human input. Reporting does not
@@ -490,7 +500,10 @@ outlives log rotation.
 Volume: at idle the plugin writes nothing. With linked work it writes one `service.health` line
 per hour. Under load it writes one `reconcile.summary` line per minute, and only when something
 happened. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
-carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Per-issue
+carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Each
+`linear` tool call logs one `tool.result` line whose `reason` is the reply's code
+(`request_refused`, `project_required`, `ambiguous_project`, `unknown_team`, `not_found`,
+`ambiguous_issue`, `issue_alias`, ...); identical results are not collapsed. Per-issue
 INFO stops for the rest of the hour at the cap (200 lines per hour in total), and a single
 `diag.throttled` WARNING records that it happened. `service.start` records the plugin `ver`, its
 source `sha` and, when visible, the git `commit`.
