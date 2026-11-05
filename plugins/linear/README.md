@@ -55,7 +55,11 @@ and admits it against its creation event token. The webhook from this app's own 
 finds that admission and starts no second task or worker. Work bound with no Agent Session
 (started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
 opens for it: one thought says this is the work already running, then Started, checkpoints,
-heartbeats and the keepalive post there as activities and Done is its only response. A
+heartbeats and the keepalive post there as activities and Done is its only response.
+Queued fallback reports proven not yet attempted move to new session activities atomically
+with adoption; attempted or uncertain provider identities retain their original destination.
+Native event capture verifies that its selected reporting owner is still current before
+advancing the reporting cursor. A
 session the work already reports to is never replaced while it may still be open (it must
 have had its final response); the new one only gets a thought. Finished work, `record_done`
 and `requester_basis: agent_session` scope (whose owner session authorizes effects) keep the

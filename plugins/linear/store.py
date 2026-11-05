@@ -762,6 +762,8 @@ class Store:
         """Repair missing delivery components without repeating native work or applied effects."""
         key = f"track:{issue_id}:{request_id}"
         with self._tx() as db:
+            if not self._report_owner_current(db, issue_id, writes):
+                return False
             saved = self.native_intent(key)
             request = (saved or {}).get("payload", {}).get("request", {})
             binding = request.get("binding")
@@ -889,13 +891,42 @@ class Store:
     def retired(self, issue_id: str | None = None) -> list[dict]:
         with self._tx() as db:
             return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
+    @staticmethod
+    def _report_owner_current(db: sqlite3.Connection, issue_id: str, writes: list) -> bool:
+        expected = [payload["native_report_owner"] for _, payload in writes if "native_report_owner" in payload]
+        if not expected:
+            return True
+        row = db.execute("SELECT owner_ref FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone()
+        return bool(row and all(owner == (row["owner_ref"] or "") for owner in expected))
+
+    def _adopt_unattempted_progress(self, db: sqlite3.Connection, issue_id: str, task_id: str,
+                                    session_id: str, at: float | None) -> None:
+        rows = db.execute("SELECT id,payload FROM outbox WHERE kind='comment' AND state='pending' "
+            "AND hold_reason IS NULL AND attempts=0 AND json_type(payload,'$.write_started')='false' "
+            "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=? "
+            "AND (json_extract(payload,'$.native_history')=1 OR json_extract(payload,'$.native_progress')=1) "
+            "AND COALESCE(json_extract(payload,'$.terminal'),0)=0 "
+            "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid", (issue_id, task_id)).fetchall()
+        for row in rows:
+            prior = json.loads(row["payload"])
+            content = prior.get("native_report_content") or {"type": "thought", "body": prior["body"]}
+            payload = {key: value for key, value in prior.items() if key not in
+                       ("id", "body", "session_key", "work_owner", "enqueued_at", "native_report_content")}
+            payload.update(session_id=session_id, content=content, native_report_owner=session_id)
+            if not self.enqueue("activity", payload, at=at):
+                raise ValueError("Adopted native progress could not be queued")
+            # This transaction also serializes transport admission: an already-attempted
+            # identity never qualifies, and an unattempted sender cannot publish after retirement.
+            db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
+
     def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str,
                       notice: dict | None = None, at: float | None = None) -> bool:
         """Report this bound task's progress in a Linear Agent Session; reporting only, never execution.
 
         Compare-and-set on the inspected owner (``""`` for work started from chat or by take_over),
         so a concurrent rebind or another session's adoption wins and this one changes nothing.
-        Queued deliveries keep their original destination (earlier progress stays comments).
+        Proven-unattempted fallback reports receive a new session destination atomically.
+        Attempted or uncertain provider identities retain their original destination.
         """
         if not session_id or session_id == expected_owner:
             raise ValueError("session adoption needs a new Agent Session")
@@ -915,6 +946,7 @@ class Store:
                 return False
             if notice and not self.enqueue("activity", notice, at=at):
                 raise ValueError("Native session adoption notice could not be queued")
+            self._adopt_unattempted_progress(db, issue_id, task_id, session_id, at)
             if closeout_status_id:
                 # The original closeout keeps its immutable destination. Adoption and this
                 # new session's dependent closeout commit together, including across restarts.
@@ -1003,7 +1035,8 @@ class Store:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
-            if not self._effect_admitted(db, issue_id): return False
+            if not self._effect_admitted(db, issue_id) or not self._report_owner_current(db, issue_id, writes):
+                return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not work: return False
             if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
@@ -1064,7 +1097,8 @@ class Store:
                       *, at: float, forget: bool = False) -> bool:
         """Advance our Kanban cursor with its Linear writes, independently of core's claim cursor."""
         with self._tx() as db:
-            if not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id)):
+            if (not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id))
+                    or not self._report_owner_current(db, issue_id, writes)):
                 return False
             row = db.execute("SELECT last_event_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not row or event_id <= row["last_event_id"]:

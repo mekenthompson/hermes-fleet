@@ -413,6 +413,133 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual([r["content"]["type"] for r in said], ["thought", "response"])
         self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
 
+    def test_adoption_during_terminal_capture_retries_with_current_owner(self):
+        self.check_adoption_during_capture(terminal=True)
+
+    def test_adoption_during_checkpoint_capture_retries_with_current_owner(self):
+        self.check_adoption_during_capture(terminal=False)
+
+    def check_adoption_during_capture(self, *, terminal):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Captured report must follow the adopted session."
+        if terminal:
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary=body, result="Local checks passed.")
+        else:
+            self.checkpoint(task_id, body)
+        prior_cursor = self.bridge.store.get(NEW_ISSUE)["last_event_id"]
+        comments = len(self.issue_comments(NEW_ISSUE))
+        other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        other.profile_home = self.home
+        capture, raced = self.bridge.store.capture_event, []
+        def race(issue, event, writes, **kwargs):
+            if not raced:
+                raced.append(True)
+                self.assertTrue(other.handle_webhook(self.session_event(NEW_ISSUE, "echo-session", None),
+                                assignment_prompt=native_input.ACTORLESS_COORDINATION))
+            return capture(issue, event, writes, **kwargs)
+        with patch.object(self.bridge.store, "capture_event", side_effect=race):
+            self.bridge.pump_kanban()
+        self.assertTrue(raced)
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["last_event_id"], prior_cursor,
+                         "A stale destination must not consume the native event")
+        for _ in range(3):
+            self.flush()
+        said = self.said("echo-session")
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
+        self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_queued_checkpoint_moves_to_session_atomically_with_adoption_and_restart(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Checkpoint already captured before session adoption."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        self.assertIs(source["payload"]["write_started"], False)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        self.bridge = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        self.bridge.profile_home = self.home
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        checkpoint = [r for r in self.said("echo-session") if r["content"].get("body") == body]
+        self.assertEqual(len(checkpoint), 1)
+        self.assertEqual(checkpoint[0]["content"]["type"], "thought")
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
+        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 0))
+
+    def test_checkpoint_publication_admitted_before_adoption_keeps_original_identity(self):
+        self.check_checkpoint_adoption_at_transport(after_admission=True)
+
+    def test_adoption_before_checkpoint_transport_admission_blocks_old_comment(self):
+        self.check_checkpoint_adoption_at_transport(after_admission=False)
+
+    def check_checkpoint_adoption_at_transport(self, *, after_admission):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Already attempted checkpoint keeps its provider identity."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        # Exercise both serializations of adoption against real durable send admission.
+        admit, raced = self.bridge.store.admit_mutation, []
+        other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        other.profile_home = self.home
+        def admission(row_id, **kwargs):
+            if row_id == source["id"] and not raced:
+                allowed = admit(row_id, **kwargs) if after_admission else None
+                raced.append(True)
+                self.assertTrue(other.handle_webhook(self.session_event(NEW_ISSUE, "echo-session", None),
+                                assignment_prompt=native_input.ACTORLESS_COORDINATION))
+                return allowed if after_admission else admit(row_id, **kwargs)
+            return admit(row_id, **kwargs)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admission):
+            self.bridge.flush(only_id=source["id"])
+        self.assertTrue(raced)
+        for _ in range(3):
+            self.flush()
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
+        self.assertIs(retained["payload"]["write_started"], after_admission)
+        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")),
+                         0 if after_admission else 1)
+        if not after_admission:
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+            self.assertEqual(retained["payload"]["applied"], 0)
+
+    def test_queued_started_progress_preserves_native_action_when_adopted(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        self.native_event(task_id, "spawned", {"pid": 4242})
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("native_progress"))
+        original = source["payload"]["native_report_content"]
+        self.assertEqual(original["type"], "action")
+        comments = len(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(sum(r["content"] == original for r in self.said("echo-session")), 1)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
     def test_adopted_session_waits_for_pr_acceptance_before_its_only_response(self):
         self.check_acceptance_session(adopt_before_completion=True)
 

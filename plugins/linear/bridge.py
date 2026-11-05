@@ -3451,13 +3451,23 @@ class Bridge:
         self._capture_native_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     @staticmethod
     def _report_writes(row: dict, writes: list) -> list:
-        if row.get("owner_ref"):
-            return writes
-        writes = [(kind, payload) for kind, payload in writes
-                  if kind != "activity" or not payload.get("ephemeral")]
-        return [("comment", {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
-                             "body": _visible_activity(payload.get("content") or {})})
-                if kind == "activity" else (kind, payload) for kind, payload in writes]
+        owner = row.get("owner_ref") or ""
+        projected = []
+        for kind, payload in writes:
+            payload = {**payload, "native_report_owner": owner}
+            if kind == "activity":
+                if owner:
+                    payload["session_id"] = owner
+                elif payload.get("ephemeral"):
+                    continue
+                else:
+                    # Retain the exact native presentation for adoption of a still-unattempted fallback.
+                    content = payload.get("content") or {}
+                    payload = {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
+                               "body": _visible_activity(content), "native_report_content": content}
+                    kind = "comment"
+            projected.append((kind, payload))
+        return projected
     def _finish_work(self, issue_id: str, writes: list, *, at: float, event_id: int | None = None,
                      reconcile_request_id: str | None = None, recheck: dict | None = None) -> bool:
         row = self.store.get(issue_id)
