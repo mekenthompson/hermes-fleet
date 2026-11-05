@@ -331,7 +331,6 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.deliver("answer-activity", "approve")
         self.assertEqual([first.result, second.result], ["once", None])
         self.adapter = await self.replacement_adapter()
-        self.adapter._asked_in(native.ISSUE, native.SESSION)
         replay = await self.deliver("answer-activity", "approve", delivery_id="after-reconnect")
         self.assertEqual(replay.acknowledged, 1)
         self.assertEqual([first.result, second.result], ["once", None])
@@ -341,7 +340,6 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_two_adapters_cannot_consume_the_same_approval_activity(self):
         first, second = await self.pending_approvals()
         other = await self.replacement_adapter()
-        other._asked_in(native.ISSUE, native.SESSION)
         publishing, release = asyncio.Event(), asyncio.Event()
         original = self.adapter._post
         async def delayed(*args, **kwargs):

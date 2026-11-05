@@ -940,7 +940,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         with self.bridge.store._tx() as db:
             return db.execute("SELECT 1 FROM outbox WHERE state='sent' AND kind='activity' "
                 "AND json_extract(payload,'$.source_activity')=? "
-                "AND json_extract(payload,'$.content.type')='response'", (activity_id,)).fetchone() is not None
+                "AND (json_extract(payload,'$.turn_final')=1 OR json_extract(payload,'$.content.type')='response')",
+                (activity_id,)).fetchone() is not None
 
     async def completed_input_replay_keeps_current_anchor(self, *, recreate=False):
         from gateway.session_authority import SessionAuthority
@@ -1029,6 +1030,173 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.inbox_row("older-queued-retry")[2] == "imported")
         self.assertEqual(len(self.rows()), 2)
         self.assertEqual(self.adapter._inputs[(self.ISSUE, self.SESSION)], "newer-queued-input")
+
+    async def queued_input_lifecycle(self, *, recreate=False):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        first_started, first_release, second_started, second_release = [asyncio.Event() for _ in range(4)]
+        async def model(event):
+            started, release = ((first_started, first_release) if event.message_id == "first"
+                                else (second_started, second_release))
+            started.set()
+            await release.wait()
+            body = "Finished " + event.message_id
+            execution_result.get()["result"] = {"completed": True, "final_response": body}
+            return body
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        self.addCleanup(first_release.set)
+        self.addCleanup(second_release.set)
+        await self.deliver("first", "Do the first task.")
+        await asyncio.wait_for(first_started.wait(), 10)
+        await self.deliver("second", "Then do the second task.")
+        await self.until(lambda: self.inbox_row("second")[2] == "imported" and
+                         any(event.message_id == "second" for event, _ in self.receipts))
+        self.assertEqual([row["status"] for row in self.rows()], ["started", "queued"])
+        first_release.set()
+        await asyncio.wait_for(second_started.wait(), 10)
+        await self.until(lambda: self.final_reply_sent("first"))
+        with self.bridge.store._tx() as db:
+            first = json.loads(db.execute("SELECT payload FROM outbox WHERE "
+                "json_extract(payload,'$.source_activity')='first' "
+                "AND (json_extract(payload,'$.turn_final')=1 OR "
+                "json_extract(payload,'$.content.type')='response')").fetchone()[0])
+        self.assertEqual(first["content"]["type"], "thought")  # the session remains working for B
+        second_event = next(event for event, _ in self.receipts if event.message_id == "second")
+        key = self.fixture.store._generate_session_key(second_event.source)
+        self.adapter.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == self.USER)
+        entry = _ApprovalEntry({"command": "second-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        self.addCleanup(clarify.clear_session, key)
+        clarify.register(clarify_id="second-question", session_key=key, question="Environment?",
+                         choices=["staging", "production"])
+        for result in (
+            await self.adapter.send(self.ISSUE, "Working on the second task.",
+                metadata={"thread_id": self.SESSION, "_interim_send": True}),
+            await self.adapter.send(self.ISSUE, "Approve second command?",
+                metadata={"thread_id": self.SESSION, "is_approval_prompt": True}),
+            await self.adapter.send_clarify(self.ISSUE, "Environment?", choices=["staging", "production"],
+                clarify_id="second-question", session_key=key, metadata={"thread_id": self.SESSION}),
+        ):
+            self.assertTrue(result.success, result.error)
+        if recreate:
+            await self.replace_input_adapter()
+        await self.deliver("clarify-answer", "staging")
+        await self.until(lambda: self.inbox_row("clarify-answer")[2] == "imported")
+        self.assertEqual(clarify.wait_for_response("second-question", timeout=0.1), "staging")
+        await self.deliver("approval-answer", "approve")
+        await self.until(lambda: self.inbox_row("approval-answer")[2] == "imported")
+        self.assertEqual(entry.result, "once")
+        self.assertEqual(len(self.rows()), 2)
+        progress = await self.adapter.send(self.ISSUE, "Second command is still running.",
+            metadata={"thread_id": self.SESSION, "_interim_send": True})
+        self.assertTrue(progress.success, progress.error)
+        # A's final still closes A's own lane, even though its visible activity is a thought.
+        late_first = await self.adapter.send(self.ISSUE, "Late first-task progress.", reply_to="first",
+            metadata={"thread_id": self.SESSION, "_interim_send": True})
+        self.assertFalse(late_first.success)
+        second_release.set()
+        await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
+        final = await self.adapter.send(self.ISSUE, "Finished second", reply_to="second",
+            metadata={"thread_id": self.SESSION})
+        self.assertTrue(final.success, final.error)
+        self.assertEqual(self.bridge.store.outbox_row(final.message_id)["payload"]["content"]["type"], "response")
+        for metadata in ({"_interim_send": True}, {"is_approval_prompt": True}):
+            late = await self.adapter.send(self.ISSUE, "Late second-task update.",
+                metadata={"thread_id": self.SESSION, **metadata})
+            self.assertFalse(late.success)
+        late = await self.adapter.send_clarify(self.ISSUE, "Late question?", choices=None,
+            clarify_id="late-second-question", session_key=key, metadata={"thread_id": self.SESSION})
+        self.assertFalse(late.success)
+
+    async def test_queued_input_remains_open_when_its_predecessor_finishes(self):
+        await self.queued_input_lifecycle()
+
+    async def test_queued_input_and_pending_prompts_survive_adapter_replacement(self):
+        await self.queued_input_lifecycle(recreate=True)
+
+    async def pending_prompt_replacement(self, kind, *, closed=False):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        started, release = asyncio.Event(), asyncio.Event()
+        async def model(event):
+            started.set()
+            await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "Finished."}
+            return "Finished."
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        self.addCleanup(release.set)
+        await self.deliver("initial", "Do the finite task.")
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        if kind == "clarify":
+            clarify.register(clarify_id="delivered-question", session_key=key,
+                question="Environment?", choices=["staging", "production"])
+            sent = await self.adapter.send_clarify(self.ISSUE, "Environment?", choices=["staging", "production"],
+                clarify_id="delivered-question", session_key=key, metadata={"thread_id": self.SESSION})
+            answer = "staging"
+        else:
+            entry = _ApprovalEntry({"command": "delivered-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [entry]
+            sent = await self.adapter.send(self.ISSUE, "Approve delivered command?",
+                metadata={"thread_id": self.SESSION, "is_approval_prompt": True})
+            answer = "approve"
+        self.assertTrue(sent.success, sent.error)
+        if closed:
+            final = await self.adapter.send(self.ISSUE, "The original turn is finished.", reply_to="initial",
+                metadata={"thread_id": self.SESSION})
+            self.assertTrue(final.success, final.error)
+        await self.replace_input_adapter()
+        await self.deliver("fresh-answer", answer)
+        await self.until(lambda: self.inbox_row("fresh-answer")[2] == "imported")
+        if closed:
+            if kind == "clarify":
+                self.assertIsNotNone(clarify.get_pending("delivered-question"))
+            else:
+                self.assertIsNone(entry.result)
+            self.assertEqual(len(self.rows()), 2)
+            return
+        if kind == "clarify":
+            self.assertEqual(clarify.wait_for_response("delivered-question", timeout=0.1), "staging")
+            clarify.register(clarify_id="undelivered-question", session_key=key,
+                question="Another environment?", choices=["staging", "production"])
+        else:
+            self.assertEqual(entry.result, "once")
+            undelivered = _ApprovalEntry({"command": "undelivered-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [undelivered]
+        self.assertEqual(len(self.rows()), 1)
+        # The saved association cannot authorize a different prompt that was never delivered.
+        await self.deliver("another-fresh-answer", answer)
+        await self.until(lambda: self.inbox_row("another-fresh-answer")[2] == "imported")
+        if kind == "clarify":
+            self.assertIsNotNone(clarify.get_pending("undelivered-question"))
+        else:
+            self.assertIsNone(undelivered.result)
+        self.assertEqual(len(self.rows()), 2)
+
+    async def test_delivered_clarify_routes_after_replacement_without_authorizing_a_new_prompt(self):
+        await self.pending_prompt_replacement("clarify")
+
+    async def test_delivered_approval_routes_after_replacement_without_authorizing_a_new_prompt(self):
+        await self.pending_prompt_replacement("approval")
+
+    async def test_closed_turn_clarify_cannot_consume_an_answer_after_replacement(self):
+        await self.pending_prompt_replacement("clarify", closed=True)
+
+    async def test_closed_turn_approval_cannot_consume_an_answer_after_replacement(self):
+        await self.pending_prompt_replacement("approval", closed=True)
 
     async def ordinary_replay_at_prompt(self, kind, *, recreate=False, unreadable=False):
         """Real authority receipts must win over later prompt interception, including reconnect."""

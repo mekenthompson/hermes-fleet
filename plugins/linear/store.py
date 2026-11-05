@@ -148,7 +148,8 @@ class Store:
             return json.loads(row[0]) if row else None
 
     def remember_conversation_input(self, issue_id: str, session_id: str, activity_id: str,
-                                    admission_id: str, sequence: int, terminal: bool) -> dict | None:
+                                    admission_id: str, sequence: int, terminal: bool,
+                                    session_keys: list[str] | None = None) -> dict | None:
         """Project Core's newest receipt as the reply anchor, never webhook arrival order.
 
         This is one delivery projection per conversation, not an input receipt ledger.
@@ -163,7 +164,8 @@ class Store:
             if terminal or saved and sequence <= saved["sequence"]:
                 return saved
             anchor = {"activity_id": activity_id, "admission_id": admission_id, "sequence": sequence,
-                      "cursor": self.conversation_cursor(issue_id, session_id)}
+                      "cursor": self.conversation_cursor(issue_id, session_id),
+                      "session_keys": list(session_keys or [])}
             db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        (self._conversation_input_key(issue_id, session_id), json.dumps(anchor)))
@@ -171,19 +173,39 @@ class Store:
 
     def conversation_finished(self, issue_id: str, session_id: str, source_activity: str,
                               source_cursor: int = 0) -> bool:
-        """A final reply queued since this input closes its progress lane, including native Done.
+        """A reply closes its owning input; unscoped native completion fences the session.
 
-        A later admitted user input may reopen the conversation. The durable outbox cursor
-        distinguishes that input without relying on wall-clock ordering or timestamp precision.
+        A queued input may have been admitted before its predecessor's final reply. That
+        predecessor must not close the queued input, even if its outbox row is newer.
         """
         with self._tx() as db:
             return db.execute(
                 "SELECT 1 FROM outbox WHERE kind='activity' AND state != 'failed' "
                 "AND COALESCE(json_extract(payload, '$.applied'), 1) != 0 "
                 "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? "
-                "AND (rowid > ? OR json_extract(payload, '$.source_activity')=?) "
-                "AND json_extract(payload, '$.content.type') IN ('response', 'error') LIMIT 1",
-                (issue_id, session_id, source_cursor, source_activity)).fetchone() is not None
+                "AND (json_extract(payload, '$.turn_final')=1 OR "
+                "json_extract(payload, '$.content.type') IN ('response', 'error')) "
+                "AND ((json_extract(payload, '$.native_reply_version')=1 AND "
+                "COALESCE(json_extract(payload, '$.turn_activity'),json_extract(payload, '$.source_activity'))=?) "
+                "OR (json_extract(payload, '$.native_reply_version') IS NULL AND rowid>?)) LIMIT 1",
+                (issue_id, session_id, source_activity, source_cursor)).fetchone() is not None
+
+    def newer_conversation_input_open(self, issue_id: str, session_id: str, source_activity: str) -> bool:
+        anchor = self.conversation_input(issue_id, session_id)
+        return bool(anchor and anchor["activity_id"] != source_activity and not self.conversation_finished(
+            issue_id, session_id, anchor["activity_id"], anchor["cursor"]))
+
+    def conversation_questions(self, issue_id: str, session_id: str) -> list[dict]:
+        """Published or delivery-uncertain questions retain their exact Core prompt identity."""
+        with self._tx() as db:
+            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND state IN ('pending','sent') "
+                "AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.content.type')='elicitation' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_type(payload,'$.native_prompt')='object' ORDER BY rowid", (issue_id, session_id))
+            return [json.loads(row[0]) for row in rows]
+
     @staticmethod
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1
