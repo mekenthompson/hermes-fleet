@@ -901,8 +901,10 @@ class Store:
 
     def _adopt_unattempted_progress(self, db: sqlite3.Connection, issue_id: str, task_id: str,
                                     session_id: str, at: float | None) -> None:
+        # Retry counts include failed reads before transport. Only the committed transport
+        # marker decides whether this identity is still safe to replace; absence stays uncertain.
         rows = db.execute("SELECT id,payload FROM outbox WHERE kind='comment' AND state='pending' "
-            "AND hold_reason IS NULL AND attempts=0 AND json_type(payload,'$.write_started')='false' "
+            "AND hold_reason IS NULL AND json_type(payload,'$.write_started')='false' "
             "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=? "
             "AND (json_extract(payload,'$.native_history')=1 OR json_extract(payload,'$.native_progress')=1) "
             "AND COALESCE(json_extract(payload,'$.terminal'),0)=0 "
@@ -933,6 +935,8 @@ class Store:
         with self._tx() as db:
             if not self._admitted(db, issue_id):
                 return False
+            if expected_owner and not self.session_answered(issue_id, expected_owner):
+                return False  # Liveness can change after the caller inspects the same owner.
             # Read the current closeout inside the adoption transaction: the reporting
             # pump may have captured it after the caller inspected native completion.
             status = self.outbox_row((self.latest_status(issue_id) or {}).get("id", ""))
@@ -966,28 +970,28 @@ class Store:
                 payload["write_started"] = False
                 if not self.enqueue("activity", payload, at=at):
                     raise ValueError("Native session closeout could not be queued")
-                if (source["state"] == "pending" and source["attempts"] == 0
-                        and prior.get("write_started") is False):
+                if source["state"] == "pending" and prior.get("write_started") is False:
                     # Preserve the original immutable body/destination, but never first
                     # publish its fallback after adoption. Admission races use this same tx.
                     db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?",
                                (source["id"],))
             return True
     def session_answered(self, issue_id: str, session_id: str) -> bool:
-        """The session's latest activity from this app is a delivered response: Linear has closed it.
-
-        A later thought or action, a pending or possibly-landed write, or no activity at all reads
-        as live; writes that never reached Linear are ignored.
-        """
+        """A delivered response closes this session only when no unresolved effect can reopen it."""
         with self._tx() as db:
-            row = db.execute("SELECT state, payload FROM outbox WHERE kind = 'activity' AND hold_reason IS NULL AND "
-                             "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ? AND "
-                             "NOT (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 0) AND "
-                             "NOT (state = 'failed' AND attempts = 0) ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
-                             (issue_id, session_id)).fetchone()
-        if not row or row["state"] != "sent":
-            return False
-        return (json.loads(row["payload"]).get("content") or {}).get("type") == "response"
+            rows = db.execute("SELECT state,hold_reason,payload FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "ORDER BY json_extract(payload,'$.enqueued_at') DESC,rowid DESC", (issue_id, session_id)).fetchall()
+            latest = None
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if payload.get("applied") == 0 or row["state"] == "failed" and payload.get("write_started") is False:
+                    continue  # Proven non-publication cannot keep the session live.
+                if row["state"] != "sent" or row["hold_reason"] is not None:
+                    return False  # Pending, held and possibly applied failures are not completion evidence.
+                if latest is None:
+                    latest = payload
+            return bool(latest and (latest.get("content") or {}).get("type") == "response")
     def put(self, issue_id: str, origin: str, owner_ref: str, *, task_id: str | None = None,
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
