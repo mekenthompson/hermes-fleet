@@ -762,13 +762,13 @@ class LinearAPI:
     def agent_activity(self, activity_id: str, session_id: str) -> dict[str, Any]:
         raise LinearError("Agent Activity authorization requires a bound specialist client", retryable=False)
     def outbound_activity(self, activity_id: str, session_id: str, issue_id: str) -> dict[str, Any] | None:
-        """Read only an activity authored by this app, for uncertain completion settlement."""
+        """Read only an activity authored by this app, for uncertain conversation settlement."""
         session = self.agent_session(session_id)
         if session["issue"]["id"] != issue_id:
             raise LinearError("Outbound activity session changed its issue", retryable=False)
         query = ("query OutboundAgentActivity($id: String!) { agentActivity(id: $id) { id user { id } "
                  "agentSession { id } content { __typename ... on AgentActivityResponseContent { body } "
-                 "... on AgentActivityThoughtContent { body } } } }")
+                 "... on AgentActivityThoughtContent { body } ... on AgentActivityElicitationContent { body } } } }")
         try:
             with self.expected_missing():
                 data = self.graphql(query, {"id": activity_id})
@@ -789,9 +789,10 @@ class LinearAPI:
                 (activity.get("agentSession") or {}).get("id") != session_id):
             raise LinearError("Outbound activity identity does not match this app and session", retryable=False)
         content = activity.get("content") or {}
-        kind = {"AgentActivityResponseContent": "response", "AgentActivityThoughtContent": "thought"}.get(content.get("__typename"))
+        kind = {"AgentActivityResponseContent": "response", "AgentActivityThoughtContent": "thought",
+                "AgentActivityElicitationContent": "elicitation"}.get(content.get("__typename"))
         if kind is None or not isinstance(content.get("body"), str):
-            raise LinearError("Outbound completion content could not be verified", retryable=False)
+            raise LinearError("Outbound conversation content could not be verified", retryable=False)
         return {"type": kind, "body": content["body"]}
 
     def question_precedes_answer(self, question_id: str, answer_id: str, session_id: str, actor_id: str) -> bool:

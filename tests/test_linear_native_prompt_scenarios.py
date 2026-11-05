@@ -560,5 +560,72 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.deliver("answer-activity", "approve", delivery_id="chronology-restored")
         self.assertEqual(first.result, "once")
 
+    async def test_approval_keeps_the_operation_context_that_core_rendered(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        description = "Cancel task t_12345678 only after its logs are saved."
+        entry = _ApprovalEntry({"command": "rm -rf build/", "description": description})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        await asyncio.to_thread(self.render_approval, key, entry.data)
+        displayed = self.posted[-1]["content"]["body"]
+        await self.deliver("answer-activity", "approve")
+        self.assertEqual(entry.result, "once")
+        self.assertIn(description, displayed)
+        self.assertIn(entry.data["command"], displayed)
+
+    async def altered_question_cannot_answer(self, *, legacy=False):
+        from tools import clarify_gateway as clarify
+        from hermes_fleet_linear_plugin.bridge import INTERNAL_ONLY_REPLY
+        key = self.session_key(await self.start_turn())
+        question = "Do you want me to cancel task t_12345678?"
+        pending = clarify.register("stored-question", key, question, ["Yes", "No"])
+        self.addCleanup(clarify.clear_session, key)
+        sent = await self.adapter.send_clarify(native.ISSUE, question, pending.choices, pending.clarify_id, key,
+            metadata={"thread_id": native.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        payload = self.store.outbox_row(sent.message_id)["payload"]
+        if legacy:
+            # Exact prior-version shape: a substituted notice retains the Core
+            # identity and select options, but has no faithful-display evidence.
+            payload["native_prompt"].pop("display", None)
+            payload["content"]["body"] = INTERNAL_ONLY_REPLY
+            self.authority.activities[sent.message_id]["content"]["body"] = INTERNAL_ONLY_REPLY
+        else:
+            payload["signal_metadata"] = {"options": [{"value": "No"}, {"value": "Yes"}]}
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), sent.message_id))
+        retry = await self.adapter.send_clarify(native.ISSUE, question, pending.choices, pending.clarify_id, key,
+            metadata={"thread_id": native.SESSION})
+        handle = self.adapter.handle_message
+        self.adapter = await self.replacement_adapter()
+        self.adapter.handle_message = handle
+        await self.deliver("answer-activity", "Yes")
+        self.assertIsNone(pending.response, "altered decision content retained consent routing")
+        self.assertEqual(len(self.messages), 2)
+        self.assertFalse(retry.success, "stored substituted content was reported as a faithful delivery")
+
+    async def test_legacy_substituted_notice_cannot_answer_after_replacement(self):
+        await self.altered_question_cannot_answer(legacy=True)
+
+    async def test_changed_visible_options_cannot_answer_after_replacement(self):
+        await self.altered_question_cannot_answer()
+
+    async def test_empty_clarification_question_is_refused_without_consent_routing(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        pending = clarify.register("empty-question", key, " ", ["Yes", "No"])
+        self.addCleanup(clarify.clear_session, key)
+        sent = await self.adapter.send_clarify(native.ISSUE, " ", pending.choices, pending.clarify_id, key,
+            metadata={"thread_id": native.SESSION})
+        self.assertFalse(sent.success)
+        self.assertEqual(self.posted, [])
+        await self.deliver("answer-activity", "Yes")
+        self.assertIsNone(pending.response)
+        self.assertEqual(len(self.messages), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

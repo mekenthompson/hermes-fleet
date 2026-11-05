@@ -51,17 +51,21 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
-# A chat reply to a person is never advisory, even when it is posted as a thought so live
-# tracked work keeps its session open: it keeps reply delivery (retry, alert) either way.
+# Final replies keep normal delivery even when projected as thoughts. Unattempted one-try
+# notes can retire, but an attempted native message retains readback and lifecycle repair.
 ADVISORY = ("(kind = 'activity' AND ((json_extract(payload, '$.content.type') IN ('thought', 'action') AND "
             "json_extract(payload, '$.native_reply_version') IS NULL) OR "
-            "COALESCE(json_extract(payload, '$.one_try'), 0) = 1))")
+            "(COALESCE(json_extract(payload, '$.one_try'), 0) = 1 AND NOT "
+            "(COALESCE(json_extract(payload, '$.native_reply_version'), 0)=1 AND "
+            "COALESCE(json_extract(payload, '$.write_started'), 1)!=0))))")
 def advisory(row: dict[str, Any]) -> bool:
-    """A thought, action or decline reply changes no issue: it gets one try and never alerts, revives or fences."""
+    """Disposable notices get one try; an uncertain native conversation effect must be settled."""
     payload = row["payload"]
     return row["kind"] == "activity" and (((payload.get("content") or {}).get("type") in ("thought", "action")
                                            and payload.get("native_reply_version") is None)
-                                          or payload.get("one_try") is True)
+                                          or (payload.get("one_try") is True and not (
+                                              payload.get("native_reply_version") == 1 and
+                                              payload.get("write_started") is not False)))
 
 
 class Store:
@@ -1221,6 +1225,12 @@ class Store:
                     "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id'))))))))")
         with self._tx() as db:
             self._hold_legacy_outbox(db)
+            # Older versions retired one-try native messages even after an uncertain send.
+            # Recover only that undecided state for readback; explicit refusals remain failed.
+            db.execute("UPDATE outbox SET state='pending' WHERE state='failed' AND kind='activity' "
+                "AND hold_reason IS NULL AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.one_try')=1 AND json_extract(payload,'$.write_started')=1 "
+                "AND json_type(payload,'$.failure_kind') IS NULL AND json_type(payload,'$.applied') IS NULL")
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
                 " AND (" + ADVISORY + " OR (o.kind='activity' AND json_extract(o.payload, '$.native_reply_version')=1) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes

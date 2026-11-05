@@ -326,7 +326,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
         await self.deliver("current-allowed-discussion", "Read the current issue and discuss its status.")
         await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
-        await self.until(lambda: bool(self.provider.mutations))
+        # HTTP acceptance precedes lifecycle reconciliation and the durable sent receipt.
+        await self.until(lambda: self.final_reply_sent("current-allowed-discussion"))
         replies = [row for row in self.bridge.store.pending() if self.bridge.store.conversation_reply(row["kind"], row["payload"])]
         self.assertEqual(replies, [])
         self.assertTrue(self.bridge.store.scope_fenced(self.ISSUE))
@@ -1494,3 +1495,24 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(hidden.response)
         self.assertFalse(hidden.event.is_set())
         self.assertEqual(len(self.rows()), 2)
+
+    async def test_decision_question_preserves_its_target_before_yes_can_answer(self):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        question = "Do you want me to cancel task t_12345678?"
+        pending = clarify.register("cancel-question", key, question, ["Yes", "No"])
+        sent = await self.adapter.send_clarify(self.ISSUE, question, pending.choices, pending.clarify_id, key,
+            metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        displayed = self.provider.activities[sent.message_id]["content"]["body"]
+        await self.replace_input_adapter()
+        await self.deliver("decision-answer", "Yes")
+        await self.until(lambda: self.inbox_row("decision-answer")[2] == "imported")
+        self.assertEqual(clarify.wait_for_response(pending.clarify_id, .1), "Yes")
+        self.assertIn(question, displayed, "consent resolved after the decision question was hidden")
+        row = self.bridge.store.outbox_row(sent.message_id)
+        self.assertEqual(row["payload"]["signal_metadata"], {"options": [{"value": "Yes"}, {"value": "No"}]})
+        self.assertEqual(len(self.rows()), 1)

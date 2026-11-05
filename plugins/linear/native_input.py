@@ -508,6 +508,14 @@ def _session_work_live(bridge, issue_id, session_id, *, strict=False) -> bool:
     return getattr(task, "status", None) not in (None, "done", "archived")
 
 
+def _question_display_matches(payload) -> bool:
+    """Only the exact displayed question and options can carry an answer association."""
+    display = (payload.get("native_prompt") or {}).get("display")
+    return (isinstance(display, dict) and display.get("content") == payload.get("content")
+            and display.get("signal") == payload.get("signal")
+            and display.get("signal_metadata") == payload.get("signal_metadata"))
+
+
 def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, nonce="",
                 signal=None, signal_metadata=None, one_try=False, source_cursor=0,
                 turn_activity=None, native_prompt=None):
@@ -528,9 +536,15 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
     if kind not in (None, "thought", "elicitation"):
         raise LinearError("Unsupported Linear reply kind", retryable=False)
     raw = body  # The create identity stays the provider's reply, before and after this filter shipped.
-    # Model-written replies keep their words; only task ids, board names, run numbers and
-    # fence/quiescence phrases are taken out.
-    body = _readable(body) or INTERNAL_ONLY_REPLY
+    if native_prompt:
+        if kind != "elicitation":
+            raise LinearError("A decision question must be displayed as an elicitation", retryable=False)
+        # A task identifier, path or execution detail can be the subject of consent.
+        # Core already renders/redacts its question; never replace it with a status notice.
+        native_prompt = {**native_prompt, "display": {
+            "content": {"type": kind, "body": body}, "signal": signal, "signal_metadata": signal_metadata}}
+    else:
+        body = _readable(body) or INTERNAL_ONLY_REPLY
     activity_id = message_id if message_id != session_id else None
     with bridge.api.requester_session(session_id, activity_id=activity_id):
         session = bridge.api.agent_session(session_id)
@@ -540,6 +554,9 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
     digest = hashlib.sha256(raw.encode()).hexdigest()
     identity = (("native-reply", bridge.profile, issue_id, session_id, message_id, digest) if kind is None
                 else ("native-reply", bridge.profile, issue_id, session_id, message_id, digest, kind, str(nonce)))
+    if native_prompt:
+        # An older client may have published substituted text under the old identity.
+        identity += ("faithful-question-v1",)
     row_id = stable_uuid4(*identity)
     final = kind is None
     if final:
@@ -979,6 +996,8 @@ def create_adapter(config, running):
             approvals = {key: {entry["request_id"] for entry in list_gateway_approvals(key)} for key in keys}
             result = []
             for question in questions:
+                if not _question_display_matches(question):
+                    continue
                 if bridge.store.conversation_finished(projected.issue_id, projected.session_id,
                         question.get("turn_activity", question["source_activity"]), question.get("source_cursor", 0)):
                     continue
@@ -1005,7 +1024,8 @@ def create_adapter(config, running):
                                           thread_id=source.thread_id) is not True:
                 return False, None, None
             keys = self._core_session_keys(source)
-            questions = [question for question in questions if not bridge.store.conversation_finished(
+            questions = [question for question in questions if _question_display_matches(question)
+                         and not bridge.store.conversation_finished(
                 projected.issue_id, projected.session_id,
                 question.get("turn_activity", question["source_activity"]), question.get("source_cursor", 0))]
             from tools import clarify_gateway as clarify
@@ -1067,6 +1087,8 @@ def create_adapter(config, running):
                                                  turn_activity=turn_activity, **reply)
                 if not row_id:
                     return SendResult(success=False, error="Linear reply authorization is held")
+                if question and not _question_display_matches((bridge.store.outbox_row(row_id) or {}).get("payload", {})):
+                    raise LinearError("Linear question cannot be displayed faithfully", retryable=False)
                 await asyncio.to_thread(bridge.flush, only_id=row_id)
                 row = bridge.store.outbox_row(row_id)
             except LinearError as error:
@@ -1100,6 +1122,8 @@ def create_adapter(config, running):
             """Ask as a Linear elicitation; a pick or typed answer comes back as the session's next prompt."""
             from agent.i18n import t
             from tools.clarify_gateway import get_pending, mark_awaiting_text
+            if not isinstance(question, str) or not question.strip():
+                return SendResult(success=False, error="Linear clarification requires a visible question")
             session_id = (metadata or {}).get("thread_id")
             bridge = running.get("bridge")
             source = await asyncio.to_thread(self._latest_input, chat_id, session_id)

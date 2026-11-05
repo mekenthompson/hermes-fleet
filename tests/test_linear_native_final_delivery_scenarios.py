@@ -318,3 +318,120 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.make_due(repair_ids[0])
         await self.flush(repair_ids[0])
         self.assertEqual(self.posted[-1]["content"]["type"], "response")
+
+    def queue_interim(self, kind="thought"):
+        return self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+            "An interim update." if kind == "thought" else "Which environment?", kind=kind,
+            nonce="interim-probe", one_try=kind == "thought",
+            native_prompt={"kind": "clarify", "clarify_id": "probe", "session_key": "probe"}
+                          if kind == "elicitation" else None,
+            signal="select" if kind == "elicitation" else None,
+            signal_metadata={"options": [{"value": "staging"}, {"value": "production"}]}
+                            if kind == "elicitation" else None)
+
+    async def test_attempted_interim_absent_readback_never_reposts(self):
+        await self.start_turn()
+        interim = self.queue_interim()
+        self.absent.add(interim)
+        await self.flush(interim)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "pending")
+        before = len(self.posted)
+        self.make_due(interim)
+        await self.flush(interim)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "pending")
+        self.assertTrue(self.store.outbox_row(interim)["payload"]["write_started"])
+
+    async def test_attempted_interim_settles_read_only_while_turn_is_live(self):
+        await self.start_turn()
+        interim = self.queue_interim()
+        self.lost.add(interim)
+        await self.flush(interim)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "pending")
+        before = len(self.posted)
+        self.make_due(interim)
+        await self.flush(interim)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "sent")
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
+    async def test_legacy_retired_uncertain_interim_is_recovered_for_readback_only(self):
+        await self.start_turn()
+        interim = self.queue_interim()
+        self.lost.add(interim)
+        await self.flush(interim)
+        # Previous versions retired the ambiguous one-try row without a rejection verdict.
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET state='failed',attempts=0 WHERE id=?", (interim,))
+        final = self.queue_final(native.ACTIVITY)
+        await self.flush(final)
+        before = len(self.posted)
+        self.make_due(interim)
+        await self.flush(interim)
+        self.assertEqual(len(self.posted), before + 1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        self.assertNotEqual(self.posted[-1]["id"], interim)
+        self.assertEqual(self.store.outbox_row(interim)["payload"]["content"]["type"], "thought")
+        self.assertEqual(self.store.outbox_row(interim)["state"], "sent")
+
+    async def test_live_question_uncertainty_keeps_awaiting_input_and_exact_content(self):
+        await self.start_turn()
+        question = self.queue_interim("elicitation")
+        self.lost.add(question)
+        await self.flush(question)
+        saved = self.store.outbox_row(question)["payload"]
+        before = len(self.posted)
+        self.make_due(question)
+        await self.flush(question)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.posted[-1]["content"]["type"], "elicitation")
+        self.assertEqual(self.store.outbox_row(question)["state"], "sent")
+        self.assertEqual(self.store.outbox_row(question)["payload"]["native_prompt"], saved["native_prompt"])
+        self.assertEqual(self.store.outbox_row(question)["payload"]["content"], saved["content"])
+        self.assertEqual(self.store.outbox_row(question)["payload"]["signal_metadata"], saved["signal_metadata"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], saved["signal_metadata"])
+
+    async def test_late_question_after_completion_repairs_without_replaying_question(self):
+        await self.start_turn()
+        question = self.queue_interim("elicitation")
+        self.lost.add(question)
+        await self.flush(question)
+        final = self.queue_final(native.ACTIVITY)
+        await self.flush(final)
+        before = len(self.posted)
+        self.make_due(question)
+        await self.flush(question)
+        self.assertEqual(len(self.posted), before + 1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        self.assertNotEqual(self.posted[-1]["id"], question)
+        self.assertEqual(self.store.outbox_row(question)["payload"]["content"]["type"], "elicitation")
+        self.assertEqual(self.store.outbox_row(question)["state"], "sent")
+
+    async def test_interim_rechecks_completion_at_mutation_admission(self):
+        await self.start_turn()
+        interim = self.queue_interim()
+        original = self.bridge.store.admit_mutation
+        def admit(row_id, **kwargs):
+            result = original(row_id, **kwargs)
+            if row_id == interim:
+                self.queue_final(native.ACTIVITY)
+            return result
+        before = len(self.posted)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(interim)
+        self.assertEqual(len(self.posted), before)
+        self.assertIs(self.store.outbox_row(interim)["payload"]["write_started"], False)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "failed")
+
+    async def test_older_final_reply_without_turn_marker_is_not_an_interim(self):
+        await self.start_turn()
+        for kind in ("response", "error"):
+            with self.subTest(kind=kind):
+                final = self.queue_final(native.ACTIVITY, "Legacy " + kind + ".")
+                payload = self.store.outbox_row(final)["payload"]
+                payload.pop("turn_final")
+                payload["content"]["type"] = kind
+                self.store.rewrite(final, payload, self.bridge.clock())
+                await self.flush(final)
+                self.assertEqual(self.store.outbox_row(final)["state"], "sent")
+                self.assertEqual(self.posted[-1]["content"], payload["content"])

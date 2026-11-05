@@ -242,3 +242,47 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.provider.mutations), before)
                 self.assertEqual(self.bridge.store.outbox_row(held)["state"], "pending")
                 self.assertIs(self.bridge.store.outbox_row(held)["payload"]["write_started"], False)
+
+    async def test_timed_out_interim_lands_after_real_core_completion(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        started, release = asyncio.Event(), asyncio.Event()
+        self.addCleanup(release.set)
+        delayed, remote_kinds = [], []
+        original = self.bridge.api.transport
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if 'agentActivityCreate' in request['query']:
+                fields = request['variables']['input']
+                if fields['content']['body'] == 'An interim update.':
+                    delayed.append((url, body, headers))
+                    raise TimeoutError('finite remote create still in flight')
+                remote_kinds.append(fields['content']['type'])
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        async def model(event):
+            started.set()
+            await release.wait()
+            await self.adapter.send(self.ISSUE, 'An interim update.',
+                metadata={'thread_id': self.SESSION, '_interim_send': True})
+            execution_result.get()['result'] = {'completed': True, 'final_response': 'All work finished.'}
+            return 'All work finished.'
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        await self.deliver('first', 'Do the bounded work.')
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: self.inbox_row('first')[2] == 'imported')
+        release.set()
+        await self.until(lambda: self.final_reply_sent('first'))
+        self.assertEqual(self.rows()[0]['status'], 'terminal')
+        self.assertEqual(remote_kinds[-1], 'response')
+        self.assertEqual(len(delayed), 1)
+        fields = json.loads(delayed[0][1])['variables']['input']
+        original(*delayed[0])
+        remote_kinds.append(fields['content']['type'])
+        self.bridge.store.defer(fields['id'], self.bridge.clock() - 1)
+        await asyncio.to_thread(self.bridge.flush)
+        print('LATE_INTERIM_PROOF', json.dumps({'remote_kinds': remote_kinds,
+            'outbox_state': self.bridge.store.outbox_row(fields['id'])['state'],
+            'core_status': self.rows()[0]['status']}), flush=True)
+        self.assertEqual(remote_kinds[-1], 'response', 'Late interim must restore the completed session')
