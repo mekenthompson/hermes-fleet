@@ -305,7 +305,15 @@ automatically.
    change); pauses the task with one guarded native Stop whose reason is
    `Paused for a handover to <name> [handoff:<request id>]` (never pushed into the recurrence
    fence); and waits up to `wait_seconds` for `inspect-cleanup` to prove the stopped run ended
-   (`state: handed_off`). It never resumes anything by itself: if the proof fails, the work stays
+   (`state: handed_off`). If the stopped worker reported back after the gateway gave up on it,
+   core leaves that attempt `unknown` and nothing in the gateway's lifetime settles it; when the
+   proof holds on exactly that row under a handover pause for the same agent (this request's or
+   an earlier one's; blocked, no current run, the row is the stopped run's card attempt), the
+   owner asks core once to resolve it (`prompt.resolve_unknown`, the same call as a person's
+   Discard, which first re-runs core's process-stop cleanup) and proves again. A `started` row is
+   waited on and asked about once it turns `unknown`; a person's pause or a pause for another
+   agent is never resolved, and a refused resolve leaves the work paused. It never
+   resumes anything by itself: if the proof fails, the work stays
    paused (`state: paused`, with a plain reason). A task already paused for a handover to the same
    agent (a retry with the same `id`, or a new request) is proven again, never stopped twice. A
    task paused by someone else is only proven, never changed (`state: unchanged`); one paused for

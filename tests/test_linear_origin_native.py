@@ -79,10 +79,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.origin_context.set("native-turn-context")
         self.calls = []
         self.before_rpc = None
+        # Owner calls the code under test may make. Inspection reads receipts only; a scenario
+        # that exercises a native control (the handover's lost-attempt Discard) widens this itself.
+        self.owner_methods = frozenset({"prompt.receipt"})
 
         async def rpc(method, **params):
             async def on_owner():
-                self.assertEqual(method, "prompt.receipt", "origin inspection must never attach or compute runtime inventory")
+                self.assertIn(method, self.owner_methods, "origin inspection must never attach or compute runtime inventory")
                 self.calls.append((method, params))
                 if self.before_rpc:
                     self.before_rpc(method, params)
