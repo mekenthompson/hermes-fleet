@@ -62,6 +62,47 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
     def make_due(self, identity):
         self.store.defer(identity, self.bridge.clock() - 1)
 
+    async def test_late_interim_cannot_close_while_captured_pr_is_unaccepted(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        task_id = self.fixture.create()
+        with self.fixture.board.conn() as conn:
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer='probe-worker'))
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        await asyncio.to_thread(self.bridge.flush)
+        await self.start_turn()
+        interim = self.queue_interim()
+        self.lost.add(interim)
+        await self.flush(interim)
+        self.assertTrue(self.store.outbox_row(interim)['payload']['write_started'])
+        receipt = {'ok': True, 'classification': 'passed', 'head_sha': 'a' * 40, 'checks': []}
+        with patch.object(bridge_module, 'pr_acceptance', lambda *args: receipt):
+            with self.fixture.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary='Implementation and local checks finished.',
+                                 result='https://github.com/example/project/pull/12')
+            await asyncio.to_thread(self.bridge.pump_kanban)
+            status = self.store.latest_status(native.ISSUE)
+            self.assertEqual(status['state'], 'done')
+            receipt.update(ok=False, classification='pending')
+            await self.flush(status['id'])
+            self.assertEqual(self.store.outbox_row(status['id'])['state'], 'pending')
+            self.assertNotEqual(self.authority.issues[native.ISSUE]['state']['type'], 'completed')
+            self.make_due(interim)
+            before = len(self.posted)
+            await self.flush(interim)
+            effects = [p['content'] for p in self.posted[before:]]
+            self.assertNotIn('response', [p['type'] for p in effects])
+            receipt.update(ok=True, classification="passed")
+            self.make_due(status["id"])
+            for _ in range(4):
+                await asyncio.to_thread(self.bridge.flush)
+            finals = [p for p in self.posted if p["content"]["type"] == "response"]
+            self.assertEqual(len(finals), 1)
+            self.make_due(interim)
+            await self.flush(interim)
+            self.assertEqual(len([p for p in self.posted if p["content"]["type"] == "response"]), 1)
+            self.assertEqual(sum(p["id"] == interim for p in self.posted), 1)
+
     async def test_response_queued_before_new_input_is_thought_when_delivered(self):
         await self.start_turn()
         first = self.queue_final(native.ACTIVITY)

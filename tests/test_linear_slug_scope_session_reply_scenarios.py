@@ -138,16 +138,27 @@ class SlugScopeAndSessionReplyScenarios(unittest.TestCase):
         self.assertEqual(row["payload"]["content"]["type"], "response")
         self.assertIn(row["payload"]["content"], self.activities)
 
-    def test_reply_for_another_session_or_finished_work_stays_a_response(self):
+    def test_reply_for_another_session_or_settled_finished_work_stays_a_response(self):
         task_id = self.session_task()
         from hermes_fleet_linear_plugin.native_input import _session_work_live
         self.assertFalse(_session_work_live(self.bridge, native.ISSUE, "another-session"))
         with self.board.conn() as conn:
             run = native.kb.get_task(conn, task_id).current_run_id
-            self.assertTrue(native.kb.complete_task(conn, task_id, result="finished", expected_run_id=run))
+            self.assertTrue(native.kb.complete_task(conn, task_id, summary="Investigation and local checks finished.",
+                                                   result="Local verification succeeded.", expected_run_id=run))
         self.assertEqual(self.board.get(task_id).status, "done")
+        self.assertTrue(_session_work_live(self.bridge, native.ISSUE, native.SESSION))
+        self.bridge.pump_kanban()
+        for _ in range(3):
+            self.bridge.flush()
+        status = self.store.latest_status(native.ISSUE)
+        self.assertTrue(self.store.terminal_status_applied(status["id"]))
+        self.assertFalse(_session_work_live(self.bridge, native.ISSUE, native.SESSION))
+        visible = len(self.activities)
         row = self.reply("The work already finished; here is the answer.")
         self.assertEqual(row["payload"]["content"]["type"], "response")
+        self.assertFalse(row["payload"]["applied"], "Native closeout already supplied the final response")
+        self.assertEqual(len(self.activities), visible)
 
     def test_failed_thought_reply_retries_like_a_reply_not_a_one_try_thought(self):
         from hermes_fleet_linear_plugin.store import advisory

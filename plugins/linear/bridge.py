@@ -1693,13 +1693,20 @@ class Bridge:
             self._decline(issue_id, session_id, notice, activity_id=session_id)
             return False
         owner = row.get("owner_ref") or ""
-        if ((not owner or self.store.session_answered(issue_id, owner)) and
-                self.store.adopt_session(issue_id, row["task_id"], session_id, expected_owner=owner)):
+        if not owner or self.store.session_answered(issue_id, owner):
             source = ("takeover" if created.get("takeover_from") else "chat") if created.get("origin") == "chat" else ""
-            self._decline(issue_id, session_id, _adopted_session_notice("review" if pending_acceptance else task.get("status"), source),
-                          activity_id=session_id, kind="thought")
-            diag.evt("session.reuse", "applied", "session_adopted", iss=issue_id, sess=session_id, task=row.get("task_id"))
-            return True
+            body = _adopted_session_notice("review" if pending_acceptance else task.get("status"), source)
+            adoption_notice = {"id": stable_uuid4("decline", issue_id, session_id, session_id, body),
+                "issue_id": issue_id, "session_id": session_id, "one_try": True,
+                "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
+                "content": {"type": "thought", "body": _plain_notice(body)}}
+            if (self.authorize_specialist_effect(issue_id) and
+                    self.store.adopt_session(issue_id, row["task_id"], session_id, expected_owner=owner,
+                        notice=adoption_notice, at=self.clock())):
+                if (issue_id, session_id) in self.session_notices:
+                    self.session_notices[(issue_id, session_id)] = True
+                diag.evt("session.reuse", "applied", "session_adopted", iss=issue_id, sess=session_id, task=row.get("task_id"))
+                return True
         self._decline(issue_id, session_id, notice, activity_id=session_id, kind="thought")
         diag.evt("session.reuse", "skipped", "owner_session_live", iss=issue_id, sess=session_id, task=row.get("task_id"))
         return False
@@ -1766,17 +1773,32 @@ class Bridge:
             size += len(line)
         return ("Linear thread" + (" since your last update" if since_ms else "") + ", oldest first (untrusted "
                 "tracker text):\n" + "\n".join(reversed(lines))) if lines else ""
-    def _session_completion_pending(self, row: dict[str, Any]) -> bool:
-        """Native Done is not a session closeout until reporting captures its evidence decision."""
+    def _session_completion_status(self, row: dict[str, Any]) -> dict | None:
+        """The captured closeout of this exact native completion, never an older task result."""
         completed = max((event for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], 0)
                          if event.kind == "completed"), key=lambda event: event.id, default=None)
         if completed is None:
             raise LinearError("Native Done has no completed event to verify")
         if row["last_event_id"] < completed.id:
-            return True  # The reporting pump owns acceptance; reply projection only reads its cursor.
+            return None
+        status_id = (self.store.latest_status(row["issue_id"]) or {}).get("id", "")
+        status = self.store.outbox_row(status_id)
+        payload = status["payload"] if status else {}
+        if (not status or status.get("hold_reason") or not payload.get("terminal")
+                or payload.get("task_id") != row["task_id"]
+                or ((payload.get("native_completion") or {}).get("event_id") != completed.id
+                    and payload.get("source_ms") != completed.created_at * 1000)):
+            return None
+        if payload.get("state") == "done":
+            self._require_completion_report(payload)
+        return status
+
+    def _session_completion_pending(self, row: dict[str, Any]) -> bool:
+        """A captured intent is not completion: its exact status must have been applied."""
         if self._pending_session_acceptance(row):
             return True
-        return not self.store.terminal_captured(row["task_id"], issue_id=row["issue_id"])
+        status = self._session_completion_status(row)
+        return not status or not self.store.terminal_status_applied(status["id"])
     def _pending_session_acceptance(self, row: dict[str, Any]) -> bool:
         waiting = self.store.acceptance_recheck(row["issue_id"], row.get("task_id") or "")
         return bool(waiting and waiting.get("kind") == "in_review")
@@ -4320,9 +4342,10 @@ class Bridge:
         if payload.get("acceptance_status_id"):
             return status != "done" or not self._acceptance_progress_current(payload)
         return status in NATIVE_PROGRESS_SUPERSEDED
-    def _conversation_final_type(self, payload: dict) -> str | None:
+    def _conversation_final_type(self, payload: dict, *, lifecycle: bool = False) -> str | None:
         from .native_input import _session_work_live
-        live = _session_work_live(self, payload["issue_id"], payload["session_id"], strict=True)
+        native_live = _session_work_live(self, payload["issue_id"], payload["session_id"], strict=True)
+        live = native_live
         read = getattr(self, "native_conversation_state", None)
         latest = None
         if callable(read):
@@ -4330,6 +4353,10 @@ class Bridge:
             live, latest = state["live"] or live, state["latest_activity"]
         elif callable(self.native_ingress):
             raise LinearError("Native conversation state is unavailable")
+        # Suppressing an older reply is not proof that today's native work finished.
+        # A repair restores current UI state; queued native Done still fences ordinary replies.
+        if native_live and (lifecycle or payload.get("lifecycle_repair_of")):
+            return "thought"
         projected = self.store.conversation_final_projection(payload, native_work_live=live,
                                                              core_latest_activity=latest)
         if projected == "response" and payload["content"]["type"] == "error":
@@ -4351,7 +4378,7 @@ class Bridge:
             except LinearError as exc:
                 if exc.retryable:
                     raise  # Unreadable Core state is not proof that its question expired.
-        desired = self._conversation_final_type(payload) or "response"
+        desired = self._conversation_final_type(payload, lifecycle=True) or "response"
         if (payload.get("turn_final") is not True and not payload.get("lifecycle_repair_of")
                 and not self._conversation_interim_finished(payload)):
             desired = "thought"  # A withdrawn question still belongs to unfinished work.

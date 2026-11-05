@@ -354,6 +354,65 @@ class ChatEntrustScenarios(unittest.TestCase):
         # Progress scope: native Done never closes the issue, so only progress is checked here.
         self.assert_reports_in_session(ISSUE, existing.id, "echo-session", done=False)
 
+    def test_session_echo_after_unaccepted_delivery_must_stay_open(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply['native']['task_id']
+        self.flush()
+        self.claim(task_id)
+        receipt = {'ok': True, 'classification': 'passed', 'head_sha': 'a' * 40, 'checks': []}
+        with patch.object(bridge_module, 'pr_acceptance', lambda *args: receipt):
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary='Implementation and local checks finished.',
+                                 result='https://github.com/example/project/pull/12')
+            self.bridge.pump_kanban()
+            status = self.bridge.store.latest_status(NEW_ISSUE)
+            self.assertEqual(status['state'], 'done')
+            receipt.update(ok=False, classification='pending')
+            self.bridge.flush(only_id=status['id'])
+            self.assertEqual(self.bridge.store.outbox_row(status['id'])['state'], 'pending')
+            comments = len(self.issue_comments(NEW_ISSUE))
+            self.echo(NEW_ISSUE, 'echo-session')
+            self.bridge.flush()
+            effects = [r['content'] for r in self.said('echo-session')]
+            self.assertNotIn('response', [p['type'] for p in effects])
+            self.assertEqual(self.bridge.store.get(NEW_ISSUE)['owner_ref'], 'echo-session')
+            receipt.update(ok=True, classification="passed")
+            self.bridge.store.defer(status["id"], self.bridge.clock() - 1)
+            for _ in range(4):
+                self.flush()
+            responses = [r for r in self.said("echo-session") if r["content"]["type"] == "response"]
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(self.said("echo-session")[-1], responses[0])
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments,
+                             "Unattempted fallback closeout must not publish after adoption")
+            self.echo(NEW_ISSUE, "echo-session")
+            for _ in range(3):
+                self.flush()
+            self.assertEqual(len([r for r in self.said("echo-session") if r["content"]["type"] == "response"]), 1)
+
+    def test_completion_capture_between_adoption_inspection_and_commit_routes_final_to_session(self):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        with self.board.conn() as conn:
+            kb.complete_task(conn, task_id, summary="Investigation and checks finished.", result="Local checks passed.")
+        comments = len(self.issue_comments(NEW_ISSUE))
+        adopt = self.bridge.store.adopt_session
+        def capture_before_adoption(*args, **kwargs):
+            self.bridge.pump_kanban()
+            return adopt(*args, **kwargs)
+        with patch.object(self.bridge.store, "adopt_session", side_effect=capture_before_adoption):
+            self.echo(NEW_ISSUE, "echo-session")
+        for _ in range(4):
+            self.flush()
+        said = self.said("echo-session")
+        self.assertEqual([r["content"]["type"] for r in said], ["thought", "response"])
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
     def test_adopted_session_waits_for_pr_acceptance_before_its_only_response(self):
         self.check_acceptance_session(adopt_before_completion=True)
 

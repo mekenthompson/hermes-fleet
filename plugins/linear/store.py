@@ -488,7 +488,7 @@ class Store:
             if self.conversation_reply(row["kind"], payload) and conversation_attempt_id:
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
                     "'$.conversation_attempt_id',?) WHERE id=?", (conversation_attempt_id, row_id)).rowcount)
-            if terminal or native_progress or self.conversation_reply(row["kind"], payload) or row["kind"] in ("status", "description", "delegate", "project_update"):
+            if terminal or payload.get("terminal") and row["kind"] in ("comment", "activity") or native_progress or self.conversation_reply(row["kind"], payload) or row["kind"] in ("status", "description", "delegate", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
@@ -889,7 +889,8 @@ class Store:
     def retired(self, issue_id: str | None = None) -> list[dict]:
         with self._tx() as db:
             return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
-    def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str) -> bool:
+    def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str,
+                      notice: dict | None = None, at: float | None = None) -> bool:
         """Report this bound task's progress in a Linear Agent Session; reporting only, never execution.
 
         Compare-and-set on the inspected owner (``""`` for work started from chat or by take_over),
@@ -901,9 +902,45 @@ class Store:
         with self._tx() as db:
             if not self._admitted(db, issue_id):
                 return False
-            return bool(db.execute("UPDATE work SET owner_ref=?, linear_session_id=? WHERE issue_id=? AND "
-                                   "origin='native' AND task_id=? AND owner_ref=?",
-                                   (session_id, session_id, issue_id, task_id, expected_owner)).rowcount)
+            # Read the current closeout inside the adoption transaction: the reporting
+            # pump may have captured it after the caller inspected native completion.
+            status = self.outbox_row((self.latest_status(issue_id) or {}).get("id", ""))
+            status_payload = status["payload"] if status else {}
+            closeout_status_id = (status["id"] if status and not status.get("hold_reason")
+                                  and status_payload.get("terminal") and status_payload.get("task_id") == task_id else None)
+            changed = db.execute("UPDATE work SET owner_ref=?, linear_session_id=? WHERE issue_id=? AND "
+                                 "origin='native' AND task_id=? AND owner_ref=?",
+                                 (session_id, session_id, issue_id, task_id, expected_owner)).rowcount
+            if not changed:
+                return False
+            if notice and not self.enqueue("activity", notice, at=at):
+                raise ValueError("Native session adoption notice could not be queued")
+            if closeout_status_id:
+                # The original closeout keeps its immutable destination. Adoption and this
+                # new session's dependent closeout commit together, including across restarts.
+                source = db.execute("SELECT id,kind,state,attempts,payload FROM outbox WHERE hold_reason IS NULL "
+                    "AND kind IN ('comment','activity') AND json_extract(payload,'$.requires_status_id')=? "
+                    "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.terminal')=1 "
+                    "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid LIMIT 1",
+                    (closeout_status_id, task_id)).fetchone()
+                if source is None:
+                    raise ValueError("Native closeout has no exact session presentation")
+                prior = json.loads(source["payload"])
+                status = self.outbox_row(closeout_status_id)["payload"]
+                payload = {key: value for key, value in prior.items() if key in
+                    ("issue_id", "task_id", "terminal", "owner_issue_id", "requires_status_id")}
+                payload.update(session_id=session_id, content={"type": "response" if status["state"] == "done" else "error",
+                    "body": prior["body"] if source["kind"] == "comment" else prior["content"]["body"]})
+                payload["write_started"] = False
+                if not self.enqueue("activity", payload, at=at):
+                    raise ValueError("Native session closeout could not be queued")
+                if (source["state"] == "pending" and source["attempts"] == 0
+                        and prior.get("write_started") is False):
+                    # Preserve the original immutable body/destination, but never first
+                    # publish its fallback after adoption. Admission races use this same tx.
+                    db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?",
+                               (source["id"],))
+            return True
     def session_answered(self, issue_id: str, session_id: str) -> bool:
         """The session's latest activity from this app is a delivered response: Linear has closed it.
 
@@ -982,6 +1019,8 @@ class Store:
             status_id = status_id or str(uuid.uuid4())
             for kind, payload in writes:
                 payload = {**payload, "work_owner": work["ownership_id"]}
+                if kind in ("comment", "activity"):
+                    payload["write_started"] = False  # Newly captured closeout; persisted before transport.
                 row_id = status_id if kind == "status" else (
                     str(payload["id"]) if kind == "comment" and payload.get("id") else str(uuid.uuid4()))
                 if kind != "status":
