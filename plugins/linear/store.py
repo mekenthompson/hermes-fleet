@@ -195,7 +195,8 @@ class Store:
         return bool(anchor and anchor["activity_id"] != source_activity and not self.conversation_finished(
             issue_id, session_id, anchor["activity_id"], anchor["cursor"]))
 
-    def conversation_final_projection(self, payload: dict, *, native_work_live: bool) -> str | None:
+    def conversation_final_projection(self, payload: dict, *, native_work_live: bool,
+                                      core_latest_activity: str | None = None) -> str | None:
         """Project completion at publication; None means a later completion superseded it."""
         issue, session = payload["issue_id"], payload["session_id"]
         source = payload.get("turn_activity", payload["source_activity"])
@@ -209,6 +210,10 @@ class Store:
                 (issue, session, payload.get("source_cursor", 0))).fetchone()
             if done:
                 return None
+            if core_latest_activity is not None:
+                if core_latest_activity != source and not native_work_live:
+                    return None  # Core already settled a newer input, even if its ACK callback is late.
+                return "thought" if native_work_live else "response"
             anchor = self.conversation_input(issue, session)
             if anchor and anchor["activity_id"] != source:
                 if self.conversation_finished(issue, session, anchor["activity_id"], anchor["cursor"]):

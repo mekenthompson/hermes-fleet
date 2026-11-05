@@ -278,6 +278,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.bridge.profile_home = self.home
         self.running["bridge"] = self.bridge
         self.bridge.native_ingress = lambda delivery: self.native_input.route_delivery(self.running, delivery)
+        self.bridge.native_conversation_state = lambda payload: self.native_input.committed_conversation_state(
+            self.running.get("native_adapter"), self.bridge, payload)
 
     async def test_creator_null_current_activity_stop_controls_linked_ready_task_before_ack(self):
         task_id = self.fixture_task()
@@ -799,6 +801,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.bridge.profile_home = self.home
         self.running["bridge"] = self.bridge
         self.bridge.native_ingress = lambda delivery: self.native_input.route_delivery(self.running, delivery)
+        self.bridge.native_conversation_state = lambda payload: self.native_input.committed_conversation_state(
+            self.running.get("native_adapter"), self.bridge, payload)
         request_id = str(uuid.uuid4())
         async def decision(event):
             context = transport.capture_context(track=True)
@@ -1390,3 +1394,103 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_inflight_ordinary_clarify_is_not_an_answer_after_replacement(self):
         await self.inflight_ordinary_replacement("clarify")
+
+    async def clarify_expiry_selection_race(self, *, multi=False):
+        """Core's actual timeout competes after the displayed FIFO identity was read."""
+        import threading
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        shown = clarify.register("shown-question", key, "Which environment?", ["staging", "production"],
+                                 multi_select=multi)
+        sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices, shown.clarify_id, key,
+            metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        hidden = clarify.register("hidden-question", key, "Next task?", ["production", "staging"], multi_select=multi)
+        await self.replace_input_adapter()
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        real_lock, real_select = clarify._lock, clarify.get_pending_for_session
+        competing, finished = threading.Event(), threading.Event()
+        results = []
+        def expire():
+            try:
+                results.append(clarify.wait_for_response(shown.clarify_id, .001))
+            finally:
+                finished.set()
+                competing.set()
+        worker = threading.Thread(target=expire)
+        class ObservedLock:
+            # Keep the actual Core RLock; observe when the real timeout either
+            # reaches a contended acquisition or finishes. No fabricated expiry.
+            def __enter__(self):
+                if threading.current_thread() is worker:
+                    if not real_lock.acquire(blocking=False):
+                        competing.set()
+                        real_lock.acquire()
+                else:
+                    real_lock.acquire()
+                return self
+            def __exit__(self, *_exc):
+                real_lock.release()
+        selected = []
+        def select_then_expire(*args, **kwargs):
+            entry = real_select(*args, **kwargs)
+            if entry is shown and not selected:
+                selected.append(entry)
+                worker.start()
+                self.assertTrue(competing.wait(5), "Core timeout never reached the selection boundary")
+            return entry
+        original = self.event("selection", "1,2" if multi else "1")
+        try:
+            with patch.object(clarify, "_lock", ObservedLock()), \
+                    patch.object(clarify, "get_pending_for_session", side_effect=select_then_expire):
+                await self.deliver_raw("selection-first", original)
+                await self.until(lambda: self.inbox_row("selection-first")[2] == "imported")
+                await asyncio.to_thread(worker.join, 5)
+            self.assertTrue(finished.is_set())
+            self.assertIsNone(hidden.response, "displayed consent was redirected to an unseen successor")
+            self.assertFalse(hidden.event.is_set())
+            expected = json.dumps(["staging", "production"]) if multi else "staging"
+            self.assertEqual(shown.response, expected)
+            self.assertEqual(results, [expected])
+            self.assertEqual(len(self.rows()), 1)
+            sent = await self.adapter.send_clarify(self.ISSUE, hidden.question, hidden.choices,
+                hidden.clarify_id, key, metadata={"thread_id": self.SESSION})
+            self.assertTrue(sent.success, sent.error)
+            await self.deliver_raw("selection-replay", original)
+            await self.until(lambda: self.inbox_row("selection-replay")[2] == "imported")
+            self.assertIsNone(hidden.response)
+            await self.deliver("fresh-selection", "1")
+            await self.until(lambda: self.inbox_row("fresh-selection")[2] == "imported")
+            expected = json.dumps(["production"]) if multi else "production"
+            self.assertEqual(clarify.wait_for_response(hidden.clarify_id, .1), expected)
+        finally:
+            if worker.ident is not None:
+                await asyncio.to_thread(worker.join, 5)
+
+    async def test_clarify_timeout_cannot_redirect_numeric_answer_to_hidden_successor(self):
+        await self.clarify_expiry_selection_race()
+
+    async def test_clarify_timeout_keeps_multiselect_bound_to_displayed_choices(self):
+        await self.clarify_expiry_selection_race(multi=True)
+
+    async def test_expired_displayed_clarify_cannot_authorize_a_hidden_successor(self):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        shown = clarify.register("shown-question", key, "Which environment?", ["staging", "production"])
+        sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices, shown.clarify_id, key,
+            metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        hidden = clarify.register("hidden-question", key, "Next task?", ["production", "staging"])
+        self.assertIsNone(await asyncio.to_thread(clarify.wait_for_response, shown.clarify_id, .001))
+        await self.replace_input_adapter()
+        await self.deliver("late-selection", "1")
+        await self.until(lambda: self.inbox_row("late-selection")[2] == "imported")
+        self.assertIsNone(hidden.response)
+        self.assertFalse(hidden.event.is_set())
+        self.assertEqual(len(self.rows()), 2)

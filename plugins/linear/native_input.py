@@ -405,6 +405,85 @@ def project_input(bridge, event) -> NativeInput | None:
     )
 
 
+
+def committed_conversation_state(adapter, bridge, payload) -> dict:
+    """Read Core's committed order and outcomes, before or after its provider ACK hook.
+
+    An unfinished admission keeps the panel working. Unknown execution or an
+    incomplete terminal receipt cannot authorize a completion publication.
+    """
+    if adapter is None or not adapter._running:
+        raise LinearError("Native conversation state is unavailable")
+    runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
+    if runner is None:
+        raise LinearError("Native conversation owner is unavailable")
+    from gateway.session_authorities import authority_for_home, admission_owner, require_serving
+    from hermes_state_runtime import get_session_admission, list_session_admissions
+    try:
+        authority = authority_for_home(runner, bridge.profile_home)
+        if authority is None:
+            raise ValueError("owning profile is unavailable")
+        require_serving(authority)
+        anchor = bridge.store.conversation_input(payload["issue_id"], payload["session_id"])
+        targets, receipt = [], None
+        if anchor:
+            receipt = get_session_admission(authority.db, admission_id=anchor["admission_id"])
+            if receipt is None:
+                raise ValueError("native conversation receipt is unavailable")
+            targets.append(receipt["target_session_id"])
+            keys = anchor.get("session_keys", [])
+        else:
+            # A scoped direct reply can precede any native input/ACK projection.
+            if payload["source_activity"] == payload["session_id"]:
+                session = bridge.api.agent_session(payload["session_id"])
+                actor = (session.get("creator") or {}).get("id")
+                if not actor:
+                    raise ValueError("created session has no verified human route")
+            else:
+                actor = bridge.api.agent_activity(payload["source_activity"], payload["session_id"])["user"]["id"]
+            source = adapter.build_source(chat_id=payload["issue_id"], thread_id=payload["session_id"],
+                user_id=actor, message_id=payload["source_activity"],
+                scope_id=bridge.api.identity["organization_id"], is_bot=False)
+            keys = adapter._core_session_keys(source)
+        # A reset/compression can move today's route while an older reply remains pending.
+        for key in keys:
+            entry = adapter._session_store.lookup_by_session_key(key)
+            if entry is not None:
+                target = admission_owner(authority, entry.session_id)
+                if target in targets:
+                    targets.remove(target)
+                targets.append(target)  # The current route takes precedence over the older owner.
+        live, latest = False, None
+        for target in targets:
+            rows = list_session_admissions(authority.db, session_id=target, pending_only=False)
+            if receipt and receipt["target_session_id"] == target and not any(
+                    row["admission_id"] == receipt["admission_id"] for row in rows):
+                rows.append(receipt)  # Core's compacted terminal receipt remains canonical.
+            newest = None
+            for row in rows:
+                envelope = row["payload"].get("native_text_v1")
+                if envelope is not None:
+                    source = envelope["source"]
+                    if (source.get("platform") != "linear" or source.get("chat_id") != payload["issue_id"]
+                            or source.get("thread_id") != payload["session_id"]
+                            or source.get("scope_id") != bridge.api.identity["organization_id"]):
+                        continue
+                status = row["status"]
+                if status not in ("queued", "started", "terminal") or (status == "terminal" and not row.get("outcome")):
+                    raise ValueError("native admission has no verified final outcome")
+                live = live or status != "terminal"
+                if (envelope is not None and not envelope["event"].get("structured_control")
+                        and (newest is None or row["seq"] > newest["seq"])):
+                    newest = row
+            if newest is not None:
+                latest = newest["payload"]["native_text_v1"]["event"]["message_id"]
+        return {"live": live, "latest_activity": latest}
+    except LinearError:
+        raise
+    except Exception as exc:
+        raise LinearError("Committed native conversation state could not be verified") from exc
+
+
 def _session_work_live(bridge, issue_id, session_id, *, strict=False) -> bool:
     """Is tracked native work this same Agent Session started still unfinished?
 
@@ -610,6 +689,9 @@ def create_adapter(config, running):
             self._loop = asyncio.get_running_loop()
             self._running = True
             running["native_adapter"] = self
+            if bridge := running.get("bridge"):
+                bridge.native_conversation_state = lambda payload: committed_conversation_state(
+                    running.get("native_adapter"), bridge, payload)
             return True
 
         async def disconnect(self):
@@ -932,16 +1014,23 @@ def create_adapter(config, running):
                 session_key = prompt.get("session_key")
                 if prompt.get("kind") != "clarify" or session_key not in keys:
                     continue
-                pending = clarify.get_pending(prompt.get("clarify_id"))
-                if (pending is None or pending.session_key != session_key or
-                        clarify.get_pending_for_session(session_key, include_choice_prompts=True) is not pending):
-                    continue
-                outcome = clarify.attempt_text_response_for_session(session_key, projected.text)
-                if outcome in (clarify.TEXT_RESOLVED, clarify.TEXT_REJECTED_SELECTION):
-                    return True, None, question
-                if outcome == clarify.TEXT_REJECTED_PROSE:
-                    clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED)
-                    return False, None, None
+                # Core's timeout and button callbacks use this same lock. Keep
+                # identity, its choice parsing and the decision in one critical
+                # section; a session lookup must never select an unseen successor.
+                with clarify._lock:
+                    pending = clarify.get_pending(prompt.get("clarify_id"))
+                    if (pending is None or pending.session_key != session_key or
+                            clarify.get_pending_for_session(session_key, include_choice_prompts=True) is not pending):
+                        continue
+                    value, reason = clarify._coerce_text_response_detailed(pending, projected.text)
+                    if value is not None:
+                        if clarify.resolve_gateway_clarify(pending.clarify_id, value):
+                            return True, None, question
+                    elif reason == "invalid_selection":
+                        return True, None, question
+                    else:
+                        clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED)
+                        return False, None, None
             decision = approval_decision(projected.text)
             if decision is None:
                 return False, None, None

@@ -4185,7 +4185,7 @@ class Bridge:
                                       payload.get("seen"), payload.get("source_ms")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
             final_reply = bool(row and self.store.conversation_reply(row["kind"], payload)
-                               and payload.get("turn_final") is True)
+                               and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")))
             if expected_content is not None and payload.get("content") != expected_content:
                 raise ProjectUpdateDeferred  # Another sender changed the encoded request's projection.
             if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
@@ -4265,7 +4265,38 @@ class Bridge:
     def _conversation_final_type(self, payload: dict) -> str | None:
         from .native_input import _session_work_live
         live = _session_work_live(self, payload["issue_id"], payload["session_id"], strict=True)
-        return self.store.conversation_final_projection(payload, native_work_live=live)
+        read = getattr(self, "native_conversation_state", None)
+        latest = None
+        if callable(read):
+            state = read(payload)
+            live, latest = state["live"] or live, state["latest_activity"]
+        elif callable(self.native_ingress):
+            raise LinearError("Native conversation state is unavailable")
+        projected = self.store.conversation_final_projection(payload, native_work_live=live,
+                                                             core_latest_activity=latest)
+        return (projected or "response") if payload.get("lifecycle_repair_of") else projected
+
+    @staticmethod
+    def _lifecycle_repair_content(kind: str) -> dict:
+        return {"type": kind, "body": ("I'm still working on your request." if kind == "thought"
+                                       else "Work in this conversation has finished.")}
+
+    def _reconcile_conversation_lifecycle(self, row: dict[str, Any]) -> None:
+        """An accepted late effect keeps its identity; a new scoped Activity repairs today's state."""
+        payload = row["payload"]
+        desired = self._conversation_final_type(payload) or "response"
+        if desired == payload["content"]["type"]:
+            return
+        identity = stable_uuid4("native-lifecycle-repair", self.profile, row["id"], desired)
+        repair = {key: payload[key] for key in ("issue_id", "session_id", "source_activity", "source_cursor",
+                   "turn_activity", "requester_sessions", "requester_activities") if key in payload}
+        repair.update(id=identity, content=self._lifecycle_repair_content(desired),
+                      content_action=True, unlinked_content=True, native_reply_version=1,
+                      write_started=False, lifecycle_repair_of=row["id"])
+        queued = self.store.enqueue("activity", repair, at=self.clock())
+        if not queued:
+            raise LinearError("Conversation lifecycle repair could not be queued")
+        self.flush(only_id=queued)  # Same outbox authorization, admission guards and retry path.
 
     def _prepare_conversation_final(self, row: dict[str, Any]) -> bool | None:
         """Settle an attempted immutable activity, or choose a fresh completion at send time."""
@@ -4279,7 +4310,8 @@ class Bridge:
             if actual is not None:
                 if actual != payload["content"]:
                     raise LinearError("Prior completion activity content differs; reconcile before retrying", retryable=False)
-                return True  # Read-only settlement; replaying it could reopen a later completed turn.
+                self._reconcile_conversation_lifecycle(row)
+                return True  # Settle the immutable original; any repair has its own outbox identity.
         desired = self._conversation_final_type(payload)
         if attempted and desired != payload["content"]["type"]:
             # Absence is not proof a timed-out mutation cannot still land. Keep the original
@@ -4288,7 +4320,8 @@ class Bridge:
         if desired is None:
             return diag.because("obsolete_progress")
         if desired != payload["content"]["type"]:
-            content = {**payload["content"], "type": desired}
+            content = (self._lifecycle_repair_content(desired) if payload.get("lifecycle_repair_of")
+                       else {**payload["content"], "type": desired})
             if not self.store.reproject_conversation_final(row["id"], payload["content"], content):
                 raise ProjectUpdateDeferred
             row["payload"] = {**payload, "content": content}
@@ -4298,12 +4331,13 @@ class Bridge:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
-        if self.store.conversation_reply(kind, payload) and payload.get("turn_final") is True:
+        if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")):
             settled = self._prepare_conversation_final(row)
             if settled is not None:
                 return settled
             payload = row["payload"]
         if (self.store.conversation_reply(kind, payload) and payload.get("turn_final") is not True and
+                not payload.get("lifecycle_repair_of") and
                 payload["content"]["type"] in ("thought", "elicitation") and
                 self.store.conversation_finished(payload["issue_id"], payload["session_id"],
                     payload.get("turn_activity", payload.get("source_activity", "")), payload.get("source_cursor", 0))):
@@ -4470,6 +4504,8 @@ class Bridge:
                 ephemeral=bool(payload.get("ephemeral")),
                 **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})),
                 expected_content=copy.deepcopy(payload["content"]) if self.store.conversation_reply(kind, payload) else None)
+            if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")):
+                self._reconcile_conversation_lifecycle(row)
             return True
         elif kind == "project_update":
             return self._send_project_update(row["id"])

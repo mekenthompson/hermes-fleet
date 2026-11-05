@@ -517,8 +517,10 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
     bridge.profile_home = home
     await asyncio.to_thread(diag.service_start, bridge.store, float(settings.get("tick_seconds", 2)), bridge.recheck_every)
     if running.get("native_requested"):
-        from .native_input import route_delivery
+        from .native_input import route_delivery, committed_conversation_state
         bridge.native_ingress = lambda delivery: route_delivery(running, delivery)
+        bridge.native_conversation_state = lambda payload: committed_conversation_state(
+            running.get("native_adapter"), bridge, payload)
     ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
     server = None
     try:

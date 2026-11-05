@@ -117,7 +117,9 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         before = len(self.posted)
         self.make_due(first)
         await self.flush(first)
-        self.assertEqual(len(self.posted), before)
+        self.assertEqual(len(self.posted), before + 1)
+        self.assertNotEqual(self.posted[-1]["id"], first)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
         self.assertEqual(self.store.outbox_row(first)["state"], "sent")
         self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")
 
@@ -132,8 +134,10 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         before = len(self.posted)
         self.make_due(first)
         await self.flush(first)
-        self.assertEqual(len(self.posted), before)
+        self.assertEqual(len(self.posted), before + 1)
+        self.assertNotEqual(self.posted[-1]["id"], first)
         self.assertEqual(self.store.outbox_row(first)["state"], "sent")
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "thought")
         self.assertEqual(self.posted[-1]["content"]["type"], "response")
 
     async def test_uncertain_absent_activity_cannot_change_immutable_content(self):
@@ -256,3 +260,61 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.posted), before)
         self.assertEqual(self.store.outbox_row(first)["state"], "pending")
         self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")
+
+    async def test_late_repair_keeps_its_identity_and_repairs_current_completion(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        await self.deliver("newer-input", "Check the next part.")
+        original = self.bridge.api.transport
+        delayed = []
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"]:
+                fields = request["variables"]["input"]
+                if fields["content"]["type"] == "thought":
+                    delayed.append((url, body, headers))
+                    raise TimeoutError("fixture holds lifecycle repair in flight")
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(len(delayed), 1)
+        fields = json.loads(delayed[0][1])["variables"]["input"]
+        self.assertNotEqual(fields["id"], first)
+        second = self.queue_final("newer-input", "Both parts finished.")
+        await self.flush(second)
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        original(*delayed[0])  # The repair thought lands after B's response.
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+        self.make_due(fields["id"])
+        await self.flush(fields["id"])
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        self.assertNotEqual(self.posted[-1]["id"], fields["id"])
+        self.assertEqual(self.store.outbox_row(fields["id"])["payload"]["content"], fields["content"])
+        self.assertEqual(self.store.outbox_row(fields["id"])["state"], "sent")
+
+    async def test_repair_rechecks_completion_before_publication(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        await self.deliver("newer-input", "Check the next part.")
+        original = self.bridge.store.admit_mutation
+        repair_ids = []
+        def admit(row_id, **kwargs):
+            payload = self.store.outbox_row(row_id)["payload"]
+            if payload.get("lifecycle_repair_of") and not repair_ids:
+                repair_ids.append(row_id)
+                self.queue_final("newer-input", "Both parts finished.")
+            return original(row_id, **kwargs)
+        self.make_due(first)
+        before = len(self.posted)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(len(repair_ids), 1)
+        self.make_due(repair_ids[0])
+        await self.flush(repair_ids[0])
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")

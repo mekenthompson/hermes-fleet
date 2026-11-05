@@ -61,6 +61,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             Platform("linear")
         from hermes_fleet_linear_plugin import native_input
         self.native_input = native_input
+        # This finite prompt fixture projects receipts itself; guarded seam tests own the real Core ledger.
+        committed = patch.object(native_input, "committed_conversation_state",
+                                 return_value={"live": False, "latest_activity": None})
+        committed.start()
+        self.addCleanup(committed.stop)
         self.running = {"bridge": self.bridge}
         self.adapter = native_input.create_adapter(PlatformConfig(enabled=True), self.running)
         self.assertTrue(await self.adapter.connect())
