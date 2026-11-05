@@ -636,8 +636,7 @@ def _adopted_session_notice(status: str | None, source: str) -> str:
         state = "It is paused and continues when it is resumed"
     else:
         state = "It is waiting to start"
-    lead = "running" if status in ("running", "ready", "review") else "set up"
-    return f"This is the work already {lead} on this issue{where}, so nothing new was started. {state}; updates appear here."
+    return f"Continuing the existing work on this issue{where}. {state}; progress will appear in this session."
 STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
 UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
                     "board.")

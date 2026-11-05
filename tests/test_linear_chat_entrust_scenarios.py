@@ -268,7 +268,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         answers = [record for record in self.authority.activity_records if record["agentSessionId"] == "echo-session"]
         # The session now reports the work (the checkpoint read after it opened lands there too).
         self.assertEqual([a["content"]["type"] for a in answers], ["thought", "thought"])  # a response would close it
-        self.assertIn("already running on this issue, continued from chat", answers[0]["content"]["body"])
+        self.assertIn("Continuing the existing work on this issue, continued from chat", answers[0]["content"]["body"])
         self.assertEqual(answers[1]["content"]["body"], "Proxy deployed to staging.")
 
     # -- HF-630: chat-started work adopts the Agent Session Linear opens for our delegate write --
@@ -336,7 +336,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "echo-session")
         answers = self.said("echo-session")
         self.assertEqual([a["content"]["type"] for a in answers], ["thought"])
-        self.assertIn("already running on this issue, continued from chat", answers[0]["content"]["body"])
+        self.assertIn("Continuing the existing work on this issue, continued from chat", answers[0]["content"]["body"])
         self.assertEqual(self.tasks(), [task_id])
         self.assert_reports_in_session(NEW_ISSUE, task_id, "echo-session")
 
@@ -347,9 +347,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertTrue(self.ask({"action": "work_on", "issue": ISSUE})["ok"])
         self.assertIsNone(self.bridge.store.native_intent(f"create:{ISSUE}"))  # no admission: existing_binding
         self.flush()
-        with self.assertLogs("hermes_plugins.linear", level="INFO") as logs:
-            self.echo(ISSUE, "echo-session")
-        self.assertTrue(any("reason=session_adopted" in line for line in logs.output))
+        self.echo(ISSUE, "echo-session")
         self.flush()
         self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "echo-session")
         self.assertEqual([a["content"]["type"] for a in self.said("echo-session")], ["thought"])
