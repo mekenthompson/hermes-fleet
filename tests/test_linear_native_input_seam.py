@@ -1704,6 +1704,10 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent.success, sent.error)
         # The uncertain old HTTP create reaches the provider after the new card.
         original(*delayed[0])
+        # The person answers while late A is visible. Its immutable Activity must
+        # not become consent to B even if a lifecycle repair displays B before delivery.
+        reply = "1" if old_kind == current_kind == "clarify" else "Yes"
+        answer = self.event("late-answer", reply)
         if exhausted:
             row = self.bridge.store.outbox_row(queued.message_id)
             self.assertTrue(self.bridge.store.retry(row, self.bridge.clock() + 25 * 3600, "fixture retry exhausted"))
@@ -1713,8 +1717,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
             self.assertEqual(self.bridge.store.outbox_row(queued.message_id)["state"], "sent")
         await self.replace_input_adapter()
-        reply = "1" if old_kind == current_kind == "clarify" else "Yes"
-        await self.deliver("late-answer", reply)
+        await self.deliver_raw("late-answer", answer)
         await self.until(lambda: self.inbox_row("late-answer")[2] == "imported")
         self.assertIsNone(current.response if current_kind == "clarify" else current.result,
                           "A reply to the late expired card authorized its differently displayed successor")
