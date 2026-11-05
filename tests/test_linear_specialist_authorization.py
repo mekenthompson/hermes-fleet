@@ -104,6 +104,10 @@ class Authority:
             if self.fail_session:
                 return 503, {}, json.dumps({"errors": [{"message": "fixture unavailable"}]}).encode()
             data = {"agentSession": self.sessions.get(variables["id"])}
+        elif "query OutboundAgentActivity" in query:
+            data = {"agentActivity": self.activities.get(variables["id"])}
+        elif "query AgentAnswerChronology" in query:
+            data = {name: self.activities.get(variables[name]) for name in ("question", "answer")}
         elif "query AgentActivityAuthorization" in query:
             data = {"agentActivity": self.activities.get(variables["id"])}
         elif "query CommentReadback(" in query:
@@ -127,6 +131,14 @@ class Authority:
             if field and field.endswith("Create") and not canonical_uuid4(client_id):
                 return 200, {}, json.dumps({"data": None, "errors": [{"message": "Argument Validation Error",
                     "extensions": {"code": "INPUT_ERROR"}}]}).encode()
+            if field == "agentActivityCreate":
+                from datetime import datetime, timezone
+                fields = variables["input"]
+                self.activities.setdefault(fields["id"], {"id": fields["id"], "user": {"id": self.viewer},
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                    "content": {**fields["content"],
+                                "__typename": "AgentActivity" + fields["content"]["type"].capitalize() + "Content"},
+                    "agentSession": {"id": fields["agentSessionId"]}})
             if field == "commentCreate":
                 fields = variables["input"]
                 self.comment_records[fields["id"]] = {"id": fields["id"], "body": fields["body"], "issue": {"id": fields["issueId"]}}

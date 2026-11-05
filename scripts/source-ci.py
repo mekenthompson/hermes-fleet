@@ -47,6 +47,7 @@ SHARED_TESTS = {
     'test_linear_event_data_scenarios.py',
     'test_linear_existing_work_scenarios.py', 'test_linear_isolation_scenarios.py',
     'test_linear_namespace_dispositions.py', 'test_linear_native_bridge_scenarios.py',
+    'test_linear_native_input_seam.py', 'test_linear_native_prompt_scenarios.py',
     'test_linear_native_frontdoor_scenarios.py', 'test_linear_origin_native.py',
     'test_linear_origin_provider_native.py', 'test_linear_plugin.py',
     'test_linear_scope_effect_scenarios.py', 'test_linear_specialist_authorization.py',
@@ -98,7 +99,7 @@ def select(paths, full=False, reason='changed paths'):
                 lanes['origin'] = True
             if name == 'test_claude_acp_context.py':
                 lanes['acp'] = True
-            if name == 'test_linear_native_input_seam.py':
+            if fnmatch.fnmatch(name, 'test_linear_native_*seam.py'):
                 lanes['input'] = True
             if name == 'test_linear_native_work_journey.py':
                 lanes['journey'] = True
