@@ -925,6 +925,111 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.board.discover(self.provider.issues[self.ISSUE]), [])
         self.assertEqual(self.decisions, [])
 
+    async def replace_input_adapter(self):
+        from gateway.config import PlatformConfig
+        await self.adapter.disconnect()
+        self.adapter = self.native_input.create_adapter(
+            PlatformConfig(enabled=True, typing_indicator=False), self.running)
+        self.assertTrue(await self.adapter.connect())
+        self.adapter.set_message_handler(self.runner._handle_message)
+        self.adapter.set_session_store(self.fixture.store)
+        self.adapter.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == self.USER)
+        self.runner.adapters[self.adapter.platform] = self.adapter
+
+    def final_reply_sent(self, activity_id):
+        with self.bridge.store._tx() as db:
+            return db.execute("SELECT 1 FROM outbox WHERE state='sent' AND kind='activity' "
+                "AND json_extract(payload,'$.source_activity')=? "
+                "AND json_extract(payload,'$.content.type')='response'", (activity_id,)).fetchone() is not None
+
+    async def completed_input_replay_keeps_current_anchor(self, *, recreate=False):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from tools import clarify_gateway as clarify
+        started, release = asyncio.Event(), asyncio.Event()
+        async def model(event):
+            if event.message_id == "current-input":
+                started.set()
+                await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "Finite check finished."}
+            return "Finite check finished."
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        original = self.event("completed-input", "Do the first finite check.")
+        await self.deliver_raw("completed-input", original)
+        await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal"
+                         and self.final_reply_sent("completed-input"))
+        await self.deliver("current-input", "Do the second finite check.")
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: any(event.message_id == "current-input" for event, _ in self.receipts)
+                         and self.inbox_row("current-input")[2] == "imported")
+        current = next(event for event, _ in self.receipts if event.message_id == "current-input")
+        key = self.fixture.store._generate_session_key(current.source)
+        self.addCleanup(clarify.clear_session, key)
+        try:
+            if recreate:
+                await self.replace_input_adapter()
+                self.assertEqual(self.adapter._inputs, {})
+                # Reconnect restores the active anchor even before another provider delivery.
+                result = await self.adapter.send(self.ISSUE, "Restored current progress.",
+                    metadata={"thread_id": self.SESSION, "_interim_send": True})
+                self.assertTrue(result.success, result.error)
+            await self.deliver_raw("old-provider-retry", original)
+            await self.until(lambda: self.inbox_row("old-provider-retry")[2] == "imported")
+            self.assertEqual(len(self.rows()), 2)
+            self.assertEqual(self.adapter._inputs[(self.ISSUE, self.SESSION)], "current-input")
+            interim = await self.adapter.send(self.ISSUE, "Current second check is running.",
+                metadata={"thread_id": self.SESSION, "_interim_send": True})
+            approval = await self.adapter.send(self.ISSUE, "Approve the current second check?",
+                metadata={"thread_id": self.SESSION, "is_approval_prompt": True})
+            clarify.register(clarify_id="current-question", session_key=key,
+                question="Which environment?", choices=["staging", "production"])
+            question = await self.adapter.send_clarify(self.ISSUE, "Which environment?",
+                choices=["staging", "production"], clarify_id="current-question", session_key=key,
+                metadata={"thread_id": self.SESSION})
+            for result in (interim, approval, question):
+                self.assertTrue(result.success, result.error)
+                row = self.bridge.store.outbox_row(result.message_id)
+                self.assertEqual(row["payload"]["source_activity"], "current-input")
+        finally:
+            release.set()
+        await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
+        # Replacement can cancel the old adapter's transport waiter. Reconcile the exact
+        # final reply through the same idempotent send path before testing its boundary.
+        final = await self.adapter.send(self.ISSUE, "Finite check finished.", reply_to="current-input",
+            metadata={"thread_id": self.SESSION})
+        self.assertTrue(final.success, final.error)
+        self.assertTrue(self.final_reply_sent("current-input"))
+        if recreate:
+            await self.replace_input_adapter()
+        # Reloading the same anchor retains its original cursor; it cannot reopen the final reply.
+        for metadata in ({"_interim_send": True}, {"is_approval_prompt": True}):
+            late = await self.adapter.send(self.ISSUE, "Late current-turn update.",
+                metadata={"thread_id": self.SESSION, **metadata})
+            self.assertFalse(late.success)
+            self.assertFalse(late.retryable)
+        late = await self.adapter.send_clarify(self.ISSUE, "Late question?", choices=None,
+            clarify_id="late-question", session_key=key, metadata={"thread_id": self.SESSION})
+        self.assertFalse(late.success)
+        self.assertFalse(late.retryable)
+
+    async def test_completed_input_replay_preserves_active_turn_reply_anchor(self):
+        await self.completed_input_replay_keeps_current_anchor()
+
+    async def test_recreated_adapter_preserves_active_anchor_and_final_reply_cursor(self):
+        await self.completed_input_replay_keeps_current_anchor(recreate=True)
+
+    async def test_pending_receipt_replay_cannot_replace_a_newer_input_anchor(self):
+        original = self.event("older-queued-input", "First queued instruction.")
+        await self.deliver_raw("older-queued-input", original)
+        await self.until(lambda: self.inbox_row("older-queued-input")[2] == "imported")
+        await self.deliver("newer-queued-input", "Second queued instruction.")
+        await self.until(lambda: self.inbox_row("newer-queued-input")[2] == "imported")
+        await self.deliver_raw("older-queued-retry", original)
+        await self.until(lambda: self.inbox_row("older-queued-retry")[2] == "imported")
+        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(self.adapter._inputs[(self.ISSUE, self.SESSION)], "newer-queued-input")
+
     async def ordinary_replay_at_prompt(self, kind, *, recreate=False, unreadable=False):
         """Real authority receipts must win over later prompt interception, including reconnect."""
         from gateway.config import PlatformConfig
@@ -1059,5 +1164,5 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.board.get(binding["task_id"]).status, "ready")
         self.assertEqual(self.inbox_row("inactive-activity"), ("default", raw, "imported", 1))
         self.assertEqual(len(self.rows()), 1)
-        await self.until(lambda: len(self.provider.mutations) == 1)
+        await self.until(lambda: len(self.provider.mutations) == 1 and self.final_reply_sent("inactive-activity"))
         self.assertFalse(self.bridge.store.pending(self.ISSUE))

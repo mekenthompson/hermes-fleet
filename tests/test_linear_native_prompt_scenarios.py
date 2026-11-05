@@ -71,7 +71,8 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         async def admit(event):
             # Core commits the input, then calls the committed-input hook.
             self.messages.append(event)
-            await self.adapter.on_message_admitted(event, SimpleNamespace(control=None))
+            await self.adapter.on_message_admitted(event, SimpleNamespace(control=None,
+                admission_id=event.message_id, sequence=len(self.messages), status="queued"))
         self.adapter.set_message_handler(lambda event: None)
         self.adapter.handle_message = admit
         self.loop = asyncio.get_running_loop()

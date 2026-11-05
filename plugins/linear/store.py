@@ -137,6 +137,38 @@ class Store:
                 "SELECT COALESCE(MAX(rowid), 0) FROM outbox WHERE kind='activity' "
                 "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=?",
                 (issue_id, session_id)).fetchone()[0]
+    @staticmethod
+    def _conversation_input_key(issue_id: str, session_id: str) -> str:
+        return "native-reply-anchor:" + json.dumps([issue_id, session_id], separators=(",", ":"))
+
+    def conversation_input(self, issue_id: str, session_id: str) -> dict | None:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                (self._conversation_input_key(issue_id, session_id),)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def remember_conversation_input(self, issue_id: str, session_id: str, activity_id: str,
+                                    admission_id: str, sequence: int, terminal: bool) -> dict | None:
+        """Project Core's newest receipt as the reply anchor, never webhook arrival order.
+
+        This is one delivery projection per conversation, not an input receipt ledger.
+        Reconciliation keeps the original outbox cursor and cannot reopen a finished input.
+        """
+        if not isinstance(admission_id, str) or not admission_id or type(sequence) is not int or sequence < 1:
+            raise ValueError("Native reply anchor requires a committed input receipt")
+        with self._tx() as db:
+            saved = self.conversation_input(issue_id, session_id)
+            if saved and sequence == saved["sequence"] and admission_id != saved["admission_id"]:
+                raise ValueError("Native reply anchor has a conflicting input receipt")
+            if terminal or saved and sequence <= saved["sequence"]:
+                return saved
+            anchor = {"activity_id": activity_id, "admission_id": admission_id, "sequence": sequence,
+                      "cursor": self.conversation_cursor(issue_id, session_id)}
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (self._conversation_input_key(issue_id, session_id), json.dumps(anchor)))
+            return anchor
+
     def conversation_finished(self, issue_id: str, session_id: str, source_activity: str,
                               source_cursor: int = 0) -> bool:
         """A final reply queued since this input closes its progress lane, including native Done.

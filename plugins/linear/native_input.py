@@ -589,6 +589,7 @@ def create_adapter(config, running):
             # send has no reply_to; this verified input is the one it answers.
             self._inputs = {}
             self._input_cursors = {}
+            self._input_sequences = {}
             # (issue id, Agent Session id) -> core session keys of questions asked there. Only a
             # session that was asked something can answer a clarify or an approval.
             self._asked = {}
@@ -722,12 +723,12 @@ def create_adapter(config, running):
                         raise LinearError("Native Stop has no committed control receipt")
                     await asyncio.to_thread(_handle_control, running["bridge"], original, projected)
                 else:
+                    anchor = running["bridge"].store.remember_conversation_input(
+                        projected.issue_id, projected.session_id, projected.message_id,
+                        receipt.admission_id, receipt.sequence, receipt.status == "terminal")
+                    self._cache_input(projected.issue_id, projected.session_id, anchor)
                     with self._relay_lock:
-                        self._inputs[(projected.issue_id, projected.session_id)] = projected.message_id
-                        source_key = (projected.issue_id, projected.session_id, projected.message_id)
-                        self._ordinary.add(source_key)
-                        self._input_cursors.setdefault(source_key, running["bridge"].store.conversation_cursor(
-                            projected.issue_id, projected.session_id))
+                        self._ordinary.add((projected.issue_id, projected.session_id, projected.message_id))
                 await asyncio.to_thread(delivery.acknowledge)
                 with self._relay_lock:
                     values = self._pending.get(key, [])
@@ -753,6 +754,23 @@ def create_adapter(config, running):
                 if isinstance(key, str) and key:
                     keys.append(key)
             return list(dict.fromkeys(keys))
+
+        def _cache_input(self, chat_id, session_id, anchor):
+            if anchor is None:
+                return None
+            key = (chat_id, session_id)
+            with self._relay_lock:
+                if anchor["sequence"] >= self._input_sequences.get(key, 0):
+                    self._input_sequences[key] = anchor["sequence"]
+                    self._inputs[key] = anchor["activity_id"]
+                    self._input_cursors[(*key, anchor["activity_id"])] = anchor["cursor"]
+                return self._inputs.get(key)
+
+        def _latest_input(self, chat_id, session_id):
+            bridge = running.get("bridge")
+            if bridge is None:
+                return None
+            return self._cache_input(chat_id, session_id, bridge.store.conversation_input(chat_id, session_id))
 
         def _asked_in(self, chat_id, session_id, session_key=""):
             with self._relay_lock:
@@ -897,8 +915,7 @@ def create_adapter(config, running):
             question = metadata.get("is_approval_prompt") is True
             if bridge is not None and session_id and reply_to and not question and metadata.get("_interim_send") is not True:
                 return await self._post(bridge, chat_id, session_id, reply_to, content)  # The turn's reply.
-            with self._relay_lock:
-                source = reply_to or self._inputs.get((chat_id, session_id))
+            source = reply_to or await asyncio.to_thread(self._latest_input, chat_id, session_id)
             if bridge is None or not session_id or not source:
                 return SendResult(success=False, error="Linear reply has no verified session/source Activity")
             if not question:
@@ -916,8 +933,7 @@ def create_adapter(config, running):
             from tools.clarify_gateway import get_pending, mark_awaiting_text
             session_id = (metadata or {}).get("thread_id")
             bridge = running.get("bridge")
-            with self._relay_lock:
-                source = self._inputs.get((chat_id, session_id))
+            source = await asyncio.to_thread(self._latest_input, chat_id, session_id)
             if bridge is None or not session_id or not source:
                 return SendResult(success=False, error="Linear clarify has no verified session/source Activity")
             choices = [str(choice) for choice in choices or ()]
