@@ -354,6 +354,60 @@ class ChatEntrustScenarios(unittest.TestCase):
         # Progress scope: native Done never closes the issue, so only progress is checked here.
         self.assert_reports_in_session(ISSUE, existing.id, "echo-session", done=False)
 
+    def test_adopted_session_waits_for_pr_acceptance_before_its_only_response(self):
+        self.check_acceptance_session(adopt_before_completion=True)
+
+    def test_session_can_be_adopted_while_pr_acceptance_is_pending(self):
+        self.check_acceptance_session(adopt_before_completion=False)
+
+    def check_acceptance_session(self, *, adopt_before_completion):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        if adopt_before_completion:
+            self.echo(NEW_ISSUE, "echo-session")
+            self.flush()
+        self.claim(task_id)
+        self.authority.issues[NEW_ISSUE]["team"]["states"]["nodes"].append(
+            {"id": "state-review", "name": "In Review", "type": "started"})
+        receipt = {"ok": False, "classification": "pending", "head_sha": "a" * 40, "checks": []}
+        with patch.object(bridge_module, "pr_acceptance", lambda *a: receipt):
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary="Implementation finished; checks are running.",
+                                 result="https://github.com/example/project/pull/12")
+            self.flush()
+            if not adopt_before_completion:
+                self.echo(NEW_ISSUE, "echo-session")
+                self.flush()
+            self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "echo-session")
+            self.assertEqual(self.authority.state(NEW_ISSUE), "In Review")
+            self.assertNotIn("response", [r["content"]["type"] for r in self.said("echo-session")])
+            comments = len(self.issue_comments(NEW_ISSUE))
+            # Chat summaries must not close the same session while acceptance is outstanding.
+            message = native_input.queue_reply(self.bridge, NEW_ISSUE, "echo-session", "echo-session",
+                                               "The required checks are still running.")
+            self.bridge.flush(only_id=message)
+            self.assertEqual(self.said("echo-session")[-1]["content"]["type"], "thought")
+            start = time.time()
+            self.bridge.clock = lambda: start + 26 * 60
+            self.bridge._recheck_row(self.bridge.store.get(NEW_ISSUE))
+            self.bridge.flush()
+            self.assertTrue(any(r.get("ephemeral") and r["content"].get("action") == "Verifying"
+                                for r in self.said("echo-session")))
+            # A delayed keepalive must not reopen the session after acceptance is verified.
+            self.bridge.clock = lambda: start + 52 * 60
+            self.bridge._keepalive(self.bridge.store.get(NEW_ISSUE))
+            receipt.update(ok=True, classification="passed")
+            for _ in range(3):
+                self.bridge.tick()
+            self.assertEqual(self.authority.state(NEW_ISSUE), "Done")
+            responses = [r for r in self.said("echo-session") if r["content"]["type"] == "response"]
+            self.assertEqual(len(responses), 1)
+            self.assertIs(responses[0], self.said("echo-session")[-1])
+            self.assertEqual(sum(r["content"].get("action") == "Verifying" for r in self.said("echo-session")), 1)
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
     def test_a_second_session_never_takes_over_a_live_adopted_one(self):
         reply = self.create(start_work=True)
         self.flush()
