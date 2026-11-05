@@ -511,12 +511,53 @@ def _session_work_live(bridge, issue_id, session_id, *, strict=False) -> bool:
     return getattr(task, "status", None) not in (None, "done", "archived")
 
 
+CHOICE_VALUE_PREFIX = "linear-choice:"
+
+
+def _question_request_identity(prompt) -> str:
+    """One Core decision, shared by every faithful presentation of that request."""
+    identity = {key: prompt.get(key) for key in ("kind", "session_key", "request_id", "clarify_id",
+                                               "question", "choices", "multi_select")}
+    return stable_uuid4("linear-core-question", json.dumps(identity, sort_keys=True, separators=(",", ":")))
+
+
+def _bound_question_options(prompt, metadata):
+    answers, options = {}, []
+    identity = _question_request_identity(prompt)
+    for index, option in enumerate((metadata or {}).get("options", [])):
+        answer = option.get("value")
+        if not isinstance(answer, str):
+            raise LinearError("Linear question option has no exact answer", retryable=False)
+        value = CHOICE_VALUE_PREFIX + stable_uuid4("linear-question-option", identity, str(index), answer)
+        answers[value] = answer
+        options.append({"label": option.get("label", answer), "value": value})
+    return {"options": options}, answers
+
+
 def _question_display_matches(payload) -> bool:
     """Only the exact displayed question and options can carry an answer association."""
-    display = (payload.get("native_prompt") or {}).get("display")
-    return (isinstance(display, dict) and display.get("content") == payload.get("content")
+    prompt = payload.get("native_prompt") or {}
+    display = prompt.get("display")
+    if not (isinstance(display, dict) and display.get("content") == payload.get("content")
             and display.get("signal") == payload.get("signal")
-            and display.get("signal_metadata") == payload.get("signal_metadata"))
+            and display.get("signal_metadata") == payload.get("signal_metadata")):
+        return False
+    if "request_identity" not in prompt:
+        return "selection_answers" not in prompt  # Old text-only associations cannot mint bound choices.
+    if prompt["request_identity"] != _question_request_identity(prompt):
+        return False
+    if payload.get("signal") == "select":
+        answers, options = prompt.get("selection_answers"), (payload.get("signal_metadata") or {}).get("options", [])
+        if not isinstance(answers, dict) or set(answers) != {option.get("value") for option in options}:
+            return False
+        for index, option in enumerate(options):
+            answer = answers[option["value"]]
+            if (not isinstance(answer, str) or option.get("label") != answer or option["value"] !=
+                    CHOICE_VALUE_PREFIX + stable_uuid4("linear-question-option", prompt["request_identity"], str(index), answer)):
+                return False
+    elif "selection_answers" in prompt:
+        return False  # A text-only question has no native option that can carry a bound value.
+    return True
 
 
 def _clarify_prompt_matches(prompt, pending) -> bool:
@@ -582,8 +623,12 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
             raise LinearError("A decision question must be displayed as an elicitation", retryable=False)
         # A task identifier, path or execution detail can be the subject of consent.
         # Core already renders/redacts its question; never replace it with a status notice.
-        native_prompt = {**native_prompt, "display": {
-            "content": {"type": kind, "body": body}, "signal": signal, "signal_metadata": signal_metadata}}
+        native_prompt = {**native_prompt, "request_identity": _question_request_identity(native_prompt)}
+        if signal == "select":
+            signal_metadata, answers = _bound_question_options(native_prompt, signal_metadata)
+            native_prompt["selection_answers"] = answers
+        native_prompt["display"] = {
+            "content": {"type": kind, "body": body}, "signal": signal, "signal_metadata": signal_metadata}
     else:
         body = _readable(body) or INTERNAL_ONLY_REPLY
     activity_id = message_id if message_id != session_id else None
@@ -597,7 +642,7 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
                 else ("native-reply", bridge.profile, issue_id, session_id, message_id, digest, kind, str(nonce)))
     if native_prompt:
         # An older client may have published substituted text under the old identity.
-        identity += ("faithful-question-v1",)
+        identity += ("bound-question-v2",)
     row_id = stable_uuid4(*identity)
     final = kind is None
     if final:
@@ -995,12 +1040,19 @@ def create_adapter(config, running):
             # delivery of an old Activity is ordinary input, never new consent.
             published = questions
             questions = self._pending_questions(bridge, projected, event, questions)
-            current_ids = {question["id"] for question in questions}
+            selected = [{**question, "_selection_text": question["native_prompt"]["selection_answers"][projected.text.strip()]}
+                        for question in questions if projected.text.strip() in
+                        question["native_prompt"].get("selection_answers", {})]
+            identities = {_question_request_identity(question["native_prompt"]) for question in (selected or questions)}
+            if selected and len(identities) == 1:
+                questions = selected
+            elif projected.text.strip().startswith(CHOICE_VALUE_PREFIX) or len(identities) != 1:
+                questions = []  # An expired selection or ambiguous free text cannot choose another request.
             verified = []
             for question in questions:
-                if await asyncio.to_thread(self._question_precedes_answer, bridge, projected, question,
-                                           published, current_ids):
+                if await asyncio.to_thread(self._question_precedes_answer, bridge, projected, question, published):
                     verified.append(question)
+                    break  # Redisplays of this same request do not grant another decision.
             questions = verified
             with self._relay_lock:
                 if answer_key in self._answered:
@@ -1055,23 +1107,27 @@ def create_adapter(config, running):
             return result
 
         @staticmethod
-        def _question_precedes_answer(bridge, projected, question, published=(), current_ids=()):
+        def _question_precedes_answer(bridge, projected, question, published=()):
             with bridge.api.requester_session(projected.session_id, activity_id=projected.message_id):
                 if not bridge.api.question_precedes_answer(question["id"], projected.message_id,
                         projected.session_id, projected.actor_id):
                     return False
-                kind = question["native_prompt"]["kind"]
+                if "_selection_text" in question:
+                    return True  # The selected value identifies this exact request, including older cards.
                 for other in published:
-                    if other["id"] == question["id"]:
+                    if _question_request_identity(other["native_prompt"]) == _question_request_identity(question["native_prompt"]):
                         continue
-                    if other.get("answered_by") and bridge.api.question_precedes_answer(
-                            other["answered_by"], projected.message_id, projected.session_id,
-                            projected.actor_id, question_actor_id=other["answer_actor"]):
-                        continue  # A verified earlier human decision closed this displayed question.
-                    # Core's FIFO/all approval commands may address several displayed,
-                    # still-pending cards. An expired card has no such answer association.
-                    if kind == "approval" and other["native_prompt"].get("kind") == "approval" and other["id"] in current_ids:
-                        continue
+                    if (not other["native_prompt"].get("selection_answers") and other.get("signal") == "select"
+                            and any(str(option.get("value", "")).strip() == projected.text.strip()
+                                    for option in (other.get("signal_metadata") or {}).get("options", []))
+                            and bridge.api.question_precedes_answer(other["id"], projected.message_id,
+                                projected.session_id, projected.actor_id)):
+                        return False  # A pre-upgrade card emits this same unqualified text when clicked.
+                    if (other.get("answered_by") and bridge.api.question_precedes_answer(
+                            other["id"], other["answered_by"], projected.session_id, other["answer_actor"])
+                            and bridge.api.question_precedes_answer(other["answered_by"], projected.message_id,
+                                projected.session_id, projected.actor_id, question_actor_id=other["answer_actor"])):
+                        continue  # This presentation was visible before the earlier human decision closed it.
                     if not bridge.api.question_precedes_answer(other["id"], projected.message_id,
                             projected.session_id, projected.actor_id):
                         continue  # A question created after this immutable answer was not visible to it.
@@ -1100,10 +1156,9 @@ def create_adapter(config, running):
                 # section; a session lookup must never select an unseen successor.
                 with clarify._lock:
                     pending = clarify.get_pending(prompt.get("clarify_id"))
-                    if (not _clarify_prompt_matches(prompt, pending) or
-                            clarify.get_pending_for_session(session_key, include_choice_prompts=True) is not pending):
+                    if not _clarify_prompt_matches(prompt, pending):
                         continue
-                    value, reason = clarify._coerce_text_response_detailed(pending, projected.text)
+                    value, reason = clarify._coerce_text_response_detailed(pending, question.get("_selection_text", projected.text))
                     if value is not None:
                         if clarify.resolve_gateway_clarify(pending.clarify_id, value):
                             bridge.store.record_question_answer(question["id"], projected.message_id, projected.actor_id)
@@ -1114,7 +1169,8 @@ def create_adapter(config, running):
                         if clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED):
                             bridge.store.record_question_answer(question["id"], projected.message_id, projected.actor_id)
                         return False, None, None
-            decision = approval_decision(projected.text)
+            reply = questions[0].get("_selection_text", projected.text) if questions else projected.text
+            decision = approval_decision(reply)
             if decision is None:
                 return False, None, None
             from tools.approval import list_gateway_approvals, resolve_gateway_approval

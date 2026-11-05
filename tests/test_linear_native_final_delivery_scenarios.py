@@ -501,3 +501,40 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.posted), before)
         self.assertEqual(self.store.outbox_row(final)["state"], "sent")
         self.assertEqual(self.store.outbox_row(final)["payload"]["content"], payload["content"])
+
+    async def test_legacy_final_thought_readback_restores_completed_session(self):
+        await self.start_turn()
+        await self.deliver("newer-input", "Finish the current part.")
+        old = self.queue_final(native.ACTIVITY, "Previous result is ready.")
+        original = self.store.outbox_row(old)["payload"]
+        legacy = {key: original[key] for key in ("id", "issue_id", "session_id", "content", "content_action",
+                  "unlinked_content", "native_reply_version", "requester_sessions", "requester_activities")}
+        self.assertEqual(legacy["content"]["type"], "thought")
+        self.store.rewrite(old, legacy, self.bridge.clock())
+        self.lost.add(old)
+        await self.flush(old)
+        final = self.queue_final("newer-input", "Everything is complete.")
+        await self.flush(final)
+        before = len(self.posted)
+        self.make_due(old)
+        await self.flush(old)
+        self.assertEqual(len(self.posted), before + 1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        self.assertNotEqual(self.posted[-1]["id"], old)
+        self.assertEqual(self.store.outbox_row(old)["payload"]["content"], legacy["content"])
+        self.assertEqual(self.store.outbox_row(old)["state"], "sent")
+
+    async def test_ambiguous_modern_thought_without_attempt_marker_stays_readback_only(self):
+        await self.start_turn()
+        interim = self.queue_interim()
+        payload = self.store.outbox_row(interim)["payload"]
+        payload.pop("write_started")
+        payload.pop("turn_final", None)
+        self.store.rewrite(interim, payload, self.bridge.clock())
+        before = len(self.posted)
+        for _ in range(2):
+            self.make_due(interim)
+            await self.flush(interim)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(interim)["state"], "pending")
+        self.assertNotIn("turn_final", self.store.outbox_row(interim)["payload"])

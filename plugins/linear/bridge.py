@@ -4186,12 +4186,15 @@ class Bridge:
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                       payload.get("seen"), payload.get("source_ms")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
+            repair_reply = bool(row and self.store.conversation_reply(row["kind"], payload)
+                                and payload.get("lifecycle_repair_of"))
             final_reply = bool(row and self.store.conversation_reply(row["kind"], payload)
-                               and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")))
+                               and payload.get("turn_final") is True and not repair_reply)
             interim_reply = bool(row and self.store.conversation_reply(row["kind"], payload) and not final_reply
-                                 and payload["content"]["type"] in ("thought", "elicitation"))
-            if interim_reply and payload.get("write_started") is not False:
-                raise ProjectUpdateDeferred  # Another sender already attempted this immutable interim.
+                                 and not repair_reply and payload["content"]["type"] in ("thought", "elicitation"))
+            question_reply = (interim_reply or repair_reply) and payload["content"]["type"] == "elicitation"
+            if (interim_reply or repair_reply and question_reply) and payload.get("write_started") is not False:
+                raise ProjectUpdateDeferred  # Another sender already attempted this immutable question/interim.
             if interim_reply:
                 if self._conversation_interim_finished(payload):
                     raise LinearError("Linear session already has its final reply", retryable=False)
@@ -4199,7 +4202,8 @@ class Bridge:
                     pass
             if expected_content is not None and payload.get("content") != expected_content:
                 raise ProjectUpdateDeferred  # Another sender changed the encoded request's projection.
-            if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
+            if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
+                    or (repair_reply and not self._conversation_repair_current(payload))):
                 raise ProjectUpdateDeferred  # HTTP body is already encoded; reproject on the next pass.
             prior_started["value"] = payload.get("write_started")
             conversation = bool(row and self.store.conversation_reply(row["kind"], payload))
@@ -4210,7 +4214,8 @@ class Bridge:
             if interim_reply and self._conversation_interim_finished(payload):
                 self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
                 raise LinearError("Linear session already has its final reply", retryable=False)
-            if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
+            if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
+                    or (repair_reply and not self._conversation_repair_current(payload))):
                 if prior_started["value"] is False:
                     self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
                 raise ProjectUpdateDeferred  # Still before transport; no completion was published.
@@ -4229,13 +4234,26 @@ class Bridge:
                     raise ProjectUpdateDeferred
             entered_transport = False
             try:
-                with self._question_publication_guard(payload) if interim_reply else nullcontext():
+                with self._question_publication_guard(payload) if question_reply else nullcontext():
                     if interim_reply and self._conversation_interim_finished(payload):
                         raise LinearError("Linear session already has its final reply", retryable=False)
+                    if repair_reply:
+                        # Core's approval lock is not reentrant. The full target was
+                        # checked before taking it; under it verify only this request's
+                        # owning turn, without enumerating and relocking other questions.
+                        if question_reply:
+                            if self._conversation_interim_finished(payload):
+                                raise ProjectUpdateDeferred
+                        elif not self._conversation_repair_current(payload):
+                            raise ProjectUpdateDeferred
                     entered_transport = True
                     yield
+            except LinearError as exc:
+                if repair_reply and not entered_transport and not exc.retryable:
+                    raise ProjectUpdateDeferred from exc  # Reconcile the expired repair on its next pass.
+                raise
             finally:
-                if interim_reply and not entered_transport and prior_started.get("value") is False:
+                if (interim_reply or repair_reply) and not entered_transport and prior_started.get("value") is False:
                     self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
         if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
             guard.rejected = lambda: self.store.project_not_applied(
@@ -4306,25 +4324,75 @@ class Bridge:
         return {"type": kind, "body": ("I'm still working on your request." if kind == "thought"
                                        else "Work in this conversation has finished.")}
 
-    def _reconcile_conversation_lifecycle(self, row: dict[str, Any]) -> None:
-        """An accepted late effect keeps its identity; a new scoped Activity repairs today's state."""
-        payload = row["payload"]
+    def _conversation_lifecycle_target(self, payload: dict) -> dict:
+        """Project today's live decision, running work or completion from existing authority."""
+        for question in self.store.conversation_question_candidates(payload["issue_id"], payload["session_id"]):
+            try:
+                with self._question_publication_guard(question):
+                    if not self._conversation_interim_finished(question):
+                        return question
+            except LinearError as exc:
+                if exc.retryable:
+                    raise  # Unreadable Core state is not proof that its question expired.
+        desired = self._conversation_final_type(payload) or "response"
         if (payload.get("turn_final") is not True and not payload.get("lifecycle_repair_of")
                 and not self._conversation_interim_finished(payload)):
-            return  # A live interim keeps its working/awaiting-input state.
-        desired = self._conversation_final_type(payload) or "response"
-        if desired == payload["content"]["type"]:
+            desired = "thought"  # A withdrawn question still belongs to unfinished work.
+        return {"content": self._lifecycle_repair_content(desired)}
+
+    @staticmethod
+    def _same_lifecycle_presentation(payload: dict, target: dict) -> bool:
+        if payload["content"]["type"] != target["content"]["type"]:
+            return False
+        if target["content"]["type"] != "elicitation":
+            return True
+        # Redisplaying a different question is a distinct effect, even when both await input.
+        return all(payload.get(key) == target.get(key) for key in
+                   ("content", "native_prompt", "signal", "signal_metadata", "source_activity", "turn_activity",
+                    "requester_sessions", "requester_activities"))
+
+    def _conversation_repair_current(self, payload: dict) -> bool:
+        return self._same_lifecycle_presentation(payload, self._conversation_lifecycle_target(payload))
+
+    def _reconcile_conversation_lifecycle(self, row: dict[str, Any]) -> None:
+        """An accepted late effect keeps its bytes; a separate scoped Activity restores current state."""
+        payload = row["payload"]
+        target = self._conversation_lifecycle_target(payload)
+        if self._same_lifecycle_presentation(payload, target):
             return
-        identity = stable_uuid4("native-lifecycle-repair", self.profile, row["id"], desired)
-        repair = {key: payload[key] for key in ("issue_id", "session_id", "source_activity", "source_cursor",
-                   "turn_activity", "requester_sessions", "requester_activities") if key in payload}
-        repair.update(id=identity, content=self._lifecycle_repair_content(desired),
-                      content_action=True, unlinked_content=True, native_reply_version=1,
+        presentation = {key: target[key] for key in ("content", "native_prompt", "signal", "signal_metadata")
+                        if key in target}
+        identity = stable_uuid4("native-lifecycle-repair", self.profile, row["id"],
+                               json.dumps(presentation, sort_keys=True, separators=(",", ":")))
+        scope = target if target["content"]["type"] == "elicitation" else payload
+        repair = {key: scope[key] for key in ("issue_id", "session_id", "source_activity", "source_cursor",
+                   "turn_activity", "requester_sessions", "requester_activities") if key in scope}
+        repair.update(presentation, id=identity, content_action=True, unlinked_content=True, native_reply_version=1,
                       write_started=False, lifecycle_repair_of=row["id"])
         queued = self.store.enqueue("activity", repair, at=self.clock())
         if not queued:
             raise LinearError("Conversation lifecycle repair could not be queued")
         self.flush(only_id=queued)  # Same outbox authorization, admission guards and retry path.
+
+    def _prepare_lifecycle_repair(self, row: dict[str, Any]) -> bool | None:
+        current = self.store.outbox_row(row["id"])
+        if current is None or current["state"] != "pending":
+            raise ProjectUpdateDeferred
+        row["payload"] = payload = current["payload"]
+        attempted = payload.get("write_started") is not False
+        if attempted:
+            actual = self.api.outbound_activity(row["id"], payload["session_id"], payload["issue_id"])
+            if actual is not None:
+                if actual != payload["content"]:
+                    raise LinearError("Prior repair activity content differs; reconcile before retrying", retryable=False)
+                self._reconcile_conversation_lifecycle(row)
+                return True
+            if payload["content"]["type"] == "elicitation" or not self._conversation_repair_current(payload):
+                raise LinearError("Prior lifecycle repair is uncertain; waiting for authoritative readback")
+        elif not self._conversation_repair_current(payload):
+            self._reconcile_conversation_lifecycle(row)
+            return diag.because("obsolete_progress")
+        return None
 
     def _conversation_interim_finished(self, payload: dict) -> bool:
         if self.store.conversation_finished(payload["issue_id"], payload["session_id"],
@@ -4403,7 +4471,8 @@ class Bridge:
             row.update(current)
         payload, kind = row["payload"], row["kind"]
         if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")):
-            settled = self._prepare_conversation_final(row)
+            settled = (self._prepare_lifecycle_repair(row) if payload.get("lifecycle_repair_of")
+                       else self._prepare_conversation_final(row))
             if settled is not None:
                 return settled
             payload = row["payload"]

@@ -1097,9 +1097,11 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                 clarify_id="second-question", session_key=key, metadata={"thread_id": self.SESSION}),
         ):
             self.assertTrue(result.success, result.error)
+        selected = next(option["value"] for option in self.bridge.store.outbox_row(result.message_id)["payload"]
+                        ["signal_metadata"]["options"] if option["label"] == "staging")
         if recreate:
             await self.replace_input_adapter()
-        await self.deliver("clarify-answer", "staging")
+        await self.deliver("clarify-answer", selected)
         await self.until(lambda: self.inbox_row("clarify-answer")[2] == "imported")
         self.assertEqual(clarify.wait_for_response("second-question", timeout=0.1), "staging")
         await self.deliver("approval-answer", "approve")
@@ -1397,7 +1399,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.inflight_ordinary_replacement("clarify")
 
     async def clarify_expiry_selection_race(self, *, multi=False):
-        """Core's actual timeout competes after the displayed FIFO identity was read."""
+        """Core's actual timeout competes while parsing the exact displayed entry."""
         import threading
         from tools import clarify_gateway as clarify
         await self.deliver("initial", "Inspect the bounded task.")
@@ -1412,7 +1414,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         hidden = clarify.register("hidden-question", key, "Next task?", ["production", "staging"], multi_select=multi)
         await self.replace_input_adapter()
         self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
-        real_lock, real_select = clarify._lock, clarify.get_pending_for_session
+        real_lock, real_coerce = clarify._lock, clarify._coerce_text_response_detailed
         competing, finished = threading.Event(), threading.Event()
         results = []
         def expire():
@@ -1436,17 +1438,16 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             def __exit__(self, *_exc):
                 real_lock.release()
         selected = []
-        def select_then_expire(*args, **kwargs):
-            entry = real_select(*args, **kwargs)
+        def coerce_while_expiring(entry, response):
             if entry is shown and not selected:
                 selected.append(entry)
                 worker.start()
-                self.assertTrue(competing.wait(5), "Core timeout never reached the selection boundary")
-            return entry
+                self.assertTrue(competing.wait(5), "Core timeout never reached the exact choice boundary")
+            return real_coerce(entry, response)
         original = self.event("selection", "1,2" if multi else "1")
         try:
             with patch.object(clarify, "_lock", ObservedLock()), \
-                    patch.object(clarify, "get_pending_for_session", side_effect=select_then_expire):
+                    patch.object(clarify, "_coerce_text_response_detailed", side_effect=coerce_while_expiring):
                 await self.deliver_raw("selection-first", original)
                 await self.until(lambda: self.inbox_row("selection-first")[2] == "imported")
                 await asyncio.to_thread(worker.join, 5)
@@ -1514,7 +1515,9 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clarify.wait_for_response(pending.clarify_id, .1), "Yes")
         self.assertIn(question, displayed, "consent resolved after the decision question was hidden")
         row = self.bridge.store.outbox_row(sent.message_id)
-        self.assertEqual(row["payload"]["signal_metadata"], {"options": [{"value": "Yes"}, {"value": "No"}]})
+        self.assertEqual([option["label"] for option in row["payload"]["signal_metadata"]["options"]], ["Yes", "No"])
+        self.assertTrue(all(option["value"].startswith(self.native_input.CHOICE_VALUE_PREFIX)
+                            for option in row["payload"]["signal_metadata"]["options"]))
         self.assertEqual(len(self.rows()), 1)
 
     async def test_late_expired_question_does_not_replace_visible_active_question(self):
@@ -1755,3 +1758,149 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_displayed_question_cannot_answer_after_committed_completion_before_final_callback(self):
         await self.queued_interim_after_core_completion("elicitation", already_displayed=True)
+
+    async def displayed_approval_selection(self, selected_index):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        entries = [_ApprovalEntry({"command": command}) for command in ("delete-old-backups", "deploy-staging")]
+        with approval._lock:
+            approval._gateway_queues[key] = entries.copy()
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        values = []
+        for entry in entries:
+            sent = await self.show_approval(key, entry)
+            self.assertTrue(sent.success, sent.error)
+            payload = self.bridge.store.outbox_row(sent.message_id)["payload"]
+            self.assertIn(entry.data["command"], payload["content"]["body"])
+            values.append(payload["signal_metadata"]["options"][0]["value"])
+        await self.replace_input_adapter()
+        await self.deliver("selected-card", values[selected_index])
+        await self.until(lambda: self.inbox_row("selected-card")[2] == "imported")
+        self.assertEqual(entries[selected_index].result, "once")
+        self.assertIsNone(entries[1 - selected_index].result, "The selected card authorized a different command")
+        self.assertNotEqual(*values, "Two different commands must not emit the same selected value")
+        await self.deliver("selected-card", values[selected_index])
+        self.assertIsNone(entries[1 - selected_index].result)
+        self.assertEqual(len(self.rows()), 1)
+
+    async def test_newer_approval_card_selection_resolves_only_its_request_after_replacement(self):
+        await self.displayed_approval_selection(1)
+
+    async def test_older_approval_card_selection_resolves_only_its_request_after_replacement(self):
+        await self.displayed_approval_selection(0)
+
+    async def test_plain_approve_cannot_choose_between_two_displayed_commands(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        entries = [_ApprovalEntry({"command": command}) for command in ("delete-old-backups", "deploy-staging")]
+        with approval._lock:
+            approval._gateway_queues[key] = entries.copy()
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        for entry in entries:
+            self.assertTrue((await self.show_approval(key, entry)).success)
+        await self.deliver("ambiguous-answer", "approve")
+        await self.until(lambda: self.inbox_row("ambiguous-answer")[2] == "imported")
+        self.assertEqual([entry.result for entry in entries], [None, None])
+        self.assertEqual(len(self.rows()), 2)
+
+    async def displayed_clarify_selection(self, selected_index):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        self.addCleanup(clarify.clear_session, key)
+        entries, values = [], []
+        for identity, choices in (("first-card", ["staging", "production"]), ("second-card", ["production", "staging"])):
+            entry = clarify.register(identity, key, "Choose " + identity, choices)
+            sent = await self.adapter.send_clarify(self.ISSUE, entry.question, entry.choices,
+                entry.clarify_id, key, metadata={"thread_id": self.SESSION})
+            self.assertTrue(sent.success, sent.error)
+            entries.append(entry)
+            options = self.bridge.store.outbox_row(sent.message_id)["payload"]["signal_metadata"]["options"]
+            # Both cards have a production option; its identity still belongs to its own question.
+            values.append(next(option["value"] for option in options if option.get("label", option["value"]) == "production"))
+        await self.replace_input_adapter()
+        await self.deliver("selected-card", values[selected_index])
+        await self.until(lambda: self.inbox_row("selected-card")[2] == "imported")
+        self.assertEqual(entries[selected_index].response, "production")
+        self.assertIsNone(entries[1 - selected_index].response)
+        self.assertNotEqual(*values)
+        self.assertFalse(entries[1 - selected_index].event.is_set())
+        self.assertEqual(len(self.rows()), 1)
+
+    async def test_newer_clarify_selection_keeps_its_own_choices_after_replacement(self):
+        await self.displayed_clarify_selection(1)
+
+    async def test_older_clarify_selection_keeps_its_own_choices_after_replacement(self):
+        await self.displayed_clarify_selection(0)
+
+    async def test_expired_native_selection_never_becomes_the_successors_text_answer(self):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        shown = clarify.register("expired-card", key, "Old environment?", ["staging", "production"])
+        sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices, shown.clarify_id, key,
+            metadata={"thread_id": self.SESSION})
+        value = self.bridge.store.outbox_row(sent.message_id)["payload"]["signal_metadata"]["options"][0]["value"]
+        self.assertIsNone(await asyncio.to_thread(clarify.wait_for_response, shown.clarify_id, .001))
+        current = clarify.register("current-card", key, "New environment?", ["production", "staging"])
+        self.assertTrue((await self.adapter.send_clarify(self.ISSUE, current.question, current.choices,
+            current.clarify_id, key, metadata={"thread_id": self.SESSION})).success)
+        await self.replace_input_adapter()
+        await self.deliver("expired-selection", value)
+        await self.until(lambda: self.inbox_row("expired-selection")[2] == "imported")
+        self.assertIsNone(current.response)
+        self.assertEqual(len(self.rows()), 2)
+
+    async def test_bound_approval_selection_cannot_answer_a_displayed_clarification(self):
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        command = _ApprovalEntry({"command": "deploy-staging"})
+        with approval._lock:
+            approval._gateway_queues[key] = [command]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        self.addCleanup(clarify.clear_session, key)
+        card = await self.show_approval(key, command)
+        selected = self.bridge.store.outbox_row(card.message_id)["payload"]["signal_metadata"]["options"][0]["value"]
+        question = clarify.register("other-kind", key, "Approve the separate plan?", ["approve", "deny"])
+        self.assertTrue((await self.adapter.send_clarify(self.ISSUE, question.question, question.choices,
+            question.clarify_id, key, metadata={"thread_id": self.SESSION})).success)
+        await self.replace_input_adapter()
+        await self.deliver("command-selection", selected)
+        await self.until(lambda: self.inbox_row("command-selection")[2] == "imported")
+        self.assertEqual(command.result, "once")
+        self.assertIsNone(question.response)
+        self.assertEqual(len(self.rows()), 1)
+
+    async def test_single_displayed_clarify_text_does_not_answer_an_undisplayed_fifo_sibling(self):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        self.addCleanup(clarify.clear_session, key)
+        hidden = clarify.register("hidden-earlier", key, "Hidden question?", ["production", "staging"])
+        shown = clarify.register("shown-later", key, "Displayed question?", ["staging", "production"])
+        sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices,
+            shown.clarify_id, key, metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        await self.deliver("single-text-answer", "staging")
+        await self.until(lambda: self.inbox_row("single-text-answer")[2] == "imported")
+        self.assertEqual(shown.response, "staging")
+        self.assertIsNone(hidden.response)
+        self.assertEqual(len(self.rows()), 1)

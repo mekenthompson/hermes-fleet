@@ -791,10 +791,12 @@ closes only that earlier turn's progress. Interim notes (`_interim_send`) post a
 `thought`. A clarify posts an `elicitation` (Linear's `select` signal with the choices
 when it has one pick; typed and numbered when it has several), and so does an approval
 prompt, with the outbox's reply delivery; either leaves the session waiting for input.
-The person's next prompt in that session answers it, as a typed reply does on other
-platforms: Core's clarify text rules resolve the clarify, and Core's approve/deny words
-(or `/approve`, `/deny`) resolve the oldest waiting approval and post a confirmation
-`thought`. An answer is taken only from a sender the gateway allowlist authorizes; any
+Each native option identifies its exact displayed Core request, so selecting an older
+card cannot answer a newer question or approve another command. When just one distinct
+question is pending, Core's clarify text rules and approve/deny words (or `/approve`,
+`/deny`) also work; ambiguous unqualified text never chooses between requests. Approval
+answers post a confirmation `thought`, and any remaining question is restored with its
+original choices. An answer is taken only from a sender the gateway allowlist authorizes; any
 other reply is an ordinary message. Redelivery of an input Core already admitted cannot
 answer a later question. A consumed answer cannot resolve another prompt, including
 after adapter replacement; failed confirmation publication does not restore consent.

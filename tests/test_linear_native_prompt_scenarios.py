@@ -180,7 +180,9 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(question["content"]["type"], "elicitation")
         self.assertIn(QUESTION, question["content"]["body"])
         self.assertEqual(question["signal"], "select")
-        self.assertEqual(question["signalMetadata"], {"options": [{"value": "staging"}, {"value": "production"}]})
+        self.assertEqual([option["label"] for option in question["signalMetadata"]["options"]], CHOICES)
+        self.assertTrue(all(option["value"].startswith(self.native_input.CHOICE_VALUE_PREFIX)
+                            for option in question["signalMetadata"]["options"]))
         answer = await self.deliver("answer-activity", "production")
         response, answered = await self.answer_later(key, waiter, clarify.clear_session)
         self.assertEqual((response, answered), ("production", True))
@@ -243,6 +245,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.messages), 2 if reopened else 1)
         self.assertEqual(self.posted[-1]["content"]["type"], "thought")  # the confirmation
 
+    def approval_value(self, entry, label="approve"):
+        question = next(row for row in self.store.conversation_questions(native.ISSUE, native.SESSION)
+                        if row["native_prompt"].get("request_id") == entry.data["request_id"])
+        return next(option["value"] for option in question["signal_metadata"]["options"] if option["label"] == label)
+
     async def pending_approvals(self, *, display_sibling=True):
         """Real core FIFO entries, with no blocking command threads to leak on failure."""
         from tools import approval
@@ -262,14 +269,15 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_deliveries_of_one_approval_activity_resolve_only_one_entry(self):
         first, second = await self.pending_approvals()
+        first_value = self.approval_value(first)
         publishing, release = asyncio.Event(), asyncio.Event()
         original = self.adapter._post
         async def delayed(*args, **kwargs):
             publishing.set()
             await release.wait()
             return await original(*args, **kwargs)
-        answer = self.delivery("answer-activity", "approve", delivery_id="first-delivery")
-        duplicate = self.delivery("answer-activity", "approve", delivery_id="duplicate-delivery")
+        answer = self.delivery("answer-activity", first_value, delivery_id="first-delivery")
+        duplicate = self.delivery("answer-activity", first_value, delivery_id="duplicate-delivery")
         with patch.object(self.adapter, "_post", side_effect=delayed):
             task = asyncio.create_task(self.route(answer))
             await asyncio.wait_for(publishing.wait(), 10)
@@ -286,25 +294,36 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, replay)
         self.assertEqual([answer.acknowledged, duplicate.acknowledged], [1, 1])
         self.assertEqual(len(self.messages), 1)
-        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "elicitation", "thought"])
+        self.assertEqual([p["content"]["type"] for p in self.posted],
+                         ["elicitation", "elicitation", "thought", "elicitation"])
+        restored = self.store.outbox_row(self.posted[-1]["id"])["payload"]
+        self.assertEqual(restored["native_prompt"]["request_id"], second.data["request_id"])
+        self.assertEqual(self.posted[-1]["content"], self.posted[1]["content"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], self.posted[1]["signalMetadata"])
         await self.deliver("new-answer-activity", "approve")
         self.assertEqual(second.result, "once")
 
     async def test_confirmation_failure_cannot_replay_an_approval_on_inbox_retry(self):
         first, second = await self.pending_approvals()
-        answer = self.delivery("answer-activity", "approve", delivery_id="failed-delivery")
+        first_value = self.approval_value(first)
+        answer = self.delivery("answer-activity", first_value, delivery_id="failed-delivery")
         with patch.object(self.bridge, "flush", side_effect=RuntimeError("publication interrupted")):
             with self.assertRaisesRegex(RuntimeError, "publication interrupted"):
                 await self.route(answer)
         self.assertEqual([first.result, second.result], ["once", None])
         self.assertEqual(answer.acknowledged, 0)
-        retry = await self.deliver("answer-activity", "approve", delivery_id="retry-delivery")
+        retry = await self.deliver("answer-activity", first_value, delivery_id="retry-delivery")
         self.assertEqual(retry.acknowledged, 1)
         self.assertEqual([first.result, second.result], ["once", None])
         self.assertFalse(second.event.is_set())
         # The already-queued confirmation can still publish independently of inbox retry.
         await asyncio.to_thread(self.bridge.flush)
-        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "elicitation", "thought"])
+        self.assertEqual([p["content"]["type"] for p in self.posted],
+                         ["elicitation", "elicitation", "thought", "elicitation"])
+        restored = self.store.outbox_row(self.posted[-1]["id"])["payload"]
+        self.assertEqual(restored["native_prompt"]["request_id"], second.data["request_id"])
+        self.assertEqual(self.posted[-1]["content"], self.posted[1]["content"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], self.posted[1]["signalMetadata"])
         self.assertEqual(len(self.messages), 1)
         await self.deliver("new-answer-activity", "approve")
         self.assertEqual(second.result, "once")
@@ -344,10 +363,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_consumed_approval_activity_survives_adapter_replacement(self):
         first, second = await self.pending_approvals()
-        await self.deliver("answer-activity", "approve")
+        first_value = self.approval_value(first)
+        await self.deliver("answer-activity", first_value)
         self.assertEqual([first.result, second.result], ["once", None])
         self.adapter = await self.replacement_adapter()
-        replay = await self.deliver("answer-activity", "approve", delivery_id="after-reconnect")
+        replay = await self.deliver("answer-activity", first_value, delivery_id="after-reconnect")
         self.assertEqual(replay.acknowledged, 1)
         self.assertEqual([first.result, second.result], ["once", None])
         await self.deliver("new-answer-activity", "approve")
@@ -355,6 +375,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_two_adapters_cannot_consume_the_same_approval_activity(self):
         first, second = await self.pending_approvals()
+        first_value = self.approval_value(first)
         other = await self.replacement_adapter()
         publishing, release = asyncio.Event(), asyncio.Event()
         original = self.adapter._post
@@ -363,9 +384,9 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return await original(*args, **kwargs)
         with patch.object(self.adapter, "_post", side_effect=delayed):
-            task = asyncio.create_task(self.deliver("answer-activity", "approve"))
+            task = asyncio.create_task(self.deliver("answer-activity", first_value))
             await asyncio.wait_for(publishing.wait(), 10)
-            duplicate = self.delivery("answer-activity", "approve", delivery_id="other-adapter")
+            duplicate = self.delivery("answer-activity", first_value, delivery_id="other-adapter")
             try:
                 self.assertTrue(other.route(duplicate))
                 future = other._submitted.get(other._delivery_key(duplicate))
@@ -626,6 +647,129 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pending.response)
         self.assertEqual(len(self.messages), 2)
 
+
+    async def test_legacy_approval_option_cannot_impersonate_new_request_text_consent(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        first, second = [_ApprovalEntry({"command": command}) for command in ("old-command", "new-command")]
+        with approval._lock:
+            approval._gateway_queues[key] = [first, second]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        with patch.object(self.bridge, "flush", return_value=0):
+            queued = await self.display_approval(first)
+        payload = self.store.outbox_row(queued.message_id)["payload"]
+        # Exact pre-upgrade select protocol: the emitted value contains no request identity.
+        payload["signal_metadata"] = {"options": [{"value": word} for word in ("approve", "approve session", "approve always", "deny")]}
+        payload["native_prompt"].pop("request_identity", None)
+        payload["native_prompt"].pop("selection_answers", None)
+        payload["native_prompt"]["display"]["signal_metadata"] = payload["signal_metadata"]
+        self.store.rewrite(queued.message_id, payload, self.bridge.clock())
+        await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        self.assertEqual(self.store.outbox_row(queued.message_id)["state"], "sent")
+        await self.deliver("old-request-answer", "approve")
+        self.assertEqual(first.result, "once")
+        self.assertEqual(self.store.outbox_row(queued.message_id)["payload"]["answered_by"], "old-request-answer")
+        self.assertTrue((await self.display_approval(second)).success)
+        selected = self.approval_value(second)
+        await self.deliver("old-card-click", "approve")
+        self.assertIsNone(second.result, "An old unbound card selected the new command")
+        await self.deliver("new-card-click", selected)
+        self.assertEqual(second.result, "once")
+
+    async def answer_marks_every_presentation(self, *, legacy=False):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        from hermes_fleet_linear_plugin.bridge import stable_uuid4
+        key = self.session_key(await self.start_turn())
+        entry = _ApprovalEntry({"command": "bounded-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        with patch.object(self.bridge, "flush", return_value=0):
+            first = await self.display_approval(entry)
+        payload = self.store.outbox_row(first.message_id)["payload"]
+        if legacy:
+            options = payload["signal_metadata"]["options"]
+            payload["signal_metadata"] = {"options": [{"value": option["label"]} for option in options]}
+            payload["native_prompt"].pop("request_identity", None)
+            payload["native_prompt"].pop("selection_answers", None)
+            payload["native_prompt"]["display"]["signal_metadata"] = payload["signal_metadata"]
+            self.store.rewrite(first.message_id, payload, self.bridge.clock())
+        await asyncio.to_thread(self.bridge.flush, only_id=first.message_id)
+        second_id = stable_uuid4("fixture-question-redisplay", first.message_id)
+        repeated = {**payload, "id": second_id, "write_started": False}
+        repeated.pop("applied", None)
+        repeated.pop("conversation_attempt_id", None)
+        self.assertEqual(self.store.enqueue("activity", repeated, at=self.bridge.clock()), second_id)
+        await asyncio.to_thread(self.bridge.flush, only_id=second_id)
+        self.assertEqual(self.store.outbox_row(second_id)["state"], "sent")
+        value = payload["signal_metadata"]["options"][0]["value"]
+        await self.deliver("same-request-answer", value)
+        self.assertEqual(entry.result, "once")
+        for identity in (first.message_id, second_id):
+            self.assertEqual(self.store.outbox_row(identity)["payload"]["answered_by"], "same-request-answer")
+        # A later unrelated question still has the normal single-question text path.
+        next_entry = _ApprovalEntry({"command": "next-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [next_entry]
+        self.assertTrue((await self.display_approval(next_entry)).success)
+        await self.deliver("next-request-answer", self.approval_value(next_entry) if legacy else "approve")
+        self.assertEqual(next_entry.result, "once")
+
+    async def test_one_answer_marks_every_presentation_of_its_exact_request(self):
+        await self.answer_marks_every_presentation()
+
+    async def test_one_answer_marks_legacy_redisplays_by_exact_core_identity(self):
+        await self.answer_marks_every_presentation(legacy=True)
+
+    async def test_tampered_native_answer_mapping_cannot_change_a_displayed_capability(self):
+        first, _ = await self.pending_approvals(display_sibling=False)
+        question = next(row for row in self.store.conversation_questions(native.ISSUE, native.SESSION)
+                        if row["native_prompt"].get("request_id") == first.data["request_id"])
+        selected = question["signal_metadata"]["options"][0]["value"]
+        question["native_prompt"]["selection_answers"][selected] = "approve always"
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(question), question["id"]))
+        await self.deliver("altered-native-value", selected)
+        self.assertIsNone(first.result)
+
+    async def test_late_consumed_redisplay_cannot_impersonate_text_consent_to_a_new_request(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        from hermes_fleet_linear_plugin.bridge import stable_uuid4
+        key = self.session_key(await self.start_turn())
+        first, second = [_ApprovalEntry({"command": command}) for command in ("old-command", "new-command")]
+        with approval._lock:
+            approval._gateway_queues[key] = [first, second]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        original = await self.display_approval(first)
+        payload = self.store.outbox_row(original.message_id)["payload"]
+        repeated_id = stable_uuid4("fixture-late-answered-question", original.message_id)
+        repeated = {**payload, "id": repeated_id, "write_started": False}
+        repeated.pop("applied", None)
+        repeated.pop("conversation_attempt_id", None)
+        self.store.enqueue("activity", repeated, at=self.bridge.clock())
+        transport, delayed = self.bridge.api.transport, []
+        def hold_redisplay(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"] and request["variables"]["input"]["id"] == repeated_id:
+                delayed.append((url, body, headers))
+                raise TimeoutError("fixture redisplay remains remotely in flight")
+            return transport(url, body, headers)
+        self.bridge.api.transport = hold_redisplay
+        await asyncio.to_thread(self.bridge.flush, only_id=repeated_id)
+        self.assertTrue(self.store.outbox_row(repeated_id)["payload"]["write_started"])
+        await self.deliver("old-request-answer", self.approval_value(first))
+        self.assertEqual(first.result, "once")
+        self.assertEqual(self.store.outbox_row(repeated_id)["payload"]["answered_by"], "old-request-answer")
+        self.assertTrue((await self.display_approval(second)).success)
+        selected = self.approval_value(second)
+        transport(*delayed[0])  # A appears after both its own answer and B's display.
+        await self.deliver("ambiguous-after-redisplay", "approve")
+        self.assertIsNone(second.result, "An already-consumed but late-visible card was wrongly skipped")
+        await self.deliver("exact-new-card-selection", selected)
+        self.assertEqual(second.result, "once")
 
 if __name__ == "__main__":
     unittest.main()

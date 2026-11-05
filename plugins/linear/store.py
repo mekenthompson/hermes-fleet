@@ -141,6 +141,12 @@ class Store:
             if not row or row["state"] != "pending" or not self.conversation_reply(row["kind"], row["payload"]):
                 return row
             payload = row["payload"]
+            # Before interim replies existed, queue_reply emitted only finals, including
+            # a thought when native work remained live. Recognize that exact old shape
+            # before grafting coordinates; a modern/ambiguous thought remains readback-only.
+            legacy_final_thought = (payload["content"]["type"] == "thought" and not any(
+                key in payload for key in ("source_activity", "turn_activity", "source_cursor", "turn_final",
+                    "write_started", "native_prompt", "one_try", "signal", "signal_metadata", "lifecycle_repair_of")))
             source = payload.get("source_activity")
             if source is None:
                 activities = payload.get("requester_activities")
@@ -154,8 +160,9 @@ class Store:
                 raise ValueError("legacy reply source is unavailable")
             updated = {"source_activity": source, "turn_activity": payload.get("turn_activity", source),
                        "source_cursor": payload.get("source_cursor", 0)}
-            if payload["content"]["type"] in ("response", "error"):
-                updated["turn_final"] = True  # These kinds finish Linear regardless of the old marker.
+            if not payload.get("lifecycle_repair_of") and (
+                    payload["content"]["type"] in ("response", "error") or legacy_final_thought):
+                updated["turn_final"] = True  # Recover the old producer's final intent, never a UI repair.
             if any(payload.get(key) != value for key, value in updated.items()):
                 payload = {**payload, **updated}
                 db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), row_id))
@@ -213,6 +220,7 @@ class Store:
         with self._tx() as db:
             return db.execute(
                 "SELECT 1 FROM outbox WHERE kind='activity' AND state != 'failed' "
+                "AND json_type(payload, '$.lifecycle_repair_of') IS NULL "
                 "AND (COALESCE(json_extract(payload, '$.applied'), 1) != 0 OR json_extract(payload, '$.turn_final')=1) "
                 "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? "
                 "AND (json_extract(payload, '$.turn_final')=1 OR "
@@ -274,9 +282,20 @@ class Store:
     def record_question_answer(self, question_id: str, activity_id: str, actor_id: str) -> None:
         """Keep the successful human decision on its existing displayed question receipt."""
         with self._tx() as db:
-            db.execute("UPDATE outbox SET payload=json_set(payload,'$.answered_by',?,'$.answer_actor',?) "
-                "WHERE id=? AND kind='activity' AND json_type(payload,'$.native_prompt')='object' "
-                "AND json_type(payload,'$.answered_by') IS NULL", (activity_id, actor_id, question_id))
+            row = self.outbox_row(question_id)
+            payload = (row or {}).get("payload", {})
+            prompt = payload.get("native_prompt") or {}
+            fields = ("kind", "session_key", "request_id", "clarify_id", "question", "choices", "multi_select")
+            identity = tuple(prompt.get(key) for key in fields)
+            rows = db.execute("SELECT id,payload FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND json_type(payload,'$.native_prompt')='object' AND json_type(payload,'$.answered_by') IS NULL",
+                (payload.get("issue_id"), payload.get("session_id"))).fetchall()
+            for candidate in rows:
+                other = json.loads(candidate["payload"])["native_prompt"]
+                if tuple(other.get(key) for key in fields) == identity:
+                    db.execute("UPDATE outbox SET payload=json_set(payload,'$.answered_by',?,'$.answer_actor',?) WHERE id=?",
+                               (activity_id, actor_id, candidate["id"]))
 
     def conversation_questions(self, issue_id: str, session_id: str) -> list[dict]:
         """Published or delivery-uncertain questions retain their exact Core prompt identity."""
@@ -289,6 +308,20 @@ class Store:
                 "AND json_type(payload,'$.native_prompt')='object' "
                 "AND (state='sent' OR json_extract(payload,'$.write_started')=1 "
                 "OR (attempts>0 AND json_type(payload,'$.write_started') IS NULL)) ORDER BY rowid",
+                (issue_id, session_id))
+            return [json.loads(row[0]) for row in rows]
+
+    def conversation_question_candidates(self, issue_id: str, session_id: str) -> list[dict]:
+        """Possible current presentations; the caller must verify the exact live Core request."""
+        with self._tx() as db:
+            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND hold_reason IS NULL "
+                "AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.content.type')='elicitation' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_type(payload,'$.native_prompt')='object' AND json_type(payload,'$.answered_by') IS NULL "
+                "AND (state IN ('pending','sent') OR json_extract(payload,'$.write_started')=1 "
+                "OR (attempts>0 AND json_type(payload,'$.write_started') IS NULL)) ORDER BY rowid DESC",
                 (issue_id, session_id))
             return [json.loads(row[0]) for row in rows]
 

@@ -22,6 +22,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
     inbox_row = seam.NativeInputSeamScenarios.inbox_row
     rows = seam.NativeInputSeamScenarios.rows
     final_reply_sent = seam.NativeInputSeamScenarios.final_reply_sent
+    show_approval = seam.NativeInputSeamScenarios.show_approval
 
     async def test_committed_input_before_receipt_projection(self):
         from gateway.session_authority import SessionAuthority
@@ -384,3 +385,256 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(repair["id"], identity)
         await asyncio.to_thread(self.bridge.flush, only_id=identity)
         self.assertEqual(len(self.provider.mutations), before + 1)
+
+    async def test_legacy_final_thought_retries_when_current_work_is_live(self):
+        identity = self.legacy_response()
+        old = self.bridge.store.outbox_row(identity)['payload']
+        old['content'] = {'type': 'thought', 'body': 'The native remainder is ready.'}
+        self.bridge.store.rewrite(identity, old, self.bridge.clock())
+        await self.start_live_for_delivery()
+        before = len(self.provider.mutations)
+        for attempt in range(2):
+            self.bridge.store.defer(identity, self.bridge.clock()-1)
+            await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        row = self.bridge.store.outbox_row(identity)
+        self.assertEqual(row['state'], 'sent', 'A pre-upgrade final thought must keep retry delivery under its original ID')
+
+    async def test_late_old_completion_preserves_current_awaiting_question(self):
+        from tools import clarify_gateway as clarify
+        identity = self.legacy_response()
+        old = self.bridge.store.outbox_row(identity)
+        await self.start_live_for_delivery()
+        key = self.adapter._core_session_keys(self.receipts[0][0].source)[0]
+        self.addCleanup(clarify.clear_session, key)
+        clarify.register(clarify_id='current-choice', session_key=key,
+            question='Which environment?', choices=['staging', 'production'])
+        remote = []
+        transport = self.bridge.api.transport
+        def observe(url, body, headers):
+            request = json.loads(body)
+            if 'agentActivityCreate' in request['query']:
+                remote.append(request['variables']['input'])
+            return transport(url, body, headers)
+        self.bridge.api.transport = observe
+        question = await self.adapter.send_clarify(self.ISSUE, 'Which environment?', ['staging', 'production'],
+            'current-choice', key, metadata={'thread_id': self.SESSION})
+        self.assertTrue(question.success)
+        self.assertEqual(remote[-1]['content']['type'], 'elicitation')
+        def land_old_response():
+            with self.bridge._outbox_requester_scope(old):
+                self.bridge.api.create_activity(identity, self.SESSION, old['payload']['content'], issue_id=self.ISSUE)
+        await asyncio.to_thread(land_old_response)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        self.assertEqual(remote[-1]['content']['type'], 'elicitation',
+            'Settling a stale final while a current question is pending must restore awaiting-input, not working')
+
+    async def test_late_expired_question_does_not_restore_awaiting_input(self):
+        from tools import clarify_gateway as clarify
+        await self.start_live_for_delivery()
+        key = self.adapter._core_session_keys(self.receipts[0][0].source)[0]
+        self.addCleanup(clarify.clear_session, key)
+        clarify.register(clarify_id='expired-choice', session_key=key,
+            question='Which environment?', choices=['staging'])
+        delayed, remote = [], []
+        transport = self.bridge.api.transport
+        def observe(url, body, headers):
+            request = json.loads(body)
+            if 'agentActivityCreate' in request['query']:
+                fields = request['variables']['input']
+                if fields['content']['type'] == 'elicitation':
+                    delayed.append((url, body, headers))
+                    raise TimeoutError('remote Activity remains in flight')
+                remote.append(fields)
+            return transport(url, body, headers)
+        self.bridge.api.transport = observe
+        question = await self.adapter.send_clarify(self.ISSUE, 'Which environment?', ['staging'],
+            'expired-choice', key, metadata={'thread_id': self.SESSION})
+        self.assertTrue(question.message_id)
+        self.assertEqual(len(delayed), 1)
+        # Real Core removes the request when its wait expires while its turn continues.
+        clarify.clear_session(key)
+        transport(*delayed[0])
+        remote.append(json.loads(delayed[0][1])['variables']['input'])
+        self.bridge.store.defer(question.message_id, self.bridge.clock()-1)
+        await asyncio.to_thread(self.bridge.flush, only_id=question.message_id)
+        row = self.bridge.store.outbox_row(question.message_id)
+        self.assertEqual(remote[-1]['content']['type'], 'thought',
+            'A late expired question must restore the still-running turn instead of awaiting a nonexistent decision')
+
+    def observe_delivery(self):
+        remote = []
+        transport = self.bridge.api.transport
+        def observe(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"]:
+                remote.append(request["variables"]["input"])
+            return transport(url, body, headers)
+        self.bridge.api.transport = observe
+        return remote
+
+    async def land_legacy_response(self, identity):
+        old = self.bridge.store.outbox_row(identity)
+        def land():
+            with self.bridge._outbox_requester_scope(old):
+                self.bridge.api.create_activity(identity, self.SESSION, old["payload"]["content"], issue_id=self.ISSUE)
+        await asyncio.to_thread(land)
+
+    def current_delivery_key(self):
+        return self.adapter._core_session_keys(self.receipts[0][0].source)[0]
+
+    async def display_delivery_clarify(self, identity="current-question", choices=None):
+        from tools import clarify_gateway as clarify
+        key = self.current_delivery_key()
+        self.addCleanup(clarify.clear_session, key)
+        choices = choices or ["staging", "production"]
+        clarify.register(identity, key, "Which environment?", choices)
+        result = await self.adapter.send_clarify(self.ISSUE, "Which environment?", choices,
+            identity, key, metadata={"thread_id": self.SESSION})
+        return result
+
+    async def test_repaired_clarification_is_one_decision_across_all_presentations(self):
+        from tools import clarify_gateway as clarify
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        remote = self.observe_delivery()
+        shown = await self.display_delivery_clarify()
+        self.assertTrue(shown.success)
+        original = self.bridge.store.outbox_row(shown.message_id)["payload"]
+        await self.land_legacy_response(identity)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        repair = self.bridge.store.outbox_row(remote[-1]["id"])["payload"]
+        self.assertNotEqual(repair["id"], shown.message_id)
+        for key in ("content", "native_prompt", "signal", "signal_metadata", "requester_activities"):
+            self.assertEqual(repair[key], original[key])
+        self.assertFalse(self.bridge.store.conversation_finished(self.ISSUE, self.SESSION, "live-input"))
+        await self.deliver("same-question-answer", "staging")
+        await self.until(lambda: self.inbox_row("same-question-answer")[2] == "imported")
+        self.assertEqual(clarify.wait_for_response("current-question", .01), "staging")
+        for displayed in (shown.message_id, repair["id"]):
+            self.assertEqual(self.bridge.store.outbox_row(displayed)["payload"]["answered_by"], "same-question-answer")
+        later = await self.display_delivery_clarify("next-question")
+        self.assertTrue(later.success)
+        await self.deliver("later-answer", "production")
+        await self.until(lambda: self.inbox_row("later-answer")[2] == "imported")
+        self.assertEqual(clarify.wait_for_response("next-question", .01), "production",
+                         "Resolved mirrored cards must not obstruct a later legitimate answer")
+        self.assertEqual(len(self.rows()), 1)
+
+    async def test_repaired_approval_preserves_exact_selected_command_without_relocking_core(self):
+        from tools import approval
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        from tools.approval_gateway_wait import _ApprovalEntry
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        remote = self.observe_delivery()
+        key = self.current_delivery_key()
+        entry = _ApprovalEntry({"command": "deploy-staging"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        shown = await self.show_approval(key, entry)
+        self.assertTrue(shown.success)
+        original = self.bridge.store.outbox_row(shown.message_id)["payload"]
+        await self.land_legacy_response(identity)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        repair = self.bridge.store.outbox_row(remote[-1]["id"])["payload"]
+        self.assertEqual(repair["content"], original["content"])
+        self.assertEqual(repair["native_prompt"], original["native_prompt"])
+        self.assertEqual(repair["signal_metadata"], original["signal_metadata"])
+        value = repair["signal_metadata"]["options"][0]["value"]
+        await self.deliver("approval-choice", value)
+        await self.until(lambda: self.inbox_row("approval-choice")[2] == "imported")
+        self.assertEqual(entry.result, "once")
+        for displayed in (shown.message_id, repair["id"]):
+            self.assertEqual(self.bridge.store.outbox_row(displayed)["payload"]["answered_by"], "approval-choice")
+        self.assertEqual(len(self.rows()), 1)
+
+    async def test_repair_question_expiring_at_admission_is_replaced_without_stale_publication(self):
+        from tools import clarify_gateway as clarify
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        remote = self.observe_delivery()
+        shown = await self.display_delivery_clarify()
+        await self.land_legacy_response(identity)
+        original = self.bridge.store.admit_mutation
+        repairs = []
+        def admit(row_id, **kwargs):
+            result = original(row_id, **kwargs)
+            payload = self.bridge.store.outbox_row(row_id)["payload"]
+            if payload.get("lifecycle_repair_of") and payload["content"]["type"] == "elicitation":
+                repairs.append(row_id)
+                clarify.clear_session(self.current_delivery_key())
+            return result
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        self.assertEqual(len(repairs), 1)
+        repair = self.bridge.store.outbox_row(repairs[0])
+        self.assertIs(repair["payload"]["write_started"], False)
+        self.assertEqual([row["content"]["type"] for row in remote], ["elicitation", "response"])
+        self.bridge.store.defer(repairs[0], self.bridge.clock() - 1)
+        await asyncio.to_thread(self.bridge.flush, only_id=repairs[0])
+        self.assertEqual(remote[-1]["content"]["type"], "thought")
+        self.assertEqual(self.bridge.store.outbox_row(repairs[0])["payload"]["content"], repair["payload"]["content"])
+        self.assertFalse(self.bridge.store.conversation_finished(self.ISSUE, self.SESSION, "live-input"))
+
+    async def test_uncertain_question_repair_landing_after_expiry_restores_working(self):
+        from tools import clarify_gateway as clarify
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        shown = await self.display_delivery_clarify()
+        await self.land_legacy_response(identity)
+        transport = self.bridge.api.transport
+        delayed, remote = [], []
+        def observe(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"]:
+                fields = request["variables"]["input"]
+                if fields["content"]["type"] == "elicitation":
+                    delayed.append((url, body, headers))
+                    raise TimeoutError("repair remains in flight")
+                remote.append(fields)
+            return transport(url, body, headers)
+        self.bridge.api.transport = observe
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        self.assertEqual(len(delayed), 1)
+        fields = json.loads(delayed[0][1])["variables"]["input"]
+        clarify.clear_session(self.current_delivery_key())
+        self.bridge.store.defer(fields["id"], self.bridge.clock() - 1)
+        await asyncio.to_thread(self.bridge.flush, only_id=fields["id"])
+        self.assertEqual(len(delayed), 1, "Unknown question repair must stay readback-only")
+        self.assertEqual(remote, [])
+        transport(*delayed[0])
+        remote.append(fields)
+        self.bridge.store.defer(fields["id"], self.bridge.clock() - 1)
+        await asyncio.to_thread(self.bridge.flush, only_id=fields["id"])
+        self.assertEqual([row["content"]["type"] for row in remote], ["elicitation", "thought"])
+        self.assertEqual(self.bridge.store.outbox_row(fields["id"])["state"], "sent")
+        self.assertEqual(self.bridge.store.outbox_row(fields["id"])["payload"]["content"], fields["content"])
+
+    async def test_another_sender_attempting_question_repair_before_guard_prevents_replay(self):
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        remote = self.observe_delivery()
+        shown = await self.display_delivery_clarify()
+        self.assertTrue(shown.success)
+        await self.land_legacy_response(identity)
+        create = self.bridge.api.create_activity
+        attempted = []
+        def race(activity_id, session_id, content, **kwargs):
+            row = self.bridge.store.outbox_row(activity_id)
+            if row and row["payload"].get("lifecycle_repair_of"):
+                self.assertTrue(self.bridge.store.admit_mutation(activity_id, expected_content=content,
+                    conversation_attempt_id="other-sender", require_unattempted=True))
+                attempted.append(activity_id)
+            return create(activity_id, session_id, content, **kwargs)
+        with patch.object(self.bridge.api, "create_activity", side_effect=race):
+            await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        self.assertEqual(len(attempted), 1)
+        self.assertEqual([row["content"]["type"] for row in remote], ["elicitation", "response"])
+        repair = self.bridge.store.outbox_row(attempted[0])
+        self.assertEqual(repair["state"], "pending")
+        self.assertEqual(repair["payload"]["conversation_attempt_id"], "other-sender")
+        self.bridge.store.defer(attempted[0], self.bridge.clock() - 1)
+        await asyncio.to_thread(self.bridge.flush, only_id=attempted[0])
+        self.assertEqual(len(remote), 2)
