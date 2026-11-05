@@ -40,6 +40,29 @@ RECHECKED_STATUSES = ("running", "ready", "blocked")  # finished or parked nativ
 # (2 min doubling to 1 h, jittered), never per tick: a few GitHub reads per issue per hour at most.
 ACCEPTANCE_RECHECK_BASE, ACCEPTANCE_RECHECK_CAP = 120.0, 3600.0
 ACCEPTANCE_MAX_WAIT = 7 * 86400.0  # after a week of no answer, the issue goes to Blocked; nothing rechecks forever
+# Core's open-PR respawn guard (hermes_cli.kanban_db_guard_wait) parks a ready card whose comments name a
+# GitHub PR from the last 24 h: a ``blocked`` event with this source. Core releases the park itself
+# (``promoted``) when that comment ages out or on a handoff; one explicit unblock lets one run through.
+PR_PARK_SOURCE = "respawn_guard"
+PARK_LIFECYCLE = ("blocked", "block_loop_detected", "unblocked", "promoted")  # core's _LIFECYCLE
+# Core's respawn-guard PR link (kanban_db_dispatch._RESPAWN_GUARD_PR_URL_RE), then the one form GitHub is asked about.
+_GUARD_PR_URL = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+", re.IGNORECASE)
+_PARK_PR = re.compile(r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]{0,9})", re.IGNORECASE)
+_PARK_PR_NUMBER = re.compile(r"\bPR #([1-9][0-9]{0,9})\b")
+def standing_pr_park(events: list):
+    """The respawn guard's park when it is the task's newest block-lifecycle event, else None.
+
+    Any later block, unblock, loop break or core's own release supersedes it."""
+    last = next((event for event in reversed(events) if event.kind in PARK_LIFECYCLE), None)
+    if last is None or last.kind != "blocked" or native_event_payload(last).get("source") != PR_PARK_SOURCE:
+        return None
+    return last
+def pr_park_notice(payload: dict) -> str:
+    """The one plain sentence for a guard park: nothing is asked of the reader."""
+    number = _PARK_PR_NUMBER.search(str(payload.get("reason") or ""))
+    pr = f"PR #{number[1]}" if number else "its pull request"
+    return (f"Paused after a restart while {pr} is open. It resumes by itself when the PR merges or closes; "
+            "ask the agent to resume if it should continue now.")
 # A team without the configured name falls back to its first state of this Linear type.
 # Blocked and In Review have no type equivalent: a team without them keeps its state.
 STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed"}
@@ -1040,6 +1063,16 @@ class Kanban:
                 require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id,
                                        request_id=self.activation_request_id(task_id, expected_event_id))
+
+    def newest_pr_url(self, task_id: str) -> str | None:
+        """The last PR link in the newest comment carrying one, as core's respawn guard reads it."""
+        with self.read_conn() as conn:
+            comments = self.comments(conn, task_id)
+        for comment in sorted(comments, key=lambda item: item.id, reverse=True):
+            urls = _GUARD_PR_URL.findall(comment.body or "")
+            if urls:
+                return urls[-1]
+        return None
 
     def activation_request_id(self, task_id: str, expected_event_id: int) -> str:
         value = f"activate:{self.executor_profile}:{self.board or 'default'}:{task_id}:{expected_event_id}"
@@ -3051,7 +3084,8 @@ class Bridge:
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
-                for step in (self._recheck_acceptance, self._reconcile_status, self._recover_binding_delegate) if caught_up else ():
+                for step in (self._recheck_acceptance, self._resume_pr_park, self._reconcile_status,
+                             self._recover_binding_delegate) if caught_up else ():
                     # These steps read Linear; a refusal or error waits (15 s doubling to 1 h, persisted)
                     # instead of repeating the same reads every tick.
                     backoff = f"{step.__name__}:{issue_id}"
@@ -3259,6 +3293,8 @@ class Bridge:
     def _native_state(self, task, adapter, last) -> str | None:
         """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
         status, payload = task.status, native_event_payload(last) if last else {}
+        if status == "blocked" and standing_pr_park(adapter.history(task.id, 0)) is not None:
+            return "in_review"  # Core's open-PR guard parked it: it waits on that PR, not on a person.
         if status in ("blocked", "triage"):
             # Native creation parks a new task until admission: that is queued, not stopped.
             queued = (getattr(last, "kind", None) == "blocked" and payload.get("reason") == "initial_status"
@@ -3315,6 +3351,9 @@ class Bridge:
             # even with this same reason, remains a real block. Reporting cannot
             # admit the task or promise that a parked task will be started.
             writes = [message("thought", "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
+        elif event.kind == "blocked" and payload.get("source") == PR_PARK_SOURCE:
+            # Core's open-PR guard parked it after a restart: nothing is asked of anyone.
+            writes = [message("thought", pr_park_notice(payload))]
         elif event.kind in ("blocked", "block_loop_detected"):
             # One plain sentence for people. Raw runtime detail stays in native Kanban history.
             writes = [message(*_block_message(payload, task_status))]
@@ -3639,6 +3678,73 @@ class Bridge:
                           "terminal": True, "owner_issue_id": issue_id,
                           "content": {"type": "error", "body": body}})], at=self.clock(), event_id=event_id, recheck=wait)
         return "failed" if written else None
+    def _resume_pr_park(self, row: dict | None, adapter) -> None:
+        """Let work core's open-PR guard parked run again once that PR has merged or closed.
+
+        Only the guard's own park (the newest block-lifecycle event is its ``blocked`` event) of a
+        native binding, already reported, with no later event of any kind. Local reads only until
+        the persisted gap (2 min doubling to 1 h) has passed; the next gap is taken before asking
+        GitHub. A merged or closed PR gets one guarded core unblock of exactly that park event,
+        decided once per park (a durable marker written before the call, never replayed). An open
+        PR, a refused or unanswered read, or any change since the read leaves it parked. Core's
+        own release (``promoted``) supersedes the park, so nothing follows it.
+        """
+        if not row or row.get("origin") != "native" or not getattr(adapter, "guarded_controls", False):
+            return
+        task = adapter.require_task(row["task_id"])
+        if task.status != "blocked":
+            return
+        events = adapter.history(task.id, 0)
+        park = standing_pr_park(events)
+        if park is None or park.id > row["last_event_id"]:
+            return  # A person's block, a Stop, a handoff pause, or a park not reported yet.
+        issue_id = row["issue_id"]
+        marker, fields = f"pr-park-resume:{issue_id}:{task.id}:{park.id}", {"iss": issue_id, "task": task.id, "evt": park.id}
+        if self.store.native_intent(marker):
+            return  # Decided once for this park.
+        if events[-1].id != park.id:
+            # Core's guarded unblock needs the park to be the newest event; something happened since.
+            diag.transition("pr_park.resume", "skipped", "pr_park_changed", key=marker, **fields)
+            return
+        key, now = f"pr_park_recheck:{issue_id}:{task.id}:{park.id}", self.clock()
+        if not self.store.backoff_ready(key, now):
+            return
+        until = self.store.backoff_fail(key, now, base=ACCEPTANCE_RECHECK_BASE, cap=ACCEPTANCE_RECHECK_CAP)
+        url = adapter.newest_pr_url(task.id)
+        link = _PARK_PR.fullmatch(url or "")
+        named = _PARK_PR_NUMBER.search(str(native_event_payload(park).get("reason") or ""))
+        if link is None or (named and named[1] != link[2]):
+            diag.transition("pr_park.resume", "skipped", "pr_park_no_pr", key=marker, next_s=int(until - now), **fields)
+            return
+        try:
+            pr = acceptance.gh_api(f"repos/{link[1]}/pulls/{int(link[2])}")
+            state, merged = pr["state"], pr.get("merged") is True
+        except (acceptance.Denied, acceptance.Unavailable, KeyError, TypeError, AttributeError):
+            diag.transition("pr_park.resume", "skipped", "pr_unreadable", key=marker, next_s=int(until - now), **fields)
+            return
+        if state != "closed":
+            diag.transition("pr_park.resume", "skipped", "pr_open", key=marker, next_s=int(until - now), **fields)
+            return
+        latest = adapter.history(task.id, 0)
+        if (adapter.require_task(task.id).status != "blocked" or getattr(standing_pr_park(latest), "id", None) != park.id
+                or latest[-1].id != park.id):
+            diag.transition("pr_park.resume", "skipped", "pr_park_changed", key=marker, **fields)
+            return
+        _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id,
+                                                             "park_event_id": park.id})
+        if not first:
+            return
+        diag.evt("pr_park.resume", "started", "pr_park_resolved", **fields)
+        try:
+            accepted = adapter.activate(task.id, park.id)
+        except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
+            self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
+            diag.warn("pr_park.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
+            return
+        self.store.native_intent_settle(marker, {"state": "applied", "accepted": bool(accepted),
+                                                 "pr": "merged" if merged else "closed"})
+        diag.transition("pr_park.resume", "applied" if accepted else "skipped",
+                        "pr_park_resumed" if accepted else "pr_park_changed", key=marker, **fields)
     def _report_delegate_allowed(self, issue: dict, payload: dict | None = None) -> bool:
         delegate = (issue.get("delegate") or {}).get("id")
         if delegate == self.api.viewer_id():
