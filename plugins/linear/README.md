@@ -810,6 +810,24 @@ answer a later question. A consumed answer cannot resolve another prompt, includ
 after adapter replacement; failed confirmation publication does not restore consent.
 Delivered questions retain their exact pending Core prompt identity across adapter replacement.
 A closed turn or a different, undelivered prompt cannot borrow that question's answer routing.
+
+The typing hook publishes a known Core tool verb without its arguments as an ephemeral `action`, at most
+once per minute when it changes, or once every ten minutes while unchanged. A phrase stays
+with its producing session and turn; callbacks without a verified source use a generic
+working message. Unknown tool labels also use that generic message. Every request needed
+to queue, authorize, send and read back a step yields at the optional API budget reserve,
+including a queued step whose budget fell before delivery. This also
+keeps an ordinary chat turn active without creating native work. Publishing runs in the
+background through the same authorized outbox; a slow API call cannot hold the typing
+hook. Queued steps expire after a minute and yield to newer admitted input, messages
+and questions. The input boundary survives restart and older input redelivery; an old
+step cannot reopen a session after its final reply. An accepted in-flight step also
+reconciles the current question, unfinished work or completion after transport. Any repair
+caused by a step keeps its optional budget cap on later retries. Answering a prompt or settling an
+approval by timeout or withdrawal resumes Core's typing refresh only once the chat has
+no other pending clarification or approval. Streaming and
+tool-progress flags are unchanged; no editable-message or streaming capability is advertised.
+
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
 uncertain creation remain pending; retry never repeats an unknown create.

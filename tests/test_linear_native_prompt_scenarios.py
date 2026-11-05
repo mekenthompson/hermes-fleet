@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -142,10 +143,55 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             _close_native_stream_boundary=lambda _label: None)
         return TurnRunner._render_approval_sync(runner, data)
 
-    def request_approval(self, session_key):
+    def turn_runner(self, session_key):
+        """Real Core prompt renderers, with only the absent stream and scheduling supplied."""
+        from gateway.run_turn_runner import TurnRunner
+        runner = object.__new__(TurnRunner)
+        runner._ctx = SimpleNamespace(_status_adapter=self.adapter, _status_chat_id=native.ISSUE,
+            _status_thread_metadata={"thread_id": native.SESSION}, session_key=session_key)
+        runner._approval_owner = None
+        runner._close_native_stream_boundary = lambda *_args, **_kwargs: None
+        runner._stream_consumer = lambda: None
+        runner._schedule = lambda coro, _why: asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return runner
+
+    def request_approval(self, session_key, command="rm -rf build/"):
+        """Core renders and pauses typing, then waits for a Linear reply to resolve it."""
         from tools.approval_gateway_wait import _await_gateway_decision
         return _await_gateway_decision(session_key, lambda data: self.render_approval(session_key, data), {
-            "command": "rm -rf build/", "description": "recursive delete", "pattern_key": "recursive delete"})
+            "command": command, "description": "recursive delete", "pattern_key": "recursive delete"})
+
+    def request_clarify(self, session_key):
+        return self.turn_runner(session_key)._ask_clarify_question(QUESTION, CHOICES, False)
+
+    def owned_status(self, phrase, event=None, callback=None):
+        from contextvars import copy_context
+        from gateway.session_context import set_session_vars
+        event = event or self.messages[-1]
+        source = event.source
+        def write():
+            set_session_vars(platform="linear", chat_id=source.chat_id, thread_id=source.thread_id,
+                message_id=event.message_id, scope_id=source.scope_id)
+            if callback:
+                callback()
+            else:
+                self.adapter.set_status_text(source.chat_id, phrase)
+        copy_context().run(write)
+
+    def status_metadata(self):
+        from gateway.platforms.helpers import typing_metadata_for_turn
+        source = self.adapter._inputs.get((native.ISSUE, native.SESSION))
+        return typing_metadata_for_turn(self.adapter, native.ISSUE, source, {"thread_id": native.SESSION})
+
+    async def start_typing_refresh(self):
+        stop = asyncio.Event()
+        task = asyncio.create_task(self.adapter._keep_typing(native.ISSUE, interval=0.05,
+            metadata=self.status_metadata(), stop_event=stop))
+        async def finish():
+            stop.set()
+            await task
+        self.addAsyncCleanup(finish)
+        return task
 
     async def display_approval(self, entry, **flags):
         key = self.session_key(self.messages[0])
@@ -158,6 +204,576 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         finally:
             if not waiter.done():
                 cleanup(key)
+
+    async def step(self, phrase=None, *, at=1000):
+        self.owned_status(phrase)
+        with patch.object(self.native_input.time, "monotonic", return_value=at):
+            await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+        tasks = list(self.adapter._step_tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def test_private_argument_not_published(self):
+        from gateway.run_turn_runner import TurnRunner
+        event = await self.start_turn()
+        runner = object.__new__(TurnRunner)
+        runner._ctx = SimpleNamespace(_live_status_adapter=self.adapter, _live_status_mode='full',
+            _run_still_current=lambda: True, source=event.source)
+        self.owned_status(None, event, lambda: runner._progress_live_status(
+            'tool.started', 'terminal', {'command': 'echo PRIVATE_CANARY'}))
+        await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+        await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        published = json.dumps(self.posted)
+        print('PROBE private argument reached action:', 'PRIVATE_CANARY' in published)
+        self.assertNotIn('PRIVATE_CANARY', published)
+
+    async def test_optional_status_obeys_reserve(self):
+        await self.start_turn()
+        api = self.bridge.api
+        api.budget = {'requests': {'limit': 5000, 'remaining': 500,
+            'reset': api.clock() + 3600, 'at': api.clock()}}
+        queries = []
+        original = api.transport
+        def count(url, body, headers):
+            queries.append(json.loads(body)['query'].split('(')[0])
+            return original(url, body, headers)
+        with patch.object(api, 'transport', side_effect=count):
+            await self.step('Checking status')
+        print('PROBE requests at 10 percent reserve:', len(queries), 'actions:', len(self.posted))
+        self.assertEqual(len(queries), 0)
+
+    async def test_queued_status_obeys_essential_reserve(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, 'Checking status', kind='action', one_try=True)
+        api = self.bridge.api
+        api.budget = {'requests': {'limit': 5000, 'remaining': 100,
+            'reset': api.clock() + 3600, 'at': api.clock()}}
+        queries = []
+        original = api.transport
+        def count(url, body, headers):
+            queries.append(json.loads(body)['query'].split('(')[0])
+            return original(url, body, headers)
+        with patch.object(api, 'transport', side_effect=count):
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+        print('PROBE queued requests at 2 percent reserve:', len(queries), 'actions:', len(self.posted))
+        self.assertEqual(len(queries), 0)
+
+    def budget(self, remaining):
+        api=self.bridge.api
+        api.budget={'requests':{'limit':5000,'remaining':remaining,'reset':api.clock()+3600,'at':api.clock()}}
+
+    async def test_every_read_and_mutation_is_optional(self):
+        from agent.display import build_status_phrase
+        await self.start_turn(); self.budget(4000); observed=[]; original=self.bridge.api.transport
+        def transport(url,body,headers):
+            observed.append((getattr(self.bridge.api._priority,'optional_work',False),json.loads(body)['query'].split('(')[0]))
+            return original(url,body,headers)
+        with patch.object(self.bridge.api,'transport',side_effect=transport):
+            await self.step(build_status_phrase('read_file',{'path':'PRIVATE_CANARY'}))
+        self.assertTrue(observed); self.assertTrue(all(flag for flag,_ in observed))
+        self.assertEqual(self.posted[-1]['content']['parameter'],build_status_phrase('read_file',None))
+        print('FULL_ACTION_REQUESTS',len(observed),'all capped optional',flush=True)
+
+    async def test_budget_drop_during_transport_admission_sends_nothing(self):
+        from agent.display import build_status_phrase
+        await self.start_turn(); self.budget(4000)
+        row=self.native_input.queue_reply(self.bridge,native.ISSUE,native.SESSION,native.ACTIVITY,
+            build_status_phrase('read_file',None),kind='action',one_try=True)
+        original=self.bridge.store.admit_mutation; entered=[]
+        def admit(identity,**kwargs):
+            result=original(identity,**kwargs)
+            if identity==row: entered.append(True); self.budget(100)
+            return result
+        with patch.object(self.bridge.store,'admit_mutation',side_effect=admit):
+            await asyncio.to_thread(self.bridge.flush,only_id=row)
+        self.assertTrue(entered);self.assertEqual(self.posted,[])
+        self.assertIs(self.store.outbox_row(row)['payload']['write_started'],False)
+
+    async def test_essential_final_still_delivers_when_optional_action_waits(self):
+        from agent.display import build_status_phrase
+        await self.start_turn(); self.budget(4000)
+        action=self.native_input.queue_reply(self.bridge,native.ISSUE,native.SESSION,native.ACTIVITY,
+            build_status_phrase('read_file',None),kind='action',one_try=True)
+        final=self.native_input.queue_reply(self.bridge,native.ISSUE,native.SESSION,native.ACTIVITY,'Finished')
+        self.budget(100)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual([p['content']['type'] for p in self.posted],['response'])
+        self.assertEqual(self.store.outbox_row(final)['state'],'sent')
+
+    async def test_old_unattempted_argument_status_retires_without_http(self):
+        from agent.display import build_status_phrase
+        await self.start_turn()
+        row=self.native_input.queue_reply(self.bridge,native.ISSUE,native.SESSION,native.ACTIVITY,
+            build_status_phrase('terminal',None),kind='action',one_try=True)
+        payload=self.store.outbox_row(row)['payload'];payload['content']['parameter']='is running echo PRIVATE_CANARY…'
+        self.store.rewrite(row,payload,self.bridge.clock()); requests=[]; original=self.bridge.api.transport
+        def transport(*args):requests.append(True);return original(*args)
+        with patch.object(self.bridge.api,'transport',side_effect=transport):
+            await asyncio.to_thread(self.bridge.flush,only_id=row)
+        self.assertEqual(requests,[]);self.assertEqual(self.posted,[])
+        self.assertFalse(self.store.outbox_row(row)['payload']['applied'])
+
+    async def test_midflight_optional_budget_drop_does_not_hold_final_in_same_batch(self):
+        await self.start_turn()
+        session, activity = "session-second", "activity-second"
+        self.authority.sessions[session] = {**self.authority.sessions[native.SESSION], "id": session}
+        delivery = self.delivery(activity, "A separate turn ready to finish")
+        data = delivery.event()
+        data["agentSession"]["id"] = session
+        self.authority.activities[activity]["agentSession"]["id"] = session
+        await self.route(Delivery(data))
+        self.budget(4000)
+        action = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Working on your request.", kind="action", one_try=True)
+        final = self.native_input.queue_reply(self.bridge, native.ISSUE, session, activity, "Finished")
+        original = self.bridge.store.admit_mutation
+        admitted = []
+        def admit(identity, **kwargs):
+            result = original(identity, **kwargs)
+            if identity == action:
+                admitted.append(result)
+                self.budget(100)
+            return result
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(admitted, [True])
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
+        self.assertEqual(self.store.outbox_row(final)["state"], "sent")
+        self.assertIs(self.store.outbox_row(action)["payload"]["write_started"], False)
+
+    async def test_status_arguments_and_unknown_tool_labels_never_leave_core_callback(self):
+        from gateway.run_turn_runner import TurnRunner
+        from agent.display import build_status_phrase
+        event = await self.start_turn()
+        runner = object.__new__(TurnRunner)
+        runner._ctx = SimpleNamespace(_live_status_adapter=self.adapter, _live_status_mode="full",
+            _run_still_current=lambda: True, source=event.source)
+        for index, tool in enumerate(("terminal", "read_file", "PRIVATE_CANARY_TOOL")):
+            self.owned_status(None, event, lambda: runner._progress_live_status("tool.started", tool,
+                {"command": "echo PRIVATE_CANARY", "path": "PRIVATE_CANARY"}))
+            with patch.object(self.native_input.time, "monotonic", return_value=1000 + index * 60):
+                await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+            await asyncio.gather(*list(self.adapter._step_tasks.values()))
+            expected = "Working on your request." if index == 2 else build_status_phrase(tool, None)
+            self.assertEqual(self.posted[-1]["content"]["parameter"], expected)
+        self.assertNotIn("PRIVATE_CANARY", json.dumps(self.posted))
+
+    async def test_session_scoped_step_caps_every_request_and_yields_before_auth(self):
+        from test_linear_specialist_authorization import SCOPE
+        from agent.display import build_status_phrase
+        self.bridge.api.specialist_scope = {**SCOPE, "requester_basis": "agent_session"}
+        await self.start_turn()
+        self.budget(4000)
+        observed = []
+        original = self.bridge.api.transport
+        def transport(*args):
+            observed.append(getattr(self.bridge.api._priority, "optional_work", False))
+            return original(*args)
+        with patch.object(self.bridge.api, "transport", side_effect=transport):
+            await self.step(build_status_phrase("read_file", None))
+            self.assertTrue(observed)
+            self.assertTrue(all(observed))
+            self.assertEqual(len(self.posted), 1)
+            print("SCOPED_ACTION_REQUESTS", len(observed), flush=True)
+            observed.clear()
+            self.budget(500)
+            await self.step(build_status_phrase("terminal", None), at=1060)
+            self.assertEqual(observed, [])
+            self.assertEqual(len(self.posted), 1)
+            self.budget(4000)
+            row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                build_status_phrase("terminal", None), kind="action", one_try=True)
+            self.budget(100)
+            observed.clear()
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+            self.assertEqual(observed, [])
+            self.assertEqual(len(self.posted), 1)
+
+    async def test_retiring_stale_status_snapshot_preserves_a_concurrent_attempt(self):
+        from agent.display import build_status_phrase
+        from hermes_fleet_linear_plugin.store import Store
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+            build_status_phrase("terminal", None), kind="action", one_try=True)
+        payload = self.store.outbox_row(row)["payload"]
+        payload["content"]["parameter"] = "is running echo PRIVATE_CANARY…"
+        self.store.rewrite(row, payload, self.bridge.clock())
+        other = Store(self.store.path)
+        original = self.bridge.store.retire_unattempted_action
+        def retire(identity, content):
+            self.assertTrue(other.admit_mutation(identity, expected_content=content,
+                mutation_attempt_id="concurrent-attempt", conversation_attempt_id="concurrent-attempt"))
+            return original(identity, content)
+        with patch.object(self.bridge.store, "retire_unattempted_action", side_effect=retire):
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+        current = self.store.outbox_row(row)
+        self.assertEqual(current["state"], "pending")
+        self.assertIs(current["payload"]["write_started"], True)
+        self.assertNotIn("applied", current["payload"])
+        self.assertEqual(self.posted, [])
+
+    async def held_step_then_new_input(self, *, restart=False):
+        await self.start_turn()
+        entered, release = threading.Event(), threading.Event()
+        original = self.bridge.flush
+        def held(**kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("test did not release optional status flush")
+            return 0 if restart else original(**kwargs)
+        with patch.object(self.bridge, "flush", side_effect=held):
+            self.owned_status("Old investigation")
+            await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+            task = self.adapter._step_tasks[(native.ISSUE, native.SESSION)]
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                await self.deliver("new-steering-input", "Stop investigating and summarize instead.")
+            finally:
+                release.set()
+                await task
+        if restart:
+            # New Store and Bridge instances must enforce the admission fence without adapter memory.
+            restarted = self.fixture.make_bridge()
+            restarted.api = self.bridge.api
+            await asyncio.to_thread(restarted.flush)
+        self.assertEqual(self.posted, [])
+
+    async def test_queued_step_cannot_follow_a_newly_admitted_input(self):
+        await self.held_step_then_new_input()
+
+    async def test_new_input_supersedes_queued_step_after_store_and_bridge_restart(self):
+        await self.held_step_then_new_input(restart=True)
+
+    async def test_committed_input_before_provider_ack_fences_queued_step(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Old investigation", kind="action", one_try=True)
+        # Core's receipt commits before the adapter's ACK hook updates the durable anchor.
+        self.assertEqual(self.store.conversation_input(native.ISSUE, native.SESSION)["activity_id"], native.ACTIVITY)
+        with patch.object(self.bridge, "native_conversation_state", return_value={
+                "live": True, "latest_activity": "new-steering-input", "turn_live": True}):
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+        self.assertEqual(self.posted, [])
+
+    async def test_committed_terminal_outcome_fences_step_before_completion_post(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Old investigation", kind="action", one_try=True)
+        with patch.object(self.bridge, "native_conversation_state", return_value={
+                "live": False, "latest_activity": native.ACTIVITY, "turn_live": False}):
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+        self.assertEqual(self.posted, [])
+
+    async def test_late_step_enqueue_and_old_input_replay_cannot_cross_new_input_fence(self):
+        from hermes_fleet_linear_plugin.native_input import queue_reply
+        await self.start_turn()
+        await self.deliver("new-steering-input", "Summarize instead.")
+        restarted = self.fixture.make_bridge()
+        restarted.api = self.bridge.api
+        old_cursor = self.adapter._input_cursors[(native.ISSUE, native.SESSION, native.ACTIVITY)]
+        anchor = restarted.store.remember_conversation_input(native.ISSUE, native.SESSION, native.ACTIVITY,
+            native.ACTIVITY, 1, False, [])
+        self.assertEqual(anchor["activity_id"], "new-steering-input")  # Original Core sequence cannot promote old input.
+        late = queue_reply(restarted, native.ISSUE, native.SESSION, native.ACTIVITY,
+                           "Old investigation", kind="action", one_try=True, source_cursor=old_cursor)
+        await asyncio.to_thread(restarted.flush, only_id=late)
+        self.assertEqual(self.posted, [])
+        anchor = restarted.store.remember_conversation_input(native.ISSUE, native.SESSION, "new-steering-input",
+            "new-steering-input", 2, False)
+        self.assertEqual(anchor["activity_id"], "new-steering-input")
+        cursor = anchor["cursor"]
+        fresh = queue_reply(restarted, native.ISSUE, native.SESSION, "new-steering-input",
+                            "Working on your request.", kind="action", one_try=True, source_cursor=cursor)
+        await asyncio.to_thread(restarted.flush, only_id=fresh)
+        self.assertEqual([p["content"].get("parameter") for p in self.posted], ["Working on your request."])
+
+    async def test_real_approval_timeout_does_not_resume_over_a_different_pending_approval(self):
+        from tools import approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        first = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        with patch("tools.approval_context._get_approval_timeout", return_value=0):
+            expired = await asyncio.to_thread(self.request_approval, key, "rm -rf dist/")
+        self.assertFalse(expired["resolved"])
+        await self.until_posted(3)
+        self.assertTrue(approval.has_blocking_approval(key))
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.15)
+        self.assertNotIn("action", [p["content"]["type"] for p in self.posted])
+        # The expired newer card cannot redirect a plain answer to this older request.
+        # Settle the exact remaining request through Core's supported withdrawal hook.
+        remaining = approval.list_gateway_approvals(key)[0]["request_id"]
+        self.assertTrue(approval.withdraw_gateway_approval(key, remaining, "Remaining request withdrawn"))
+        self.assertEqual((await self.answer_later(key, first, approval.unregister_gateway_notify))["cancelled"],
+                         "Remaining request withdrawn")
+        await self.until_posted(5)  # The timeout notice restored the still-pending first card.
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_real_approval_withdrawal_resumes_without_a_timeout_notice(self):
+        from tools import approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        request_id = approval.list_gateway_approvals(key)[0]["request_id"]
+        self.assertTrue(approval.withdraw_gateway_approval(key, request_id, "Prompt withdrawn"))
+        result = await self.answer_later(key, waiter, approval.unregister_gateway_notify)
+        self.assertEqual(result["cancelled"], "Prompt withdrawn")
+        self.assertIsNone(result["choice"])
+        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        await self.start_typing_refresh()
+        await self.until_posted(2)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "action"])
+
+    async def test_real_approval_timeout_resumes_core_typing_without_a_human_answer(self):
+        from tools import approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        with patch("tools.approval_context._get_approval_timeout", return_value=0):
+            result = await asyncio.to_thread(self.request_approval, key)
+        self.assertFalse(result["resolved"])
+        self.assertFalse(approval.has_blocking_approval(key))
+        await self.until_posted(2)  # Core's timeout notice still posts.
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.2)
+        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        self.assertIn("action", [p["content"]["type"] for p in self.posted])
+
+    async def test_real_approval_answer_resumes_core_typing_and_posts_a_live_step(self):
+        from tools import approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        await self.deliver("approval-answer", "approve")
+        result = await self.answer_later(key, waiter, approval.unregister_gateway_notify)
+        self.assertTrue(result["resolved"])
+        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+        await self.start_typing_refresh()
+        await self.until_posted(3)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought", "action"])
+
+    async def test_real_approval_answer_keeps_typing_paused_for_the_next_approval(self):
+        from tools import approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        first = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        second = asyncio.create_task(asyncio.to_thread(self.request_approval, key, "rm -rf dist/"))
+        await self.until_posted(2)
+        selected = next(option["value"] for option in self.posted[0]["signalMetadata"]["options"]
+                        if option["label"] == "approve")
+        await self.deliver("first-approval-answer", selected)
+        self.assertTrue((await self.answer_later(key, first, approval.unregister_gateway_notify))["resolved"])
+        self.assertTrue(approval.has_blocking_approval(key))
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.15)
+        self.assertNotIn("action", [p["content"]["type"] for p in self.posted])
+        await self.deliver("second-approval-answer", "deny")
+        self.assertTrue((await self.answer_later(key, second, approval.unregister_gateway_notify))["resolved"])
+        await self.until_posted(6)  # Confirmation restores the still-pending second card.
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_real_clarify_resume_preserves_a_pending_approval(self):
+        from tools import approval, clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        self.addCleanup(clarify.clear_session, key)
+        approval_waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        question_waiter = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+        await self.until_posted(2)
+        selected = next(option["value"] for option in self.posted[1]["signalMetadata"]["options"]
+                        if option["label"] == "staging")
+        await self.deliver("clarify-answer", selected)
+        self.assertEqual(await self.answer_later(key, question_waiter, clarify.clear_session), ("staging", True))
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        await self.deliver("remaining-approval-answer", "approve")
+        self.assertTrue((await self.answer_later(key, approval_waiter, approval.unregister_gateway_notify))["resolved"])
+        await self.start_typing_refresh()
+        await self.until_posted(4)
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_real_clarify_resume_preserves_another_question(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(clarify.clear_session, key)
+        first = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+        await self.until_posted(1)
+        second = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+        await self.until_posted(2)
+        # Two simultaneous cards have ambiguous plain-text routing. Settle the exact
+        # older request through Core, then answer the still-visible newest question.
+        older = clarify.get_pending_for_session(key, include_choice_prompts=True)
+        self.assertTrue(clarify.resolve_gateway_clarify(older.clarify_id, "staging"))
+        self.assertEqual(await self.answer_later(key, first, clarify.clear_session), ("staging", True))
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        await self.deliver("second-clarify-answer", "production")
+        self.assertEqual(await self.answer_later(key, second, clarify.clear_session), ("production", True))
+        await self.start_typing_refresh()
+        await self.until_posted(3)
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_real_callbacks_keep_status_phrases_with_independent_agent_sessions(self):
+        from gateway.run_turn_runner import TurnRunner
+        from gateway.platforms.helpers import typing_metadata_for_turn
+        from agent.display import build_status_phrase
+        first = await self.start_turn()
+        first_meta = self.status_metadata()
+        session, activity = "session-second", "activity-second"
+        self.authority.sessions[session] = {**self.authority.sessions[native.SESSION], "id": session}
+        delivery = self.delivery(activity, "Another task in the same issue")
+        data = delivery.event()
+        data["agentSession"]["id"] = session
+        self.authority.activities[activity]["agentSession"]["id"] = session
+        await self.route(Delivery(data))
+        second = self.messages[-1]
+        second_meta = typing_metadata_for_turn(self.adapter, native.ISSUE, activity, {"thread_id": session})
+        runners = []
+        for event in (first, second):
+            runner = object.__new__(TurnRunner)
+            runner._ctx = SimpleNamespace(_live_status_adapter=self.adapter, _live_status_mode="full",
+                _run_still_current=lambda: True, source=event.source)
+            runners.append(runner)
+        await asyncio.gather(*(asyncio.to_thread(self.owned_status, None, event,
+            lambda runner=runner, tool=tool: runner._progress_live_status(
+                "tool.started", tool, {"command": "echo PRIVATE_CANARY", "path": "PRIVATE_CANARY"}))
+            for runner, event, tool in zip(runners, (first, second), ("read_file", "terminal"))))
+        with patch.object(self.native_input.time, "monotonic", return_value=1000):
+            await self.adapter.send_typing(native.ISSUE, metadata=first_meta)
+            await self.adapter.send_typing(native.ISSUE, metadata=second_meta)
+        await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        self.assertEqual({p["agentSessionId"]: p["content"]["parameter"] for p in self.posted}, {
+            native.SESSION: build_status_phrase("read_file", None),
+            session: build_status_phrase("terminal", None)})
+        self.owned_status(None, first, lambda: runners[0]._progress_live_status("tool.completed", "read_file", {}))
+        self.assertEqual(self.adapter._step_phrases[(native.ISSUE, session, activity)],
+                         build_status_phrase("terminal", None))
+        with patch.object(self.native_input.time, "monotonic", return_value=2000):
+            await self.adapter.send_typing(native.ISSUE, metadata=first_meta)
+        await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+
+    async def test_unowned_core_callback_cannot_borrow_environment_identity(self):
+        import os
+        from gateway.run_turn_runner import TurnRunner
+        event = await self.start_turn()
+        runner = object.__new__(TurnRunner)
+        runner._ctx = SimpleNamespace(_live_status_adapter=self.adapter, _live_status_mode="full",
+            _run_still_current=lambda: True, source=event.source)
+        with patch.dict(os.environ, {"HERMES_SESSION_PLATFORM": "linear", "HERMES_SESSION_CHAT_ID": native.ISSUE,
+                "HERMES_SESSION_THREAD_ID": native.SESSION, "HERMES_SESSION_MESSAGE_ID": native.ACTIVITY,
+                "HERMES_SESSION_SCOPE_ID": event.source.scope_id}):
+            runner._progress_live_status("tool.started", "terminal", {"command": "echo unproven"})
+        await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+        await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+
+    async def test_live_step_throttles_changed_phrases_and_keeps_chat_alive(self):
+        from agent.display import build_status_phrase
+        first, second = build_status_phrase("read_file", None), build_status_phrase("terminal", None)
+        await self.start_turn()  # No native task exists: ordinary chat needs its own keepalive.
+        await self.step(first)
+        self.assertEqual(self.posted[-1]["content"], {
+            "type": "action", "action": "Working", "parameter": first})
+        self.assertIs(self.posted[-1]["ephemeral"], True)
+        await self.step(second, at=1059)
+        self.assertEqual(len(self.posted), 1)
+        await self.step(second, at=1060)
+        self.assertEqual(len(self.posted), 2)
+        await self.step(second, at=1659)
+        self.assertEqual(len(self.posted), 2)
+        await self.step(second, at=1660)
+        self.assertEqual(len(self.posted), 3)
+        self.assertEqual(len({row["id"] for row in self.posted}), 3)
+
+    async def test_live_step_hook_does_not_wait_for_network_and_only_one_is_in_flight(self):
+        await self.start_turn()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.adapter._post_reply
+        async def delayed(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+        with patch.object(self.adapter, "_post_reply", side_effect=delayed):
+            await asyncio.wait_for(self.adapter.send_typing(native.ISSUE,
+                metadata=self.status_metadata()), 0.1)
+            await entered.wait()
+            await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+            self.assertEqual(len(self.adapter._step_tasks), 1)
+            release.set()
+            await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        self.assertEqual(len(self.posted), 1)
+
+    async def test_live_step_stops_at_final_and_reopens_only_for_new_input(self):
+        await self.start_turn()
+        await self.step()
+        final = await self.adapter.send(native.ISSUE, "Finished.", reply_to=native.ACTIVITY,
+                                        metadata={"thread_id": native.SESSION})
+        self.assertTrue(final.success, final.error)
+        await self.step("Late step", at=2000)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["action", "response"])
+        await self.deliver("new-step-input", "Check again.")
+        await self.step("Checking again.", at=2000)
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_queued_live_step_cannot_follow_native_final_or_expire_into_a_later_turn(self):
+        from hermes_fleet_linear_plugin.native_input import queue_reply
+        await self.start_turn()
+        pending = queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                              "Checking.", kind="action", one_try=True)
+        result = await self.adapter.send(native.ISSUE, "Finished.", reply_to=native.ACTIVITY,
+                                         metadata={"thread_id": native.SESSION})
+        self.assertTrue(result.success)
+        await asyncio.to_thread(self.bridge.flush, only_id=pending)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
+        await self.deliver("fresh-step-input", "Check the next issue.")
+        cursor = self.store.conversation_cursor(native.ISSUE, native.SESSION)
+        expired = queue_reply(self.bridge, native.ISSUE, native.SESSION, "fresh-step-input",
+                              "Old phrase", kind="action", one_try=True, source_cursor=cursor)
+        row = self.store.outbox_row(expired)
+        self.store.rewrite(expired, {**row["payload"], "expires_at": self.bridge.clock() - 1}, self.bridge.clock())
+        await asyncio.to_thread(self.bridge.flush, only_id=expired)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
+
+    async def test_held_live_step_cannot_replace_a_newer_question(self):
+        from hermes_fleet_linear_plugin.native_input import queue_reply
+        await self.start_turn()
+        pending = queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                              "Checking.", kind="action", one_try=True)
+        from tools import clarify_gateway as clarify
+        key = self.session_key(self.messages[0])
+        self.addCleanup(clarify.clear_session, key)
+        waiter = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+        await self.until_posted(1)
+        await asyncio.to_thread(self.bridge.flush, only_id=pending)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation"])
+        await self.deliver("question-answer", "staging")
+        await self.answer_later(key, waiter, clarify.clear_session)
+
+    async def test_question_invalidates_scheduled_live_step(self):
+        await self.start_turn()
+        key = (native.ISSUE, native.SESSION)
+        lock = self.adapter._reply_locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
+        task = self.adapter._step_tasks[key]
+        self.adapter._pause_steps(*key)
+        lock.release()
+        await task
+        await self.step("Must remain waiting.", at=2000)
+        self.assertEqual(self.posted, [])
 
     async def test_interim_send_posts_a_thought_into_the_turns_session(self):
         from gateway.run import _interim_metadata

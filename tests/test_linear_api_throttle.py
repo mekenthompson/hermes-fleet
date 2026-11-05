@@ -104,6 +104,31 @@ class IdentityProofCacheTests(unittest.TestCase):
 
 
 class SharedBudgetTests(unittest.TestCase):
+    def test_optional_operation_cap_survives_nested_essential_and_restores_on_exit(self):
+        clock = Clock()
+        wire = Wire(clock, lambda: budget_headers(clock, 500))
+        api = LinearAPI(lambda: "t", transport=wire, clock=clock)
+        with api.priority("essential"):
+            with self.assertRaises(Throttled), api.optional_work():
+                api.issue("issue-1")  # This read observes 10% remaining.
+                with api.priority("essential"):
+                    api.update_issue("issue-1", {"stateId": "s"})
+            self.assertEqual(wire.kinds(), ["read"])
+            api.update_issue("issue-1", {"stateId": "s"})
+        self.assertEqual(wire.kinds(), ["read", "mutation"])
+
+    def test_optional_operation_loads_shared_budget_before_any_request(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "rate-limit.json"
+            writer = LinearAPI(lambda: "t", clock=clock, rate_limit_path=path)
+            writer._pause(budget_headers(clock, 500), limited=False)
+            wire = Wire(clock)
+            reader = LinearAPI(lambda: "t", transport=wire, clock=clock, rate_limit_path=path)
+            with reader.priority("essential"), self.assertRaises(Throttled), reader.optional_work():
+                reader.issue("issue-1")
+            self.assertEqual(wire.calls, [])
+
     def test_ratelimited_with_headers_pauses_every_client_of_the_profile(self):
         clock = Clock()
         with tempfile.TemporaryDirectory() as directory:

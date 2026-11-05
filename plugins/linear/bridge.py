@@ -4055,6 +4055,33 @@ class Bridge:
                 except Exception as exc:
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="admission", iss=row["issue_id"], task=row.get("task_id"), exc=type(exc).__name__)
 
+    @staticmethod
+    def _optional_conversation_status(payload):
+        return (payload.get("content", {}).get("type") == "action" or
+                (payload.get("optional_status_repair") is True and bool(payload.get("lifecycle_repair_of"))))
+
+    @contextmanager
+    def _optional_action_budget(self, row):
+        payload = row["payload"]
+        if not (self.store.conversation_reply(row["kind"], payload) and
+                self._optional_conversation_status(payload)):
+            yield True
+            return
+        if payload.get("content", {}).get("type") == "action" and payload.get("write_started") is False:
+            if self._conversation_step_expired(payload) or not self._conversation_step_safe(payload):
+                self.store.retire_unattempted_action(row["id"], payload["content"])
+                yield False
+                return
+        entered = False
+        try:
+            with self.api.optional_work():
+                entered = True
+                yield True
+        except RateLimited as exc:
+            self.store.defer(row["id"], exc.until)
+            if not entered:
+                yield False
+
     def flush(self, *, only_id: str | None = None) -> int:
         """Deliver due writes, oldest first per issue, until nothing more can go out now."""
         with self._priority("essential"):
@@ -4065,84 +4092,93 @@ class Bridge:
             progress = False
             for row in self.store.due(self.clock()):
                 if only_id is not None and row["id"] != only_id: continue
-                with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row), self._one_try(row):
-                    if not self._authorize_outbox_effect(row):
-                        if advisory(row): continue
-                        payload = row["payload"]
-                        missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
-                                   and any(not (payload.get("requester_sessions") or {}).get(issue_id)
-                                           for issue_id in self._outbox_scope_issue_ids(row)))
-                        reason = ("Missing persisted requester-session authority; operator reconciliation required"
-                                  if missing else "Specialist authorization unavailable or revoked; no write attempted")
-                        checks = int(payload.get("authorization_checks", 0)) + 1
-                        self.store.rewrite(row["id"], {**payload, "authorization_error": reason,
-                                           "authorization_checks": checks, "authorization_failed_at": self.clock(),
-                                           "reported": int(missing)},
-                                           self.clock() + min(60 * 2 ** min(checks - 1, 6), 3600))
-                        if missing:
-                            self.store.mark(row["id"], "failed")
-                            progress = ((self.store.outbox_row(row["id"]) or {}).get("state") == "failed") or progress
-                        diag.count("held"); diag.warn("outbox.retry", "held", "requester_session_missing" if missing else "auth_unavailable", **diag.outbox_fields(row))
+                with self._optional_action_budget(row) as allowed:
+                    if not allowed:
                         continue
-                    if row["kind"] != "project_update" and not (
-                            self.store.independent_message(row["kind"], row["payload"]) or
-                            self.store.reporting_notice(row["kind"], row["payload"])) and any(
-                            self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
-                            for issue_id in self._outbox_scope_issue_ids(row)):
-                        continue
-                    diag.clear(); started = time.monotonic()
-                    try:
-                        applied = self._send(row)
-                    except NativeProgressSuperseded:
-                        applied = diag.because("obsolete_progress")
-                    except ProjectUpdateDeferred:
-                        current = self.store.outbox_row(row["id"])
-                        if current is None:
-                            progress = True
-                        else:
-                            if (current["payload"].get("native_history") is True and
-                                    current["payload"].get("write_started") is False):
-                                row["_unattempted_history_deferred"] = True
-                            if not advisory(row):  # advisory rows get one try and retire instead
-                                # A guard that keeps holding a due row must not re-read Linear every tick.
-                                self.store.defer_guarded(row["id"], self.clock())
-                        continue
-                    except RateLimited as exc:
-                        self.store.defer(row["id"], exc.until)
-                        return sent
-                    except LinearError as exc:
-                        if self.store.conversation_reply(row["kind"], row["payload"]):
-                            row.update(self.store.outbox_row(row["id"]) or {})  # The mutation guard persisted its attempt.
-                        if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
-                            self._alert_reauthorization()
-                        if self._specialist_scope_active() and not exc.retryable and any(
-                                text in str(exc).lower() for text in ("specialist scope", "specialist authorization")):
-                            targets = self._outbox_scope_issue_ids(row)
-                            denied = [issue_id for issue_id in targets
-                                      if not self.authorize_specialist_effect(issue_id)]
-                            if not denied and targets:
-                                self._fence_scope_denial(targets[0], exc)
+                    with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row), self._one_try(row):
+                        if not self._authorize_outbox_effect(row):
+                            if advisory(row): continue
+                            payload = row["payload"]
+                            missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
+                                       and any(not (payload.get("requester_sessions") or {}).get(issue_id)
+                                               for issue_id in self._outbox_scope_issue_ids(row)))
+                            reason = ("Missing persisted requester-session authority; operator reconciliation required"
+                                      if missing else "Specialist authorization unavailable or revoked; no write attempted")
+                            checks = int(payload.get("authorization_checks", 0)) + 1
+                            self.store.rewrite(row["id"], {**payload, "authorization_error": reason,
+                                               "authorization_checks": checks, "authorization_failed_at": self.clock(),
+                                               "reported": int(missing)},
+                                               self.clock() + min(60 * 2 ** min(checks - 1, 6), 3600))
+                            if missing:
+                                self.store.mark(row["id"], "failed")
+                                progress = ((self.store.outbox_row(row["id"]) or {}).get("state") == "failed") or progress
+                            diag.count("held"); diag.warn("outbox.retry", "held", "requester_session_missing" if missing else "auth_unavailable", **diag.outbox_fields(row))
                             continue
-                        if advisory(row):
-                            diag.outbox_failure(row, exc, advisory=True)
-                            progress = True
-                        elif not exc.retryable:
-                            self.store.mark(row["id"], "failed", _public(str(exc))[:300])
-                            self.store.note_reason(row["id"], "failure_reason", diag.outbox_failure(row, exc))
-                            if row["payload"].get("reconcile_required"): progress = True
-                        else:
-                            gave_up = self.store.retry(row, self.clock(), _public(str(exc))[:300])
-                            failure = diag.outbox_failure(row, exc, gave_up=gave_up)
-                            if gave_up: self.store.note_reason(row["id"], "failure_reason", failure)
-                        continue
-                    if self.store.mark_sent(row["id"], applied):
-                        self.store.note_reason(row["id"], "outcome_reason", diag.outbox_result(row, applied, started))
-                        sent, progress = sent + 1, True
+                        if row["kind"] != "project_update" and not (
+                                self.store.independent_message(row["kind"], row["payload"]) or
+                                self.store.reporting_notice(row["kind"], row["payload"])) and any(
+                                self.store.issue_reconciliation_blocked(issue_id, except_id=row["id"])
+                                for issue_id in self._outbox_scope_issue_ids(row)):
+                            continue
+                        diag.clear(); started = time.monotonic()
+                        try:
+                            applied = self._send(row)
+                        except NativeProgressSuperseded:
+                            applied = diag.because("obsolete_progress")
+                        except ProjectUpdateDeferred:
+                            current = self.store.outbox_row(row["id"])
+                            if current is None:
+                                progress = True
+                            else:
+                                if (current["payload"].get("native_history") is True and
+                                        current["payload"].get("write_started") is False):
+                                    row["_unattempted_history_deferred"] = True
+                                if not advisory(row):  # advisory rows get one try and retire instead
+                                    # A guard that keeps holding a due row must not re-read Linear every tick.
+                                    self.store.defer_guarded(row["id"], self.clock())
+                            continue
+                        except RateLimited as exc:
+                            self.store.defer(row["id"], exc.until)
+                            if (self.store.conversation_reply(row["kind"], row["payload"]) and
+                                    self._optional_conversation_status(row["payload"])):
+                                continue  # Disposable status cannot hold an essential reply in this batch.
+                            return sent
+                        except LinearError as exc:
+                            if self.store.conversation_reply(row["kind"], row["payload"]):
+                                row.update(self.store.outbox_row(row["id"]) or {})  # The mutation guard persisted its attempt.
+                            if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
+                                self._alert_reauthorization()
+                            if self._specialist_scope_active() and not exc.retryable and any(
+                                    text in str(exc).lower() for text in ("specialist scope", "specialist authorization")):
+                                targets = self._outbox_scope_issue_ids(row)
+                                denied = [issue_id for issue_id in targets
+                                          if not self.authorize_specialist_effect(issue_id)]
+                                if not denied and targets:
+                                    self._fence_scope_denial(targets[0], exc)
+                                continue
+                            if advisory(row):
+                                diag.outbox_failure(row, exc, advisory=True)
+                                progress = True
+                            elif not exc.retryable:
+                                self.store.mark(row["id"], "failed", _public(str(exc))[:300])
+                                self.store.note_reason(row["id"], "failure_reason", diag.outbox_failure(row, exc))
+                                if row["payload"].get("reconcile_required"): progress = True
+                            else:
+                                gave_up = self.store.retry(row, self.clock(), _public(str(exc))[:300])
+                                failure = diag.outbox_failure(row, exc, gave_up=gave_up)
+                                if gave_up: self.store.note_reason(row["id"], "failure_reason", failure)
+                            continue
+                        if self.store.mark_sent(row["id"], applied):
+                            self.store.note_reason(row["id"], "outcome_reason", diag.outbox_result(row, applied, started))
+                            sent, progress = sent + 1, True
             for row in self.store.unreported_failed():
                 if only_id is not None and row["id"] != only_id: continue
-                if not self._authorize_outbox_effect(row): continue
-                if self._loud(row, LinearError("delivery failed", retryable=bool(row["attempts"]))):
-                    self.store.report(row["id"])
+                with self._optional_action_budget(row) as allowed:
+                    if not allowed:
+                        continue
+                    if not self._authorize_outbox_effect(row): continue
+                    if self._loud(row, LinearError("delivery failed", retryable=bool(row["attempts"]))):
+                        self.store.report(row["id"])
             if progress:
                 self.store.revive_failed(self.clock())
         return sent
@@ -4230,11 +4266,13 @@ class Bridge:
             final_reply = bool(row and self.store.conversation_reply(row["kind"], payload)
                                and payload.get("turn_final") is True and not repair_reply)
             interim_reply = bool(row and self.store.conversation_reply(row["kind"], payload) and not final_reply
-                                 and not repair_reply and payload["content"]["type"] in ("thought", "elicitation"))
+                                 and not repair_reply and payload["content"]["type"] in ("thought", "elicitation", "action"))
             question_reply = (interim_reply or repair_reply) and payload["content"]["type"] == "elicitation"
             if (interim_reply or repair_reply and question_reply) and payload.get("write_started") is not False:
                 raise ProjectUpdateDeferred  # Another sender already attempted this immutable question/interim.
             if interim_reply:
+                if self._conversation_step_expired(payload):
+                    raise LinearError("Linear live status expired before publication", retryable=False)
                 if self._conversation_interim_finished(payload):
                     raise LinearError("Linear session already has its final reply", retryable=False)
                 with self._question_publication_guard(payload):
@@ -4284,6 +4322,14 @@ class Bridge:
                                 raise ProjectUpdateDeferred
                         elif not self._conversation_repair_current(payload):
                             raise ProjectUpdateDeferred
+                    if interim_reply and self._conversation_step_expired(payload):
+                        raise LinearError("Linear live status expired before publication", retryable=False)
+                    if interim_reply and payload["content"]["type"] == "action":
+                        if not self._conversation_step_safe(payload):
+                            raise LinearError("Linear live status has an unsupported phrase", retryable=False)
+                    if conversation and self._optional_conversation_status(payload):
+                        with self.api.optional_work():
+                            pass  # Authorization reads may have consumed the optional reserve.
                     entered_transport = True
                     yield
             except LinearError as exc:
@@ -4390,6 +4436,8 @@ class Bridge:
         desired = self._conversation_final_type(payload, lifecycle=True) or "response"
         if (payload.get("turn_final") is not True and not payload.get("lifecycle_repair_of")
                 and not self._conversation_interim_finished(payload)):
+            if payload["content"]["type"] == "action":
+                return payload  # A current ephemeral step needs no persistent status duplicate.
             desired = "thought"  # A withdrawn question still belongs to unfinished work.
         return {"content": self._lifecycle_repair_content(desired)}
 
@@ -4422,6 +4470,8 @@ class Bridge:
                    "turn_activity", "requester_sessions", "requester_activities") if key in scope}
         repair.update(presentation, id=identity, content_action=True, unlinked_content=True, native_reply_version=1,
                       write_started=False, lifecycle_repair_of=row["id"])
+        if self._optional_conversation_status(payload):
+            repair["optional_status_repair"] = True  # Keep the originating step's reserve cap across retries.
         queued = self.store.enqueue("activity", repair, at=self.clock())
         if not queued:
             raise LinearError("Conversation lifecycle repair could not be queued")
@@ -4447,7 +4497,19 @@ class Bridge:
             return diag.because("obsolete_progress")
         return None
 
+    def _conversation_step_expired(self, payload: dict) -> bool:
+        return payload.get("content", {}).get("type") == "action" and self.clock() >= payload.get("expires_at", 0)
+
+    @staticmethod
+    def _conversation_step_safe(payload: dict) -> bool:
+        from .native_input import step_phrase
+        content = payload["content"]
+        return content.get("action") == "Working" and step_phrase(content.get("parameter")) == content.get("parameter")
+
     def _conversation_interim_finished(self, payload: dict) -> bool:
+        is_step = payload.get("content", {}).get("type") == "action"
+        if is_step and self.store.conversation_step_superseded(payload["id"]):
+            return True
         if self.store.conversation_finished(payload["issue_id"], payload["session_id"],
                 payload.get("turn_activity", payload.get("source_activity", "")), payload.get("source_cursor", 0)):
             return True
@@ -4456,7 +4518,8 @@ class Bridge:
             state = read(payload)
             if state.get("turn_live") is None:
                 raise LinearError("The interim's owning Core admission could not be verified")
-            return state["turn_live"] is False
+            return (state["turn_live"] is False or (is_step and state["latest_activity"] is not None
+                    and state["latest_activity"] != payload.get("source_activity")))
         if callable(self.native_ingress):
             raise LinearError("Native conversation state is unavailable")
         return False
@@ -4530,7 +4593,7 @@ class Bridge:
                 return settled
             payload = row["payload"]
         if (self.store.conversation_reply(kind, payload) and payload.get("turn_final") is not True and
-                not payload.get("lifecycle_repair_of") and payload["content"]["type"] in ("thought", "elicitation")):
+                not payload.get("lifecycle_repair_of") and payload["content"]["type"] in ("thought", "elicitation", "action")):
             settled = self._prepare_conversation_interim(row)
             if settled is not None:
                 return settled
@@ -4539,6 +4602,8 @@ class Bridge:
                 raise LinearError("Linear session already has its final reply", retryable=False)
             with self._question_publication_guard(payload):
                 pass
+        if self.store.conversation_reply(kind, payload) and self._conversation_step_expired(payload):
+            return diag.because("obsolete_progress")
         attempted_progress = ((payload.get("native_progress") is True or payload.get("native_history") is True) and
                               (payload.get("write_started") is not False or row["attempts"]))
         if payload.get("claim") or payload.get("admission_id"):
@@ -4702,7 +4767,7 @@ class Bridge:
                 **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})),
                 expected_content=copy.deepcopy(payload["content"]) if self.store.conversation_reply(kind, payload) else None)
             if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True
-                    or payload.get("lifecycle_repair_of") or payload["content"]["type"] in ("thought", "elicitation")):
+                    or payload.get("lifecycle_repair_of") or payload["content"]["type"] in ("thought", "elicitation", "action")):
                 self._reconcile_conversation_lifecycle(row)
             return True
         elif kind == "project_update":
