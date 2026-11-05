@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 import test_linear_native_bridge_scenarios as native
+from linear_core_capabilities import requires_status_metadata
 
 QUESTION = "Which environment should the migration run against?"
 CHOICES = ["staging", "production"]
@@ -213,6 +214,55 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         if tasks:
             await asyncio.gather(*tasks)
 
+    async def test_legacy_typing_without_producer_anchor_cannot_borrow_admitted_input(self):
+        await self.start_turn()
+        self.assertEqual(self.adapter._inputs[(native.ISSUE, native.SESSION)], native.ACTIVITY)
+        stop = asyncio.Event()
+        observed = []
+        original = self.adapter.send_typing
+        async def typing(*args, **kwargs):
+            observed.append(kwargs.get("metadata"))
+            return await original(*args, **kwargs)
+        with patch.object(self.adapter, "send_typing", side_effect=typing):
+            task = asyncio.create_task(self.adapter._keep_typing(native.ISSUE, interval=0.01,
+                metadata={"thread_id": native.SESSION}, stop_event=stop))
+            try:
+                await self.wait_for_step_condition(lambda: len(observed) >= 2)
+            finally:
+                stop.set()
+                await task
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.adapter._step_tasks, {})
+        self.assertTrue(all("_linear_status_source" not in metadata for metadata in observed))
+
+    @requires_status_metadata
+    async def test_approval_withdrawal_after_remote_accept_before_ack_restores_live_turn(self):
+        from tools import approval
+        release = threading.Event()
+        self.addCleanup(release.set)
+        mutate = self.bridge._mutate_outbox
+        withdraw = approval.withdraw_gateway_approval
+        held = []
+        def accepted(row_id, *args, **kwargs):
+            result = mutate(row_id, *args, **kwargs)
+            row = self.bridge.store.outbox_row(row_id)
+            if row["payload"]["content"]["type"] == "elicitation":
+                held.append(True)
+                if not release.wait(10):
+                    raise TimeoutError("test did not withdraw the accepted question")
+            return result
+        def settle(*args, **kwargs):
+            try:
+                return withdraw(*args, **kwargs)
+            finally:
+                release.set()
+        with patch.object(self.bridge, "_mutate_outbox", side_effect=accepted), \
+                patch.object(approval, "withdraw_gateway_approval", side_effect=settle):
+            await self.test_real_approval_withdrawal_resumes_without_a_timeout_notice()
+        self.assertEqual(held, [True])
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought", "action"])
+
+    @requires_status_metadata
     async def test_private_argument_not_published(self):
         from gateway.run_turn_runner import TurnRunner
         event = await self.start_turn()
@@ -227,6 +277,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         print('PROBE private argument reached action:', 'PRIVATE_CANARY' in published)
         self.assertNotIn('PRIVATE_CANARY', published)
 
+    @requires_status_metadata
     async def test_optional_status_obeys_reserve(self):
         await self.start_turn()
         api = self.bridge.api
@@ -263,6 +314,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         api=self.bridge.api
         api.budget={'requests':{'limit':5000,'remaining':remaining,'reset':api.clock()+3600,'at':api.clock()}}
 
+    @requires_status_metadata
     async def test_every_read_and_mutation_is_optional(self):
         from agent.display import build_status_phrase
         await self.start_turn(); self.budget(4000); observed=[]; original=self.bridge.api.transport
@@ -342,6 +394,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.outbox_row(final)["state"], "sent")
         self.assertIs(self.store.outbox_row(action)["payload"]["write_started"], False)
 
+    @requires_status_metadata
     async def test_status_arguments_and_unknown_tool_labels_never_leave_core_callback(self):
         from gateway.run_turn_runner import TurnRunner
         from agent.display import build_status_phrase
@@ -359,6 +412,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.posted[-1]["content"]["parameter"], expected)
         self.assertNotIn("PRIVATE_CANARY", json.dumps(self.posted))
 
+    @requires_status_metadata
     async def test_session_scoped_step_caps_every_request_and_yields_before_auth(self):
         from test_linear_specialist_authorization import SCOPE
         from agent.display import build_status_phrase
@@ -439,9 +493,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(restarted.flush)
         self.assertEqual(self.posted, [])
 
+    @requires_status_metadata
     async def test_queued_step_cannot_follow_a_newly_admitted_input(self):
         await self.held_step_then_new_input()
 
+    @requires_status_metadata
     async def test_new_input_supersedes_queued_step_after_store_and_bridge_restart(self):
         await self.held_step_then_new_input(restart=True)
 
@@ -488,6 +544,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(restarted.flush, only_id=fresh)
         self.assertEqual([p["content"].get("parameter") for p in self.posted], ["Working on your request."])
 
+    @requires_status_metadata
     async def test_real_approval_timeout_does_not_resume_over_a_different_pending_approval(self):
         from tools import approval
         key = self.session_key(await self.start_turn())
@@ -513,23 +570,32 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(5)  # The timeout notice restored the still-pending first card.
         self.assertEqual(self.posted[-1]["content"]["type"], "action")
 
+    @requires_status_metadata
     async def test_real_approval_withdrawal_resumes_without_a_timeout_notice(self):
         from tools import approval
         key = self.session_key(await self.start_turn())
         self.addCleanup(approval.unregister_gateway_notify, key)
-        waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
-        await self.until_posted(1)
-        request_id = approval.list_gateway_approvals(key)[0]["request_id"]
-        self.assertTrue(approval.withdraw_gateway_approval(key, request_id, "Prompt withdrawn"))
-        result = await self.answer_later(key, waiter, approval.unregister_gateway_notify)
-        self.assertEqual(result["cancelled"], "Prompt withdrawn")
-        self.assertIsNone(result["choice"])
-        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
-        self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
-        await self.start_typing_refresh()
-        await self.until_posted(2)
-        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "action"])
+        # Model the real still-running Core admission. The fixture's default final-reply
+        # projection excludes live work and cannot describe this pre-ack withdrawal race.
+        with patch.object(self.bridge, "native_conversation_state", return_value={
+                "live": True, "latest_activity": native.ACTIVITY, "turn_live": True}):
+            waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+            await self.until_posted(1)
+            request_id = approval.list_gateway_approvals(key)[0]["request_id"]
+            self.assertTrue(approval.withdraw_gateway_approval(key, request_id, "Prompt withdrawn"))
+            result = await self.answer_later(key, waiter, approval.unregister_gateway_notify)
+            self.assertEqual(result["cancelled"], "Prompt withdrawn")
+            self.assertIsNone(result["choice"])
+            self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+            self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+            await self.start_typing_refresh()
+            await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
+            kinds = [p["content"]["type"] for p in self.posted]
+            self.assertEqual(kinds[0], "elicitation")
+            self.assertEqual(kinds[-1], "action")
+            self.assertTrue(all(kind in ("elicitation", "thought", "action") for kind in kinds))
 
+    @requires_status_metadata
     async def test_real_approval_timeout_resumes_core_typing_without_a_human_answer(self):
         from tools import approval
         key = self.session_key(await self.start_turn())
@@ -545,6 +611,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
         self.assertIn("action", [p["content"]["type"] for p in self.posted])
 
+    @requires_status_metadata
     async def test_real_approval_answer_resumes_core_typing_and_posts_a_live_step(self):
         from tools import approval
         key = self.session_key(await self.start_turn())
@@ -560,6 +627,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(3)
         self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought", "action"])
 
+    @requires_status_metadata
     async def test_real_approval_answer_keeps_typing_paused_for_the_next_approval(self):
         from tools import approval
         key = self.session_key(await self.start_turn())
@@ -583,6 +651,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(6)  # Confirmation restores the still-pending second card.
         self.assertEqual(self.posted[-1]["content"]["type"], "action")
 
+    @requires_status_metadata
     async def test_real_clarify_resume_preserves_a_pending_approval(self):
         from tools import approval, clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -609,6 +678,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             while not predicate():
                 await asyncio.sleep(0.01)
 
+    @requires_status_metadata
     async def test_real_clarify_timeout_retires_pause_and_restarts_owned_status(self):
         from tools import clarify_gateway as clarify
         from agent.display import build_status_phrase
@@ -627,6 +697,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
         self.assertEqual(self.posted[-1]["content"]["parameter"], phrase)
 
+    @requires_status_metadata
     async def test_real_clarify_withdrawal_retires_pause_and_restores_work(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -640,6 +711,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(3)
         self.assertEqual(self.posted[-1]["content"]["type"], "action")
 
+    @requires_status_metadata
     async def test_clarify_timeout_preserves_another_live_question(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -669,6 +741,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.answer_later(key, first, clarify.clear_session), ("staging", True))
         await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
 
+    @requires_status_metadata
     async def test_clarify_timeout_preserves_a_live_approval(self):
         from tools import clarify_gateway as clarify, approval
         key = self.session_key(await self.start_turn())
@@ -721,6 +794,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(self.bridge.flush)
         self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
 
+    @requires_status_metadata
     async def test_clarify_retirement_uses_completed_core_turn_without_reopening_status(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -746,6 +820,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "response"])
         self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
 
+    @requires_status_metadata
     async def test_clarify_timeout_does_not_unpause_another_agent_session_question(self):
         from tools import clarify_gateway as clarify
         first_event = await self.start_turn()
@@ -769,9 +844,22 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         key = self.session_key(self.messages[-1])
         runner = self.turn_runner(key)
         runner._ctx._status_thread_metadata = {"thread_id": session}
-        with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
-            self.assertFalse((await asyncio.to_thread(runner._ask_clarify_question, QUESTION, CHOICES, False))[1])
-        await self.until_posted(3)
+        # Publication is earlier than retirement completion. Hold that exact CI window.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.bridge._queue_conversation_lifecycle_repair
+        def held(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("retire_clarify") and not release.wait(10):
+                raise TimeoutError("test did not release completed retirement publication")
+            return result
+        with patch.object(self.bridge, "_queue_conversation_lifecycle_repair", side_effect=held):
+            with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+                self.assertFalse((await asyncio.to_thread(runner._ask_clarify_question, QUESTION, CHOICES, False))[1])
+            await self.until_posted(3)
+            self.assertIn((native.ISSUE, session), self.adapter._step_paused)
+            release.set()
+            await self.wait_for_step_condition(lambda: (native.ISSUE, session) not in self.adapter._step_paused)
         self.assertFalse(clarify.has_pending(key))
         self.assertTrue(clarify.has_pending(first_key))
         self.assertIn(native.ISSUE, self.adapter._typing_paused)
@@ -785,6 +873,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.answer_later(first_key, first, clarify.clear_session), ("staging", True))
         await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
 
+    @requires_status_metadata
     async def test_clarify_retirement_precedes_the_first_resumed_typing_action(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -809,6 +898,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             await self.until_posted(3)
         self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought", "action"])
 
+    @requires_status_metadata
     async def test_real_clarify_resume_preserves_another_question(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())
@@ -830,6 +920,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(3)
         self.assertEqual(self.posted[-1]["content"]["type"], "action")
 
+    @requires_status_metadata
     async def test_real_callbacks_keep_status_phrases_with_independent_agent_sessions(self):
         from gateway.run_turn_runner import TurnRunner
         from gateway.platforms.helpers import typing_metadata_for_turn
@@ -870,6 +961,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
         self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
 
+    @requires_status_metadata
     async def test_unowned_core_callback_cannot_borrow_environment_identity(self):
         import os
         from gateway.run_turn_runner import TurnRunner
@@ -885,6 +977,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
         self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
 
+    @requires_status_metadata
     async def test_live_step_throttles_changed_phrases_and_keeps_chat_alive(self):
         from agent.display import build_status_phrase
         first, second = build_status_phrase("read_file", None), build_status_phrase("terminal", None)
@@ -903,6 +996,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.posted), 3)
         self.assertEqual(len({row["id"] for row in self.posted}), 3)
 
+    @requires_status_metadata
     async def test_live_step_hook_does_not_wait_for_network_and_only_one_is_in_flight(self):
         await self.start_turn()
         entered, release = asyncio.Event(), asyncio.Event()
@@ -921,6 +1015,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*list(self.adapter._step_tasks.values()))
         self.assertEqual(len(self.posted), 1)
 
+    @requires_status_metadata
     async def test_live_step_stops_at_final_and_reopens_only_for_new_input(self):
         await self.start_turn()
         await self.step()
@@ -967,6 +1062,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.deliver("question-answer", "staging")
         await self.answer_later(key, waiter, clarify.clear_session)
 
+    @requires_status_metadata
     async def test_question_invalidates_scheduled_live_step(self):
         await self.start_turn()
         key = (native.ISSUE, native.SESSION)

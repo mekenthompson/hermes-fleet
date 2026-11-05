@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import test_linear_native_input_seam as seam
+from linear_core_capabilities import requires_status_metadata
 
 
 @unittest.skipUnless(seam.SOURCE and seam.GUARDED_ROOT, "requires scripts/run-linear-input-scenarios.py")
@@ -75,6 +76,29 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.store.outbox_row(row)['state'], 'sent')
         self.assertEqual(remote_kinds[-1], 'thought', 'A successful stale action must reconcile the current working state')
 
+    async def test_legacy_core_typing_without_anchor_is_safe_with_a_live_admission(self):
+        await self.start_live_for_delivery()
+        self.assertEqual(self.adapter._inputs[(self.ISSUE, self.SESSION)], "live-input")
+        stop = asyncio.Event()
+        observed = []
+        original = self.adapter.send_typing
+        async def typing(*args, **kwargs):
+            observed.append(kwargs.get("metadata"))
+            return await original(*args, **kwargs)
+        with patch.object(self.adapter, "send_typing", side_effect=typing):
+            task = asyncio.create_task(self.adapter._keep_typing(self.ISSUE, interval=0.01,
+                metadata={"thread_id": self.SESSION}, stop_event=stop))
+            try:
+                await self.until(lambda: len(observed) >= 2)
+            finally:
+                stop.set()
+                await task
+        self.assertTrue(all("_linear_status_source" not in metadata for metadata in observed))
+        with self.bridge.store._tx() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.content.type')='action'").fetchone()[0], 0)
+
+    @requires_status_metadata
     async def test_status_phrase_stays_with_its_executing_producer(self):
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result

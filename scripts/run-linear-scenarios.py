@@ -96,14 +96,14 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "tes
         try:
             os.environ.clear()
             os.environ.update(isolated)
-            return run_suite(tests_dir, pattern, shard)
+            return run_suite(tests_dir, pattern, shard, revision=actual)
         finally:
             os.environ.clear()
             os.environ.update(inherited)
 
 
 def run_suite(tests_dir: Path, pattern: str = "test_linear_*scenarios.py",
-              shard: tuple[int, int] | None = None) -> int:
+              shard: tuple[int, int] | None = None, *, revision: str | None = None) -> int:
     suite = select_shard(unittest.defaultTestLoader.discover(
         start_dir=str(tests_dir), pattern=pattern,
     ), shard)
@@ -112,8 +112,12 @@ def run_suite(tests_dir: Path, pattern: str = "test_linear_*scenarios.py",
         return 1
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if result.skipped:
-        print(f"Linear scenario suite skipped={len(result.skipped)}; required lane failed", file=sys.stderr)
-        return 1
+        sys.path.insert(0, str(ROOT / "tests"))
+        from linear_core_capabilities import unexpected_skips
+        if unexpected_skips(result.skipped, revision):
+            print(f"Linear scenario suite skipped={len(result.skipped)}; required lane failed", file=sys.stderr)
+            return 1
+        print(f"Historical Core {revision}: producer-metadata qualifications={len(result.skipped)}", file=sys.stderr)
     return 0 if result.wasSuccessful() else 1
 
 
