@@ -760,26 +760,38 @@ def create_adapter(config, running):
                     keys.append(session_key)
 
         async def _answer(self, bridge, projected, event):
-            """Resolve a waiting clarify or approval from this reply; False routes it as a message."""
+            """Consume one provider activity before publishing any answer confirmation."""
             key = (projected.issue_id, projected.session_id)
+            answer_key = (*key, projected.message_id)
             with self._relay_lock:
-                if (*key, projected.message_id) in self._answered:
+                if answer_key in self._answered:
                     return True
-                recorded = list(self._asked[key]) if key in self._asked else None
+                if key not in self._asked:
+                    return False
+                recorded = list(self._asked[key])
                 source_cursor = self._question_cursors.get(key, 0)
-            if recorded is None:
-                return False
-            if await self._resolve_answer(bridge, projected, event, recorded, source_cursor):
-                with self._relay_lock:
-                    self._answered.add((*key, projected.message_id))
-                return True
-            return False
+                # Reserve before core effects. Resolution is synchronous under this lock;
+                # no other delivery of this activity can advance the next FIFO approval.
+                # Keep it on unexpected resolver errors too: core may already have
+                # released a waiter. Replaying uncertain consent is not safe.
+                self._answered.add(answer_key)
+                consumed, confirmation = self._resolve_answer(projected, event, recorded)
+                if not consumed:
+                    self._answered.remove(answer_key)
+                    return False
+            if confirmation is not None:
+                # Delivery belongs to the outbox. Failure or cancellation here must never
+                # undo the core decision or allow this activity to answer another prompt.
+                await self._post(bridge, projected.issue_id, projected.session_id, projected.message_id,
+                                 confirmation, kind="thought", source_cursor=source_cursor)
+            return True
 
-        async def _resolve_answer(self, bridge, projected, event, recorded, source_cursor):
+        def _resolve_answer(self, projected, event, recorded):
+            """Return (consumed, optional confirmation), with no asynchronous publication."""
             source = event.source
             if self._is_sender_authorized(projected.actor_id, source.chat_type, source.chat_id,
                                           thread_id=source.thread_id) is not True:
-                return False
+                return False, None
             keys = list(dict.fromkeys(recorded + self._core_session_keys(source)))
             from tools import clarify_gateway as clarify
             for session_key in keys:
@@ -788,14 +800,14 @@ def create_adapter(config, running):
                     continue
                 outcome = clarify.attempt_text_response_for_session(session_key, projected.text)
                 if outcome in (clarify.TEXT_RESOLVED, clarify.TEXT_REJECTED_SELECTION):
-                    return True  # An invalid pick keeps the question open for another try, as in core.
+                    return True, None  # An invalid pick keeps the question open for another try, as in core.
                 if outcome == clarify.TEXT_REJECTED_PROSE:
                     # Core's rule for prose at a choice-only prompt: release it, then route the prose.
                     clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED)
-                    return False
+                    return False, None
             decision = approval_decision(projected.text)
             if decision is None:
-                return False
+                return False, None
             from tools.approval import has_blocking_approval, resolve_gateway_approval
             choice, resolve_all, reason = decision
             for session_key in keys:
@@ -803,10 +815,8 @@ def create_adapter(config, running):
                     continue
                 count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all, reason=reason)
                 if count:
-                    await self._post(bridge, projected.issue_id, projected.session_id, projected.message_id,
-                                     _approval_confirmation(choice, count, reason), kind="thought", source_cursor=source_cursor)
-                    return True
-            return False
+                    return True, _approval_confirmation(choice, count, reason)
+            return False, None
 
         async def _post(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False,
                         source_cursor=None, **reply):

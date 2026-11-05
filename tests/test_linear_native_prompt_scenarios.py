@@ -76,17 +76,25 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.adapter.handle_message = admit
         self.loop = asyncio.get_running_loop()
 
-    async def deliver(self, identity, body, *, user=native.USER):
+    def delivery(self, identity, body, *, user=native.USER, delivery_id=None):
         self.authority.activities[identity] = {"id": identity, "user": {"id": user},
                                                "agentSession": {"id": native.SESSION}}
         event = self.fixture.event("prompted", body=body)
         event["agentActivity"].update(id=identity, user={"id": user})
         delivery = Delivery(event)
+        delivery.delivery_id = delivery_id or identity
+        return delivery
+
+    async def deliver(self, identity, body, *, user=native.USER, delivery_id=None):
+        delivery = self.delivery(identity, body, user=user, delivery_id=delivery_id)
+        await self.route(delivery)
+        return delivery
+
+    async def route(self, delivery):
         self.assertTrue(self.adapter.route(delivery))
         future = self.adapter._submitted.get(self.adapter._delivery_key(delivery))
         if future is not None:
             await asyncio.wait_for(asyncio.wrap_future(future), 10)
-        return delivery
 
     async def start_turn(self):
         delivery = await self.deliver(native.ACTIVITY, "Run the schema migration for this issue.")
@@ -219,6 +227,89 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer.acknowledged, 1)
         self.assertEqual(len(self.messages), 2 if reopened else 1)
         self.assertEqual(self.posted[-1]["content"]["type"], "thought")  # the confirmation
+
+    async def pending_approvals(self):
+        """Real core FIFO entries, with no blocking command threads to leak on failure."""
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        turn = await self.start_turn()
+        key = self.session_key(turn)
+        entries = [_ApprovalEntry({"command": command}) for command in ("first", "second")]
+        with approval._lock:
+            approval._gateway_queues[key] = entries.copy()
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        result = await self.adapter.send(native.ISSUE, "Approve the first command?", metadata={
+            "thread_id": native.SESSION, "is_approval_prompt": True})
+        self.assertTrue(result.success, result.error)
+        return entries
+
+    async def test_concurrent_deliveries_of_one_approval_activity_resolve_only_one_entry(self):
+        first, second = await self.pending_approvals()
+        publishing, release = asyncio.Event(), asyncio.Event()
+        original = self.adapter._post
+        async def delayed(*args, **kwargs):
+            publishing.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+        answer = self.delivery("answer-activity", "approve", delivery_id="first-delivery")
+        duplicate = self.delivery("answer-activity", "approve", delivery_id="duplicate-delivery")
+        with patch.object(self.adapter, "_post", side_effect=delayed):
+            task = asyncio.create_task(self.route(answer))
+            await asyncio.wait_for(publishing.wait(), 10)
+            replay = asyncio.create_task(self.route(duplicate))
+            try:
+                async with asyncio.timeout(10):
+                    while not replay.done() and second.result is None:
+                        await asyncio.sleep(0.01)
+                self.assertEqual([first.result, second.result], ["once", None])
+                self.assertTrue(first.event.is_set())
+                self.assertFalse(second.event.is_set())
+            finally:
+                release.set()
+                await asyncio.gather(task, replay)
+        self.assertEqual([answer.acknowledged, duplicate.acknowledged], [1, 1])
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+        await self.deliver("new-answer-activity", "approve")
+        self.assertEqual(second.result, "once")
+
+    async def test_confirmation_failure_cannot_replay_an_approval_on_inbox_retry(self):
+        first, second = await self.pending_approvals()
+        answer = self.delivery("answer-activity", "approve", delivery_id="failed-delivery")
+        with patch.object(self.bridge, "flush", side_effect=RuntimeError("publication interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "publication interrupted"):
+                await self.route(answer)
+        self.assertEqual([first.result, second.result], ["once", None])
+        self.assertEqual(answer.acknowledged, 0)
+        retry = await self.deliver("answer-activity", "approve", delivery_id="retry-delivery")
+        self.assertEqual(retry.acknowledged, 1)
+        self.assertEqual([first.result, second.result], ["once", None])
+        self.assertFalse(second.event.is_set())
+        # The already-queued confirmation can still publish independently of inbox retry.
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+        self.assertEqual(len(self.messages), 1)
+        await self.deliver("new-answer-activity", "approve")
+        self.assertEqual(second.result, "once")
+
+    async def test_clarify_activity_replay_cannot_answer_the_next_question(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(clarify.clear_session, key)
+        for identity in ("first-question", "second-question"):
+            clarify.register(clarify_id=identity, session_key=key, question=QUESTION, choices=CHOICES)
+            result = await self.adapter.send_clarify(native.ISSUE, QUESTION, choices=CHOICES,
+                clarify_id=identity, session_key=key, metadata={"thread_id": native.SESSION})
+            self.assertTrue(result.success, result.error)
+            if identity == "first-question":
+                await self.deliver("answer-activity", "staging")
+                self.assertEqual(clarify.wait_for_response(identity, timeout=0), "staging")
+        duplicate = await self.deliver("answer-activity", "staging", delivery_id="duplicate-delivery")
+        self.assertEqual(duplicate.acknowledged, 1)
+        self.assertIsNotNone(clarify.get_pending("second-question"))
+        await self.deliver("new-answer-activity", "production")
+        self.assertEqual(clarify.wait_for_response("second-question", timeout=0), "production")
+        self.assertEqual(len(self.messages), 1)
 
     async def test_final_reply_is_unchanged_and_nothing_posts_after_it(self):
         from gateway.run import _interim_metadata
