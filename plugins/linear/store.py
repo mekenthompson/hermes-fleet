@@ -1016,6 +1016,27 @@ class Store:
         with self._tx() as db:
             db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)", (key, value))
             return db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
+    @staticmethod
+    def _prompt_answer_key(issue_id: str, session_id: str, activity_id: str) -> str:
+        return "native-prompt-answer:" + json.dumps([issue_id, session_id, activity_id], separators=(",", ":"))
+
+    def prompt_answer_reserved(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+        with self._tx() as db:
+            return db.execute("SELECT 1 FROM metadata WHERE key=?",
+                (self._prompt_answer_key(issue_id, session_id, activity_id),)).fetchone() is not None
+
+    def reserve_prompt_answer(self, issue_id: str, session_id: str, activity_id: str) -> str | None:
+        """Commit consumption before core effects; only one adapter may use this activity."""
+        token = uuid.uuid4().hex
+        saved = self.first_value(self._prompt_answer_key(issue_id, session_id, activity_id), token)
+        return token if saved == token else None
+
+    def release_prompt_answer(self, issue_id: str, session_id: str, activity_id: str, token: str) -> None:
+        """Release only our reservation when no prompt consumed the input."""
+        with self._tx() as db:
+            db.execute("DELETE FROM metadata WHERE key=? AND value=?",
+                (self._prompt_answer_key(issue_id, session_id, activity_id), token))
+
     # -- outbox -----------------------------------------------------------
     def enqueue(self, kind: str, payload: dict[str, Any], *, at: float | None = None) -> str:
         row_id = str(payload.get("id") or uuid.uuid4())

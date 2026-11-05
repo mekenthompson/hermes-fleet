@@ -792,7 +792,9 @@ The person's next prompt in that session answers it, as a typed reply does on ot
 platforms: Core's clarify text rules resolve the clarify, and Core's approve/deny words
 (or `/approve`, `/deny`) resolve the oldest waiting approval and post a confirmation
 `thought`. An answer is taken only from a sender the gateway allowlist authorizes; any
-other reply is an ordinary message.
+other reply is an ordinary message. Redelivery of an input Core already admitted cannot
+answer a later question. A consumed answer cannot resolve another prompt, including
+after adapter replacement; failed confirmation publication does not restore consent.
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
 uncertain creation remain pending; retry never repeats an unknown create.

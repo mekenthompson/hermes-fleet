@@ -925,6 +925,84 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.board.discover(self.provider.issues[self.ISSUE]), [])
         self.assertEqual(self.decisions, [])
 
+    async def ordinary_replay_at_prompt(self, kind, *, recreate=False, unreadable=False):
+        """Real authority receipts must win over later prompt interception, including reconnect."""
+        from gateway.config import PlatformConfig
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        text = "approve" if kind == "approval" else "staging"
+        original = self.event("ordinary-before-question", text)
+        await self.deliver_raw("ordinary-before-question", original)
+        await self.until(lambda: self.receipts and self.inbox_row("ordinary-before-question")[2] == "imported")
+        source = self.receipts[0][0].source
+        key = self.fixture.store._generate_session_key(source)
+        if recreate:
+            await self.adapter.disconnect()
+            self.adapter = self.native_input.create_adapter(
+                PlatformConfig(enabled=True, typing_indicator=False), self.running)
+            self.assertTrue(await self.adapter.connect())
+            self.adapter.set_message_handler(self.runner._handle_message)
+            self.adapter.set_session_store(self.fixture.store)
+            self.runner.adapters[self.adapter.platform] = self.adapter
+            self.assertEqual(getattr(self.adapter, "_ordinary", set()), set())
+        self.adapter.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == self.USER)
+        await self.deliver("current-input", "Continue the bounded check.")
+        await self.until(lambda: self.inbox_row("current-input")[2] == "imported")
+        if kind == "approval":
+            entry = _ApprovalEntry({"command": "later-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [entry]
+            self.addCleanup(approval.unregister_gateway_notify, key)
+            sent = await self.adapter.send(self.ISSUE, "Approve this later command?", metadata={
+                "thread_id": self.SESSION, "is_approval_prompt": True})
+        else:
+            clarify.register(clarify_id="later-question", session_key=key,
+                question="Which environment?", choices=["staging", "production"])
+            self.addCleanup(clarify.clear_session, key)
+            sent = await self.adapter.send_clarify(self.ISSUE, "Which environment?",
+                choices=["staging", "production"], clarify_id="later-question", session_key=key,
+                metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        if unreadable:
+            with patch("gateway.session_native_delivery.find", side_effect=sqlite3.OperationalError("receipt unavailable")):
+                await self.deliver_raw("ordinary-redelivery", original)
+                await self.until(lambda: all(f.done() for f in self.adapter._submitted.values()))
+            self.assertEqual(self.inbox_row("ordinary-redelivery")[2], "pending")
+        else:
+            await self.deliver_raw("ordinary-redelivery", original)
+            await self.until(lambda: self.inbox_row("ordinary-redelivery")[2] == "imported")
+        self.assertEqual(len(self.rows()), 2)
+        if kind == "approval":
+            self.assertIsNone(entry.result)
+            self.assertFalse(entry.event.is_set())
+        else:
+            self.assertIsNotNone(clarify.get_pending("later-question"))
+        if unreadable:
+            return
+        await self.deliver("fresh-answer", text)
+        await self.until(lambda: self.inbox_row("fresh-answer")[2] == "imported")
+        if kind == "approval":
+            self.assertEqual(entry.result, "once")
+        else:
+            self.assertEqual(clarify.wait_for_response("later-question", timeout=0), "staging")
+        self.assertEqual(len(self.rows()), 2)  # only the two ordinary inputs reached the FIFO
+        self.assertEqual(self.decisions, [])
+
+    async def test_ordinary_input_replay_cannot_answer_later_approval(self):
+        await self.ordinary_replay_at_prompt("approval")
+
+    async def test_ordinary_input_replay_cannot_answer_later_clarify(self):
+        await self.ordinary_replay_at_prompt("clarify")
+
+    async def test_recreated_adapter_checks_durable_receipt_before_approval(self):
+        await self.ordinary_replay_at_prompt("approval", recreate=True)
+
+    async def test_recreated_adapter_checks_durable_receipt_before_clarify(self):
+        await self.ordinary_replay_at_prompt("clarify", recreate=True)
+
+    async def test_unreadable_durable_receipt_cannot_authorize_an_approval(self):
+        await self.ordinary_replay_at_prompt("approval", recreate=True, unreadable=True)
+
     async def test_native_commit_with_failed_inbox_update_retries_receipt_without_duplicate_input(self):
         with sqlite3.connect(self.inbox.database) as db:
             db.execute("CREATE TRIGGER fixture_refuse_ack BEFORE UPDATE OF status ON deliveries "

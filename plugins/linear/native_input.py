@@ -593,7 +593,8 @@ def create_adapter(config, running):
             # session that was asked something can answer a clarify or an approval.
             self._asked = {}
             self._question_cursors = {}
-            self._answered = set()  # provider inputs consumed as answers; a redelivery is not a new message
+            self._answered = set()  # cache of the store's durable consumed-answer reservations
+            self._ordinary = set()  # inputs already handed to Core, including admission still in flight
 
         async def connect(self, *, is_reconnect=False):
             if not native_supported():
@@ -663,6 +664,8 @@ def create_adapter(config, running):
                 with self._relay_lock:
                     self._submitted.pop(self._delivery_key(delivery), None)
                 return
+            with self._relay_lock:
+                self._ordinary.add((projected.issue_id, projected.session_id, projected.message_id))
             # Linear expects a visible response within seconds; the model turn may take minutes.
             await asyncio.to_thread(acknowledge, bridge, projected)
             if projected.source == "delegation":
@@ -722,6 +725,7 @@ def create_adapter(config, running):
                     with self._relay_lock:
                         self._inputs[(projected.issue_id, projected.session_id)] = projected.message_id
                         source_key = (projected.issue_id, projected.session_id, projected.message_id)
+                        self._ordinary.add(source_key)
                         self._input_cursors.setdefault(source_key, running["bridge"].store.conversation_cursor(
                             projected.issue_id, projected.session_id))
                 await asyncio.to_thread(delivery.acknowledge)
@@ -759,6 +763,26 @@ def create_adapter(config, running):
                 if session_key and session_key not in keys:
                     keys.append(session_key)
 
+        async def _ordinary_receipt(self, event):
+            """Ask Core's owning authority; its receipts and tombstones survive adapter replacement."""
+            runner = getattr(self._message_handler, "__self__", None) or self.gateway_runner
+            if runner is None:
+                return False  # standalone adapter fixtures have no native authority
+            from gateway.session_authorities import require_active_authority
+            from gateway.session_envelope import prepare_native
+            from gateway.session_native_delivery import find, identity
+            scope = getattr(runner, "_async_profile_scope_for_source", None)
+            if not callable(scope) and getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+                raise LinearError("Native Linear receipt profile is unavailable")
+            async with scope(event.source) if callable(scope) else nullcontext():
+                authority = require_active_authority(runner)
+                payload = await prepare_native(runner, event)
+                principal, request = identity(event.source, payload)
+                # Core validates the exact source/content, current authorization and runtime epoch.
+                # An unreadable or conflicting receipt is a refusal, never permission to answer.
+                return await asyncio.to_thread(find, authority, principal, request, payload,
+                                               getattr(event, "raw_message", None)) is not None
+
         async def _answer(self, bridge, projected, event):
             """Consume one provider activity before publishing any answer confirmation."""
             key = (projected.issue_id, projected.session_id)
@@ -766,18 +790,38 @@ def create_adapter(config, running):
             with self._relay_lock:
                 if answer_key in self._answered:
                     return True
-                if key not in self._asked:
+                if answer_key in self._ordinary:
+                    return False
+            if await asyncio.to_thread(bridge.store.prompt_answer_reserved, *answer_key):
+                return True
+            with self._relay_lock:
+                if key not in self._asked or answer_key in self._ordinary:
+                    return False
+            if await self._ordinary_receipt(event):
+                with self._relay_lock:
+                    self._ordinary.add(answer_key)
+                return False  # Core reconciles its original receipt; it is not a new answer.
+            with self._relay_lock:
+                if answer_key in self._answered:
+                    return True
+                if answer_key in self._ordinary:
                     return False
                 recorded = list(self._asked[key])
                 source_cursor = self._question_cursors.get(key, 0)
-                # Reserve before core effects. Resolution is synchronous under this lock;
-                # no other delivery of this activity can advance the next FIFO approval.
-                # Keep it on unexpected resolver errors too: core may already have
-                # released a waiter. Replaying uncertain consent is not safe.
+                # Commit the reservation before synchronous core effects. Separate adapters
+                # sharing this Store cannot consume the activity twice, including after reconnect.
+                token = bridge.store.reserve_prompt_answer(*answer_key)
+                if token is None:
+                    self._answered.add(answer_key)
+                    return True
+                # Keep it on unexpected resolver errors too: core may already have released
+                # a waiter. Replaying uncertain consent is not safe.
                 self._answered.add(answer_key)
                 consumed, confirmation = self._resolve_answer(projected, event, recorded)
                 if not consumed:
+                    bridge.store.release_prompt_answer(*answer_key, token)
                     self._answered.remove(answer_key)
+                    self._ordinary.add(answer_key)
                     return False
             if confirmation is not None:
                 # Delivery belongs to the outbox. Failure or cancellation here must never

@@ -311,6 +311,57 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clarify.wait_for_response("second-question", timeout=0), "production")
         self.assertEqual(len(self.messages), 1)
 
+    async def replacement_adapter(self):
+        """A separate adapter and Store connection, sharing only persisted provider state."""
+        from copy import copy
+        from gateway.config import PlatformConfig
+        from hermes_fleet_linear_plugin.store import Store
+        bridge = copy(self.bridge)
+        bridge.store = Store(self.store.path)
+        replacement = self.native_input.create_adapter(PlatformConfig(enabled=True), {"bridge": bridge})
+        self.assertTrue(await replacement.connect())
+        self.addAsyncCleanup(replacement.disconnect)
+        replacement.set_message_handler(lambda event: None)
+        replacement.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == native.USER)
+        return replacement
+
+    async def test_consumed_approval_activity_survives_adapter_replacement(self):
+        first, second = await self.pending_approvals()
+        await self.deliver("answer-activity", "approve")
+        self.assertEqual([first.result, second.result], ["once", None])
+        self.adapter = await self.replacement_adapter()
+        self.adapter._asked_in(native.ISSUE, native.SESSION)
+        replay = await self.deliver("answer-activity", "approve", delivery_id="after-reconnect")
+        self.assertEqual(replay.acknowledged, 1)
+        self.assertEqual([first.result, second.result], ["once", None])
+        await self.deliver("new-answer-activity", "approve")
+        self.assertEqual(second.result, "once")
+
+    async def test_two_adapters_cannot_consume_the_same_approval_activity(self):
+        first, second = await self.pending_approvals()
+        other = await self.replacement_adapter()
+        other._asked_in(native.ISSUE, native.SESSION)
+        publishing, release = asyncio.Event(), asyncio.Event()
+        original = self.adapter._post
+        async def delayed(*args, **kwargs):
+            publishing.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+        with patch.object(self.adapter, "_post", side_effect=delayed):
+            task = asyncio.create_task(self.deliver("answer-activity", "approve"))
+            await asyncio.wait_for(publishing.wait(), 10)
+            duplicate = self.delivery("answer-activity", "approve", delivery_id="other-adapter")
+            try:
+                self.assertTrue(other.route(duplicate))
+                future = other._submitted.get(other._delivery_key(duplicate))
+                if future is not None:
+                    await asyncio.wait_for(asyncio.wrap_future(future), 10)
+                self.assertEqual([first.result, second.result], ["once", None])
+                self.assertEqual(duplicate.acknowledged, 1)
+            finally:
+                release.set()
+                await task
+
     async def test_final_reply_is_unchanged_and_nothing_posts_after_it(self):
         from gateway.run import _interim_metadata
         from hermes_fleet_linear_plugin.bridge import stable_uuid4
