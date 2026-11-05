@@ -23,6 +23,17 @@ GUARDED_ROOT = os.environ.get("HERMES_LINEAR_INPUT_TEST_ROOT")
 
 @unittest.skipUnless(SOURCE and GUARDED_ROOT, "requires scripts/run-linear-input-scenarios.py")
 class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
+    async def show_approval(self, key, entry=None):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        if entry is None:
+            entry = _ApprovalEntry({"command": "bounded-command"})
+            with approval._lock:
+                approval._gateway_queues.setdefault(key, []).append(entry)
+            self.addCleanup(approval.unregister_gateway_notify, key)
+        return await self.adapter.send_exec_approval(self.ISSUE, entry.data["command"], key,
+            request_id=entry.data["request_id"], metadata={"thread_id": self.SESSION})
+
     async def asyncSetUp(self):
         # Reuse Core's finite settings/agent boundary, never GatewayRunner.
         spec = importlib.util.spec_from_file_location("finite_native_retry_fixture",
@@ -154,8 +165,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
 
     def event(self, identity, body, *, signal=None, action="prompted"):
         from test_linear_specialist_authorization import USER
-        self.provider.activities[identity] = {"id": identity, "user": {"id": USER},
-                                              "agentSession": {"id": self.SESSION}}
+        self.provider.activities.setdefault(identity, {"id": identity, "user": {"id": USER},
+            "createdAt": datetime.now(timezone.utc).isoformat(), "agentSession": {"id": self.SESSION}})
         activity = {"id": identity, "user": {"id": USER}, "content": {"body": body}}
         if signal:
             activity["signal"] = signal
@@ -981,8 +992,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.adapter._inputs[(self.ISSUE, self.SESSION)], "current-input")
             interim = await self.adapter.send(self.ISSUE, "Current second check is running.",
                 metadata={"thread_id": self.SESSION, "_interim_send": True})
-            approval = await self.adapter.send(self.ISSUE, "Approve the current second check?",
-                metadata={"thread_id": self.SESSION, "is_approval_prompt": True})
+            approval = await self.show_approval(key)
             clarify.register(clarify_id="current-question", session_key=key,
                 question="Which environment?", choices=["staging", "production"])
             question = await self.adapter.send_clarify(self.ISSUE, "Which environment?",
@@ -1077,8 +1087,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         for result in (
             await self.adapter.send(self.ISSUE, "Working on the second task.",
                 metadata={"thread_id": self.SESSION, "_interim_send": True}),
-            await self.adapter.send(self.ISSUE, "Approve second command?",
-                metadata={"thread_id": self.SESSION, "is_approval_prompt": True}),
+            await self.show_approval(key, entry),
             await self.adapter.send_clarify(self.ISSUE, "Environment?", choices=["staging", "production"],
                 clarify_id="second-question", session_key=key, metadata={"thread_id": self.SESSION}),
         ):
@@ -1149,8 +1158,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             entry = _ApprovalEntry({"command": "delivered-command"})
             with approval._lock:
                 approval._gateway_queues[key] = [entry]
-            sent = await self.adapter.send(self.ISSUE, "Approve delivered command?",
-                metadata={"thread_id": self.SESSION, "is_approval_prompt": True})
+            sent = await self.show_approval(key, entry)
             answer = "approve"
         self.assertTrue(sent.success, sent.error)
         if closed:
@@ -1226,8 +1234,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             with approval._lock:
                 approval._gateway_queues[key] = [entry]
             self.addCleanup(approval.unregister_gateway_notify, key)
-            sent = await self.adapter.send(self.ISSUE, "Approve this later command?", metadata={
-                "thread_id": self.SESSION, "is_approval_prompt": True})
+            sent = await self.show_approval(key, entry)
         else:
             clarify.register(clarify_id="later-question", session_key=key,
                 question="Which environment?", choices=["staging", "production"])
@@ -1334,3 +1341,52 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.rows()), 1)
         await self.until(lambda: len(self.provider.mutations) == 1 and self.final_reply_sent("inactive-activity"))
         self.assertFalse(self.bridge.store.pending(self.ISSUE))
+
+    async def inflight_ordinary_replacement(self, kind):
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Do the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        old = self.adapter
+        reached, release = asyncio.Event(), asyncio.Event()
+        handle = old.handle_message
+        async def paused(event):
+            reached.set()
+            await release.wait()
+            await handle(event)
+        old.handle_message = paused
+        raw = self.event("ordinary-answer", "approve" if kind == "approval" else "staging")
+        await self.deliver_raw("ordinary-first", raw)
+        await asyncio.wait_for(reached.wait(), 10)
+        self.assertFalse(any(row["request_id"] == "ordinary-answer" for row in self.rows()))
+        try:
+            await self.replace_input_adapter()
+            if kind == "approval":
+                entry = _ApprovalEntry({"command": "later-command"})
+                with approval._lock:
+                    approval._gateway_queues[key] = [entry]
+                self.addCleanup(approval.unregister_gateway_notify, key)
+                sent = await self.show_approval(key, entry)
+            else:
+                self.addCleanup(clarify.clear_session, key)
+                clarify.register(clarify_id="later-question", session_key=key,
+                    question="Environment?", choices=["staging", "production"])
+                sent = await self.adapter.send_clarify(self.ISSUE, "Environment?", ["staging", "production"],
+                    "later-question", key, metadata={"thread_id": self.SESSION})
+            self.assertTrue(sent.success, sent.error)
+            await self.deliver_raw("ordinary-replay", raw)
+            await self.until(lambda: self.inbox_row("ordinary-replay")[2] == "imported")
+            if kind == "approval":
+                self.assertIsNone(entry.result)
+            else:
+                self.assertIsNotNone(clarify.get_pending("later-question"))
+            self.assertEqual(sum(row["request_id"] == "ordinary-answer" for row in self.rows()), 1)
+        finally:
+            release.set()
+
+    async def test_inflight_ordinary_approval_is_not_consent_after_replacement(self):
+        await self.inflight_ordinary_replacement("approval")
+
+    async def test_inflight_ordinary_clarify_is_not_an_answer_after_replacement(self):
+        await self.inflight_ordinary_replacement("clarify")

@@ -405,7 +405,7 @@ def project_input(bridge, event) -> NativeInput | None:
     )
 
 
-def _session_work_live(bridge, issue_id, session_id) -> bool:
+def _session_work_live(bridge, issue_id, session_id, *, strict=False) -> bool:
     """Is tracked native work this same Agent Session started still unfinished?
 
     Linear completes a session on a ``response`` activity, while the bridge keeps
@@ -420,8 +420,12 @@ def _session_work_live(bridge, issue_id, session_id) -> bool:
         _, task = bridge._native_task(issue_id)
     except RateLimited:
         raise
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise LinearError("Tracked native work completion could not be verified") from exc
         return False
+    if strict and getattr(task, "status", None) is None:
+        raise LinearError("Tracked native work has no verified completion state")
     return getattr(task, "status", None) not in (None, "done", "archived")
 
 
@@ -467,7 +471,7 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
     payload = {
         "id": row_id, "issue_id": issue_id, "session_id": session_id,
         "content": {"type": kind, "body": body},
-        "content_action": True, "unlinked_content": True, "native_reply_version": 1,
+        "content_action": True, "unlinked_content": True, "native_reply_version": 1, "write_started": False,
         "source_activity": message_id, "source_cursor": source_cursor,
         "turn_activity": turn_activity or message_id,
         **({"turn_final": True} if final else {}),
@@ -776,13 +780,34 @@ def create_adapter(config, running):
                 return None
             return self._cache_input(chat_id, session_id, bridge.store.conversation_input(chat_id, session_id))
 
-        def _approval_prompt(self, chat_id, session_id, source):
+        @staticmethod
+        def _approval_declined(reason):
+            # Core treats a definitive connector refusal as undeliverable, never
+            # as permission to fall back to an unbound text approval.
+            return SendResult(success=False, error=reason,
+                              raw_response={"code": "egress_declined", "success": False})
+
+        async def _send_exec_approval_prompt(self, prompt):
+            """Bind Core's exact displayed request, including its offered capabilities."""
             from tools.approval import list_gateway_approvals
-            anchor = running["bridge"].store.conversation_input(chat_id, session_id)
-            keys = anchor.get("session_keys", []) if anchor and anchor["activity_id"] == source else []
-            targets = [{"session_key": key, "request_id": entry["request_id"]}
-                       for key in keys for entry in list_gateway_approvals(key) if entry.get("request_id")]
-            return {"kind": "approval", "targets": targets}
+            session_id = (prompt.metadata or {}).get("thread_id")
+            bridge = running.get("bridge")
+            source = self._latest_input(prompt.chat_id, session_id) if bridge and session_id else None
+            anchor = bridge.store.conversation_input(prompt.chat_id, session_id) if source else None
+            if (not anchor or prompt.session_key not in anchor.get("session_keys", []) or
+                    not prompt.request_id or not any(entry.get("request_id") == prompt.request_id
+                        for entry in list_gateway_approvals(prompt.session_key))):
+                return self._approval_declined("Linear approval has no verified pending request for this session")
+            descriptor = {"kind": "approval", "session_key": prompt.session_key,
+                          "request_id": prompt.request_id, "choices": prompt.choices}
+            words = {"once": "approve", "session": "approve session", "always": "approve always", "deny": "deny"}
+            options = [words[choice] for choice in prompt.choices if choice in words]
+            result = await self._post(bridge, prompt.chat_id, session_id, source, prompt.text,
+                kind="elicitation", question=True, nonce=prompt.request_id, native_prompt=descriptor,
+                signal="select", signal_metadata={"options": [{"value": word} for word in options]})
+            if not result.success and not result.retryable and not (result.raw_response or {}).get("ambiguous"):
+                return self._approval_declined(result.error)
+            return result
 
         async def _ordinary_receipt(self, event):
             """Ask Core's owning authority; its receipts and tombstones survive adapter replacement."""
@@ -813,15 +838,27 @@ def create_adapter(config, running):
                     return True
                 if answer_key in self._ordinary:
                     return False
-            if await asyncio.to_thread(bridge.store.prompt_answer_reserved, *answer_key):
-                return True
-            questions = await asyncio.to_thread(bridge.store.conversation_questions, *key)
+            disposition = bridge.store.prompt_disposition(*answer_key)
+            if disposition is not None:
+                return disposition != "ordinary"
+            # No await between observing no question and fixing ordinary routing. A
+            # reconnect before Core commits must still hand this input back to Core.
+            questions = bridge.store.conversation_questions(*key)
             if not questions:
-                return False
+                return not bridge.store.remember_ordinary_prompt(*answer_key)
             if await self._ordinary_receipt(event):
+                ordinary = bridge.store.remember_ordinary_prompt(*answer_key)
                 with self._relay_lock:
-                    self._ordinary.add(answer_key)
-                return False  # Core reconciles its original receipt; it is not a new answer.
+                    (self._ordinary if ordinary else self._answered).add(answer_key)
+                return not ordinary  # Core reconciles its original receipt; it is not a new answer.
+            # Only still-pending, open questions need provider chronology. A first
+            # delivery of an old Activity is ordinary input, never new consent.
+            questions = self._pending_questions(bridge, projected, event, questions)
+            verified = []
+            for question in questions:
+                if await asyncio.to_thread(self._question_precedes_answer, bridge, projected, question):
+                    verified.append(question)
+            questions = verified
             with self._relay_lock:
                 if answer_key in self._answered:
                     return True
@@ -831,6 +868,9 @@ def create_adapter(config, running):
                 # sharing this Store cannot consume the activity twice, including after reconnect.
                 token = bridge.store.reserve_prompt_answer(*answer_key)
                 if token is None:
+                    if bridge.store.prompt_disposition(*answer_key) == "ordinary":
+                        self._ordinary.add(answer_key)
+                        return False
                     self._answered.add(answer_key)
                     return True
                 # Keep it on unexpected resolver errors too: core may already have released
@@ -849,6 +889,32 @@ def create_adapter(config, running):
                                  confirmation, kind="thought", source_cursor=question.get("source_cursor", 0),
                                  turn_activity=question.get("turn_activity", question["source_activity"]))
             return True
+
+        def _pending_questions(self, bridge, projected, event, questions):
+            from tools import clarify_gateway as clarify
+            from tools.approval import list_gateway_approvals
+            keys = self._core_session_keys(event.source)
+            approvals = {key: {entry["request_id"] for entry in list_gateway_approvals(key)} for key in keys}
+            result = []
+            for question in questions:
+                if bridge.store.conversation_finished(projected.issue_id, projected.session_id,
+                        question.get("turn_activity", question["source_activity"]), question.get("source_cursor", 0)):
+                    continue
+                prompt = question["native_prompt"]
+                key = prompt.get("session_key")
+                if key not in keys:
+                    continue
+                pending = clarify.get_pending(prompt.get("clarify_id")) if prompt.get("kind") == "clarify" else None
+                if ((pending is not None and pending.session_key == key) or
+                        (prompt.get("kind") == "approval" and prompt.get("request_id") in approvals[key])):
+                    result.append(question)
+            return result
+
+        @staticmethod
+        def _question_precedes_answer(bridge, projected, question):
+            with bridge.api.requester_session(projected.session_id, activity_id=projected.message_id):
+                return bridge.api.question_precedes_answer(question["id"], projected.message_id,
+                                                          projected.session_id, projected.actor_id)
 
         def _resolve_answer(self, bridge, projected, event, questions):
             """Resolve only an open question's still-pending Core identity, without publication."""
@@ -882,10 +948,11 @@ def create_adapter(config, running):
             from tools.approval import list_gateway_approvals, resolve_gateway_approval
             choice, resolve_all, reason = decision
             for session_key in keys:
-                allowed = {target["request_id"]: question for question in questions
+                allowed = {question["native_prompt"]["request_id"]: question for question in questions
                            if question["native_prompt"].get("kind") == "approval"
-                           for target in question["native_prompt"].get("targets", [])
-                           if target.get("session_key") == session_key}
+                           and question["native_prompt"].get("session_key") == session_key
+                           and question["native_prompt"].get("request_id")
+                           and choice in question["native_prompt"].get("choices", [])}
                 targets = [entry["request_id"] for entry in list_gateway_approvals(session_key)
                            if entry.get("request_id") in allowed]
                 if not resolve_all:
@@ -938,11 +1005,7 @@ def create_adapter(config, running):
             if not question:
                 # Mid-turn notes are Linear thoughts: only the turn's reply may complete the session.
                 return await self._post(bridge, chat_id, session_id, source, content, kind="thought")
-            # An approval prompt (or core's plain-text clarify) asks the person: the session awaits input.
-            import uuid
-            prompt = self._approval_prompt(chat_id, session_id, source)
-            return await self._post(bridge, chat_id, session_id, source, content, kind="elicitation",
-                                    question=True, nonce=uuid.uuid4().hex, native_prompt=prompt)
+            return self._approval_declined("Linear approval requires Core's exact pending request identity")
 
         async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
             """Ask as a Linear elicitation; a pick or typed answer comes back as the session's next prompt."""

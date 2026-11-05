@@ -78,8 +78,9 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.loop = asyncio.get_running_loop()
 
     def delivery(self, identity, body, *, user=native.USER, delivery_id=None):
-        self.authority.activities[identity] = {"id": identity, "user": {"id": user},
-                                               "agentSession": {"id": native.SESSION}}
+        from datetime import datetime, timezone
+        self.authority.activities.setdefault(identity, {"id": identity, "user": {"id": user},
+            "createdAt": datetime.now(timezone.utc).isoformat(), "agentSession": {"id": native.SESSION}})
         event = self.fixture.event("prompted", body=body)
         event["agentActivity"].update(id=identity, user={"id": user})
         delivery = Delivery(event)
@@ -126,17 +127,25 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         return _clarify_send_then_wait(future, clarify_id=clarify_id, session_key=session_key,
                                        clarify_mod=clarify, fallback=fallback)
 
+    def render_approval(self, session_key, data):
+        """Exercise Core's real card routing and delivery-outcome fallback logic."""
+        from gateway.run_turn_runner import TurnRunner
+        runner = SimpleNamespace(
+            _ctx=SimpleNamespace(_status_adapter=self.adapter, _status_chat_id=native.ISSUE,
+                session_key=session_key, _status_thread_metadata={"thread_id": native.SESSION}),
+            _schedule=lambda coro, _label: asyncio.run_coroutine_threadsafe(coro, self.loop),
+            _close_native_stream_boundary=lambda _label: None)
+        return TurnRunner._render_approval_sync(runner, data)
+
     def request_approval(self, session_key):
-        """Core's text approval path (no native buttons): the prompt, then the gateway wait."""
-        from gateway.run import _format_exec_approval_fallback, _interim_metadata
         from tools.approval_gateway_wait import _await_gateway_decision
-        def notify(data):
-            text = _format_exec_approval_fallback(data["command"], data["description"], "/")
-            metadata = {"thread_id": native.SESSION, "is_approval_prompt": True}
-            asyncio.run_coroutine_threadsafe(self.adapter.send(
-                native.ISSUE, text, metadata=_interim_metadata(metadata)), self.loop).result(timeout=15)
-        return _await_gateway_decision(session_key, notify, {
+        return _await_gateway_decision(session_key, lambda data: self.render_approval(session_key, data), {
             "command": "rm -rf build/", "description": "recursive delete", "pattern_key": "recursive delete"})
+
+    async def display_approval(self, entry, **flags):
+        key = self.session_key(self.messages[0])
+        return await self.adapter.send_exec_approval(native.ISSUE, entry.data["command"], key,
+            request_id=entry.data["request_id"], metadata={"thread_id": native.SESSION}, **flags)
 
     async def answer_later(self, key, waiter, cleanup):
         try:
@@ -229,7 +238,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.messages), 2 if reopened else 1)
         self.assertEqual(self.posted[-1]["content"]["type"], "thought")  # the confirmation
 
-    async def pending_approvals(self):
+    async def pending_approvals(self, *, display_sibling=True):
         """Real core FIFO entries, with no blocking command threads to leak on failure."""
         from tools import approval
         from tools.approval_gateway_wait import _ApprovalEntry
@@ -239,9 +248,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         with approval._lock:
             approval._gateway_queues[key] = entries.copy()
         self.addCleanup(approval.unregister_gateway_notify, key)
-        result = await self.adapter.send(native.ISSUE, "Approve the first command?", metadata={
-            "thread_id": native.SESSION, "is_approval_prompt": True})
+        result = await self.display_approval(entries[0])
         self.assertTrue(result.success, result.error)
+        if display_sibling:
+            result = await self.display_approval(entries[1])
+            self.assertTrue(result.success, result.error)
         return entries
 
     async def test_concurrent_deliveries_of_one_approval_activity_resolve_only_one_entry(self):
@@ -270,7 +281,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, replay)
         self.assertEqual([answer.acknowledged, duplicate.acknowledged], [1, 1])
         self.assertEqual(len(self.messages), 1)
-        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "elicitation", "thought"])
         await self.deliver("new-answer-activity", "approve")
         self.assertEqual(second.result, "once")
 
@@ -288,7 +299,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(second.event.is_set())
         # The already-queued confirmation can still publish independently of inbox retry.
         await asyncio.to_thread(self.bridge.flush)
-        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "elicitation", "thought"])
         self.assertEqual(len(self.messages), 1)
         await self.deliver("new-answer-activity", "approve")
         self.assertEqual(second.result, "once")
@@ -417,6 +428,132 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success, result.error)
         self.assertEqual(self.posted[-1]["content"]["type"], "thought")
 
+
+    async def test_displayed_request_does_not_authorize_an_undisplayed_sibling_after_replacement(self):
+        from tools import approval
+        first, second = await self.pending_approvals(display_sibling=False)
+        key = self.session_key(self.messages[0])
+        self.assertEqual(approval.resolve_gateway_approval(key, "deny", request_id=first.data["request_id"]), 1)
+        self.adapter = await self.replacement_adapter()
+        # Ordinary fallback in this fixture must remain visible without a fake admission receipt.
+        ordinary = []
+        async def receive(event):
+            ordinary.append(event)
+        self.adapter.handle_message = receive
+        await self.deliver("sibling-answer", "approve")
+        self.assertIsNone(second.result)
+        self.assertEqual([event.message_id for event in ordinary], ["sibling-answer"])
+
+    async def test_exact_card_preserves_offered_approval_capabilities(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        entry = _ApprovalEntry({"command": "bounded-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        result = await self.display_approval(entry, allow_session=False, allow_permanent=False)
+        self.assertTrue(result.success, result.error)
+        await self.deliver("overbroad-answer", "/approve always")
+        self.assertIsNone(entry.result)
+        await self.deliver("exact-answer", "approve")
+        self.assertEqual(entry.result, "once")
+
+    async def test_core_renderer_declines_missing_identity_without_text_fallback(self):
+        from gateway.run_turn_runner import _ExecApprovalDeclined
+        key = self.session_key(await self.start_turn())
+        with patch.object(self.adapter, "send", wraps=self.adapter.send) as fallback:
+            with self.assertRaises(_ExecApprovalDeclined):
+                await asyncio.to_thread(self.render_approval, key, {"command": "unbound-command"})
+        fallback.assert_not_called()
+        self.assertEqual(self.posted, [])
+
+    async def test_core_renderer_preserves_ambiguous_exact_card_without_text_fallback(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        entry = _ApprovalEntry({"command": "bounded-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        with patch.object(self.bridge, "flush", return_value=0), \
+                patch.object(self.adapter, "send", wraps=self.adapter.send) as fallback:
+            await asyncio.to_thread(self.render_approval, key, entry.data)
+        fallback.assert_not_called()
+        await self.deliver("undelivered-answer", "approve")
+        self.assertIsNone(entry.result)  # queued but unattempted is not a displayed card
+
+    async def test_core_renderer_failed_card_cannot_fall_back_to_broad_consent(self):
+        from gateway.platforms.base import SendResult
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        entry = _ApprovalEntry({"command": "bounded-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [entry]
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        with patch.object(self.adapter, "_send_exec_approval_prompt", return_value=SendResult(False, error="failed")), \
+                patch.object(self.adapter, "send", wraps=self.adapter.send) as fallback:
+            await asyncio.to_thread(self.render_approval, key, entry.data)
+        fallback.assert_called_once()
+        self.assertEqual(self.posted, [])
+        await self.deliver("unbound-answer", "approve")
+        self.assertIsNone(entry.result)
+
+    async def old_first_delivery(self, kind):
+        from tools import approval, clarify_gateway as clarify
+        from tools.approval_gateway_wait import _ApprovalEntry
+        key = self.session_key(await self.start_turn())
+        old = self.delivery("old-unseen-answer", "approve" if kind == "approval" else "staging")
+        self.assertEqual(len(self.messages), 1)
+        if kind == "approval":
+            entry = _ApprovalEntry({"command": "new-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [entry]
+            self.addCleanup(approval.unregister_gateway_notify, key)
+            result = await self.display_approval(entry)
+        else:
+            clarify.register(clarify_id="new-question", session_key=key, question=QUESTION, choices=CHOICES)
+            self.addCleanup(clarify.clear_session, key)
+            result = await self.adapter.send_clarify(native.ISSUE, QUESTION, CHOICES, "new-question", key,
+                metadata={"thread_id": native.SESSION})
+        self.assertTrue(result.success, result.error)
+        handle = self.adapter.handle_message
+        self.adapter = await self.replacement_adapter()
+        self.adapter.handle_message = handle
+        await self.route(old)
+        self.assertEqual(old.acknowledged, 1)
+        self.assertEqual(len(self.messages), 2)  # first delivery remains ordinary input
+        if kind == "approval":
+            self.assertIsNone(entry.result)
+        else:
+            self.assertIsNotNone(clarify.get_pending("new-question"))
+        await self.deliver("fresh-answer", "approve" if kind == "approval" else "production")
+        if kind == "approval":
+            self.assertEqual(entry.result, "once")
+        else:
+            self.assertEqual(clarify.wait_for_response("new-question", timeout=0.1), "production")
+
+    async def test_first_delivery_created_before_approval_is_not_consent(self):
+        await self.old_first_delivery("approval")
+
+    async def test_first_delivery_created_before_clarify_is_not_an_answer(self):
+        await self.old_first_delivery("clarify")
+
+    async def test_missing_authoritative_question_time_cannot_grant_consent(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        first, second = await self.pending_approvals(display_sibling=False)
+        question = self.authority.activities[self.posted[-1]["id"]]
+        stamp = question.pop("createdAt")
+        answer = self.delivery("answer-activity", "approve")
+        with self.assertRaises(LinearError):
+            await self.route(answer)
+        self.assertIsNone(first.result)
+        self.assertIsNone(second.result)
+        self.assertEqual(answer.acknowledged, 0)
+        question["createdAt"] = stamp
+        await self.deliver("answer-activity", "approve", delivery_id="chronology-restored")
+        self.assertEqual(first.result, "once")
 
 if __name__ == "__main__":
     unittest.main()

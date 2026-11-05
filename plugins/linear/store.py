@@ -181,7 +181,7 @@ class Store:
         with self._tx() as db:
             return db.execute(
                 "SELECT 1 FROM outbox WHERE kind='activity' AND state != 'failed' "
-                "AND COALESCE(json_extract(payload, '$.applied'), 1) != 0 "
+                "AND (COALESCE(json_extract(payload, '$.applied'), 1) != 0 OR json_extract(payload, '$.turn_final')=1) "
                 "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? "
                 "AND (json_extract(payload, '$.turn_final')=1 OR "
                 "json_extract(payload, '$.content.type') IN ('response', 'error')) "
@@ -195,6 +195,45 @@ class Store:
         return bool(anchor and anchor["activity_id"] != source_activity and not self.conversation_finished(
             issue_id, session_id, anchor["activity_id"], anchor["cursor"]))
 
+    def conversation_final_projection(self, payload: dict, *, native_work_live: bool) -> str | None:
+        """Project completion at publication; None means a later completion superseded it."""
+        issue, session = payload["issue_id"], payload["session_id"]
+        source = payload.get("turn_activity", payload["source_activity"])
+        with self._tx() as db:
+            # Native work's unscoped Done remains a session fence, independent of chat receipts.
+            done = db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND state!='failed' "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND json_extract(payload,'$.native_reply_version') IS NULL "
+                "AND json_extract(payload,'$.content.type') IN ('response','error') AND rowid>? LIMIT 1",
+                (issue, session, payload.get("source_cursor", 0))).fetchone()
+            if done:
+                return None
+            anchor = self.conversation_input(issue, session)
+            if anchor and anchor["activity_id"] != source:
+                if self.conversation_finished(issue, session, anchor["activity_id"], anchor["cursor"]):
+                    return "thought" if native_work_live else None
+                return "thought"
+            return "thought" if native_work_live else "response"
+
+    def reproject_conversation_final(self, row_id: str, expected: dict, content: dict) -> bool:
+        """CAS only an unattempted body; another sender's frozen request cannot be rewritten."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            if (not row or row["state"] != "pending" or row["payload"].get("write_started") is not False
+                    or row["payload"].get("content") != expected):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.content',json(?)) WHERE id=?",
+                       (json.dumps(content), row_id))
+            return True
+
+    def conversation_not_attempted(self, row_id: str, attempt_id: str) -> None:
+        """Only a pre-transport guard or definitive rejection may clear a fresh attempt."""
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) "
+                       "WHERE id=? AND state='pending' AND json_extract(payload,'$.native_reply_version')=1 "
+                       "AND json_extract(payload,'$.conversation_attempt_id')=?", (row_id, attempt_id))
+
     def conversation_questions(self, issue_id: str, session_id: str) -> list[dict]:
         """Published or delivery-uncertain questions retain their exact Core prompt identity."""
         with self._tx() as db:
@@ -203,7 +242,10 @@ class Store:
                 "AND json_extract(payload,'$.content.type')='elicitation' "
                 "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
                 "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
-                "AND json_type(payload,'$.native_prompt')='object' ORDER BY rowid", (issue_id, session_id))
+                "AND json_type(payload,'$.native_prompt')='object' "
+                "AND (state='sent' OR json_extract(payload,'$.write_started')=1 "
+                "OR (attempts>0 AND json_type(payload,'$.write_started') IS NULL)) ORDER BY rowid",
+                (issue_id, session_id))
             return [json.loads(row[0]) for row in rows]
 
     @staticmethod
@@ -324,7 +366,9 @@ class Store:
     def guard_issue_work(self, issue_id: str) -> Iterator[bool]:
         with self._tx() as db:
             yield self._effect_admitted(db, issue_id)
-    def admit_mutation(self, row_id: str, *, terminal: bool = False) -> bool:
+    def admit_mutation(self, row_id: str, *, terminal: bool = False,
+                       expected_content: dict | None = None, conversation_attempt_id: str | None = None,
+                       require_unattempted: bool = False) -> bool:
         """Persist a remote-send marker without using a Linear record as execution authority."""
         if getattr(self._local, "db", None) is not None:
             raise RuntimeError("mutation admission requires its own commit")
@@ -336,6 +380,10 @@ class Store:
             if not self.delivery_allowed(row_id):
                 return False
             payload = json.loads(row["payload"])
+            if expected_content is not None and payload.get("content") != expected_content:
+                return False
+            if require_unattempted and payload.get("write_started") is not False:
+                return False  # Another sender started after this caller read the fresh row.
             if (payload.get("native_history") is True or payload.get("native_progress") is True) and payload.get("requires_status_id"):
                 dependency = self.outbox_row(payload["requires_status_id"])
                 if not self.history_status_settled(dependency):
@@ -360,7 +408,10 @@ class Store:
             native_progress = (row["kind"] in ("comment", "activity") and
                                (payload.get("native_progress") is True or payload.get("native_history") is True)
                                and payload.get("task_id"))
-            if terminal or native_progress or row["kind"] in ("status", "description", "delegate", "project_update"):
+            if self.conversation_reply(row["kind"], payload) and conversation_attempt_id:
+                return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
+                    "'$.conversation_attempt_id',?) WHERE id=?", (conversation_attempt_id, row_id)).rowcount)
+            if terminal or native_progress or self.conversation_reply(row["kind"], payload) or row["kind"] in ("status", "description", "delegate", "project_update"):
                 return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
                                        "WHERE id=?", (row_id,)).rowcount)
             return True
@@ -1074,10 +1125,19 @@ class Store:
     def _prompt_answer_key(issue_id: str, session_id: str, activity_id: str) -> str:
         return "native-prompt-answer:" + json.dumps([issue_id, session_id, activity_id], separators=(",", ":"))
 
-    def prompt_answer_reserved(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+    def prompt_disposition(self, issue_id: str, session_id: str, activity_id: str) -> str | None:
+        """Transport routing intent only; Core still owns admission and its receipt."""
         with self._tx() as db:
-            return db.execute("SELECT 1 FROM metadata WHERE key=?",
-                (self._prompt_answer_key(issue_id, session_id, activity_id),)).fetchone() is not None
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                (self._prompt_answer_key(issue_id, session_id, activity_id),)).fetchone()
+            return row[0] if row else None
+
+    def remember_ordinary_prompt(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+        """Commit ordinary routing before handoff, atomically against answer consumption."""
+        return self.first_value(self._prompt_answer_key(issue_id, session_id, activity_id), "ordinary") == "ordinary"
+
+    def prompt_answer_reserved(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+        return self.prompt_disposition(issue_id, session_id, activity_id) not in (None, "ordinary")
 
     def reserve_prompt_answer(self, issue_id: str, session_id: str, activity_id: str) -> str | None:
         """Commit consumption before core effects; only one adapter may use this activity."""
@@ -1086,9 +1146,9 @@ class Store:
         return token if saved == token else None
 
     def release_prompt_answer(self, issue_id: str, session_id: str, activity_id: str, token: str) -> None:
-        """Release only our reservation when no prompt consumed the input."""
+        """An unconsumed answer becomes ordinary input, without a replayable routing gap."""
         with self._tx() as db:
-            db.execute("DELETE FROM metadata WHERE key=? AND value=?",
+            db.execute("UPDATE metadata SET value='ordinary' WHERE key=? AND value=?",
                 (self._prompt_answer_key(issue_id, session_id, activity_id), token))
 
     # -- outbox -----------------------------------------------------------

@@ -1,0 +1,258 @@
+"""Completion publication follows the latest admitted turn, including uncertain sends.
+
+Uses the existing real-Core adapter/bridge fixture; only Linear's HTTP boundary is faked.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import unittest
+from unittest.mock import patch
+
+import test_linear_native_prompt_scenarios as prompts
+
+native = prompts.native
+
+
+@unittest.skipIf(native.CORE is not None, f"native source unavailable ({native.CORE})")
+class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
+    delivery = prompts.NativePromptScenarios.delivery
+    deliver = prompts.NativePromptScenarios.deliver
+    route = prompts.NativePromptScenarios.route
+    start_turn = prompts.NativePromptScenarios.start_turn
+
+    async def asyncSetUp(self):
+        await prompts.NativePromptScenarios.asyncSetUp(self)
+        self.remote = {}
+        self.lost = set()
+        self.absent = set()
+        original = self.bridge.api.transport
+
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if "query OutboundAgentActivity" in request["query"]:
+                record = self.remote.get(request["variables"]["id"])
+                if record is None:
+                    return 200, {}, json.dumps({"errors": [{"message": "Entity not found: AgentActivity",
+                        "extensions": {"code": "INPUT_ERROR"}}]}).encode()
+                return 200, {}, json.dumps({"data": {"agentActivity": record}}).encode()
+            result = original(url, body, headers)
+            if "agentActivityCreate" in request["query"]:
+                fields = request["variables"]["input"]
+                identity = fields["id"]
+                if identity not in self.absent:
+                    self.remote.setdefault(identity, {"id": identity, "user": {"id": native.VIEWER},
+                        "agentSession": {"id": fields["agentSessionId"]},
+                        "content": {"__typename": "AgentActivity" + fields["content"]["type"].capitalize() + "Content",
+                                    "body": fields["content"]["body"]}})
+                if identity in self.lost or identity in self.absent:
+                    raise TimeoutError("fixture lost response")
+            return result
+
+        self.bridge.api.transport = transport
+
+    def queue_final(self, source, body="Finished."):
+        cursor = self.adapter._input_cursors.get((native.ISSUE, native.SESSION, source), 0)
+        return self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, source, body,
+                                             source_cursor=cursor)
+
+    async def flush(self, identity):
+        return await asyncio.to_thread(self.bridge.flush, only_id=identity)
+
+    def make_due(self, identity):
+        self.store.defer(identity, self.bridge.clock() - 1)
+
+    async def test_response_queued_before_new_input_is_thought_when_delivered(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")
+        await self.deliver("newer-input", "Check the next part.")
+        self.assertEqual(await self.flush(first), 1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+        self.assertFalse(self.store.conversation_finished(native.ISSUE, native.SESSION, "newer-input"))
+        self.assertTrue(self.store.conversation_finished(native.ISSUE, native.SESSION, native.ACTIVITY))
+
+    async def test_older_thought_does_not_reopen_after_newer_final(self):
+        await self.start_turn()
+        await self.deliver("newer-input", "Check the next part.")
+        first = self.queue_final(native.ACTIVITY)
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "thought")
+        second = self.queue_final("newer-input", "Both parts finished.")
+        await self.flush(second)
+        count = len(self.posted)
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+        await self.flush(first)
+        self.assertEqual(len(self.posted), count)
+        self.assertFalse(self.store.outbox_row(first)["payload"]["applied"])
+        # Suppression is about publication, not permission for A's progress to resume.
+        self.assertTrue(self.store.conversation_finished(native.ISSUE, native.SESSION, native.ACTIVITY))
+
+    async def test_admission_between_projection_and_mutation_defers_then_reprojects(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        original = self.bridge.store.admit_mutation
+        raced = []
+        def admit(row_id, **kwargs):
+            result = original(row_id, **kwargs)
+            if row_id == first and not raced:
+                raced.append(True)
+                self.store.remember_conversation_input(native.ISSUE, native.SESSION, "newer-input", "admission-b", 2, False)
+            return result
+        before = len(self.posted)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(first)
+        self.assertEqual(len(self.posted), before, repr(self.posted))
+        self.assertIs(self.store.outbox_row(first)["payload"]["write_started"], False)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
+    async def test_lost_response_is_settled_read_only_after_newer_turn(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        self.assertTrue(self.store.outbox_row(first)["payload"]["write_started"])
+        await self.deliver("newer-input", "Check the next part.")
+        before = len(self.posted)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "sent")
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")
+
+    async def test_lost_thought_is_not_reposted_after_newer_turn_finishes(self):
+        await self.start_turn()
+        await self.deliver("newer-input", "Check the next part.")
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        second = self.queue_final("newer-input", "Both parts finished.")
+        await self.flush(second)
+        before = len(self.posted)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "sent")
+        self.assertEqual(self.posted[-1]["content"]["type"], "response")
+
+    async def test_uncertain_absent_activity_cannot_change_immutable_content(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.absent.add(first)
+        await self.flush(first)
+        await self.deliver("newer-input", "Check the next part.")
+        before = len(self.posted)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "pending")
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")
+
+    async def test_unscoped_native_done_still_fences_completion(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.store.enqueue("activity", {"id": "native-done", "issue_id": native.ISSUE,
+            "session_id": native.SESSION, "content": {"type": "response", "body": "Done."}})
+        before = len(self.posted)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertFalse(self.store.outbox_row(first)["payload"]["applied"])
+
+    async def test_uncertain_activity_from_another_actor_is_not_settled(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        self.remote[first]["user"]["id"] = native.USER
+        self.make_due(first)
+        before = len(self.posted)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "failed")
+
+    async def test_another_sender_cannot_change_the_already_encoded_body(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        original = self.bridge.store.admit_mutation
+        raced = []
+        def admit(row_id, **kwargs):
+            if row_id == first and not raced:
+                raced.append(True)
+                self.store.remember_conversation_input(native.ISSUE, native.SESSION, "newer-input", "admission-b", 2, False)
+                current = self.store.outbox_row(row_id)["payload"]["content"]
+                self.assertTrue(self.store.reproject_conversation_final(row_id, current, {**current, "type": "thought"}))
+            return original(row_id, **kwargs)
+        before = len(self.posted)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
+    async def test_rejected_sender_cannot_unfreeze_another_unknown_attempt(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        content = self.store.outbox_row(first)["payload"]["content"]
+        self.assertTrue(self.store.admit_mutation(first, expected_content=content, conversation_attempt_id="sender-a"))
+        self.assertTrue(self.bridge.store.admit_mutation(first, expected_content=content, conversation_attempt_id="sender-b"))
+        self.store.conversation_not_attempted(first, "sender-a")
+        self.assertTrue(self.store.outbox_row(first)["payload"]["write_started"])
+        await self.deliver("newer-input", "Check the next part.")
+        before = len(self.posted)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "pending")
+
+    async def test_earlier_summary_can_still_post_while_native_work_is_live(self):
+        self.fixture.create()
+        await self.start_turn()
+        await self.deliver("newer-input", "Check the next part.")
+        first = self.queue_final(native.ACTIVITY, "First summary.")
+        second = self.queue_final("newer-input", "Second summary.")
+        await self.flush(second)
+        await self.flush(first)
+        self.assertEqual(self.posted[-1]["content"], {"type": "thought", "body": "First summary."})
+
+    async def test_unreadable_tracked_work_holds_final_without_guessing_finished(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        self.fixture.create()
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        before = len(self.posted)
+        with patch.object(self.bridge, "_native_task", side_effect=LinearError("fixture unavailable")):
+            await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "pending")
+        self.assertIs(self.store.outbox_row(first)["payload"]["write_started"], False)
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
+    async def test_fresh_admission_cannot_replace_another_unknown_attempt(self):
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        original = self.bridge.store.admit_mutation
+        raced = []
+        def admit(row_id, **kwargs):
+            if row_id == first and not raced:
+                raced.append(True)
+                content = self.store.outbox_row(first)["payload"]["content"]
+                self.assertTrue(self.store.admit_mutation(first, expected_content=content,
+                                                         conversation_attempt_id="other-sender"))
+                self.store.remember_conversation_input(native.ISSUE, native.SESSION,
+                                                       "newer-input", "admission-b", 2, False)
+            return original(row_id, **kwargs)
+        before = len(self.posted)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        payload = self.store.outbox_row(first)["payload"]
+        self.assertIs(payload["write_started"], True)
+        self.assertEqual(payload["conversation_attempt_id"], "other-sender")
+        self.make_due(first)
+        await self.flush(first)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(first)["state"], "pending")
+        self.assertEqual(self.store.outbox_row(first)["payload"]["content"]["type"], "response")

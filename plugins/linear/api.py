@@ -558,7 +558,7 @@ class LinearAPI:
             duplicate_check = request_kind == "mutation" and "mutation Create(" in query
             raise LinearError(_graphql_rejection(errors, request_kind,
                                                  expected_missing=getattr(self._expected_missing, "on", False)),
-                              errors=errors if duplicate_check else None, retryable=False)
+                              errors=errors if duplicate_check or query.startswith("query OutboundAgentActivity(") else None, retryable=False)
         if status >= 400 or not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
             raise LinearError(f"Linear HTTP {status}", retryable=status < 400 or status >= 500)
         return payload["data"]
@@ -761,6 +761,64 @@ class LinearAPI:
         raise LinearError("Agent Session authorization requires a bound specialist client", retryable=False)
     def agent_activity(self, activity_id: str, session_id: str) -> dict[str, Any]:
         raise LinearError("Agent Activity authorization requires a bound specialist client", retryable=False)
+    def outbound_activity(self, activity_id: str, session_id: str, issue_id: str) -> dict[str, Any] | None:
+        """Read only an activity authored by this app, for uncertain completion settlement."""
+        session = self.agent_session(session_id)
+        if session["issue"]["id"] != issue_id:
+            raise LinearError("Outbound activity session changed its issue", retryable=False)
+        query = ("query OutboundAgentActivity($id: String!) { agentActivity(id: $id) { id user { id } "
+                 "agentSession { id } content { __typename ... on AgentActivityResponseContent { body } "
+                 "... on AgentActivityThoughtContent { body } } } }")
+        try:
+            with self.expected_missing():
+                data = self.graphql(query, {"id": activity_id})
+        except LinearError as exc:
+            errors = exc.errors
+            if (isinstance(errors, list) and len(errors) == 1 and isinstance(errors[0], dict)
+                    and errors[0].get("message") == "Entity not found: AgentActivity"
+                    and (errors[0].get("extensions") or {}).get("code") == "INPUT_ERROR"):
+                return None
+            raise
+        if "agentActivity" not in data:
+            raise LinearError("Outbound activity readback is incomplete")
+        activity = data["agentActivity"]
+        if activity is None:
+            return None
+        if (not isinstance(activity, dict) or activity.get("id") != activity_id or
+                (activity.get("user") or {}).get("id") != self.viewer_id() or
+                (activity.get("agentSession") or {}).get("id") != session_id):
+            raise LinearError("Outbound activity identity does not match this app and session", retryable=False)
+        content = activity.get("content") or {}
+        kind = {"AgentActivityResponseContent": "response", "AgentActivityThoughtContent": "thought"}.get(content.get("__typename"))
+        if kind is None or not isinstance(content.get("body"), str):
+            raise LinearError("Outbound completion content could not be verified", retryable=False)
+        return {"type": kind, "body": content["body"]}
+
+    def question_precedes_answer(self, question_id: str, answer_id: str, session_id: str, actor_id: str) -> bool:
+        """Compare the provider's immutable creation times for these exact two activities."""
+        from datetime import datetime
+        self.agent_session(session_id)
+        fields = "{ id createdAt user { id } agentSession { id } }"
+        data = self.graphql("query AgentAnswerChronology($question: String!, $answer: String!) { "
+            "question: agentActivity(id: $question) " + fields +
+            " answer: agentActivity(id: $answer) " + fields + " }",
+            {"question": question_id, "answer": answer_id})
+        stamps = []
+        for label, identity, actor in (("question", question_id, self.viewer_id()), ("answer", answer_id, actor_id)):
+            activity = data.get(label)
+            if (not isinstance(activity, dict) or activity.get("id") != identity or
+                    (activity.get("user") or {}).get("id") != actor or
+                    (activity.get("agentSession") or {}).get("id") != session_id):
+                raise LinearError("Linear question/answer chronology could not be verified")
+            try:
+                stamp = datetime.fromisoformat(activity["createdAt"].replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    raise ValueError("missing timezone")
+            except (KeyError, TypeError, AttributeError, ValueError):
+                raise LinearError("Linear question/answer creation time is unavailable") from None
+            stamps.append(stamp)
+        return stamps[0] < stamps[1]
+
     def create_comment(self, client_id: str, issue_id: str, body: str) -> None:
         self._create("commentCreate", "CommentCreateInput", {"id": client_id, "issueId": issue_id, "body": body})
     def create_activity(self, client_id: str, session_id: str, content: dict[str, Any], *,

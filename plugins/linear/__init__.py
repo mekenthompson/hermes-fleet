@@ -354,6 +354,10 @@ class BoundLinearAPI(LinearAPI):
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation([issue_id]):
             return super().update_issue(issue_id, fields)
+    def question_precedes_answer(self, question_id, answer_id, session_id, actor_id):
+        with self._permit_specialist_operation():
+            return super().question_precedes_answer(question_id, answer_id, session_id, actor_id)
+
     def create_comment(self, client_id, issue_id, body):
         if self.specialist_scope is not None or self.identity.get("teams") or self.identity.get("projects"):
             self._mutation_issue(issue_id)
@@ -363,6 +367,11 @@ class BoundLinearAPI(LinearAPI):
         self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().verify_comment(comment_id, issue_id, body)
+    def outbound_activity(self, activity_id, session_id, issue_id):
+        self._mutation_issue(issue_id)
+        with self._permit_specialist_operation():
+            return super().outbound_activity(activity_id, session_id, issue_id)
+
     def create_activity(self, client_id, session_id, content, *, issue_id=None, ephemeral=False, **signal):
         if self.specialist_scope is not None:
             if not isinstance(issue_id, str) or not issue_id:

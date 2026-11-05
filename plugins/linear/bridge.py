@@ -4105,7 +4105,8 @@ class Bridge:
             if progress:
                 self.store.revive_failed(self.clock())
         return sent
-    def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False, issue_ids=None) -> None:
+    def _mutate_outbox(self, row_id: str, action: Callable[[], None], *, terminal: bool = False, issue_ids=None,
+                       expected_content: dict | None = None) -> None:
         if not self.store.delivery_allowed(row_id):
             raise ProjectUpdateDeferred
         prior_started = {}
@@ -4183,8 +4184,22 @@ class Bridge:
                 if not self.may_write(current, bool(payload.get("claim")), float(payload.get("enqueued_at", 0)),
                                       payload.get("seen"), payload.get("source_ms")):
                     raise LinearError("Human changed issue state or assignment; reporting status held", retryable=False)
+            final_reply = bool(row and self.store.conversation_reply(row["kind"], payload)
+                               and payload.get("turn_final") is True)
+            if expected_content is not None and payload.get("content") != expected_content:
+                raise ProjectUpdateDeferred  # Another sender changed the encoded request's projection.
+            if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
+                raise ProjectUpdateDeferred  # HTTP body is already encoded; reproject on the next pass.
             prior_started["value"] = payload.get("write_started")
-            if not self.store.admit_mutation(row_id, terminal=terminal): raise ProjectUpdateDeferred
+            conversation = bool(row and self.store.conversation_reply(row["kind"], payload))
+            prior_started["attempt_id"] = uuid.uuid4().hex if conversation else None
+            options = ({"expected_content": expected_content, "conversation_attempt_id": prior_started["attempt_id"],
+                        "require_unattempted": prior_started["value"] is False} if conversation else {})
+            if not self.store.admit_mutation(row_id, terminal=terminal, **options): raise ProjectUpdateDeferred
+            if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
+                if prior_started["value"] is False:
+                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
+                raise ProjectUpdateDeferred  # Still before transport; no completion was published.
             if (prior_started.get("value") is False and row["attempts"] == 0 and
                     (payload.get("native_history") is True or payload.get("native_progress") is True)):
                 work, task = self._native_task(payload["issue_id"])
@@ -4205,6 +4220,12 @@ class Bridge:
         elif (self.store.outbox_row(row_id) or {}).get("kind") == "delegate":
             guard.rejected = lambda: self.store.delegate_not_applied(
                 row_id, started_before=prior_started.get("value"))
+        elif self.store.conversation_reply((self.store.outbox_row(row_id) or {}).get("kind", ""),
+                                           (self.store.outbox_row(row_id) or {}).get("payload", {})):
+            def rejected():
+                if prior_started.get("value") is False:
+                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
+            guard.rejected = rejected
         with self.api.guarded_mutation(guard):
             action()
     def _history_receipt_allows(self, payload: dict, issue: dict) -> bool:
@@ -4241,10 +4262,47 @@ class Bridge:
         if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
             return False
         return self._native_effect_task(payload["issue_id"]).status in NATIVE_PROGRESS_SUPERSEDED
+    def _conversation_final_type(self, payload: dict) -> str | None:
+        from .native_input import _session_work_live
+        live = _session_work_live(self, payload["issue_id"], payload["session_id"], strict=True)
+        return self.store.conversation_final_projection(payload, native_work_live=live)
+
+    def _prepare_conversation_final(self, row: dict[str, Any]) -> bool | None:
+        """Settle an attempted immutable activity, or choose a fresh completion at send time."""
+        current = self.store.outbox_row(row["id"])
+        if current is None or current["state"] != "pending":
+            raise ProjectUpdateDeferred
+        row["payload"] = payload = current["payload"]
+        attempted = payload.get("write_started") is not False
+        if attempted:
+            actual = self.api.outbound_activity(row["id"], payload["session_id"], payload["issue_id"])
+            if actual is not None:
+                if actual != payload["content"]:
+                    raise LinearError("Prior completion activity content differs; reconcile before retrying", retryable=False)
+                return True  # Read-only settlement; replaying it could reopen a later completed turn.
+        desired = self._conversation_final_type(payload)
+        if attempted and desired != payload["content"]["type"]:
+            # Absence is not proof a timed-out mutation cannot still land. Keep the original
+            # identity/content frozen until authoritative readback resolves that attempt.
+            raise LinearError("Prior completion activity is uncertain after conversation state changed")
+        if desired is None:
+            return diag.because("obsolete_progress")
+        if desired != payload["content"]["type"]:
+            content = {**payload["content"], "type": desired}
+            if not self.store.reproject_conversation_final(row["id"], payload["content"], content):
+                raise ProjectUpdateDeferred
+            row["payload"] = {**payload, "content": content}
+        return None
+
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
+        if self.store.conversation_reply(kind, payload) and payload.get("turn_final") is True:
+            settled = self._prepare_conversation_final(row)
+            if settled is not None:
+                return settled
+            payload = row["payload"]
         if (self.store.conversation_reply(kind, payload) and payload.get("turn_final") is not True and
                 payload["content"]["type"] in ("thought", "elicitation") and
                 self.store.conversation_finished(payload["issue_id"], payload["session_id"],
@@ -4410,7 +4468,8 @@ class Bridge:
             self._mutate_outbox(row["id"], lambda: self.api.create_activity(
                 row["id"], payload["session_id"], payload["content"], issue_id=payload["issue_id"],
                 ephemeral=bool(payload.get("ephemeral")),
-                **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})))
+                **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})),
+                expected_content=copy.deepcopy(payload["content"]) if self.store.conversation_reply(kind, payload) else None)
             return True
         elif kind == "project_update":
             return self._send_project_update(row["id"])
