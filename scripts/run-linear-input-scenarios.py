@@ -54,7 +54,7 @@ def main():
         sys.path.insert(0, str(source))
         from hermes_cli import version_info
         version_info._cached_version_info = version_info.VersionInfo("fixture", "fixture", 0, actual, None, "ci")
-        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_native_input_seam.py")
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_native_*seam.py")
         result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
         if guard.violations:
             print("Forbidden operations attempted: " + json.dumps(guard.violations), file=sys.stderr)

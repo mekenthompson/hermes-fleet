@@ -55,7 +55,11 @@ and admits it against its creation event token. The webhook from this app's own 
 finds that admission and starts no second task or worker. Work bound with no Agent Session
 (started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
 opens for it: one thought says this is the work already running, then Started, checkpoints,
-heartbeats and the keepalive post there as activities and Done is its only response. A
+heartbeats and the keepalive post there as activities and Done is its only response.
+Queued fallback reports proven not yet attempted move to new session activities atomically
+with adoption; attempted or uncertain provider identities retain their original destination.
+Native event capture verifies that its selected reporting owner is still current before
+advancing the reporting cursor. A
 session the work already reports to is never replaced while it may still be open (it must
 have had its final response); the new one only gets a thought. Finished work, `record_done`
 and `requester_basis: agent_session` scope (whose owner session authorizes effects) keep the
@@ -785,6 +789,27 @@ unfinished, a reply goes out as a `thought` with the same text and the work's ow
 completes the session; otherwise it stays a `response`. Either way it keeps reply delivery
 (retries and failure reporting), not a thought's single try. Prior uncertain
 effects stay held while unrelated authorized discussion continues.
+
+A send in the middle of a turn has no `reply_to`; it goes to the session's latest
+admitted provider input, and is refused when the adapter has none or that input has
+already had its `response`. Replayed older receipts preserve the current input and its
+original final-response boundary, including after adapter replacement. If another input
+is already queued, finishing the earlier turn keeps the session working; its completion
+closes only that earlier turn's progress. Interim notes (`_interim_send`) post as a single-try
+`thought`. A clarify posts an `elicitation` (Linear's `select` signal with the choices
+when it has one pick; typed and numbered when it has several), and so does an approval
+prompt, with the outbox's reply delivery; either leaves the session waiting for input.
+Each native option identifies its exact displayed Core request, so selecting an older
+card cannot answer a newer question or approve another command. When just one distinct
+question is pending, Core's clarify text rules and approve/deny words (or `/approve`,
+`/deny`) also work; ambiguous unqualified text never chooses between requests. Approval
+answers post a confirmation `thought`, and any remaining question is restored with its
+original choices. An answer is taken only from a sender the gateway allowlist authorizes; any
+other reply is an ordinary message. Redelivery of an input Core already admitted cannot
+answer a later question. A consumed answer cannot resolve another prompt, including
+after adapter replacement; failed confirmation publication does not restore consent.
+Delivered questions retain their exact pending Core prompt identity across adapter replacement.
+A closed turn or a different, undelivered prompt cannot borrow that question's answer routing.
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
 uncertain creation remain pending; retry never repeats an unknown create.

@@ -354,6 +354,11 @@ class BoundLinearAPI(LinearAPI):
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation([issue_id]):
             return super().update_issue(issue_id, fields)
+    def question_precedes_answer(self, question_id, answer_id, session_id, actor_id, *, question_actor_id=None):
+        with self._permit_specialist_operation():
+            return super().question_precedes_answer(question_id, answer_id, session_id, actor_id,
+                                                   question_actor_id=question_actor_id)
+
     def create_comment(self, client_id, issue_id, body):
         if self.specialist_scope is not None or self.identity.get("teams") or self.identity.get("projects"):
             self._mutation_issue(issue_id)
@@ -363,7 +368,12 @@ class BoundLinearAPI(LinearAPI):
         self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().verify_comment(comment_id, issue_id, body)
-    def create_activity(self, client_id, session_id, content, *, issue_id=None, ephemeral=False):
+    def outbound_activity(self, activity_id, session_id, issue_id):
+        self._mutation_issue(issue_id)
+        with self._permit_specialist_operation():
+            return super().outbound_activity(activity_id, session_id, issue_id)
+
+    def create_activity(self, client_id, session_id, content, *, issue_id=None, ephemeral=False, **signal):
         if self.specialist_scope is not None:
             if not isinstance(issue_id, str) or not issue_id:
                 raise LinearError("Specialist Agent Activity requires its owning issue id", retryable=False)
@@ -372,7 +382,7 @@ class BoundLinearAPI(LinearAPI):
                 raise LinearError("Agent Activity session does not belong to the authorized issue", retryable=False)
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation([issue_id], session_id=session_id):
-            return super().create_activity(client_id, session_id, content, ephemeral=ephemeral)
+            return super().create_activity(client_id, session_id, content, ephemeral=ephemeral, **signal)
 
     def create_project_update(self, client_id, project_id, body, *, issue_ids=None):
         if self.specialist_scope is not None:
@@ -508,8 +518,10 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
     bridge.profile_home = home
     await asyncio.to_thread(diag.service_start, bridge.store, float(settings.get("tick_seconds", 2)), bridge.recheck_every)
     if running.get("native_requested"):
-        from .native_input import route_delivery
+        from .native_input import route_delivery, committed_conversation_state
         bridge.native_ingress = lambda delivery: route_delivery(running, delivery)
+        bridge.native_conversation_state = lambda payload: committed_conversation_state(
+            running.get("native_adapter"), bridge, payload)
     ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
     server = None
     try:

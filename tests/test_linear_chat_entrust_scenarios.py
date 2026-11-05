@@ -354,6 +354,349 @@ class ChatEntrustScenarios(unittest.TestCase):
         # Progress scope: native Done never closes the issue, so only progress is checked here.
         self.assert_reports_in_session(ISSUE, existing.id, "echo-session", done=False)
 
+    def test_session_echo_after_unaccepted_delivery_must_stay_open(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply['native']['task_id']
+        self.flush()
+        self.claim(task_id)
+        receipt = {'ok': True, 'classification': 'passed', 'head_sha': 'a' * 40, 'checks': []}
+        with patch.object(bridge_module, 'pr_acceptance', lambda *args: receipt):
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary='Implementation and local checks finished.',
+                                 result='https://github.com/example/project/pull/12')
+            self.bridge.pump_kanban()
+            status = self.bridge.store.latest_status(NEW_ISSUE)
+            self.assertEqual(status['state'], 'done')
+            receipt.update(ok=False, classification='pending')
+            self.bridge.flush(only_id=status['id'])
+            self.assertEqual(self.bridge.store.outbox_row(status['id'])['state'], 'pending')
+            comments = len(self.issue_comments(NEW_ISSUE))
+            self.echo(NEW_ISSUE, 'echo-session')
+            self.bridge.flush()
+            effects = [r['content'] for r in self.said('echo-session')]
+            self.assertNotIn('response', [p['type'] for p in effects])
+            self.assertEqual(self.bridge.store.get(NEW_ISSUE)['owner_ref'], 'echo-session')
+            receipt.update(ok=True, classification="passed")
+            self.bridge.store.defer(status["id"], self.bridge.clock() - 1)
+            for _ in range(4):
+                self.flush()
+            responses = [r for r in self.said("echo-session") if r["content"]["type"] == "response"]
+            self.assertEqual(len(responses), 1)
+            self.assertEqual(self.said("echo-session")[-1], responses[0])
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments,
+                             "Unattempted fallback closeout must not publish after adoption")
+            self.echo(NEW_ISSUE, "echo-session")
+            for _ in range(3):
+                self.flush()
+            self.assertEqual(len([r for r in self.said("echo-session") if r["content"]["type"] == "response"]), 1)
+
+    def test_completion_capture_between_adoption_inspection_and_commit_routes_final_to_session(self):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        with self.board.conn() as conn:
+            kb.complete_task(conn, task_id, summary="Investigation and checks finished.", result="Local checks passed.")
+        comments = len(self.issue_comments(NEW_ISSUE))
+        adopt = self.bridge.store.adopt_session
+        def capture_before_adoption(*args, **kwargs):
+            self.bridge.pump_kanban()
+            return adopt(*args, **kwargs)
+        with patch.object(self.bridge.store, "adopt_session", side_effect=capture_before_adoption):
+            self.echo(NEW_ISSUE, "echo-session")
+        for _ in range(4):
+            self.flush()
+        said = self.said("echo-session")
+        self.assertEqual([r["content"]["type"] for r in said], ["thought", "response"])
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
+    def test_adoption_during_terminal_capture_retries_with_current_owner(self):
+        self.check_adoption_during_capture(terminal=True)
+
+    def test_adoption_during_checkpoint_capture_retries_with_current_owner(self):
+        self.check_adoption_during_capture(terminal=False)
+
+    def check_adoption_during_capture(self, *, terminal):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Captured report must follow the adopted session."
+        if terminal:
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary=body, result="Local checks passed.")
+        else:
+            self.checkpoint(task_id, body)
+        prior_cursor = self.bridge.store.get(NEW_ISSUE)["last_event_id"]
+        comments = len(self.issue_comments(NEW_ISSUE))
+        other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        other.profile_home = self.home
+        capture, raced = self.bridge.store.capture_event, []
+        def race(issue, event, writes, **kwargs):
+            if not raced:
+                raced.append(True)
+                self.assertTrue(other.handle_webhook(self.session_event(NEW_ISSUE, "echo-session", None),
+                                assignment_prompt=native_input.ACTORLESS_COORDINATION))
+            return capture(issue, event, writes, **kwargs)
+        with patch.object(self.bridge.store, "capture_event", side_effect=race):
+            self.bridge.pump_kanban()
+        self.assertTrue(raced)
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["last_event_id"], prior_cursor,
+                         "A stale destination must not consume the native event")
+        for _ in range(3):
+            self.flush()
+        said = self.said("echo-session")
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
+        self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_queued_checkpoint_moves_to_session_atomically_with_adoption_and_restart(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Checkpoint already captured before session adoption."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        self.assertIs(source["payload"]["write_started"], False)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        self.bridge = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        self.bridge.profile_home = self.home
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        checkpoint = [r for r in self.said("echo-session") if r["content"].get("body") == body]
+        self.assertEqual(len(checkpoint), 1)
+        self.assertEqual(checkpoint[0]["content"]["type"], "thought")
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
+        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 0))
+
+    def test_checkpoint_publication_admitted_before_adoption_keeps_original_identity(self):
+        self.check_checkpoint_adoption_at_transport(after_admission=True)
+
+    def test_adoption_before_checkpoint_transport_admission_blocks_old_comment(self):
+        self.check_checkpoint_adoption_at_transport(after_admission=False)
+
+    def check_checkpoint_adoption_at_transport(self, *, after_admission):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Already attempted checkpoint keeps its provider identity."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        # Exercise both serializations of adoption against real durable send admission.
+        admit, raced = self.bridge.store.admit_mutation, []
+        other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        other.profile_home = self.home
+        def admission(row_id, **kwargs):
+            if row_id == source["id"] and not raced:
+                allowed = admit(row_id, **kwargs) if after_admission else None
+                raced.append(True)
+                self.assertTrue(other.handle_webhook(self.session_event(NEW_ISSUE, "echo-session", None),
+                                assignment_prompt=native_input.ACTORLESS_COORDINATION))
+                return allowed if after_admission else admit(row_id, **kwargs)
+            return admit(row_id, **kwargs)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admission):
+            self.bridge.flush(only_id=source["id"])
+        self.assertTrue(raced)
+        for _ in range(3):
+            self.flush()
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
+        self.assertIs(retained["payload"]["write_started"], after_admission)
+        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")),
+                         0 if after_admission else 1)
+        if not after_admission:
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+            self.assertEqual(retained["payload"]["applied"], 0)
+
+    def test_queued_started_progress_preserves_native_action_when_adopted(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        self.native_event(task_id, "spawned", {"pid": 4242})
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("native_progress"))
+        original = source["payload"]["native_report_content"]
+        self.assertEqual(original["type"], "action")
+        comments = len(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(sum(r["content"] == original for r in self.said("echo-session")), 1)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
+    def test_checkpoint_read_failure_after_admission_routes_after_adoption(self):
+        self.check_checkpoint_failure_after_admission(concurrent=False)
+
+    def test_checkpoint_pretransport_cleanup_preserves_another_sender(self):
+        self.check_checkpoint_failure_after_admission(concurrent=True)
+
+    def check_checkpoint_failure_after_admission(self, *, concurrent):
+        from hermes_fleet_linear_plugin.api import LinearError
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Checkpoint with an admitted local read failure."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        original, failed = self.bridge._native_task, []
+        def read(issue_id):
+            if self.bridge.store.outbox_row(source["id"])["payload"]["write_started"] is True and not failed:
+                failed.append(True)
+                if concurrent:
+                    other = Store(self.bridge.store.path)
+                    self.assertTrue(other.admit_mutation(source["id"]))
+                raise LinearError("Transient native read after admission")
+            return original(issue_id)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        with patch.object(self.bridge, "_native_task", side_effect=read):
+            self.bridge.flush(only_id=source["id"])
+        self.assertTrue(failed)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertIs(self.bridge.store.outbox_row(source["id"])["payload"]["write_started"], concurrent)
+        self.echo(NEW_ISSUE, "echo-session")
+        retained = self.bridge.store.outbox_row(source["id"])
+        if concurrent:
+            self.assertEqual(retained["state"], "pending")
+            self.assertIs(retained["payload"]["write_started"], True)
+            self.assertFalse(any(r["kind"] == "activity" and r["payload"].get("content", {}).get("body") == body
+                                 for r in self.bridge.store.pending(NEW_ISSUE)))
+        else:
+            for _ in range(3):
+                self.flush()
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+            self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 1)
+            self.assertEqual(retained["state"], "sent")
+            self.assertEqual(retained["payload"]["applied"], False)
+
+    def test_checkpoint_read_failure_before_transport_still_routes_after_adoption(self):
+        self.check_checkpoint_read_failure_adoption(legacy=False, marker=False)
+
+    def test_legacy_checkpoint_false_marker_after_read_failure_can_move(self):
+        self.check_checkpoint_read_failure_adoption(legacy=True, marker=False)
+
+    def test_legacy_checkpoint_missing_marker_after_read_failure_keeps_identity(self):
+        self.check_checkpoint_read_failure_adoption(legacy=True, marker=None)
+
+    def check_checkpoint_read_failure_adoption(self, *, legacy, marker):
+        from hermes_fleet_linear_plugin.api import LinearError
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Checkpoint waiting after a pre-transport read failure."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        payload = dict(source["payload"])
+        if legacy:
+            payload.pop("native_report_content", None)
+            payload.pop("native_report_owner", None)
+        if marker is None:
+            payload.pop("write_started")
+        self.bridge.store.rewrite(source["id"], payload, source["next_at"])
+        with patch.object(self.bridge, "_native_effect_task", side_effect=LinearError("Native state read unavailable")):
+            self.bridge.flush(only_id=source["id"])
+        failed = self.bridge.store.outbox_row(source["id"])
+        self.assertGreater(failed["attempts"], 0)
+        self.assertIs(failed["payload"].get("write_started"), marker)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
+        if marker is None:
+            self.assertEqual(retained["state"], "pending")
+            self.assertNotIn("applied", retained["payload"])
+            self.assertFalse(any(r["kind"] == "activity" and r["payload"].get("content", {}).get("body") == body
+                                 for r in self.bridge.store.pending(NEW_ISSUE)))
+            return  # Missing legacy markers remain uncertain, never a new session effect.
+        self.bridge.store.defer(source["id"], self.bridge.clock() - 1)
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 1)
+
+    def test_adoption_rechecks_published_old_owner_progress_in_transaction(self):
+        self.check_reopened_owner_during_adoption(publication="sent")
+
+    def test_adoption_rechecks_pending_old_owner_progress_in_transaction(self):
+        self.check_reopened_owner_during_adoption(publication="pending")
+
+    def test_adoption_rechecks_unknown_old_owner_progress_in_transaction(self):
+        self.check_reopened_owner_during_adoption(publication="unknown")
+
+    def check_reopened_owner_during_adoption(self, *, publication):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.echo(NEW_ISSUE, "old-session")
+        self.flush()
+        self.bridge._decline(NEW_ISSUE, "old-session", "The conversation is answered.")
+        self.flush()
+        self.assertTrue(self.bridge.store.session_answered(NEW_ISSUE, "old-session"))
+        other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
+        other.profile_home = self.home
+        adopt, raced = self.bridge.store.adopt_session, []
+        def reopen_then_adopt(*args, **kwargs):
+            self.checkpoint(task_id, "The old owner has newly reported work.")
+            other.pump_kanban()
+            if publication == "sent":
+                other.flush()
+            elif publication == "unknown":
+                checkpoint = next(row for row in other.store.pending(NEW_ISSUE)
+                    if row["kind"] == "activity" and row["payload"].get("content", {}).get("body") ==
+                    "The old owner has newly reported work.")
+                self.assertTrue(other.store.admit_mutation(checkpoint["id"]))
+                other.store.mark(checkpoint["id"], "failed", "Unknown publication after durable transport admission")
+            raced.append(True)
+            return adopt(*args, **kwargs)
+        with patch.object(self.bridge.store, "adopt_session", side_effect=reopen_then_adopt):
+            self.echo(NEW_ISSUE, "new-session")
+        self.assertTrue(raced)
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "old-session")
+        self.assertFalse(other.store.session_answered(NEW_ISSUE, "old-session"))
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_later_response_cannot_hide_an_older_unknown_owner_activity(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.echo(NEW_ISSUE, "old-session")
+        self.flush()
+        self.checkpoint(task_id, "Unknown older checkpoint.")
+        self.bridge.pump_kanban()
+        checkpoint = next(row for row in self.bridge.store.pending(NEW_ISSUE)
+            if row["kind"] == "activity" and row["payload"].get("content", {}).get("body") == "Unknown older checkpoint.")
+        self.assertTrue(self.bridge.store.admit_mutation(checkpoint["id"]))
+        self.bridge.store.mark(checkpoint["id"], "failed", "Unknown publication after durable transport admission")
+        self.bridge._decline(NEW_ISSUE, "old-session", "Later response.")
+        final = next(row for row in self.bridge.store.pending(NEW_ISSUE)
+            if row["kind"] == "activity" and row["payload"].get("content", {}).get("body") == "Later response.")
+        self.bridge.flush(only_id=final["id"])
+        self.assertEqual(self.bridge.store.outbox_row(final["id"])["state"], "sent")
+        self.assertFalse(self.bridge.store.session_answered(NEW_ISSUE, "old-session"))
+        self.echo(NEW_ISSUE, "new-session")
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "old-session")
+
     def test_adopted_session_waits_for_pr_acceptance_before_its_only_response(self):
         self.check_acceptance_session(adopt_before_completion=True)
 

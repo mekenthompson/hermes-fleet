@@ -51,17 +51,21 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
-# A chat reply to a person is never advisory, even when it is posted as a thought so live
-# tracked work keeps its session open: it keeps reply delivery (retry, alert) either way.
+# Final replies keep normal delivery even when projected as thoughts. Unattempted one-try
+# notes can retire, but an attempted native message retains readback and lifecycle repair.
 ADVISORY = ("(kind = 'activity' AND ((json_extract(payload, '$.content.type') IN ('thought', 'action') AND "
             "json_extract(payload, '$.native_reply_version') IS NULL) OR "
-            "COALESCE(json_extract(payload, '$.one_try'), 0) = 1))")
+            "(COALESCE(json_extract(payload, '$.one_try'), 0) = 1 AND NOT "
+            "(COALESCE(json_extract(payload, '$.native_reply_version'), 0)=1 AND "
+            "COALESCE(json_extract(payload, '$.write_started'), 1)!=0))))")
 def advisory(row: dict[str, Any]) -> bool:
-    """A thought, action or decline reply changes no issue: it gets one try and never alerts, revives or fences."""
+    """Disposable notices get one try; an uncertain native conversation effect must be settled."""
     payload = row["payload"]
     return row["kind"] == "activity" and (((payload.get("content") or {}).get("type") in ("thought", "action")
                                            and payload.get("native_reply_version") is None)
-                                          or payload.get("one_try") is True)
+                                          or (payload.get("one_try") is True and not (
+                                              payload.get("native_reply_version") == 1 and
+                                              payload.get("write_started") is not False)))
 
 
 class Store:
@@ -128,7 +132,199 @@ class Store:
                 and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
                 and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
-                and content.get("type") in ("response", "error", "thought") and isinstance(content.get("body"), str))
+                and content.get("type") in ("response", "error", "thought", "elicitation")
+                and isinstance(content.get("body"), str))
+    def normalize_conversation_reply(self, row_id: str) -> dict | None:
+        """Recover old reply coordinates without changing its identity, content or attempt history."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            if not row or row["state"] != "pending" or not self.conversation_reply(row["kind"], row["payload"]):
+                return row
+            payload = row["payload"]
+            # Before interim replies existed, queue_reply emitted only finals, including
+            # a thought when native work remained live. Recognize that exact old shape
+            # before grafting coordinates; a modern/ambiguous thought remains readback-only.
+            legacy_final_thought = (payload["content"]["type"] == "thought" and not any(
+                key in payload for key in ("source_activity", "turn_activity", "source_cursor", "turn_final",
+                    "write_started", "native_prompt", "one_try", "signal", "signal_metadata", "lifecycle_repair_of")))
+            source = payload.get("source_activity")
+            if source is None:
+                activities = payload.get("requester_activities")
+                if activities is not None:
+                    if not isinstance(activities, dict) or set(activities) != {payload["issue_id"]}:
+                        raise ValueError("legacy reply requester activity is ambiguous")
+                    source = activities[payload["issue_id"]]
+                else:
+                    source = payload["session_id"]  # The original created-session requester scope.
+            if not isinstance(source, str) or not source or source != source.strip():
+                raise ValueError("legacy reply source is unavailable")
+            updated = {"source_activity": source, "turn_activity": payload.get("turn_activity", source),
+                       "source_cursor": payload.get("source_cursor", 0)}
+            if not payload.get("lifecycle_repair_of") and (
+                    payload["content"]["type"] in ("response", "error") or legacy_final_thought):
+                updated["turn_final"] = True  # Recover the old producer's final intent, never a UI repair.
+            if any(payload.get(key) != value for key, value in updated.items()):
+                payload = {**payload, **updated}
+                db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), row_id))
+                row["payload"] = payload
+            return row
+
+    def conversation_cursor(self, issue_id: str, session_id: str) -> int:
+        """Outbox boundary when a new verified provider input is admitted."""
+        with self._tx() as db:
+            return db.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=?",
+                (issue_id, session_id)).fetchone()[0]
+    @staticmethod
+    def _conversation_input_key(issue_id: str, session_id: str) -> str:
+        return "native-reply-anchor:" + json.dumps([issue_id, session_id], separators=(",", ":"))
+
+    def conversation_input(self, issue_id: str, session_id: str) -> dict | None:
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                (self._conversation_input_key(issue_id, session_id),)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def remember_conversation_input(self, issue_id: str, session_id: str, activity_id: str,
+                                    admission_id: str, sequence: int, terminal: bool,
+                                    session_keys: list[str] | None = None) -> dict | None:
+        """Project Core's newest receipt as the reply anchor, never webhook arrival order.
+
+        This is one delivery projection per conversation, not an input receipt ledger.
+        Reconciliation keeps the original outbox cursor and cannot reopen a finished input.
+        """
+        if not isinstance(admission_id, str) or not admission_id or type(sequence) is not int or sequence < 1:
+            raise ValueError("Native reply anchor requires a committed input receipt")
+        with self._tx() as db:
+            saved = self.conversation_input(issue_id, session_id)
+            if saved and sequence == saved["sequence"] and admission_id != saved["admission_id"]:
+                raise ValueError("Native reply anchor has a conflicting input receipt")
+            if terminal or saved and sequence <= saved["sequence"]:
+                return saved
+            anchor = {"activity_id": activity_id, "admission_id": admission_id, "sequence": sequence,
+                      "cursor": self.conversation_cursor(issue_id, session_id),
+                      "session_keys": list(session_keys or [])}
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (self._conversation_input_key(issue_id, session_id), json.dumps(anchor)))
+            return anchor
+
+    def conversation_finished(self, issue_id: str, session_id: str, source_activity: str,
+                              source_cursor: int = 0) -> bool:
+        """A reply closes its owning input; unscoped native completion fences the session.
+
+        A queued input may have been admitted before its predecessor's final reply. That
+        predecessor must not close the queued input, even if its outbox row is newer.
+        """
+        with self._tx() as db:
+            return db.execute(
+                "SELECT 1 FROM outbox WHERE kind='activity' AND state != 'failed' "
+                "AND json_type(payload, '$.lifecycle_repair_of') IS NULL "
+                "AND (COALESCE(json_extract(payload, '$.applied'), 1) != 0 OR json_extract(payload, '$.turn_final')=1) "
+                "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? "
+                "AND (json_extract(payload, '$.turn_final')=1 OR "
+                "json_extract(payload, '$.content.type') IN ('response', 'error')) "
+                "AND ((json_extract(payload, '$.native_reply_version')=1 AND "
+                "COALESCE(json_extract(payload, '$.turn_activity'),json_extract(payload, '$.source_activity'))=?) "
+                "OR (json_extract(payload, '$.native_reply_version') IS NULL AND rowid>?)) LIMIT 1",
+                (issue_id, session_id, source_activity, source_cursor)).fetchone() is not None
+
+    def newer_conversation_input_open(self, issue_id: str, session_id: str, source_activity: str) -> bool:
+        anchor = self.conversation_input(issue_id, session_id)
+        return bool(anchor and anchor["activity_id"] != source_activity and not self.conversation_finished(
+            issue_id, session_id, anchor["activity_id"], anchor["cursor"]))
+
+    def conversation_final_projection(self, payload: dict, *, native_work_live: bool,
+                                      core_latest_activity: str | None = None) -> str | None:
+        """Project completion at publication; None means a later completion superseded it."""
+        issue, session = payload["issue_id"], payload["session_id"]
+        source = payload.get("turn_activity", payload["source_activity"])
+        with self._tx() as db:
+            # Native work's unscoped Done remains a session fence, independent of chat receipts.
+            done = db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND state!='failed' "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND json_extract(payload,'$.native_reply_version') IS NULL "
+                "AND json_extract(payload,'$.content.type') IN ('response','error') AND rowid>? LIMIT 1",
+                (issue, session, payload.get("source_cursor", 0))).fetchone()
+            if done:
+                return None
+            if core_latest_activity is not None:
+                if core_latest_activity != source and not native_work_live:
+                    return None  # Core already settled a newer input, even if its ACK callback is late.
+                return "thought" if native_work_live else "response"
+            anchor = self.conversation_input(issue, session)
+            if anchor and anchor["activity_id"] != source:
+                if self.conversation_finished(issue, session, anchor["activity_id"], anchor["cursor"]):
+                    return "thought" if native_work_live else None
+                return "thought"
+            return "thought" if native_work_live else "response"
+
+    def reproject_conversation_final(self, row_id: str, expected: dict, content: dict) -> bool:
+        """CAS only an unattempted body; another sender's frozen request cannot be rewritten."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            if (not row or row["state"] != "pending" or row["payload"].get("write_started") is not False
+                    or row["payload"].get("content") != expected):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.content',json(?)) WHERE id=?",
+                       (json.dumps(content), row_id))
+            return True
+
+    def conversation_not_attempted(self, row_id: str, attempt_id: str) -> None:
+        """Only a pre-transport guard or definitive rejection may clear a fresh attempt."""
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) "
+                       "WHERE id=? AND state='pending' AND json_extract(payload,'$.native_reply_version')=1 "
+                       "AND json_extract(payload,'$.conversation_attempt_id')=?", (row_id, attempt_id))
+
+    def record_question_answer(self, question_id: str, activity_id: str, actor_id: str) -> None:
+        """Keep the successful human decision on its existing displayed question receipt."""
+        with self._tx() as db:
+            row = self.outbox_row(question_id)
+            payload = (row or {}).get("payload", {})
+            prompt = payload.get("native_prompt") or {}
+            fields = ("kind", "session_key", "request_id", "clarify_id", "question", "choices", "multi_select")
+            identity = tuple(prompt.get(key) for key in fields)
+            rows = db.execute("SELECT id,payload FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND json_type(payload,'$.native_prompt')='object' AND json_type(payload,'$.answered_by') IS NULL",
+                (payload.get("issue_id"), payload.get("session_id"))).fetchall()
+            for candidate in rows:
+                other = json.loads(candidate["payload"])["native_prompt"]
+                if tuple(other.get(key) for key in fields) == identity:
+                    db.execute("UPDATE outbox SET payload=json_set(payload,'$.answered_by',?,'$.answer_actor',?) WHERE id=?",
+                               (activity_id, actor_id, candidate["id"]))
+
+    def conversation_questions(self, issue_id: str, session_id: str) -> list[dict]:
+        """Published or delivery-uncertain questions retain their exact Core prompt identity."""
+        with self._tx() as db:
+            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.content.type')='elicitation' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_type(payload,'$.native_prompt')='object' "
+                "AND (state='sent' OR json_extract(payload,'$.write_started')=1 "
+                "OR (attempts>0 AND json_type(payload,'$.write_started') IS NULL)) ORDER BY rowid",
+                (issue_id, session_id))
+            return [json.loads(row[0]) for row in rows]
+
+    def conversation_question_candidates(self, issue_id: str, session_id: str) -> list[dict]:
+        """Possible current presentations; the caller must verify the exact live Core request."""
+        with self._tx() as db:
+            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND hold_reason IS NULL "
+                "AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.content.type')='elicitation' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "AND COALESCE(json_extract(payload,'$.applied'),1)!=0 "
+                "AND json_type(payload,'$.native_prompt')='object' AND json_type(payload,'$.answered_by') IS NULL "
+                "AND (state IN ('pending','sent') OR json_extract(payload,'$.write_started')=1 "
+                "OR (attempts>0 AND json_type(payload,'$.write_started') IS NULL)) ORDER BY rowid DESC",
+                (issue_id, session_id))
+            return [json.loads(row[0]) for row in rows]
+
     @staticmethod
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1
@@ -247,7 +443,9 @@ class Store:
     def guard_issue_work(self, issue_id: str) -> Iterator[bool]:
         with self._tx() as db:
             yield self._effect_admitted(db, issue_id)
-    def admit_mutation(self, row_id: str, *, terminal: bool = False) -> bool:
+    def admit_mutation(self, row_id: str, *, terminal: bool = False,
+                       expected_content: dict | None = None, conversation_attempt_id: str | None = None,
+                       require_unattempted: bool = False, mutation_attempt_id: str | None = None) -> bool:
         """Persist a remote-send marker without using a Linear record as execution authority."""
         if getattr(self._local, "db", None) is not None:
             raise RuntimeError("mutation admission requires its own commit")
@@ -259,6 +457,10 @@ class Store:
             if not self.delivery_allowed(row_id):
                 return False
             payload = json.loads(row["payload"])
+            if expected_content is not None and payload.get("content") != expected_content:
+                return False
+            if require_unattempted and payload.get("write_started") is not False:
+                return False  # Another sender started after this caller read the fresh row.
             if (payload.get("native_history") is True or payload.get("native_progress") is True) and payload.get("requires_status_id"):
                 dependency = self.outbox_row(payload["requires_status_id"])
                 if not self.history_status_settled(dependency):
@@ -283,27 +485,33 @@ class Store:
             native_progress = (row["kind"] in ("comment", "activity") and
                                (payload.get("native_progress") is True or payload.get("native_history") is True)
                                and payload.get("task_id"))
-            if terminal or native_progress or row["kind"] in ("status", "description", "delegate", "project_update"):
-                return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
-                                       "WHERE id=?", (row_id,)).rowcount)
-            return True
-    def reject_native_message_before_transport(self, row_id: str, *, started_before: bool | None) -> bool:
-        """Only the pre-yield guard's proved non-send can restore an unstarted marker."""
-        if started_before is not False:
-            return False
-        with self._tx() as db:
-            row = db.execute("SELECT kind,state,attempts,payload FROM outbox WHERE id=?", (row_id,)).fetchone()
-            if not row or row["state"] != "pending" or row["attempts"] != 0 or row["kind"] not in ("comment", "activity"):
-                return False
-            payload = json.loads(row["payload"])
-            if (payload.get("write_started") is not True or not payload.get("task_id") or
-                    not (payload.get("native_history") is True or payload.get("native_progress") is True)):
-                return False
-            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) WHERE id=?", (row_id,))
-            self._sequence_native_history(db, payload["issue_id"])
+            if terminal or payload.get("terminal") and row["kind"] in ("comment", "activity") or native_progress or self.conversation_reply(row["kind"], payload) or row["kind"] in ("status", "description", "delegate", "project_update"):
+                # Every sender replaces this token, including callers that only use
+                # the legacy admission API. An older guard cannot clear its marker.
+                attempt_id = mutation_attempt_id or uuid.uuid4().hex
+                if self.conversation_reply(row["kind"], payload) and conversation_attempt_id:
+                    return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
+                        "'$.mutation_attempt_id',?,'$.conversation_attempt_id',?) WHERE id=?",
+                        (attempt_id, conversation_attempt_id, row_id)).rowcount)
+                return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
+                    "'$.mutation_attempt_id',?) WHERE id=?", (attempt_id, row_id)).rowcount)
             return True
 
-    def delegate_not_applied(self, row_id: str, *, started_before: bool | None) -> bool:
+    def mutation_not_attempted(self, row_id: str, attempt_id: str) -> bool:
+        """Restore only this sender's proven pre-transport state, never another attempt."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            payload = (row or {}).get("payload", {})
+            if (not row or row["state"] != "pending" or payload.get("write_started") is not True
+                    or payload.get("mutation_attempt_id") != attempt_id):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) WHERE id=?", (row_id,))
+            if payload.get("native_history") is True or payload.get("native_progress") is True:
+                self._sequence_native_history(db, payload["issue_id"])
+            return True
+
+    def delegate_not_applied(self, row_id: str, *, started_before: bool | None,
+                             attempt_id: str | None = None) -> bool:
         """Only an affirmative HTTP rejection can undo this attempt's send marker."""
         if started_before is not False:
             return False
@@ -312,6 +520,8 @@ class Store:
             if not row or row["kind"] != "delegate" or row["state"] != "pending":
                 return False
             payload = json.loads(row["payload"])
+            if attempt_id is not None and payload.get("mutation_attempt_id") != attempt_id:
+                return False
             if payload.get("delegate_routing_version") != 1 or payload.get("reconcile_required") or payload.get("delegate_receipt"):
                 return False
             db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('false')) WHERE id=?", (row_id,))
@@ -557,6 +767,8 @@ class Store:
         """Repair missing delivery components without repeating native work or applied effects."""
         key = f"track:{issue_id}:{request_id}"
         with self._tx() as db:
+            if not self._report_owner_current(db, issue_id, writes):
+                return False
             saved = self.native_intent(key)
             request = (saved or {}).get("payload", {}).get("request", {})
             binding = request.get("binding")
@@ -684,36 +896,107 @@ class Store:
     def retired(self, issue_id: str | None = None) -> list[dict]:
         with self._tx() as db:
             return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
-    def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str) -> bool:
+    @staticmethod
+    def _report_owner_current(db: sqlite3.Connection, issue_id: str, writes: list) -> bool:
+        expected = [payload["native_report_owner"] for _, payload in writes if "native_report_owner" in payload]
+        if not expected:
+            return True
+        row = db.execute("SELECT owner_ref FROM work WHERE issue_id=? AND origin='native'", (issue_id,)).fetchone()
+        return bool(row and all(owner == (row["owner_ref"] or "") for owner in expected))
+
+    def _adopt_unattempted_progress(self, db: sqlite3.Connection, issue_id: str, task_id: str,
+                                    session_id: str, at: float | None) -> None:
+        # Retry counts include failed reads before transport. Only the committed transport
+        # marker decides whether this identity is still safe to replace; absence stays uncertain.
+        rows = db.execute("SELECT id,payload FROM outbox WHERE kind='comment' AND state='pending' "
+            "AND hold_reason IS NULL AND json_type(payload,'$.write_started')='false' "
+            "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.task_id')=? "
+            "AND (json_extract(payload,'$.native_history')=1 OR json_extract(payload,'$.native_progress')=1) "
+            "AND COALESCE(json_extract(payload,'$.terminal'),0)=0 "
+            "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid", (issue_id, task_id)).fetchall()
+        for row in rows:
+            prior = json.loads(row["payload"])
+            content = prior.get("native_report_content") or {"type": "thought", "body": prior["body"]}
+            payload = {key: value for key, value in prior.items() if key not in
+                       ("id", "body", "session_key", "work_owner", "enqueued_at", "native_report_content")}
+            payload.update(session_id=session_id, content=content, native_report_owner=session_id)
+            if not self.enqueue("activity", payload, at=at):
+                raise ValueError("Adopted native progress could not be queued")
+            # This transaction also serializes transport admission: an already-attempted
+            # identity never qualifies, and an unattempted sender cannot publish after retirement.
+            db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
+
+    def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str,
+                      notice: dict | None = None, at: float | None = None) -> bool:
         """Report this bound task's progress in a Linear Agent Session; reporting only, never execution.
 
         Compare-and-set on the inspected owner (``""`` for work started from chat or by take_over),
         so a concurrent rebind or another session's adoption wins and this one changes nothing.
-        Queued deliveries keep their original destination (earlier progress stays comments).
+        Proven-unattempted fallback reports receive a new session destination atomically.
+        Attempted or uncertain provider identities retain their original destination.
         """
         if not session_id or session_id == expected_owner:
             raise ValueError("session adoption needs a new Agent Session")
         with self._tx() as db:
             if not self._admitted(db, issue_id):
                 return False
-            return bool(db.execute("UPDATE work SET owner_ref=?, linear_session_id=? WHERE issue_id=? AND "
-                                   "origin='native' AND task_id=? AND owner_ref=?",
-                                   (session_id, session_id, issue_id, task_id, expected_owner)).rowcount)
+            if expected_owner and not self.session_answered(issue_id, expected_owner):
+                return False  # Liveness can change after the caller inspects the same owner.
+            # Read the current closeout inside the adoption transaction: the reporting
+            # pump may have captured it after the caller inspected native completion.
+            status = self.outbox_row((self.latest_status(issue_id) or {}).get("id", ""))
+            status_payload = status["payload"] if status else {}
+            closeout_status_id = (status["id"] if status and not status.get("hold_reason")
+                                  and status_payload.get("terminal") and status_payload.get("task_id") == task_id else None)
+            changed = db.execute("UPDATE work SET owner_ref=?, linear_session_id=? WHERE issue_id=? AND "
+                                 "origin='native' AND task_id=? AND owner_ref=?",
+                                 (session_id, session_id, issue_id, task_id, expected_owner)).rowcount
+            if not changed:
+                return False
+            if notice and not self.enqueue("activity", notice, at=at):
+                raise ValueError("Native session adoption notice could not be queued")
+            self._adopt_unattempted_progress(db, issue_id, task_id, session_id, at)
+            if closeout_status_id:
+                # The original closeout keeps its immutable destination. Adoption and this
+                # new session's dependent closeout commit together, including across restarts.
+                source = db.execute("SELECT id,kind,state,attempts,payload FROM outbox WHERE hold_reason IS NULL "
+                    "AND kind IN ('comment','activity') AND json_extract(payload,'$.requires_status_id')=? "
+                    "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.terminal')=1 "
+                    "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid LIMIT 1",
+                    (closeout_status_id, task_id)).fetchone()
+                if source is None:
+                    raise ValueError("Native closeout has no exact session presentation")
+                prior = json.loads(source["payload"])
+                status = self.outbox_row(closeout_status_id)["payload"]
+                payload = {key: value for key, value in prior.items() if key in
+                    ("issue_id", "task_id", "terminal", "owner_issue_id", "requires_status_id")}
+                payload.update(session_id=session_id, content={"type": "response" if status["state"] == "done" else "error",
+                    "body": prior["body"] if source["kind"] == "comment" else prior["content"]["body"]})
+                payload["write_started"] = False
+                if not self.enqueue("activity", payload, at=at):
+                    raise ValueError("Native session closeout could not be queued")
+                if source["state"] == "pending" and prior.get("write_started") is False:
+                    # Preserve the original immutable body/destination, but never first
+                    # publish its fallback after adoption. Admission races use this same tx.
+                    db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?",
+                               (source["id"],))
+            return True
     def session_answered(self, issue_id: str, session_id: str) -> bool:
-        """The session's latest activity from this app is a delivered response: Linear has closed it.
-
-        A later thought or action, a pending or possibly-landed write, or no activity at all reads
-        as live; writes that never reached Linear are ignored.
-        """
+        """A delivered response closes this session only when no unresolved effect can reopen it."""
         with self._tx() as db:
-            row = db.execute("SELECT state, payload FROM outbox WHERE kind = 'activity' AND hold_reason IS NULL AND "
-                             "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ? AND "
-                             "NOT (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 0) AND "
-                             "NOT (state = 'failed' AND attempts = 0) ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
-                             (issue_id, session_id)).fetchone()
-        if not row or row["state"] != "sent":
-            return False
-        return (json.loads(row["payload"]).get("content") or {}).get("type") == "response"
+            rows = db.execute("SELECT state,hold_reason,payload FROM outbox WHERE kind='activity' "
+                "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "
+                "ORDER BY json_extract(payload,'$.enqueued_at') DESC,rowid DESC", (issue_id, session_id)).fetchall()
+            latest = None
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if payload.get("applied") == 0 or row["state"] == "failed" and payload.get("write_started") is False:
+                    continue  # Proven non-publication cannot keep the session live.
+                if row["state"] != "sent" or row["hold_reason"] is not None:
+                    return False  # Pending, held and possibly applied failures are not completion evidence.
+                if latest is None:
+                    latest = payload
+            return bool(latest and (latest.get("content") or {}).get("type") == "response")
     def put(self, issue_id: str, origin: str, owner_ref: str, *, task_id: str | None = None,
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
@@ -761,7 +1044,8 @@ class Store:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
-            if not self._effect_admitted(db, issue_id): return False
+            if not self._effect_admitted(db, issue_id) or not self._report_owner_current(db, issue_id, writes):
+                return False
             work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not work: return False
             if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
@@ -777,6 +1061,8 @@ class Store:
             status_id = status_id or str(uuid.uuid4())
             for kind, payload in writes:
                 payload = {**payload, "work_owner": work["ownership_id"]}
+                if kind in ("comment", "activity"):
+                    payload["write_started"] = False  # Newly captured closeout; persisted before transport.
                 row_id = status_id if kind == "status" else (
                     str(payload["id"]) if kind == "comment" and payload.get("id") else str(uuid.uuid4()))
                 if kind != "status":
@@ -820,7 +1106,8 @@ class Store:
                       *, at: float, forget: bool = False) -> bool:
         """Advance our Kanban cursor with its Linear writes, independently of core's claim cursor."""
         with self._tx() as db:
-            if not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id)):
+            if (not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id))
+                    or not self._report_owner_current(db, issue_id, writes)):
                 return False
             row = db.execute("SELECT last_event_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
             if not row or event_id <= row["last_event_id"]:
@@ -1023,6 +1310,36 @@ class Store:
         with self._tx() as db:
             db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?,?)", (key, value))
             return db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()[0]
+    @staticmethod
+    def _prompt_answer_key(issue_id: str, session_id: str, activity_id: str) -> str:
+        return "native-prompt-answer:" + json.dumps([issue_id, session_id, activity_id], separators=(",", ":"))
+
+    def prompt_disposition(self, issue_id: str, session_id: str, activity_id: str) -> str | None:
+        """Transport routing intent only; Core still owns admission and its receipt."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                (self._prompt_answer_key(issue_id, session_id, activity_id),)).fetchone()
+            return row[0] if row else None
+
+    def remember_ordinary_prompt(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+        """Commit ordinary routing before handoff, atomically against answer consumption."""
+        return self.first_value(self._prompt_answer_key(issue_id, session_id, activity_id), "ordinary") == "ordinary"
+
+    def prompt_answer_reserved(self, issue_id: str, session_id: str, activity_id: str) -> bool:
+        return self.prompt_disposition(issue_id, session_id, activity_id) not in (None, "ordinary")
+
+    def reserve_prompt_answer(self, issue_id: str, session_id: str, activity_id: str) -> str | None:
+        """Commit consumption before core effects; only one adapter may use this activity."""
+        token = uuid.uuid4().hex
+        saved = self.first_value(self._prompt_answer_key(issue_id, session_id, activity_id), token)
+        return token if saved == token else None
+
+    def release_prompt_answer(self, issue_id: str, session_id: str, activity_id: str, token: str) -> None:
+        """An unconsumed answer becomes ordinary input, without a replayable routing gap."""
+        with self._tx() as db:
+            db.execute("UPDATE metadata SET value='ordinary' WHERE key=? AND value=?",
+                (self._prompt_answer_key(issue_id, session_id, activity_id), token))
+
     # -- outbox -----------------------------------------------------------
     def enqueue(self, kind: str, payload: dict[str, Any], *, at: float | None = None) -> str:
         row_id = str(payload.get("id") or uuid.uuid4())
@@ -1088,6 +1405,12 @@ class Store:
                     "AND json_extract(l.payload, '$.issue_id') = json_extract(s.payload, '$.issue_id'))))))))")
         with self._tx() as db:
             self._hold_legacy_outbox(db)
+            # Older versions retired one-try native messages even after an uncertain send.
+            # Recover only that undecided state for readback; explicit refusals remain failed.
+            db.execute("UPDATE outbox SET state='pending' WHERE state='failed' AND kind='activity' "
+                "AND hold_reason IS NULL AND json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.one_try')=1 AND json_extract(payload,'$.write_started')=1 "
+                "AND json_type(payload,'$.failure_kind') IS NULL AND json_type(payload,'$.applied') IS NULL")
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
                 " AND (" + ADVISORY + " OR (o.kind='activity' AND json_extract(o.payload, '$.native_reply_version')=1) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
@@ -1458,13 +1781,16 @@ class Store:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
                            (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
             return True
-    def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None) -> bool:
+    def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None,
+                            attempt_id: str | None = None) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending' AND hold_reason IS NULL", (row_id,)).fetchone()
             if not row:
                 return False
             payload = json.loads(row["payload"])
+            if attempt_id is not None and payload.get("mutation_attempt_id") != attempt_id:
+                return False
             if known_rejection:
                 prior = payload.get("write_started") if started_before is None else started_before
                 legacy_create = prior is None and payload.get("send_body") is not None
