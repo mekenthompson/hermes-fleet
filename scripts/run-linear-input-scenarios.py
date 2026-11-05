@@ -58,7 +58,11 @@ def main():
         result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
         if guard.violations:
             print("Forbidden operations attempted: " + json.dumps(guard.violations), file=sys.stderr)
-        return 0 if result.wasSuccessful() and not result.skipped and not guard.violations else 1
+        from linear_core_capabilities import unexpected_skips
+        unexpected = unexpected_skips(result.skipped, actual)
+        if result.skipped and not unexpected:
+            print(f"Historical Core {actual}: producer-metadata qualifications={len(result.skipped)}", file=sys.stderr)
+        return 0 if result.wasSuccessful() and not unexpected and not guard.violations else 1
 
 
 if __name__ == "__main__":

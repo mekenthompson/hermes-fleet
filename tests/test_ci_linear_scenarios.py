@@ -176,5 +176,45 @@ class LinearScenarioLaneTests(unittest.TestCase):
         self.assertIn("scripts/verify-public-tree.py", policy_job)
 
 
+class HistoricalCoreQualificationTests(unittest.TestCase):
+    def run_skip(self, revision, *, reason=None, identity=None, capability=False):
+        import contextlib
+        import importlib.util
+        import io
+        from unittest.mock import patch
+        import linear_core_capabilities as capabilities
+        spec = importlib.util.spec_from_file_location("scenario_qualification_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        class Scenario(unittest.TestCase):
+            def id(self):
+                return identity or next(iter(capabilities.STATUS_METADATA_TESTS))
+            def runTest(self):
+                self.skipTest(reason or capabilities.STATUS_METADATA_REASON)
+        with patch.object(capabilities, "status_metadata_available", return_value=capability), \
+                patch.object(runner.unittest.defaultTestLoader, "discover", return_value=unittest.TestSuite([Scenario()])), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return runner.run_suite(ROOT / "tests", revision=revision)
+
+    def test_only_the_two_exact_historical_pins_qualify_named_absent_capability(self):
+        from linear_core_capabilities import HISTORICAL_STATUS_CORES
+        for revision in HISTORICAL_STATUS_CORES:
+            with self.subTest(revision=revision):
+                self.assertEqual(self.run_skip(revision), 0)
+
+    def test_release_and_unknown_revisions_cannot_skip_feature_coverage(self):
+        release = json.loads((ROOT / "release/agent-image-manifest.json").read_text())["revision"]
+        for revision in (release, "f" * 40, None):
+            with self.subTest(revision=revision):
+                self.assertEqual(self.run_skip(revision), 1)
+
+    def test_historical_pin_does_not_qualify_arbitrary_skips_or_present_capability(self):
+        from linear_core_capabilities import HISTORICAL_STATUS_CORES
+        revision = next(iter(HISTORICAL_STATUS_CORES))
+        self.assertEqual(self.run_skip(revision, reason="unrelated unavailable feature"), 1)
+        self.assertEqual(self.run_skip(revision, identity="other.Scenario.test_hidden"), 1)
+        self.assertEqual(self.run_skip(revision, capability=True), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
