@@ -128,7 +128,21 @@ class Store:
                 and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
                 and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
-                and content.get("type") in ("response", "error", "thought") and isinstance(content.get("body"), str))
+                and content.get("type") in ("response", "error", "thought", "elicitation")
+                and isinstance(content.get("body"), str))
+    def conversation_finished(self, issue_id: str, session_id: str, source_activity: str) -> bool:
+        """Has this session's reply to ``source_activity`` already completed it (a response or error)?
+
+        Queued counts: the outbox delivers it. Only a reply that can no longer be sent does not.
+        """
+        with self._tx() as db:
+            return db.execute(
+                "SELECT 1 FROM outbox WHERE kind='activity' AND state != 'failed' "
+                "AND json_extract(payload, '$.native_reply_version')=1 "
+                "AND json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? "
+                "AND json_extract(payload, '$.source_activity')=? "
+                "AND json_extract(payload, '$.content.type') IN ('response', 'error') LIMIT 1",
+                (issue_id, session_id, source_activity)).fetchone() is not None
     @staticmethod
     def reporting_notice(kind: str, payload: dict[str, Any]) -> bool:
         return (kind == "activity" and payload.get("reporting_notice_version") == 1

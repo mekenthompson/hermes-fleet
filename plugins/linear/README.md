@@ -781,6 +781,18 @@ unfinished, a reply goes out as a `thought` with the same text and the work's ow
 completes the session; otherwise it stays a `response`. Either way it keeps reply delivery
 (retries and failure reporting), not a thought's single try. Prior uncertain
 effects stay held while unrelated authorized discussion continues.
+
+A send in the middle of a turn has no `reply_to`; it goes to the session's latest
+admitted provider input, and is refused when the adapter has none or that input has
+already had its `response`. Interim notes (`_interim_send`) post as a single-try
+`thought`. A clarify posts an `elicitation` (Linear's `select` signal with the choices
+when it has one pick; typed and numbered when it has several), and so does an approval
+prompt, with the outbox's reply delivery; either leaves the session waiting for input.
+The person's next prompt in that session answers it, as a typed reply does on other
+platforms: Core's clarify text rules resolve the clarify, and Core's approve/deny words
+(or `/approve`, `/deny`) resolve the oldest waiting approval and post a confirmation
+`thought`. An answer is taken only from a sender the gateway allowlist authorizes; any
+other reply is an ordinary message.
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
 uncertain creation remain pending; retry never repeats an unknown create.

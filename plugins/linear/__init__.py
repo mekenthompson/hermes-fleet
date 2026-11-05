@@ -363,7 +363,7 @@ class BoundLinearAPI(LinearAPI):
         self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().verify_comment(comment_id, issue_id, body)
-    def create_activity(self, client_id, session_id, content, *, issue_id=None, ephemeral=False):
+    def create_activity(self, client_id, session_id, content, *, issue_id=None, ephemeral=False, **signal):
         if self.specialist_scope is not None:
             if not isinstance(issue_id, str) or not issue_id:
                 raise LinearError("Specialist Agent Activity requires its owning issue id", retryable=False)
@@ -372,7 +372,7 @@ class BoundLinearAPI(LinearAPI):
                 raise LinearError("Agent Activity session does not belong to the authorized issue", retryable=False)
             self._mutation_issue(issue_id)
         with self._permit_specialist_operation([issue_id], session_id=session_id):
-            return super().create_activity(client_id, session_id, content, ephemeral=ephemeral)
+            return super().create_activity(client_id, session_id, content, ephemeral=ephemeral, **signal)
 
     def create_project_update(self, client_id, project_id, body, *, issue_ids=None):
         if self.specialist_scope is not None:

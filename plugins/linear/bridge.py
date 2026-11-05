@@ -4404,7 +4404,8 @@ class Bridge:
                 raise LinearError("Attempted native history activity requires exact delivery reconciliation", retryable=False)
             self._mutate_outbox(row["id"], lambda: self.api.create_activity(
                 row["id"], payload["session_id"], payload["content"], issue_id=payload["issue_id"],
-                ephemeral=bool(payload.get("ephemeral"))))
+                ephemeral=bool(payload.get("ephemeral")),
+                **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})))
             return True
         elif kind == "project_update":
             return self._send_project_update(row["id"])

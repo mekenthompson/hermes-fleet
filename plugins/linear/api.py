@@ -764,12 +764,20 @@ class LinearAPI:
     def create_comment(self, client_id: str, issue_id: str, body: str) -> None:
         self._create("commentCreate", "CommentCreateInput", {"id": client_id, "issueId": issue_id, "body": body})
     def create_activity(self, client_id: str, session_id: str, content: dict[str, Any], *,
-                        issue_id: str | None = None, ephemeral: bool = False) -> None:
+                        issue_id: str | None = None, ephemeral: bool = False,
+                        signal: str | None = None, signal_metadata: dict[str, Any] | None = None) -> None:
         fields = {"id": client_id, "agentSessionId": session_id, "content": content}
         if ephemeral:
             if content.get("type") not in ("thought", "action"):
                 raise LinearError("only a thought or action activity can be ephemeral", retryable=False)
             fields["ephemeral"] = True
+        if signal is not None:
+            # Linear's ``select`` offers options on a question; the person's pick comes back as a prompt.
+            if signal != "select" or content.get("type") != "elicitation":
+                raise LinearError("only an elicitation can carry the select signal", retryable=False)
+            fields["signal"] = signal
+            if signal_metadata is not None:
+                fields["signalMetadata"] = signal_metadata
         self._create("agentActivityCreate", "AgentActivityCreateInput", fields)
     def create_project_update(self, client_id: str, project_id: str, body: str, *,
                               issue_ids: list[str] | None = None) -> None:

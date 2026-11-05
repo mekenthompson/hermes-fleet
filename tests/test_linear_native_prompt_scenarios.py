@@ -1,0 +1,245 @@
+"""Mid-turn Linear sends: interim notes, clarify questions and approval prompts.
+
+Core sends these without ``reply_to``. The adapter used to refuse every one of them, so
+a clarify was "[clarify prompt could not be delivered]", a text approval waited out
+``approvals.timeout`` and denied, and heartbeats vanished. Here they post into the turn's
+own Agent Session: interim notes as a ``thought``, questions as an ``elicitation`` (with
+Linear's ``select`` signal for one pick), and the person's next prompt answers them
+through Core's own clarify and approval resolution. The turn's reply is unchanged.
+
+The Linear provider is the fixture; Core's adapter base, clarify and approval modules,
+and the plugin's outbox are the real ones.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import test_linear_native_bridge_scenarios as native
+
+QUESTION = "Which environment should the migration run against?"
+CHOICES = ["staging", "production"]
+
+
+class Delivery:
+    """One provider input as the reporting thread hands it to the adapter."""
+
+    def __init__(self, event):
+        self.profile, self.logical_agent = "default", "default"
+        self.delivery_id = event["agentActivity"]["id"]
+        self.payload = json.dumps(event)
+        self.acknowledged = 0
+
+    def event(self):
+        return json.loads(self.payload)
+
+    def acknowledge(self):
+        self.acknowledged += 1
+
+
+@unittest.skipIf(native.CORE is not None, f"native source unavailable ({native.CORE})")
+class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.fixture = native.NativeBridgeScenarios()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.bridge, self.store, self.authority = self.fixture.bridge, self.fixture.store, self.fixture.authority
+        self.posted = []
+        original = self.bridge.api.transport
+        def observe(url, body, headers):
+            payload = json.loads(body)
+            if "agentActivityCreate" in payload["query"]:
+                self.posted.append(payload["variables"]["input"])
+            return original(url, body, headers)
+        self.bridge.api.transport = observe
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platform_registry import platform_registry
+        with patch.object(platform_registry, "is_registered", return_value=True):
+            Platform("linear")
+        from hermes_fleet_linear_plugin import native_input
+        self.native_input = native_input
+        self.running = {"bridge": self.bridge}
+        self.adapter = native_input.create_adapter(PlatformConfig(enabled=True), self.running)
+        self.assertTrue(await self.adapter.connect())
+        self.addAsyncCleanup(self.adapter.disconnect)
+        # The runner's allowlist check: only the issue's person may answer.
+        self.adapter.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == native.USER)
+        self.messages = []
+        async def admit(event):
+            # Core commits the input, then calls the committed-input hook.
+            self.messages.append(event)
+            await self.adapter.on_message_admitted(event, SimpleNamespace(control=None))
+        self.adapter.set_message_handler(lambda event: None)
+        self.adapter.handle_message = admit
+        self.loop = asyncio.get_running_loop()
+
+    async def deliver(self, identity, body, *, user=native.USER):
+        self.authority.activities[identity] = {"id": identity, "user": {"id": user},
+                                               "agentSession": {"id": native.SESSION}}
+        event = self.fixture.event("prompted", body=body)
+        event["agentActivity"].update(id=identity, user={"id": user})
+        delivery = Delivery(event)
+        self.assertTrue(self.adapter.route(delivery))
+        future = self.adapter._submitted.get(self.adapter._delivery_key(delivery))
+        if future is not None:
+            await asyncio.wait_for(asyncio.wrap_future(future), 10)
+        return delivery
+
+    async def start_turn(self):
+        delivery = await self.deliver(native.ACTIVITY, "Run the schema migration for this issue.")
+        self.assertEqual(delivery.acknowledged, 1)
+        self.assertEqual(len(self.messages), 1)
+        return self.messages[0]
+
+    def session_key(self, event):
+        return self.adapter._core_session_keys(event.source)[0] if hasattr(self.adapter, "_core_session_keys") \
+            else self.adapter._source_session_key(event.source)
+
+    async def until_posted(self, count):
+        async with asyncio.timeout(10):
+            while len(self.posted) < count:
+                await asyncio.sleep(0.01)
+
+    def ask(self, session_key, clarify_id, choices):
+        """Core's clarify path: register, send the card, plain-text fallback, bounded wait."""
+        from gateway.run_turn_runner_clarify_delivery import _clarify_send_then_wait, text_fallback_coro
+        from tools import clarify_gateway as clarify
+        send = dict(chat_id=native.ISSUE, question=QUESTION, choices=choices, clarify_id=clarify_id,
+                    session_key=session_key, metadata={"thread_id": native.SESSION})
+        clarify.register(clarify_id=clarify_id, session_key=session_key, question=QUESTION, choices=choices)
+        future = asyncio.run_coroutine_threadsafe(self.adapter.send_clarify(**send), self.loop)
+        def fallback():
+            coro = text_fallback_coro(self.adapter, **send)
+            return None if coro is None else asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return _clarify_send_then_wait(future, clarify_id=clarify_id, session_key=session_key,
+                                       clarify_mod=clarify, fallback=fallback)
+
+    def request_approval(self, session_key):
+        """Core's text approval path (no native buttons): the prompt, then the gateway wait."""
+        from gateway.run import _format_exec_approval_fallback, _interim_metadata
+        from tools.approval_gateway_wait import _await_gateway_decision
+        def notify(data):
+            text = _format_exec_approval_fallback(data["command"], data["description"], "/")
+            metadata = {"thread_id": native.SESSION, "is_approval_prompt": True}
+            asyncio.run_coroutine_threadsafe(self.adapter.send(
+                native.ISSUE, text, metadata=_interim_metadata(metadata)), self.loop).result(timeout=15)
+        return _await_gateway_decision(session_key, notify, {
+            "command": "rm -rf build/", "description": "recursive delete", "pattern_key": "recursive delete"})
+
+    async def answer_later(self, key, waiter, cleanup):
+        try:
+            return await asyncio.wait_for(waiter, 10)
+        finally:
+            if not waiter.done():
+                cleanup(key)
+
+    async def test_interim_send_posts_a_thought_into_the_turns_session(self):
+        from gateway.run import _interim_metadata
+        await self.start_turn()
+        result = await self.adapter.send(native.ISSUE, "Still checking the migration plan.",
+                                         metadata=_interim_metadata({"thread_id": native.SESSION}))
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(self.posted[-1]["agentSessionId"], native.SESSION)
+        self.assertEqual(self.posted[-1]["content"], {"type": "thought", "body": "Still checking the migration plan."})
+        self.assertNotIn("signal", self.posted[-1])
+
+    async def test_clarify_with_choices_is_a_select_elicitation_and_the_reply_answers_it(self):
+        from tools import clarify_gateway as clarify
+        turn = await self.start_turn()
+        key = self.session_key(turn)
+        waiter = asyncio.create_task(asyncio.to_thread(self.ask, key, "clarify-env", CHOICES))
+        await self.until_posted(1)
+        question = self.posted[-1]
+        self.assertEqual(question["agentSessionId"], native.SESSION)
+        self.assertEqual(question["content"]["type"], "elicitation")
+        self.assertIn(QUESTION, question["content"]["body"])
+        self.assertEqual(question["signal"], "select")
+        self.assertEqual(question["signalMetadata"], {"options": [{"value": "staging"}, {"value": "production"}]})
+        answer = await self.deliver("answer-activity", "production")
+        response, answered = await self.answer_later(key, waiter, clarify.clear_session)
+        self.assertEqual((response, answered), ("production", True))
+        self.assertEqual(answer.acknowledged, 1)
+        self.assertEqual(len(self.messages), 1)  # the answer went to the clarify, not a new turn
+
+    async def test_open_clarify_takes_free_text_and_a_stranger_cannot_answer(self):
+        from tools import clarify_gateway as clarify
+        turn = await self.start_turn()
+        key = self.session_key(turn)
+        waiter = asyncio.create_task(asyncio.to_thread(self.ask, key, "clarify-open", None))
+        await self.until_posted(1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "elicitation")
+        self.assertNotIn("signal", self.posted[-1])
+        await self.deliver("stranger-activity", "use production", user="someone-else")
+        self.assertIsNotNone(clarify.get_pending("clarify-open"))
+        await self.deliver("answer-activity", "Use staging first, please.")
+        response, answered = await self.answer_later(key, waiter, clarify.clear_session)
+        self.assertEqual((response, answered), ("Use staging first, please.", True))
+
+    async def test_clarify_without_a_verified_session_is_a_definitive_failure(self):
+        from gateway.run_turn_runner_clarify_delivery import UNDELIVERED
+        response, answered = await asyncio.to_thread(self.ask, "agent:main:linear:dm:none", "clarify-none", CHOICES)
+        self.assertEqual((response, answered), (UNDELIVERED, False))
+        self.assertEqual(self.posted, [])
+
+    async def test_text_approval_is_an_elicitation_and_approve_resolves_it(self):
+        await self.check_approval("approve", "once")
+
+    async def test_text_approval_deny_resolves_it(self):
+        await self.check_approval("/deny not on the shared host", "deny")
+
+    async def check_approval(self, reply, choice):
+        from tools import approval
+        turn = await self.start_turn()
+        key = self.session_key(turn)
+        waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        prompt = self.posted[-1]
+        self.assertEqual(prompt["agentSessionId"], native.SESSION)
+        self.assertEqual(prompt["content"]["type"], "elicitation")
+        self.assertIn("rm -rf build/", prompt["content"]["body"])
+        answer = await self.deliver("answer-activity", reply)
+        result = await self.answer_later(key, waiter, approval.unregister_gateway_notify)
+        self.assertTrue(result["resolved"], result)
+        self.assertEqual(result["choice"], choice)
+        if choice == "deny":
+            self.assertEqual(result["reason"], "not on the shared host")
+        self.assertEqual(answer.acknowledged, 1)
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")  # the confirmation
+
+    async def test_final_reply_is_unchanged_and_nothing_posts_after_it(self):
+        from gateway.run import _interim_metadata
+        from hermes_fleet_linear_plugin.bridge import stable_uuid4
+        import hashlib
+        await self.start_turn()
+        body = "The migration ran on staging; production is next."
+        result = await self.adapter.send(native.ISSUE, body, reply_to=native.ACTIVITY,
+                                         metadata={"thread_id": native.SESSION})
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(self.posted[-1]["content"], {"type": "response", "body": body})
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        self.assertEqual(result.message_id, stable_uuid4("native-reply", self.bridge.profile, native.ISSUE,
+                                                         native.SESSION, native.ACTIVITY, digest))
+        late = await self.adapter.send(native.ISSUE, "Still working.",
+                                       metadata=_interim_metadata({"thread_id": native.SESSION}))
+        self.assertFalse(late.success)
+        self.assertFalse(late.retryable)
+        self.assertEqual(len(self.posted), 1)
+        # A new prompt reopens the session: its interim notes post again.
+        await self.deliver("next-activity", "Now production, please.")
+        again = await self.adapter.send(native.ISSUE, "Starting production.",
+                                        metadata=_interim_metadata({"thread_id": native.SESSION}))
+        self.assertTrue(again.success, again.error)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
+    async def test_send_without_reply_to_and_no_verified_session_is_still_refused(self):
+        result = await self.adapter.send(native.ISSUE, "Orphan note.", metadata={"thread_id": native.SESSION})
+        self.assertFalse(result.success)
+        self.assertEqual(self.posted, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
