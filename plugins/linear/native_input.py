@@ -426,7 +426,7 @@ def _session_work_live(bridge, issue_id, session_id) -> bool:
 
 
 def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, nonce="",
-                signal=None, signal_metadata=None, one_try=False):
+                signal=None, signal_metadata=None, one_try=False, source_cursor=0):
     """Queue an independent reply with one immutable remote create identity.
 
     Native delivery retries reuse this outbox row. Queuing is not publication:
@@ -464,7 +464,7 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
         "id": row_id, "issue_id": issue_id, "session_id": session_id,
         "content": {"type": kind, "body": body},
         "content_action": True, "unlinked_content": True, "native_reply_version": 1,
-        "source_activity": message_id,
+        "source_activity": message_id, "source_cursor": source_cursor,
         "requester_sessions": {issue_id: session_id},
         **({"requester_activities": {issue_id: activity_id}} if activity_id else {}),
         **({"signal": signal, "signal_metadata": signal_metadata} if signal else {}),
@@ -588,6 +588,7 @@ def create_adapter(config, running):
             # (issue id, Agent Session id) -> the latest provider input admitted for it. A mid-turn
             # send has no reply_to; this verified input is the one it answers.
             self._inputs = {}
+            self._input_cursors = {}
             # (issue id, Agent Session id) -> core session keys of questions asked there. Only a
             # session that was asked something can answer a clarify or an approval.
             self._asked = {}
@@ -719,6 +720,9 @@ def create_adapter(config, running):
                 else:
                     with self._relay_lock:
                         self._inputs[(projected.issue_id, projected.session_id)] = projected.message_id
+                        source_key = (projected.issue_id, projected.session_id, projected.message_id)
+                        self._input_cursors.setdefault(source_key, running["bridge"].store.conversation_cursor(
+                            projected.issue_id, projected.session_id))
                 await asyncio.to_thread(delivery.acknowledge)
                 with self._relay_lock:
                     values = self._pending.get(key, [])
@@ -801,12 +805,14 @@ def create_adapter(config, running):
 
         async def _post(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False, **reply):
             """Queue one reply on the outbox, publish it, and report what Linear has."""
+            with self._relay_lock:
+                cursor = self._input_cursors.get((chat_id, session_id, source), 0)
             try:
                 if kind is not None and await asyncio.to_thread(
-                        bridge.store.conversation_finished, chat_id, session_id, source):
+                        bridge.store.conversation_finished, chat_id, session_id, source, cursor):
                     return SendResult(success=False, error="Linear session already has its final reply")
                 row_id = await asyncio.to_thread(queue_reply, bridge, chat_id, session_id, source, content,
-                                                 kind=kind, one_try=kind == "thought", **reply)
+                                                 kind=kind, one_try=kind == "thought", source_cursor=cursor, **reply)
                 if not row_id:
                     return SendResult(success=False, error="Linear reply authorization is held")
                 await asyncio.to_thread(bridge.flush, only_id=row_id)

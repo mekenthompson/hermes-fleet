@@ -240,6 +240,32 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(self.posted, [])
 
+    async def test_queued_interim_is_not_delivered_after_the_final_reply(self):
+        from hermes_fleet_linear_plugin.native_input import queue_reply
+        await self.start_turn()
+        pending = queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                              "Late progress", kind="thought")
+        result = await self.adapter.send(native.ISSUE, "Finished.", reply_to=native.ACTIVITY,
+                                         metadata={"thread_id": native.SESSION})
+        self.assertTrue(result.success, result.error)
+        self.bridge.flush(only_id=pending)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
+        self.assertEqual(self.bridge.store.outbox_row(pending)["state"], "failed")
+
+    async def test_native_done_also_closes_the_turns_progress_lane(self):
+        await self.start_turn()
+        self.bridge._decline(native.ISSUE, native.SESSION, "Done.", activity_id="native-done")
+        self.bridge.flush()
+        result = await self.adapter.send(native.ISSUE, "Late note.",
+            metadata={"thread_id": native.SESSION, "_interim_send": True})
+        self.assertFalse(result.success)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
+        await self.deliver("next-activity", "Start the next check.")
+        result = await self.adapter.send(native.ISSUE, "Checking.",
+            metadata={"thread_id": native.SESSION, "_interim_send": True})
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+
 
 if __name__ == "__main__":
     unittest.main()

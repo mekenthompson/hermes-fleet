@@ -4245,6 +4245,11 @@ class Bridge:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
         payload, kind = row["payload"], row["kind"]
+        if (self.store.conversation_reply(kind, payload) and
+                payload["content"]["type"] in ("thought", "elicitation") and
+                self.store.conversation_finished(payload["issue_id"], payload["session_id"],
+                    payload.get("source_activity", ""), payload.get("source_cursor", 0))):
+            raise LinearError("Linear session already has its final reply", retryable=False)
         attempted_progress = ((payload.get("native_progress") is True or payload.get("native_history") is True) and
                               (payload.get("write_started") is not False or row["attempts"]))
         if payload.get("claim") or payload.get("admission_id"):
