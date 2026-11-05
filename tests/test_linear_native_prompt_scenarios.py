@@ -63,7 +63,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.native_input = native_input
         # This finite prompt fixture projects receipts itself; guarded seam tests own the real Core ledger.
         committed = patch.object(native_input, "committed_conversation_state",
-                                 return_value={"live": False, "latest_activity": None})
+                                 return_value={"live": False, "latest_activity": None, "turn_live": True})
         committed.start()
         self.addCleanup(committed.stop)
         self.running = {"bridge": self.bridge}

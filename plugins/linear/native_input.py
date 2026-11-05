@@ -453,7 +453,7 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
                 if target in targets:
                     targets.remove(target)
                 targets.append(target)  # The current route takes precedence over the older owner.
-        live, latest = False, None
+        live, latest, turn_live = False, None, None
         for target in targets:
             rows = list_session_admissions(authority.db, session_id=target, pending_only=False)
             if receipt and receipt["target_session_id"] == target and not any(
@@ -472,12 +472,15 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
                 if status not in ("queued", "started", "terminal") or (status == "terminal" and not row.get("outcome")):
                     raise ValueError("native admission has no verified final outcome")
                 live = live or status != "terminal"
+                if (envelope is not None and envelope["event"].get("message_id") ==
+                        payload.get("turn_activity", payload.get("source_activity"))):
+                    turn_live = bool(turn_live) or status != "terminal"
                 if (envelope is not None and not envelope["event"].get("structured_control")
                         and (newest is None or row["seq"] > newest["seq"])):
                     newest = row
             if newest is not None:
                 latest = newest["payload"]["native_text_v1"]["event"]["message_id"]
-        return {"live": live, "latest_activity": latest}
+        return {"live": live, "latest_activity": latest, "turn_live": turn_live}
     except LinearError:
         raise
     except Exception as exc:
@@ -514,6 +517,44 @@ def _question_display_matches(payload) -> bool:
     return (isinstance(display, dict) and display.get("content") == payload.get("content")
             and display.get("signal") == payload.get("signal")
             and display.get("signal_metadata") == payload.get("signal_metadata"))
+
+
+def _clarify_prompt_matches(prompt, pending) -> bool:
+    return (pending is not None and pending.session_key == prompt.get("session_key")
+            and pending.question == prompt.get("question")
+            and list(pending.choices or []) == prompt.get("choices")
+            and pending.multi_select == prompt.get("multi_select"))
+
+
+@contextmanager
+def question_publication_guard(payload):
+    """Keep a displayed decision bound to its live Core request through transport."""
+    prompt = payload.get("native_prompt")
+    if not prompt:
+        if payload.get("content", {}).get("type") == "elicitation":
+            raise LinearError("Linear question has no exact Core request", retryable=False)
+        yield
+        return
+    if not _question_display_matches(payload):
+        raise LinearError("Linear question cannot be displayed faithfully", retryable=False)
+    key = prompt.get("session_key")
+    if prompt.get("kind") == "clarify":
+        from tools import clarify_gateway as clarify
+        with clarify._lock:
+            pending = clarify.get_pending(prompt.get("clarify_id"))
+            if not _clarify_prompt_matches(prompt, pending):
+                raise LinearError("Linear clarification is no longer the displayed Core request", retryable=False)
+            yield
+    elif prompt.get("kind") == "approval":
+        from tools import approval
+        with approval._lock:
+            pending = next((entry for entry in approval._gateway_queues.get(key, [])
+                            if entry.data.get("request_id") == prompt.get("request_id")), None)
+            if pending is None or pending.event.is_set() or pending.result is not None:
+                raise LinearError("Linear approval is no longer pending in Core", retryable=False)
+            yield
+    else:
+        raise LinearError("Linear question has no supported Core request", retryable=False)
 
 
 def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, nonce="",
@@ -952,10 +993,13 @@ def create_adapter(config, running):
                 return not ordinary  # Core reconciles its original receipt; it is not a new answer.
             # Only still-pending, open questions need provider chronology. A first
             # delivery of an old Activity is ordinary input, never new consent.
+            published = questions
             questions = self._pending_questions(bridge, projected, event, questions)
+            current_ids = {question["id"] for question in questions}
             verified = []
             for question in questions:
-                if await asyncio.to_thread(self._question_precedes_answer, bridge, projected, question):
+                if await asyncio.to_thread(self._question_precedes_answer, bridge, projected, question,
+                                           published, current_ids):
                     verified.append(question)
             questions = verified
             with self._relay_lock:
@@ -998,24 +1042,43 @@ def create_adapter(config, running):
             for question in questions:
                 if not _question_display_matches(question):
                     continue
-                if bridge.store.conversation_finished(projected.issue_id, projected.session_id,
-                        question.get("turn_activity", question["source_activity"]), question.get("source_cursor", 0)):
+                if bridge._conversation_interim_finished(question):
                     continue
                 prompt = question["native_prompt"]
                 key = prompt.get("session_key")
                 if key not in keys:
                     continue
                 pending = clarify.get_pending(prompt.get("clarify_id")) if prompt.get("kind") == "clarify" else None
-                if ((pending is not None and pending.session_key == key) or
+                if (_clarify_prompt_matches(prompt, pending) or
                         (prompt.get("kind") == "approval" and prompt.get("request_id") in approvals[key])):
                     result.append(question)
             return result
 
         @staticmethod
-        def _question_precedes_answer(bridge, projected, question):
+        def _question_precedes_answer(bridge, projected, question, published=(), current_ids=()):
             with bridge.api.requester_session(projected.session_id, activity_id=projected.message_id):
-                return bridge.api.question_precedes_answer(question["id"], projected.message_id,
-                                                          projected.session_id, projected.actor_id)
+                if not bridge.api.question_precedes_answer(question["id"], projected.message_id,
+                        projected.session_id, projected.actor_id):
+                    return False
+                kind = question["native_prompt"]["kind"]
+                for other in published:
+                    if other["id"] == question["id"]:
+                        continue
+                    if other.get("answered_by") and bridge.api.question_precedes_answer(
+                            other["answered_by"], projected.message_id, projected.session_id,
+                            projected.actor_id, question_actor_id=other["answer_actor"]):
+                        continue  # A verified earlier human decision closed this displayed question.
+                    # Core's FIFO/all approval commands may address several displayed,
+                    # still-pending cards. An expired card has no such answer association.
+                    if kind == "approval" and other["native_prompt"].get("kind") == "approval" and other["id"] in current_ids:
+                        continue
+                    if not bridge.api.question_precedes_answer(other["id"], projected.message_id,
+                            projected.session_id, projected.actor_id):
+                        continue  # A question created after this immutable answer was not visible to it.
+                    if not bridge.api.question_precedes_answer(other["id"], question["id"],
+                            projected.session_id, bridge.api.identity["viewer_id"]):
+                        return False  # A later (or ambiguously simultaneous) question owned the visible choices.
+                return True
 
         def _resolve_answer(self, bridge, projected, event, questions):
             """Resolve only an open question's still-pending Core identity, without publication."""
@@ -1025,9 +1088,7 @@ def create_adapter(config, running):
                 return False, None, None
             keys = self._core_session_keys(source)
             questions = [question for question in questions if _question_display_matches(question)
-                         and not bridge.store.conversation_finished(
-                projected.issue_id, projected.session_id,
-                question.get("turn_activity", question["source_activity"]), question.get("source_cursor", 0))]
+                         and not bridge._conversation_interim_finished(question)]
             from tools import clarify_gateway as clarify
             for question in questions:
                 prompt = question["native_prompt"]
@@ -1039,17 +1100,19 @@ def create_adapter(config, running):
                 # section; a session lookup must never select an unseen successor.
                 with clarify._lock:
                     pending = clarify.get_pending(prompt.get("clarify_id"))
-                    if (pending is None or pending.session_key != session_key or
+                    if (not _clarify_prompt_matches(prompt, pending) or
                             clarify.get_pending_for_session(session_key, include_choice_prompts=True) is not pending):
                         continue
                     value, reason = clarify._coerce_text_response_detailed(pending, projected.text)
                     if value is not None:
                         if clarify.resolve_gateway_clarify(pending.clarify_id, value):
+                            bridge.store.record_question_answer(question["id"], projected.message_id, projected.actor_id)
                             return True, None, question
                     elif reason == "invalid_selection":
                         return True, None, question
                     else:
-                        clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED)
+                        if clarify.resolve_gateway_clarify(pending.clarify_id, clarify.CANCELLED):
+                            bridge.store.record_question_answer(question["id"], projected.message_id, projected.actor_id)
                         return False, None, None
             decision = approval_decision(projected.text)
             if decision is None:
@@ -1066,8 +1129,12 @@ def create_adapter(config, running):
                            if entry.get("request_id") in allowed]
                 if not resolve_all:
                     targets = targets[:1]
-                count = sum(resolve_gateway_approval(session_key, choice, reason=reason, request_id=identity)
-                            for identity in targets)
+                count = 0
+                for identity in targets:
+                    resolved = resolve_gateway_approval(session_key, choice, reason=reason, request_id=identity)
+                    if resolved:
+                        bridge.store.record_question_answer(allowed[identity]["id"], projected.message_id, projected.actor_id)
+                        count += resolved
                 if count:
                     return True, _approval_confirmation(choice, count, reason), allowed[targets[0]]
             return False, None, None
@@ -1142,7 +1209,8 @@ def create_adapter(config, running):
                                   "", t("gateway.clarify.hint_multi")])
             if choices:
                 mark_awaiting_text(clarify_id)  # Linear lets the person type an answer instead of picking.
-            prompt = {"kind": "clarify", "clarify_id": clarify_id, "session_key": session_key}
+            prompt = {"kind": "clarify", "clarify_id": clarify_id, "session_key": session_key,
+                      "question": question, "choices": choices, "multi_select": multi}
             return await self._post(bridge, chat_id, session_id, source, body, kind="elicitation",
                                     question=True, nonce=clarify_id, native_prompt=prompt, **reply)
 

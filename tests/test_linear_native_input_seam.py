@@ -1516,3 +1516,242 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         row = self.bridge.store.outbox_row(sent.message_id)
         self.assertEqual(row["payload"]["signal_metadata"], {"options": [{"value": "Yes"}, {"value": "No"}]})
         self.assertEqual(len(self.rows()), 1)
+
+    async def test_late_expired_question_does_not_replace_visible_active_question(self):
+        from tools import clarify_gateway as clarify
+        from unittest.mock import patch
+        await self.deliver('initial', 'Inspect the bounded task.')
+        await self.until(lambda: self.receipts and self.inbox_row('initial')[2] == 'imported')
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+        self.addCleanup(clarify.clear_session, key)
+        old = clarify.register('old-question', key, 'Which environment for the old operation?', ['staging', 'production'])
+        with patch.object(self.bridge, 'flush', return_value=0):
+            queued = await self.adapter.send_clarify(self.ISSUE, old.question, old.choices, old.clarify_id, key, metadata={'thread_id': self.SESSION})
+        self.assertFalse(queued.success)
+        self.assertIs(self.bridge.store.outbox_row(queued.message_id)['payload']['write_started'], False)
+        self.assertIsNone(await asyncio.to_thread(clarify.wait_for_response, old.clarify_id, 0.001))
+        active = clarify.register('current-question', key, 'Which environment for the new operation?', ['production', 'staging'])
+        sent = await self.adapter.send_clarify(self.ISSUE, active.question, active.choices, active.clarify_id, key, metadata={'thread_id': self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        await self.replace_input_adapter()
+        await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        late = self.provider.activities.get(queued.message_id)
+        await self.deliver('answer', '1')
+        await self.until(lambda: self.inbox_row('answer')[2] == 'imported')
+        self.assertIsNone(late, 'Expired question was published after a newer displayed question; numeric answer resolved the newer choice order')
+        self.assertEqual(active.response, "production")
+
+
+    async def queued_interim_after_core_completion(self, kind, *, already_displayed=False):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from tools import clarify_gateway as clarify
+        started, release, sending_final, permit_final = [asyncio.Event() for _ in range(4)]
+        self.addCleanup(release.set)
+        self.addCleanup(permit_final.set)
+        async def model(event):
+            started.set()
+            await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "Done."}
+            return "Done."
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        await self.deliver("initial", "Do this finite task.")
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        pending = clarify.register("still-pending", key, "Proceed with the operation?", ["Yes", "No"])
+        with patch.object(self.bridge, "flush", return_value=0):
+            if kind == "elicitation":
+                queued = await self.adapter.send_clarify(self.ISSUE, pending.question, pending.choices,
+                    pending.clarify_id, key, metadata={"thread_id": self.SESSION})
+            else:
+                queued = await self.adapter.send(self.ISSUE, "Checking the operation.",
+                    metadata={"thread_id": self.SESSION, "_interim_send": True})
+        if already_displayed:
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+            self.assertIn(queued.message_id, self.provider.activities)
+        original_send = self.adapter.send
+        async def delayed_final(chat_id, content, reply_to=None, metadata=None):
+            if reply_to == "initial" and content == "Done.":
+                sending_final.set()
+                await permit_final.wait()
+            return await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        with patch.object(self.adapter, "send", side_effect=delayed_final):
+            release.set()
+            await asyncio.wait_for(sending_final.wait(), 10)
+            try:
+                self.assertTrue(all(row["status"] == "terminal" for row in self.rows()))
+                self.assertIs(clarify.get_pending(pending.clarify_id), pending)
+                if already_displayed:
+                    self.adapter.set_authorization_check(lambda user_id, *_a, **_k: user_id == self.USER)
+                    await self.deliver("answer-after-terminal", "Yes")
+                    await self.until(lambda: self.inbox_row("answer-after-terminal")[2] == "imported")
+                    self.assertIsNone(pending.response, "A completed Core turn accepted a stale displayed decision")
+                    self.assertFalse(pending.event.is_set())
+                else:
+                    await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+                    self.assertNotIn(queued.message_id, self.provider.activities,
+                                     "An interim published after its committed Core turn completed")
+                    self.assertIs(self.bridge.store.outbox_row(queued.message_id)["payload"]["write_started"], False)
+            finally:
+                permit_final.set()
+                await self.until(lambda: self.final_reply_sent("initial"))
+
+    async def test_queued_question_is_fenced_by_committed_completion_before_final_callback(self):
+        await self.queued_interim_after_core_completion("elicitation")
+
+    async def test_queued_thought_is_fenced_by_committed_completion_before_final_callback(self):
+        await self.queued_interim_after_core_completion("thought")
+
+    async def test_question_expiry_during_mutation_admission_prevents_publication(self):
+        from tools import clarify_gateway as clarify
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        pending = clarify.register("admission-race", key, "Choose an environment.", ["staging", "production"])
+        with patch.object(self.bridge, "flush", return_value=0):
+            queued = await self.adapter.send_clarify(self.ISSUE, pending.question, pending.choices,
+                pending.clarify_id, key, metadata={"thread_id": self.SESSION})
+        admit = self.bridge.store.admit_mutation
+        def expire_after_admit(identity, **kwargs):
+            result = admit(identity, **kwargs)
+            if identity == queued.message_id:
+                self.assertIsNone(clarify.wait_for_response(pending.clarify_id, .001))
+            return result
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=expire_after_admit):
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        self.assertNotIn(queued.message_id, self.provider.activities)
+        self.assertIs(self.bridge.store.outbox_row(queued.message_id)["payload"]["write_started"], False)
+
+    async def test_question_publication_serializes_with_concurrent_core_expiry(self):
+        from tools import clarify_gateway as clarify
+        import threading
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        pending = clarify.register("transport-race", key, "Choose an environment.", ["staging", "production"])
+        expiry_started, expired = threading.Event(), threading.Event()
+        def expire():
+            expiry_started.set()
+            clarify.wait_for_response(pending.clarify_id, .001)
+            expired.set()
+        thread = threading.Thread(target=expire)
+        original = self.bridge.api.transport
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"] and request["variables"]["input"]["content"]["type"] == "elicitation":
+                thread.start()
+                self.assertTrue(expiry_started.wait(1))
+                self.assertFalse(expired.wait(.02), "Core expired the request during its locked publication")
+                self.assertIs(clarify.get_pending(pending.clarify_id), pending)
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        sent = await self.adapter.send_clarify(self.ISSUE, pending.question, pending.choices,
+            pending.clarify_id, key, metadata={"thread_id": self.SESSION})
+        self.assertTrue(sent.success, sent.error)
+        await asyncio.to_thread(thread.join, 2)
+        self.assertTrue(expired.is_set())
+        self.assertIn(sent.message_id, self.provider.activities)
+
+    async def late_uncertain_question_cannot_answer_successor(self, old_kind, current_kind, *, exhausted=False):
+        from tools import clarify_gateway as clarify, approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        original, delayed = self.bridge.api.transport, []
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if not delayed and "agentActivityCreate" in request["query"] and request["variables"]["input"]["content"]["type"] == "elicitation":
+                delayed.append((url, body, headers))
+                raise TimeoutError("fixture remote request remains in flight")
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        if old_kind == "clarify":
+            old_choices = ["staging", "production"] if current_kind == "clarify" else ["Yes", "No"]
+            old = clarify.register("late-old", key, "Choose the old operation.", old_choices)
+            queued = await self.adapter.send_clarify(self.ISSUE, old.question, old.choices,
+                old.clarify_id, key, metadata={"thread_id": self.SESSION})
+            self.assertIsNone(await asyncio.to_thread(clarify.wait_for_response, old.clarify_id, .001))
+        else:
+            old = _ApprovalEntry({"command": "old-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [old]
+            queued = await self.show_approval(key, old)
+            self.assertTrue(approval.withdraw_gateway_approval(key, old.data["request_id"], "expired"))
+        self.assertFalse(queued.success)
+        self.assertTrue(self.bridge.store.outbox_row(queued.message_id)["payload"]["write_started"])
+        if current_kind == "clarify":
+            choices = ["production", "staging"] if old_kind == "clarify" else ["Yes", "No"]
+            current = clarify.register("current-question", key, "Choose the new operation.", choices)
+            sent = await self.adapter.send_clarify(self.ISSUE, current.question, current.choices,
+                current.clarify_id, key, metadata={"thread_id": self.SESSION})
+        else:
+            current = _ApprovalEntry({"command": "new-command"})
+            with approval._lock:
+                approval._gateway_queues[key] = [current]
+            sent = await self.show_approval(key, current)
+        self.assertTrue(sent.success, sent.error)
+        # The uncertain old HTTP create reaches the provider after the new card.
+        original(*delayed[0])
+        if exhausted:
+            row = self.bridge.store.outbox_row(queued.message_id)
+            self.assertTrue(self.bridge.store.retry(row, self.bridge.clock() + 25 * 3600, "fixture retry exhausted"))
+            self.assertEqual(self.bridge.store.outbox_row(queued.message_id)["state"], "failed")
+        else:
+            self.bridge.store.defer(queued.message_id, self.bridge.clock() - 1)
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+            self.assertEqual(self.bridge.store.outbox_row(queued.message_id)["state"], "sent")
+        await self.replace_input_adapter()
+        reply = "1" if old_kind == current_kind == "clarify" else "Yes"
+        await self.deliver("late-answer", reply)
+        await self.until(lambda: self.inbox_row("late-answer")[2] == "imported")
+        self.assertIsNone(current.response if current_kind == "clarify" else current.result,
+                          "A reply to the late expired card authorized its differently displayed successor")
+        self.assertFalse(current.event.is_set())
+        self.assertEqual(len(self.rows()), 2)
+
+    async def test_late_uncertain_clarify_cannot_redirect_numeric_answer_after_replacement(self):
+        await self.late_uncertain_question_cannot_answer_successor("clarify", "clarify")
+
+    async def test_late_uncertain_clarify_cannot_authorize_a_command_approval(self):
+        await self.late_uncertain_question_cannot_answer_successor("clarify", "approval")
+
+    async def test_late_uncertain_approval_cannot_answer_a_clarification(self):
+        await self.late_uncertain_question_cannot_answer_successor("approval", "clarify")
+
+    async def test_withdrawn_approval_cannot_publish_during_mutation_admission(self):
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        pending = _ApprovalEntry({"command": "bounded-command"})
+        with approval._lock:
+            approval._gateway_queues[key] = [pending]
+        with patch.object(self.bridge, "flush", return_value=0):
+            queued = await self.show_approval(key, pending)
+        admit = self.bridge.store.admit_mutation
+        def withdraw_after_admit(identity, **kwargs):
+            result = admit(identity, **kwargs)
+            if identity == queued.message_id:
+                self.assertTrue(approval.withdraw_gateway_approval(key, pending.data["request_id"], "expired"))
+            return result
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=withdraw_after_admit):
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        self.assertNotIn(queued.message_id, self.provider.activities)
+        self.assertIs(self.bridge.store.outbox_row(queued.message_id)["payload"]["write_started"], False)
+
+    async def test_exhausted_uncertain_question_remains_a_visible_consent_barrier(self):
+        await self.late_uncertain_question_cannot_answer_successor("clarify", "clarify", exhausted=True)
+
+    async def test_displayed_question_cannot_answer_after_committed_completion_before_final_callback(self):
+        await self.queued_interim_after_core_completion("elicitation", already_displayed=True)

@@ -286,3 +286,101 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
             'outbox_state': self.bridge.store.outbox_row(fields['id'])['state'],
             'core_status': self.rows()[0]['status']}), flush=True)
         self.assertEqual(remote_kinds[-1], 'response', 'Late interim must restore the completed session')
+
+    async def start_live_for_delivery(self):
+        from gateway.session_authority import SessionAuthority
+        started, release = asyncio.Event(), asyncio.Event()
+        self.addCleanup(release.set)
+        async def model(event):
+            started.set()
+            await release.wait()
+            return None
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        await self.deliver("live-input", "Keep working until released.")
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: self.inbox_row("live-input")[2] == "imported")
+        await self.until(lambda: bool(self.receipts))
+
+    async def test_definitively_rejected_rate_limit_retries_the_exact_question(self):
+        from tools import clarify_gateway as clarify
+        await self.start_live_for_delivery()
+        key = self.adapter._core_session_keys(self.receipts[0][0].source)[0]
+        self.addCleanup(clarify.clear_session, key)
+        original = self.bridge.api.transport
+        for limited in ("http", "graphql"):
+            with self.subTest(limited=limited):
+                identity = "limited-question-" + limited
+                clarify.register(clarify_id=identity, session_key=key,
+                                 question="Which environment?", choices=["staging"])
+                creates, reads = [], []
+                def transport(url, body, headers):
+                    request = json.loads(body)
+                    if "agentActivityCreate" in request["query"]:
+                        creates.append(request["variables"]["input"])
+                        if len(creates) == 1:
+                            if limited == "http":
+                                return 429, {"Retry-After": "1"}, b"{}"
+                            return 200, {}, json.dumps({"errors": [{"message": "rate limited",
+                                "extensions": {"code": "RATELIMITED"}}]}).encode()
+                    if "query OutboundAgentActivity" in request["query"]:
+                        reads.append(request["variables"]["id"])
+                    return original(url, body, headers)
+                self.bridge.api.transport = transport
+                result = await self.adapter.send_clarify(self.ISSUE, "Which environment?", ["staging"],
+                    identity, key, metadata={"thread_id": self.SESSION})
+                question = result.message_id
+                self.assertTrue(question)
+                started = self.bridge.store.outbox_row(question)["payload"]["write_started"]
+                self.bridge.api.paused_until = 0
+                self.bridge.store.defer(question, self.bridge.clock() - 1)
+                await asyncio.to_thread(self.bridge.flush, only_id=question)
+                self.assertIs(started, False)
+                self.assertEqual(self.bridge.store.outbox_row(question)["state"], "sent")
+                self.assertEqual(len(creates), 2)
+                self.assertEqual(creates[0], creates[1])
+                self.assertEqual(reads, [])
+
+    def legacy_response(self, identity="c5cf9a31-7480-4667-bfff-81db6ea4703c"):
+        # Exact pre-PR queue_reply shape: no source, final, cursor or attempt metadata.
+        self.event("older-input", "Previous task.")
+        legacy = {"id": identity, "issue_id": self.ISSUE, "session_id": self.SESSION,
+            "content": {"type": "response", "body": "Previous task finished."},
+            "content_action": True, "unlinked_content": True, "native_reply_version": 1,
+            "requester_sessions": {self.ISSUE: self.SESSION},
+            "requester_activities": {self.ISSUE: "older-input"}}
+        return self.bridge.store.enqueue("activity", legacy, at=self.bridge.clock())
+
+    async def test_pre_upgrade_response_cannot_finish_new_running_turn(self):
+        identity = self.legacy_response()
+        await self.start_live_for_delivery()
+        before = len(self.provider.mutations)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        row = self.bridge.store.outbox_row(identity)
+        self.assertEqual(len(self.provider.mutations), before)
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["payload"]["content"], {"type": "response", "body": "Previous task finished."})
+
+    async def test_accepted_pre_upgrade_response_is_settled_and_repairs_current_work(self):
+        identity = self.legacy_response()
+        original = self.bridge.store.outbox_row(identity)
+        def land():
+            with self.bridge._outbox_requester_scope(original):
+                self.bridge.api.create_activity(identity, self.SESSION, original["payload"]["content"],
+                                                issue_id=self.ISSUE)
+        await asyncio.to_thread(land)
+        await self.start_live_for_delivery()
+        before = len(self.provider.mutations)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        settled = self.bridge.store.outbox_row(identity)
+        self.assertEqual(settled["state"], "sent")
+        self.assertEqual(settled["payload"]["content"], original["payload"]["content"])
+        self.assertEqual(settled["payload"]["requester_activities"], original["payload"]["requester_activities"])
+        self.assertEqual(len(self.provider.mutations), before + 1)
+        with self.bridge.store._tx() as db:
+            repair = json.loads(db.execute("SELECT payload FROM outbox WHERE "
+                "json_extract(payload,'$.lifecycle_repair_of')=?", (identity,)).fetchone()[0])
+        self.assertEqual(repair["content"]["type"], "thought")
+        self.assertNotEqual(repair["id"], identity)
+        await asyncio.to_thread(self.bridge.flush, only_id=identity)
+        self.assertEqual(len(self.provider.mutations), before + 1)

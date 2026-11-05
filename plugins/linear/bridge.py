@@ -4192,8 +4192,11 @@ class Bridge:
                                  and payload["content"]["type"] in ("thought", "elicitation"))
             if interim_reply and payload.get("write_started") is not False:
                 raise ProjectUpdateDeferred  # Another sender already attempted this immutable interim.
-            if interim_reply and self._conversation_interim_finished(payload):
-                raise LinearError("Linear session already has its final reply", retryable=False)
+            if interim_reply:
+                if self._conversation_interim_finished(payload):
+                    raise LinearError("Linear session already has its final reply", retryable=False)
+                with self._question_publication_guard(payload):
+                    pass
             if expected_content is not None and payload.get("content") != expected_content:
                 raise ProjectUpdateDeferred  # Another sender changed the encoded request's projection.
             if final_reply and self._conversation_final_type(payload) != payload["content"]["type"]:
@@ -4224,7 +4227,16 @@ class Bridge:
                     # Still before guard yield: this request has made no HTTP call.
                     self.store.reject_native_message_before_transport(row_id, started_before=prior_started["value"])
                     raise ProjectUpdateDeferred
-            yield
+            entered_transport = False
+            try:
+                with self._question_publication_guard(payload) if interim_reply else nullcontext():
+                    if interim_reply and self._conversation_interim_finished(payload):
+                        raise LinearError("Linear session already has its final reply", retryable=False)
+                    entered_transport = True
+                    yield
+            finally:
+                if interim_reply and not entered_transport and prior_started.get("value") is False:
+                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
         if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
             guard.rejected = lambda: self.store.project_not_applied(
                 row_id, known_rejection=True, started_before=prior_started.get("value"))
@@ -4285,6 +4297,8 @@ class Bridge:
             raise LinearError("Native conversation state is unavailable")
         projected = self.store.conversation_final_projection(payload, native_work_live=live,
                                                              core_latest_activity=latest)
+        if projected == "response" and payload["content"]["type"] == "error":
+            projected = "error"  # Preserve a legacy final error's immutable completion semantics.
         return (projected or "response") if payload.get("lifecycle_repair_of") else projected
 
     @staticmethod
@@ -4313,8 +4327,23 @@ class Bridge:
         self.flush(only_id=queued)  # Same outbox authorization, admission guards and retry path.
 
     def _conversation_interim_finished(self, payload: dict) -> bool:
-        return self.store.conversation_finished(payload["issue_id"], payload["session_id"],
-            payload.get("turn_activity", payload.get("source_activity", "")), payload.get("source_cursor", 0))
+        if self.store.conversation_finished(payload["issue_id"], payload["session_id"],
+                payload.get("turn_activity", payload.get("source_activity", "")), payload.get("source_cursor", 0)):
+            return True
+        read = getattr(self, "native_conversation_state", None)
+        if callable(read):
+            state = read(payload)
+            if state.get("turn_live") is None:
+                raise LinearError("The interim's owning Core admission could not be verified")
+            return state["turn_live"] is False
+        if callable(self.native_ingress):
+            raise LinearError("Native conversation state is unavailable")
+        return False
+
+    @staticmethod
+    def _question_publication_guard(payload):
+        from .native_input import question_publication_guard
+        return question_publication_guard(payload)
 
     def _prepare_conversation_interim(self, row: dict[str, Any]) -> bool | None:
         """An attempted interim is readback-only, even if the remote create has not appeared yet."""
@@ -4364,6 +4393,14 @@ class Bridge:
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
+        if self.store.conversation_reply(row["kind"], row["payload"]):
+            try:
+                current = self.store.normalize_conversation_reply(row["id"])
+            except ValueError as exc:
+                raise LinearError("Legacy conversation reply needs requester reconciliation", retryable=False) from exc
+            if current is None or current["state"] != "pending":
+                raise ProjectUpdateDeferred
+            row.update(current)
         payload, kind = row["payload"], row["kind"]
         if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")):
             settled = self._prepare_conversation_final(row)
@@ -4378,6 +4415,8 @@ class Bridge:
             payload = row["payload"]
             if self._conversation_interim_finished(payload):
                 raise LinearError("Linear session already has its final reply", retryable=False)
+            with self._question_publication_guard(payload):
+                pass
         attempted_progress = ((payload.get("native_progress") is True or payload.get("native_history") is True) and
                               (payload.get("write_started") is not False or row["attempts"]))
         if payload.get("claim") or payload.get("admission_id"):

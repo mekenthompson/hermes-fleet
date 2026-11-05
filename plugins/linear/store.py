@@ -134,6 +134,34 @@ class Store:
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
                 and content.get("type") in ("response", "error", "thought", "elicitation")
                 and isinstance(content.get("body"), str))
+    def normalize_conversation_reply(self, row_id: str) -> dict | None:
+        """Recover old reply coordinates without changing its identity, content or attempt history."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            if not row or row["state"] != "pending" or not self.conversation_reply(row["kind"], row["payload"]):
+                return row
+            payload = row["payload"]
+            source = payload.get("source_activity")
+            if source is None:
+                activities = payload.get("requester_activities")
+                if activities is not None:
+                    if not isinstance(activities, dict) or set(activities) != {payload["issue_id"]}:
+                        raise ValueError("legacy reply requester activity is ambiguous")
+                    source = activities[payload["issue_id"]]
+                else:
+                    source = payload["session_id"]  # The original created-session requester scope.
+            if not isinstance(source, str) or not source or source != source.strip():
+                raise ValueError("legacy reply source is unavailable")
+            updated = {"source_activity": source, "turn_activity": payload.get("turn_activity", source),
+                       "source_cursor": payload.get("source_cursor", 0)}
+            if payload["content"]["type"] in ("response", "error"):
+                updated["turn_final"] = True  # These kinds finish Linear regardless of the old marker.
+            if any(payload.get(key) != value for key, value in updated.items()):
+                payload = {**payload, **updated}
+                db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), row_id))
+                row["payload"] = payload
+            return row
+
     def conversation_cursor(self, issue_id: str, session_id: str) -> int:
         """Outbox boundary when a new verified provider input is admitted."""
         with self._tx() as db:
@@ -243,10 +271,17 @@ class Store:
                        "WHERE id=? AND state='pending' AND json_extract(payload,'$.native_reply_version')=1 "
                        "AND json_extract(payload,'$.conversation_attempt_id')=?", (row_id, attempt_id))
 
+    def record_question_answer(self, question_id: str, activity_id: str, actor_id: str) -> None:
+        """Keep the successful human decision on its existing displayed question receipt."""
+        with self._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.answered_by',?,'$.answer_actor',?) "
+                "WHERE id=? AND kind='activity' AND json_type(payload,'$.native_prompt')='object' "
+                "AND json_type(payload,'$.answered_by') IS NULL", (activity_id, actor_id, question_id))
+
     def conversation_questions(self, issue_id: str, session_id: str) -> list[dict]:
         """Published or delivery-uncertain questions retain their exact Core prompt identity."""
         with self._tx() as db:
-            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND state IN ('pending','sent') "
+            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity' "
                 "AND json_extract(payload,'$.native_reply_version')=1 "
                 "AND json_extract(payload,'$.content.type')='elicitation' "
                 "AND json_extract(payload,'$.issue_id')=? AND json_extract(payload,'$.session_id')=? "

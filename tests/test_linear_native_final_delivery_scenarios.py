@@ -320,11 +320,18 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.posted[-1]["content"]["type"], "response")
 
     def queue_interim(self, kind="thought"):
+        prompt = None
+        if kind == "elicitation":
+            from tools import clarify_gateway as clarify
+            key = self.adapter._core_session_keys(self.messages[0].source)[0]
+            clarify.register(clarify_id="probe", session_key=key, question="Which environment?",
+                             choices=["staging", "production"])
+            self.addCleanup(clarify.clear_session, key)
+            prompt = {"kind": "clarify", "clarify_id": "probe", "session_key": key,
+                      "question": "Which environment?", "choices": ["staging", "production"], "multi_select": False}
         return self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
             "An interim update." if kind == "thought" else "Which environment?", kind=kind,
-            nonce="interim-probe", one_try=kind == "thought",
-            native_prompt={"kind": "clarify", "clarify_id": "probe", "session_key": "probe"}
-                          if kind == "elicitation" else None,
+            nonce="interim-probe", one_try=kind == "thought", native_prompt=prompt,
             signal="select" if kind == "elicitation" else None,
             signal_metadata={"options": [{"value": "staging"}, {"value": "production"}]}
                             if kind == "elicitation" else None)
@@ -435,3 +442,62 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
                 await self.flush(final)
                 self.assertEqual(self.store.outbox_row(final)["state"], "sent")
                 self.assertEqual(self.posted[-1]["content"], payload["content"])
+
+    async def test_rate_limit_does_not_clear_an_earlier_unknown_final_attempt(self):
+        await self.start_turn()
+        final = self.queue_final(native.ACTIVITY)
+        self.absent.add(final)
+        await self.flush(final)
+        self.assertTrue(self.store.outbox_row(final)["payload"]["write_started"])
+        original = self.bridge.api.transport
+        def transport(url, body, headers):
+            if "agentActivityCreate" in json.loads(body)["query"]:
+                return 429, {"Retry-After": "1"}, b"{}"
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        self.make_due(final)
+        await self.flush(final)
+        self.assertTrue(self.store.outbox_row(final)["payload"]["write_started"])
+        self.assertEqual(self.store.outbox_row(final)["state"], "pending")
+
+    async def test_partial_rate_limit_response_preserves_question_uncertainty(self):
+        await self.start_turn()
+        question = self.queue_interim("elicitation")
+        original = self.bridge.api.transport
+        creates = []
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if "agentActivityCreate" in request["query"]:
+                creates.append(request["variables"]["input"])
+                return 200, {}, json.dumps({"data": {"agentActivityCreate": {"success": True}},
+                    "errors": [{"message": "partial rate limit", "extensions": {"code": "RATELIMITED"}}]}).encode()
+            return original(url, body, headers)
+        self.bridge.api.transport = transport
+        await self.flush(question)
+        self.assertTrue(self.store.outbox_row(question)["payload"]["write_started"])
+        self.bridge.api.paused_until = 0
+        self.make_due(question)
+        await self.flush(question)
+        self.assertEqual(len(creates), 1)
+        self.assertTrue(self.store.outbox_row(question)["payload"]["write_started"])
+        self.assertEqual(self.store.outbox_row(question)["state"], "pending")
+
+    async def test_legacy_error_readback_preserves_immutable_error_content(self):
+        await self.start_turn()
+        final = self.queue_final(native.ACTIVITY, "The earlier request failed.")
+        payload = self.store.outbox_row(final)["payload"]
+        payload.pop("turn_final")
+        payload.pop("write_started")
+        payload.pop("source_activity")
+        payload.pop("turn_activity")
+        payload.pop("source_cursor")
+        payload["content"]["type"] = "error"
+        self.store.rewrite(final, payload, self.bridge.clock())
+        self.remote[final] = {"id": final, "user": {"id": native.VIEWER},
+            "agentSession": {"id": native.SESSION},
+            "content": {"__typename": "AgentActivityErrorContent", "body": payload["content"]["body"]}}
+        before = len(self.posted)
+        await self.flush(final)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(final)["state"], "sent")
+        self.assertEqual(self.store.outbox_row(final)["payload"]["content"], payload["content"])

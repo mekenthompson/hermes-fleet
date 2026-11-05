@@ -533,6 +533,13 @@ class LinearAPI:
             codes = [e["extensions"].get("code") for e in errors or []
                      if isinstance(e, dict) and isinstance(e.get("extensions"), dict)]
             if status == 429 or "RATELIMITED" in codes:
+                rejected = getattr(guard, "rejected", None) if guard is not None else None
+                no_effect_data = not (isinstance(payload, dict) and payload.get("data"))
+                definite = no_effect_data and (status == 429 or (
+                    isinstance(errors, list) and len(codes) == len(errors) and
+                    all(code == "RATELIMITED" for code in codes)))
+                if definite and callable(rejected):
+                    rejected()  # Release only this rejected attempt, never an earlier unknown send.
                 raise RateLimited(self._pause(response_headers))
             self._pause(response_headers, limited=False)
             if status == 401:
@@ -768,7 +775,8 @@ class LinearAPI:
             raise LinearError("Outbound activity session changed its issue", retryable=False)
         query = ("query OutboundAgentActivity($id: String!) { agentActivity(id: $id) { id user { id } "
                  "agentSession { id } content { __typename ... on AgentActivityResponseContent { body } "
-                 "... on AgentActivityThoughtContent { body } ... on AgentActivityElicitationContent { body } } } }")
+                 "... on AgentActivityThoughtContent { body } ... on AgentActivityElicitationContent { body } "
+                 "... on AgentActivityErrorContent { body } } } }")
         try:
             with self.expected_missing():
                 data = self.graphql(query, {"id": activity_id})
@@ -790,12 +798,13 @@ class LinearAPI:
             raise LinearError("Outbound activity identity does not match this app and session", retryable=False)
         content = activity.get("content") or {}
         kind = {"AgentActivityResponseContent": "response", "AgentActivityThoughtContent": "thought",
-                "AgentActivityElicitationContent": "elicitation"}.get(content.get("__typename"))
+                "AgentActivityElicitationContent": "elicitation", "AgentActivityErrorContent": "error"}.get(content.get("__typename"))
         if kind is None or not isinstance(content.get("body"), str):
             raise LinearError("Outbound conversation content could not be verified", retryable=False)
         return {"type": kind, "body": content["body"]}
 
-    def question_precedes_answer(self, question_id: str, answer_id: str, session_id: str, actor_id: str) -> bool:
+    def question_precedes_answer(self, question_id: str, answer_id: str, session_id: str, actor_id: str, *,
+                                 question_actor_id: str | None = None) -> bool:
         """Compare the provider's immutable creation times for these exact two activities."""
         from datetime import datetime
         self.agent_session(session_id)
@@ -805,7 +814,8 @@ class LinearAPI:
             " answer: agentActivity(id: $answer) " + fields + " }",
             {"question": question_id, "answer": answer_id})
         stamps = []
-        for label, identity, actor in (("question", question_id, self.viewer_id()), ("answer", answer_id, actor_id)):
+        for label, identity, actor in (("question", question_id, question_actor_id or self.viewer_id()),
+                                       ("answer", answer_id, actor_id)):
             activity = data.get(label)
             if (not isinstance(activity, dict) or activity.get("id") != identity or
                     (activity.get("user") or {}).get("id") != actor or
