@@ -847,6 +847,28 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         task_id = self.fixture_task()
         question = "@agent is the rollout finished, or is anything still waiting?"
         seen = []
+        completion_started, replay_receipt_started, completion_finished = (asyncio.Event() for _ in range(3))
+        admitted, completed = self.adapter.on_message_admitted, self.adapter.on_processing_complete
+        receipt_count = 0
+        async def overlap_receipt(event, receipt):
+            nonlocal receipt_count
+            receipt_count += 1
+            if receipt_count == 2:
+                replay_receipt_started.set()
+                await completion_finished.wait()
+            await admitted(event, receipt)
+        async def overlap_completion(event, outcome):
+            if not completion_started.is_set():
+                completion_started.set()
+                await replay_receipt_started.wait()
+                try:
+                    await completed(event, outcome)
+                finally:
+                    completion_finished.set()
+            else:
+                await completed(event, outcome)
+        self.adapter.on_message_admitted = overlap_receipt
+        self.adapter.on_processing_complete = overlap_completion
         async def answer(event):
             # The acknowledgment is already visible in Linear before any model turn.
             seen.append((event.text, event.channel_context, [query for query in self.provider.mutations
@@ -877,8 +899,23 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: activity_creates() == 2)
         activities = activity_creates()
         # A redelivered mention neither posts a second acknowledgment nor starts a second model turn.
+        await self.until(completion_started.is_set)
         await self.deliver_raw("human-mention-redelivery", event)
-        await self.until(lambda: self.inbox_row("human-mention-redelivery")[2] == "imported")
+        await self.until(completion_finished.is_set)
+        delivery_key = ("default", "provider-fixture", "human-mention-redelivery")
+        await self.until(lambda: delivery_key in self.adapter._failed and
+                         self.adapter._submitted[delivery_key].done())
+        self.assertEqual(self.inbox_row("human-mention-redelivery")[2], "pending")
+        # Original completion can overlap a replay's committed callback. The finite
+        # host must run the real reporting retry loop, as the service does, before
+        # demanding its inbox ACK; sleeping cannot drive that recovery.
+        retry_at = self.bridge.clock() + 3600
+        self.bridge.clock = lambda: retry_at  # Advance beyond the reporting retry backoff.
+        async with asyncio.timeout(10):
+            while self.inbox_row("human-mention-redelivery")[2] != "imported":
+                await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database)
+                await asyncio.sleep(0.01)
+        self.assertEqual(len(self.rows()), 1)
         await asyncio.to_thread(self.bridge.flush)
         self.assertEqual(activity_creates(), activities)
         self.assertEqual(len(seen), 1)
