@@ -623,6 +623,21 @@ def _same_work_notice(status: str | None, from_chat: bool, recorded: bool = Fals
         return ("This is the work already started from chat, so nothing new was started. Updates are "
                 "posted on this issue and in that chat.")
     return "This work was set up from chat and is waiting to start, so nothing new was started."
+def _adopted_session_notice(status: str | None, source: str) -> str:
+    """The thought on an Agent Session that now reports work already running (never a response)."""
+    where = {"chat": ", continued from chat", "takeover": ", taken over from another agent"}.get(source, "")
+    if status == "running":
+        state = "The agent is working on it now"
+    elif status == "ready":
+        state = "It is queued for the next free worker"
+    elif status == "review":
+        state = "It is waiting for review"
+    elif status in ("blocked", "triage"):
+        state = "It is paused and continues when it is resumed"
+    else:
+        state = "It is waiting to start"
+    lead = "running" if status in ("running", "ready", "review") else "set up"
+    return f"This is the work already {lead} on this issue{where}, so nothing new was started. {state}; updates appear here."
 STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
 UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
                     "board.")
@@ -746,18 +761,6 @@ def acceptance_expired(url: str, classification: str) -> str:
     reason = _WAITING_REASON.get(classification, _WAITING_REASON["infra"])
     return (f"The work is finished, but its pull request's checks could not be confirmed within 7 days ({url}): "
             f"{reason}. The agent has stopped checking. Confirm the checks, then complete the work again.")
-def relayed_notify_sub(sub: dict) -> bool:
-    """A passive ``linear`` subscription with no Agent Session to reply in.
-
-    The Linear adapter's send() refuses these on every attempt, so core's
-    notifier holds them forever; the bridge relays the same task events itself.
-    Session-bound Linear subscriptions are left alone.
-    """
-    metadata = sub.get("delivery_metadata") or {}
-    return (str(sub.get("platform") or "").lower() == "linear"
-            and (sub.get("delivery_mode") or "notify") == "notify"
-            and not sub.get("thread_id")
-            and not (isinstance(metadata, dict) and metadata.get("thread_id")))
 def iso_ms(raw: Any) -> float:
     try:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000
@@ -927,24 +930,6 @@ class Kanban:
         with self.conn():
             if issue is not None:
                 require_task_issue_scope(self.require_task(task_id), issue)
-    def retire_relayed_notify_subs(self) -> list[tuple[str, str]]:
-        """Remove the thread-less Linear notify subscriptions earlier releases created.
-
-        Returns (task id, issue id) for each removed row. Only rows the Linear
-        adapter refuses on every attempt qualify (see ``relayed_notify_sub``);
-        nothing they would deliver is lost, because the bridge already reports
-        those events. Child tasks inherited the same rows, so they go too.
-        """
-        if getattr(self, "history_only", False):
-            return []
-        removed = []
-        with self.conn() as conn:
-            for sub in self.kn.list_notify_subs(conn):
-                if relayed_notify_sub(sub) and self.kn.remove_notify_sub(
-                        conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-                        thread_id=sub.get("thread_id") or ""):
-                    removed.append((sub["task_id"], sub["chat_id"]))
-        return removed
     def subscribe_origin(self, task_id: str, route: dict) -> None:
         """Native notify subscription for the chat that asked; core's notifier delivers to it."""
         with self.conn() as conn:
@@ -1258,7 +1243,6 @@ class Bridge:
         self._rechecked_at: dict[str, float] = {}
         self._pump_authorized: dict[str, float] = {}  # issue id -> when its cached specialist-scope proof expires
         self._last_unbound_sweep = 0.0
-        self._notify_subs_retired: set[str] = set()  # boards swept of relayed Linear notify subs
         self.native_ingress = None
         # (issue id, Agent Session id) of a delegation admission in progress -> _decline answered it.
         self.session_notices: dict[tuple[str, str], bool] = {}
@@ -1676,7 +1660,8 @@ class Bridge:
                     created = (self.store.native_intent(f"create:{issue['id']}") or {}).get("payload") or {}
                     notice = _same_work_notice(task.get("status"), created.get("origin") == "chat",
                                                created.get("record_done") is True)
-                    self._decline(issue["id"], session_id, notice, activity_id=session_id)
+                    if self._same_work_session(issue["id"], session_id, row, task, notice):
+                        return True
                 return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
             task = self.native_status(issue["id"])
             if task.get("reconciliation_required"):
@@ -1685,9 +1670,38 @@ class Bridge:
             if row.get("owner_ref") == session_id:
                 # A redelivery of the session this work is already linked to: it was answered the first time.
                 return diag.evt("session.reuse", "applied", "same_session", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
-            self._decline(issue["id"], session_id, _existing_work_notice(task.get("status")), activity_id=session_id)
+            if self._same_work_session(issue["id"], session_id, row, task, _existing_work_notice(task.get("status"))):
+                return True
             return diag.decision("session.start", diag.because("existing_binding", True, "refused"), iss=issue["id"], sess=session_id, task=row.get("task_id"))  # The original durable binding was verified; do not resume it.
         return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt), iss=issue["id"], sess=session_id)
+    def _same_work_session(self, issue_id: str, session_id: str, row: dict, task: dict, notice: str) -> bool:
+        """Answer a new Agent Session on work this profile already holds; True when it now reports there.
+
+        Linear opens one when this app becomes delegate of work bound with no session (started
+        from chat, take_over or a track link), and a ``response`` would close it at once (HF-630).
+        Live work adopts it instead: progress, heartbeats and the keepalive go to this session as
+        activities and Done is its only response. A session the work already reports to is never
+        taken over while it may still be open, so that case only gets a thought. Finished work,
+        record_done and specialist ``agent_session`` scope (whose owner session authorizes
+        effects) keep the plain response.
+        """
+        created = (self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}
+        live = (task.get("linked") and not task.get("reconciliation_required") and
+                task.get("status") not in ("done", "archived") and not created.get("record_done"))
+        if not live or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+            self._decline(issue_id, session_id, notice, activity_id=session_id)
+            return False
+        owner = row.get("owner_ref") or ""
+        if ((not owner or self.store.session_answered(issue_id, owner)) and
+                self.store.adopt_session(issue_id, row["task_id"], session_id, expected_owner=owner)):
+            source = ("takeover" if created.get("takeover_from") else "chat") if created.get("origin") == "chat" else ""
+            self._decline(issue_id, session_id, _adopted_session_notice(task.get("status"), source),
+                          activity_id=session_id, kind="thought")
+            diag.evt("session.reuse", "applied", "session_adopted", iss=issue_id, sess=session_id, task=row.get("task_id"))
+            return True
+        self._decline(issue_id, session_id, notice, activity_id=session_id, kind="thought")
+        diag.evt("session.reuse", "skipped", "owner_session_live", iss=issue_id, sess=session_id, task=row.get("task_id"))
+        return False
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
@@ -1703,18 +1717,19 @@ class Bridge:
         result = self.followup(issue["id"], body, marker, requester_session=session_id, source_ms=event_ms(event))
         self._decline(issue["id"], session_id, _followup_notice(result))
 
-    def _decline(self, issue_id: str, session_id: str, body: str, *, activity_id: str = "") -> None:
+    def _decline(self, issue_id: str, session_id: str, body: str, *, activity_id: str = "", kind: str = "response") -> None:
         """Answer a session we will not act on, so Linear shows why instead of an unresponsive agent.
 
-        With the triggering activity id the reply has a stable client id: a retried delivery (an
-        unconfirmed Stop is retried for hours) posts each distinct answer once, never per retry."""
+        A ``thought`` answers without closing the session. With the triggering activity id the reply
+        has a stable client id: a retried delivery (an unconfirmed Stop is retried for hours) posts
+        each distinct answer once, never per retry."""
         if self.authorize_specialist_effect(issue_id):
             if (issue_id, session_id) in self.session_notices:
                 self.session_notices[(issue_id, session_id)] = True
             stable = {"id": stable_uuid4("decline", issue_id, session_id, activity_id, body)} if activity_id else {}
             self.store.enqueue("activity", {**stable, "issue_id": issue_id, "session_id": session_id, "one_try": True,
                                "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
-                               "content": {"type": "response", "body": _plain_notice(body)}}, at=self.clock())
+                               "content": {"type": kind, "body": _plain_notice(body)}}, at=self.clock())
     SESSION_TURN_TTL = 15 * 60  # seconds: a lost turn-end callback never pins In Progress
     def session_turn(self, issue_id: str, active: bool) -> None:
         """A Linear session turn on admitted delegated work started or ended (native_input).
@@ -3973,36 +3988,8 @@ class Bridge:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
             self.drain_ingress(ingress, retry_now=True)
-        self._retire_relayed_notify_subs()
         self._recover_admissions()
         self.pump_kanban()
-
-    def _retire_relayed_notify_subs(self) -> None:
-        """Drop the undeliverable Linear notify subscriptions earlier releases created.
-
-        Each board is swept once per process; a failed sweep waits (15 s doubling
-        to 1 h, persisted) and retries on a later tick. One INFO line per removed row.
-        """
-        if not callable(getattr(self.kanban, "retire_relayed_notify_subs", None)):
-            return  # Not the native Kanban adapter: there are no core subscriptions to retire.
-        retired = self._notify_subs_retired
-        home = getattr(self.kanban, "board", None) or "default"
-        for board in sorted({home, *self.store.native_boards()} - retired):
-            backoff = f"retire_notify_subs:{board}"
-            if not self.store.backoff_ready(backoff, self.clock()):
-                continue
-            try:
-                adapter = self.kanban if board == home else self.kanban.for_board(board)
-                removed = adapter.retire_relayed_notify_subs()
-            except Exception as exc:  # Reporting is unaffected; core keeps retrying until this succeeds.
-                until = self.store.backoff_fail(backoff, self.clock())
-                diag.warn("notify.retire", "held", diag.exc_reason(exc), exc=type(exc).__name__,
-                          next_s=until - self.clock())
-                continue
-            self.store.backoff_clear(backoff)
-            retired.add(board)
-            for task_id, issue_id in removed:
-                diag.evt("notify.retire", "applied", "bridge_relayed", iss=issue_id, task=task_id)
 
     def _recover_admissions(self) -> None:
         """Use the existing service loop; one unavailable binding holds only itself."""
@@ -4582,7 +4569,6 @@ class Bridge:
         try:
             if ingress is not None:
                 self.drain_ingress(ingress)
-            self._retire_relayed_notify_subs()
             self._recover_admissions()
             self.pump_kanban()
             self.recheck()
