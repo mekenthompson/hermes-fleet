@@ -49,8 +49,8 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         with self.board.conn() as db:
             return getattr(self.board.kb, action)(db, *args, **kwargs)
 
-    def ticks(self, count=3):
-        self.fixture.fixture.clock.now = time.time() + 2  # Linear reads after the native facts
+    def ticks(self, count=3, *, after=2):
+        self.fixture.fixture.clock.now = time.time() + after  # Linear reads after the native facts
         for _ in range(count):
             self.bridge.pump_kanban()
             self.bridge.flush()
@@ -60,6 +60,22 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
 
     def mutations(self):
         return self.fixture.mutations()
+
+    def admitted_by_delegation(self, *, turn):
+        """A person delegates the issue: our own admission unblocks one task that awaits its first claim."""
+        if turn:
+            self.bridge.session_turn("issue-1", True)  # the Linear session turn starts as work_on routes it
+        self.assertTrue(self.bridge.handle_webhook(self.fixture.human_assignment()))
+        task = self.bridge.store.native_binding("issue-1")["task_id"]
+        self.assertEqual(self.board.get(task).status, "ready")
+        self.assertEqual([e.kind for e in self.board.history(task, 0)][-1], "unblocked")
+        return task
+
+    def written_states(self):
+        """Every state this app wrote to Linear, in order."""
+        names = {state["id"]: state["name"] for state in self.states}
+        return [names[entry["toStateId"]] for entry in self.remote.history.get("issue-1", [])
+                if entry["actorId"] == SELF and entry["fromStateId"] != entry["toStateId"]]
 
     def failed(self):
         with self.bridge.store._tx() as db:
@@ -82,6 +98,51 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         self.ticks()
         self.assertEqual(self.state(), "Todo")  # was In Progress before this change
         self.assertNotIn("In Progress", [self.remote.state("issue-1")])
+
+    def test_own_admission_waiting_for_its_first_claim_never_flickers_to_todo(self):
+        # HF-629: route + session turn + unblock, turn ends, the 60 s dispatcher claims later.
+        # Linear went Backlog -> In Progress -> Todo -> In Progress within 40 s.
+        task = self.admitted_by_delegation(turn=True)
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")  # the session turn is on it
+        self.bridge.session_turn("issue-1", False)  # the turn ends before the dispatcher's tick
+        self.ticks(after=20)
+        self.assertEqual(self.state(), "In Progress")
+        self.ticks(after=45)
+        self.assertEqual(self.state(), "In Progress")
+        self.native("claim_task", task, claimer="native-worker")
+        self.ticks(after=50)
+        self.assertEqual(self.state(), "In Progress")
+        self.assertEqual(self.written_states(), ["In Progress"])  # never Todo in between
+        self.assertEqual(self.failed(), [])
+
+    def test_own_admission_never_claimed_falls_back_to_todo_after_the_bound(self):
+        # A stuck dispatcher: In Progress must not be claimed forever.
+        self.admitted_by_delegation(turn=True)
+        self.ticks()
+        self.bridge.session_turn("issue-1", False)
+        self.ticks(after=self.bridge.FIRST_CLAIM_HOLD - 10)
+        self.assertEqual(self.state(), "In Progress")
+        self.ticks(after=self.bridge.FIRST_CLAIM_HOLD + 5)
+        self.assertEqual(self.state(), "Todo")
+        self.assertEqual(self.written_states(), ["In Progress", "Todo"])
+
+    def test_own_admission_never_shown_in_progress_still_shows_todo(self):
+        self.admitted_by_delegation(turn=False)
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+        self.assertNotIn("In Progress", self.written_states())
+
+    def test_own_admission_back_in_ready_after_it_ran_shows_todo(self):
+        # Back in the queue after a run (released, reclaimed): nobody is on it, so Todo as before.
+        task = self.admitted_by_delegation(turn=False)
+        self.native("claim_task", task, claimer="native-worker")
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")
+        self.native("reclaim_task", task, reason="operator released it")
+        self.assertEqual(self.board.get(task).status, "ready")
+        self.ticks(after=10)
+        self.assertEqual(self.state(), "Todo")
 
     def test_running_work_shows_in_progress(self):
         self.task(claim=True)

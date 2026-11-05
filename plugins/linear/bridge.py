@@ -3216,6 +3216,9 @@ class Bridge:
                 turn = state == "todo" and self._session_turn_active(row["issue_id"])
                 if turn:
                     state = "in_progress"  # The agent's Linear session turn is working on it now.
+                elif (state == "todo" and latest.get("state") == "in_progress" and not latest.get("refused")
+                      and self._awaiting_first_claim(row, task, adapter)):
+                    return  # Our own admission, shown In Progress, waits for its first claim: no Todo flicker.
                 if state is None or state == latest.get("state"):
                     return
                 payload = {"state": state, "source_ms": getattr(last, "created_at", self.clock()) * 1000,
@@ -3230,6 +3233,29 @@ class Bridge:
                                                 iss=row["issue_id"], task=row["task_id"], state=payload["state"])
         elif payload["state"] != latest.get("state"):
             raise LinearError("Status reconcile was not queued; retrying later")  # pump backs off
+    # A just-admitted task waits at most one dispatcher tick (kanban.dispatch_interval_seconds, 60 s
+    # default and fleet-wide) for its first claim. Three ticks absorb a slow or skipped tick; past
+    # that the dispatcher is not picking it up, and Linear shows the truth again: Todo.
+    FIRST_CLAIM_HOLD = 3 * 60  # seconds
+    def _awaiting_first_claim(self, row: dict, task, adapter) -> bool:
+        """Ready only because this agent's own admission just unblocked it, never claimed, within the bound.
+
+        Proof is native and durable: this binding's accepted activation intent, whose receipt
+        (the unblock carrying our request id and token) is in history, and no claim or spawn since.
+        A task back in ready after it ran is not this case: it shows Todo as before."""
+        if task.status != "ready":
+            return False
+        activation = self.store.native_intent(f"activate:{row['issue_id']}:{task.id}") or {}
+        token = (activation.get("payload") or {}).get("expected_event_id")
+        if activation.get("state") != "applied" or not activation.get("accepted") or token is None:
+            return False
+        events = adapter.history(task.id, 0)
+        after = [event for event in events if event.id > token]
+        if not adapter.activation_receipt(task.id, token, after):
+            return False
+        if any(event.kind in ("claimed", "spawned") for event in events):
+            return False
+        return self.clock() - after[0].created_at < self.FIRST_CLAIM_HOLD
     def _native_state(self, task, adapter, last) -> str | None:
         """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
         status, payload = task.status, native_event_payload(last) if last else {}
