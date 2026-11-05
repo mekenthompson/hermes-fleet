@@ -16,6 +16,8 @@ import logging
 from pathlib import Path
 import sqlite3
 import threading
+import time
+import uuid
 
 from .api import LinearError, RateLimited
 from .bridge import INTERNAL_ONLY_REPLY, _existing_work_notice, _readable, activation_event_ms, stable_uuid4
@@ -600,7 +602,31 @@ def question_publication_guard(payload):
         raise LinearError("Linear question has no supported Core request", retryable=False)
 
 
-def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, nonce="",
+def step_phrase(text):
+    """Emit only a known Core verb; never copy an argument preview or custom tool name."""
+    from agent.display import build_status_phrase, tool_verb_connector
+    tools = ("web_search", "web_extract", "browser_navigate", "browser_click", "browser_type",
+             "read_file", "write_file", "patch", "search_files", "terminal", "execute_code",
+             "image_generate", "video_generate", "text_to_speech", "vision_analyze", "session_search",
+             "skill_view", "skills_list", "skill_manage", "delegate_task", "cronjob_manage", "clarify",
+             "memory", "todo_list")
+    for tool in tools:
+        brief = build_status_phrase(tool, None)
+        if brief and isinstance(text, str) and (text == brief or
+                text.startswith(brief.removesuffix("…") + tool_verb_connector(tool))):
+            return brief
+    return "Working on your request."
+
+
+def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, **options):
+    if not isinstance(body, str) or not body:
+        raise LinearError("Linear reply needs text", retryable=False)
+    with bridge.api.optional_work() if kind == "action" else nullcontext():
+        return _queue_reply(bridge, issue_id, session_id, message_id,
+                            step_phrase(body) if kind == "action" else body, kind=kind, **options)
+
+
+def _queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, nonce="",
                 signal=None, signal_metadata=None, one_try=False, source_cursor=0,
                 turn_activity=None, native_prompt=None):
     """Queue an independent reply with one immutable remote create identity.
@@ -608,16 +634,16 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
     Native delivery retries reuse this outbox row. Queuing is not publication:
     the adapter must inspect the row after the existing scoped sender runs.
 
-    ``kind`` is set for a mid-turn post (a ``thought`` note or an ``elicitation``
-    question); ``nonce`` then tells apart two posts with the same words. A final
-    reply leaves both unset and keeps the identity it always had.
+    ``kind`` is set for a mid-turn post (a ``thought`` note, ``elicitation``
+    question or ephemeral ``action`` status); ``nonce`` distinguishes posts with the same
+    words. A final reply leaves both unset and keeps the identity it always had.
     """
     issue_id = _identifier(issue_id, "reply issue")
     session_id = _identifier(session_id, "reply Agent Session")
     message_id = _identifier(message_id, "reply source Activity")
     if not isinstance(body, str) or not body:
         raise LinearError("Linear reply needs text", retryable=False)
-    if kind not in (None, "thought", "elicitation"):
+    if kind not in (None, "thought", "elicitation", "action"):
         raise LinearError("Unsupported Linear reply kind", retryable=False)
     raw = body  # The create identity stays the provider's reply, before and after this filter shipped.
     if native_prompt:
@@ -654,7 +680,9 @@ def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, no
         kind = "thought" if live else "response"
     payload = {
         "id": row_id, "issue_id": issue_id, "session_id": session_id,
-        "content": {"type": kind, "body": body},
+        "content": ({"type": "action", "action": "Working", "parameter": body}
+                    if kind == "action" else {"type": kind, "body": body}),
+        **({"ephemeral": True, "expires_at": bridge.clock() + 60} if kind == "action" else {}),
         "content_action": True, "unlinked_content": True, "native_reply_version": 1, "write_started": False,
         "source_activity": message_id, "source_cursor": source_cursor,
         "turn_activity": turn_activity or message_id,
@@ -772,6 +800,7 @@ def create_adapter(config, running):
 
     class LinearAdapter(BasePlatformAdapter):
         requires_durable_input_ack = True
+        supports_status_text = True
 
         def __init__(self):
             super().__init__(config, Platform("linear"))
@@ -787,6 +816,15 @@ def create_adapter(config, running):
             self._input_sequences = {}
             self._answered = set()  # cache of the store's durable consumed-answer reservations
             self._ordinary = set()  # inputs already handed to Core, including admission still in flight
+            self._reply_locks = {}
+            self._step_phrases = {}
+            self._step_tasks = {}
+            self._step_attempts = {}
+            self._step_generation = {}
+            self._step_closed = set()
+            self._step_paused = set()
+            self._observed_approvals = set()
+            self._step_session_keys = {}
 
         async def connect(self, *, is_reconnect=False):
             if not native_supported():
@@ -917,10 +955,14 @@ def create_adapter(config, running):
                         raise LinearError("Native Stop has no committed control receipt")
                     await asyncio.to_thread(_handle_control, running["bridge"], original, projected)
                 else:
-                    anchor = running["bridge"].store.remember_conversation_input(
-                        projected.issue_id, projected.session_id, projected.message_id,
-                        receipt.admission_id, receipt.sequence, receipt.status == "terminal",
-                        self._core_session_keys(event.source))
+                    bridge = running["bridge"]
+                    def remember_input():
+                        with bridge.lock(projected.issue_id):
+                            return bridge.store.remember_conversation_input(
+                                projected.issue_id, projected.session_id, projected.message_id,
+                                receipt.admission_id, receipt.sequence, receipt.status == "terminal",
+                                self._core_session_keys(event.source))
+                    anchor = await asyncio.to_thread(remember_input)
                     self._cache_input(projected.issue_id, projected.session_id, anchor)
                     with self._relay_lock:
                         self._ordinary.add((projected.issue_id, projected.session_id, projected.message_id))
@@ -934,6 +976,7 @@ def create_adapter(config, running):
                     self._submitted.pop(self._delivery_key(delivery), None)
 
         async def on_processing_complete(self, event, outcome):
+            self._close_steps(event.source.chat_id, event.source.thread_id, event.message_id)
             self._end_turn(self._event_key(event))
             self._refused(event)  # No effect once the committed-input hook ACKed.
 
@@ -956,6 +999,9 @@ def create_adapter(config, running):
             key = (chat_id, session_id)
             with self._relay_lock:
                 if anchor["sequence"] >= self._input_sequences.get(key, 0):
+                    if self._inputs.get(key) != anchor["activity_id"]:
+                        self._invalidate_steps(*key)
+                        self._step_paused.discard(key)
                     self._input_sequences[key] = anchor["sequence"]
                     self._inputs[key] = anchor["activity_id"]
                     self._input_cursors[(*key, anchor["activity_id"])] = anchor["cursor"]
@@ -966,6 +1012,30 @@ def create_adapter(config, running):
             if bridge is None:
                 return None
             return self._cache_input(chat_id, session_id, bridge.store.conversation_input(chat_id, session_id))
+
+        def _pause_steps(self, chat_id, session_id, session_key=""):
+            self._step_paused.add((chat_id, session_id))
+            self._invalidate_steps(chat_id, session_id)
+            with self._relay_lock:
+                keys = self._step_session_keys.setdefault((chat_id, session_id), [])
+                bridge = running.get("bridge")
+                anchor = bridge.store.conversation_input(chat_id, session_id) if bridge else None
+                for value in [*((anchor or {}).get("session_keys", [])), session_key]:
+                    if value and value not in keys:
+                        keys.append(value)
+                observed_keys = list(keys)
+            # Core owns settlement and its timeout notice. Observe it without replacing
+            # the renderer's hook, so timeout/withdrawal can resume without a human reply.
+            from tools.approval import list_gateway_approvals, observe_gateway_settle
+            for core_key in observed_keys:
+                for pending in list_gateway_approvals(core_key):
+                    request_id = pending.get("request_id")
+                    observed = (core_key, request_id)
+                    if not request_id or observed in self._observed_approvals:
+                        continue
+                    if observe_gateway_settle(core_key, request_id,
+                            lambda _reason, chat=chat_id: self.resume_typing_for_chat(chat)):
+                        self._observed_approvals.add(observed)
 
         @staticmethod
         def _approval_declined(reason):
@@ -989,6 +1059,7 @@ def create_adapter(config, running):
                           "request_id": prompt.request_id, "choices": prompt.choices}
             words = {"once": "approve", "session": "approve session", "always": "approve always", "deny": "deny"}
             options = [words[choice] for choice in prompt.choices if choice in words]
+            self._pause_steps(prompt.chat_id, session_id, prompt.session_key)
             result = await self._post(bridge, prompt.chat_id, session_id, source, prompt.text,
                 kind="elicitation", question=True, nonce=prompt.request_id, native_prompt=descriptor,
                 signal="select", signal_metadata={"options": [{"value": word} for word in options]})
@@ -1085,6 +1156,7 @@ def create_adapter(config, running):
                 await self._post(bridge, projected.issue_id, projected.session_id, projected.message_id,
                                  confirmation, kind="thought", source_cursor=question.get("source_cursor", 0),
                                  turn_activity=question.get("turn_activity", question["source_activity"]))
+            self.resume_typing_for_chat(projected.issue_id)
             return True
 
         def _pending_questions(self, bridge, projected, event, questions):
@@ -1197,8 +1269,112 @@ def create_adapter(config, running):
                     return True, _approval_confirmation(choice, count, reason), allowed[targets[0]]
             return False, None, None
 
-        async def _post(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False,
-                        source_cursor=None, turn_activity=None, **reply):
+        def resume_typing_for_chat(self, chat_id):
+            """Resume Core's paused refresh only when this chat has no remaining prompt.
+
+            Approval replies bypass Core's slash-command confirmation, which normally
+            resumes typing. Clarify's real renderer calls this again after its waiter
+            retires; until then has_pending conservatively retains the pause.
+            """
+            from tools import clarify_gateway as clarify
+            from tools.approval import has_blocking_approval
+            with self._relay_lock:
+                for key in list(self._step_paused):
+                    if key[0] != chat_id:
+                        continue
+                    keys = self._step_session_keys.get(key, [])
+                    if keys and not any(has_blocking_approval(session_key) or clarify.has_pending(session_key)
+                                        for session_key in keys):
+                        self._step_paused.discard(key)
+                # Core's pause is chat-wide. A different Linear thread may still be waiting.
+                if not any(key[0] == chat_id for key in self._step_paused):
+                    super().resume_typing_for_chat(chat_id)
+
+        def _invalidate_steps(self, chat_id, session_id):
+            key = (chat_id, session_id)
+            self._step_generation[key] = self._step_generation.get(key, 0) + 1
+
+        def _close_steps(self, chat_id, session_id, source):
+            with self._relay_lock:
+                self._step_phrases.pop((chat_id, session_id, source), None)
+            self._step_closed.add((chat_id, session_id, source))
+            self._invalidate_steps(chat_id, session_id)
+
+        def set_status_text(self, chat_id, text):
+            """Keep phrases only with Core's task-local producer identity, never its chat-wide slot."""
+            from gateway import session_context as context
+            bridge = running.get("bridge")
+            # get_session_env falls back to process environment; that cannot prove a producer.
+            platform = context._SESSION_PLATFORM.get(None)
+            chat = context._SESSION_CHAT_ID.get(None)
+            session = context._SESSION_THREAD_ID.get(None)
+            source = context._SESSION_MESSAGE_ID.get(None)
+            scope = context._SESSION_SCOPE_ID.get(None)
+            if (bridge is None or platform != "linear" or chat != chat_id
+                    or scope != bridge.api.identity["organization_id"]
+                    or not isinstance(session, str) or not session
+                    or not isinstance(source, str) or not source):
+                return  # A truthful generic keepalive is available when the callback has no owner.
+            key = (chat_id, session, source)
+            with self._relay_lock:
+                if key in self._step_closed:
+                    return
+                if text:
+                    self._step_phrases[key] = step_phrase(text)
+                else:
+                    self._step_phrases.pop(key, None)
+
+        def status_metadata_for_turn(self, chat_id, anchor, metadata):
+            """Core captures this producer's reply anchor once when its turn starts."""
+            return {**(metadata or {}), "_linear_status_source": anchor}
+
+        async def send_typing(self, chat_id, metadata=None):
+            """Schedule optional status work; Core gives this hook only 1.5 seconds."""
+            session_id = (metadata or {}).get("thread_id")
+            bridge = running.get("bridge")
+            key = (chat_id, session_id)
+            source = (metadata or {}).get("_linear_status_source")
+            with self._relay_lock:
+                current = self._inputs.get(key)
+            if (not self._running or bridge is None or not source or source != current or not session_id
+                    or key in self._step_paused or (*key, source) in self._step_closed
+                    or key in self._step_tasks):
+                return
+            with self._relay_lock:
+                phrase = self._step_phrases.get((*key, source)) or "Working on your request."
+            now = time.monotonic()
+            last = self._step_attempts.get(key)
+            if last and (now - last[0] < 60 or (phrase == last[1] and now - last[0] < 600)):
+                return
+            # Reserve at scheduling time, including failures: a network outage must not turn
+            # Core's two-second typing refresh into API retries. One task per session at a time.
+            self._step_attempts[key] = (now, phrase)
+            generation = self._step_generation.get(key, 0)
+            async def publish():
+                try:
+                    await self._post(bridge, chat_id, session_id, source, phrase, kind="action",
+                                     nonce=uuid.uuid4().hex, step_generation=generation)
+                except Exception:
+                    log.debug("linear: optional live status unavailable", exc_info=True)
+                finally:
+                    self._step_tasks.pop(key, None)
+            task = asyncio.create_task(publish())
+            self._step_tasks[key] = task
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        async def _post(self, bridge, chat_id, session_id, source, content, *, step_generation=None, **reply):
+            key = (chat_id, session_id)
+            # A scheduled action finishes before a later question/final, or is invalidated while
+            # waiting. It cannot arrive after an elicitation and reopen the awaiting-input state.
+            async with self._reply_locks.setdefault(key, asyncio.Lock()):
+                if step_generation is not None and (step_generation != self._step_generation.get(key, 0)
+                        or key in self._step_paused or (*key, source) in self._step_closed):
+                    return SendResult(success=False, error="Linear live status is no longer current")
+                return await self._post_reply(bridge, chat_id, session_id, source, content, **reply)
+
+        async def _post_reply(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False,
+                              source_cursor=None, turn_activity=None, **reply):
             """Queue one reply on the outbox, publish it, and report what Linear has."""
             with self._relay_lock:
                 cursor = (self._input_cursors.get((chat_id, session_id, source), 0)
@@ -1208,7 +1384,7 @@ def create_adapter(config, running):
                         bridge.store.conversation_finished, chat_id, session_id, turn_activity or source, cursor):
                     return SendResult(success=False, error="Linear session already has its final reply")
                 row_id = await asyncio.to_thread(queue_reply, bridge, chat_id, session_id, source, content,
-                                                 kind=kind, one_try=kind == "thought", source_cursor=cursor,
+                                                 kind=kind, one_try=kind in ("thought", "action"), source_cursor=cursor,
                                                  turn_activity=turn_activity, **reply)
                 if not row_id:
                     return SendResult(success=False, error="Linear reply authorization is held")
@@ -1234,6 +1410,7 @@ def create_adapter(config, running):
             bridge = running.get("bridge")
             question = metadata.get("is_approval_prompt") is True
             if bridge is not None and session_id and reply_to and not question and metadata.get("_interim_send") is not True:
+                self._close_steps(chat_id, session_id, reply_to)
                 return await self._post(bridge, chat_id, session_id, reply_to, content)  # The turn's reply.
             source = reply_to or await asyncio.to_thread(self._latest_input, chat_id, session_id)
             if bridge is None or not session_id or not source:
@@ -1269,6 +1446,7 @@ def create_adapter(config, running):
                 mark_awaiting_text(clarify_id)  # Linear lets the person type an answer instead of picking.
             prompt = {"kind": "clarify", "clarify_id": clarify_id, "session_key": session_key,
                       "question": question, "choices": choices, "multi_select": multi}
+            self._pause_steps(chat_id, session_id, session_key)
             return await self._post(bridge, chat_id, session_id, source, body, kind="elicitation",
                                     question=True, nonce=clarify_id, native_prompt=prompt, **reply)
 

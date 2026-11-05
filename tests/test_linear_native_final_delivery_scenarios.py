@@ -44,7 +44,7 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
                     self.remote.setdefault(identity, {"id": identity, "user": {"id": native.VIEWER},
                         "agentSession": {"id": fields["agentSessionId"]},
                         "content": {"__typename": "AgentActivity" + fields["content"]["type"].capitalize() + "Content",
-                                    "body": fields["content"]["body"]}})
+                                    **{key: value for key, value in fields["content"].items() if key != "type"}}})
                 if identity in self.lost or identity in self.absent:
                     raise TimeoutError("fixture lost response")
             return result
@@ -61,6 +61,192 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
 
     def make_due(self, identity):
         self.store.defer(identity, self.bridge.clock() - 1)
+
+    async def test_successful_action_response_after_other_sender_final(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Working on your request.", kind="action", one_try=True)
+        other = self.fixture.make_bridge()
+        other.native_conversation_state = self.bridge.native_conversation_state
+        original = self.bridge.api.transport
+        other.api.transport = original
+        delivered = []
+        once = []
+
+        def receive(url, body, headers):
+            request = json.loads(body)
+            fields = request.get("variables", {}).get("input", {})
+            if "agentActivityCreate" in request["query"]:
+                if fields["id"] == row and not once:
+                    once.append(True)
+                    final = self.native_input.queue_reply(other, native.ISSUE, native.SESSION,
+                        native.ACTIVITY, "All work finished.")
+                    other.flush(only_id=final)
+                    self.assertEqual(other.store.outbox_row(final)["state"], "sent")
+                    delivered.append("response")
+                delivered.append(fields["content"]["type"])
+            return original(url, body, headers)
+
+        self.bridge.api.transport = receive
+        await asyncio.to_thread(self.bridge.flush, only_id=row)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+        print("INDEPENDENT_SUCCESS_RACE", delivered, flush=True)
+        self.assertEqual(delivered[-1], "response", "A successful action crossing final must restore completion")
+
+    async def test_successful_action_response_restores_the_exact_pending_question(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Working on your request.", kind="action", one_try=True)
+        other = self.fixture.make_bridge()
+        other.native_conversation_state = self.bridge.native_conversation_state
+        original = self.bridge.api.transport
+        other.api.transport = original
+        displayed = []
+        def receive(url, body, headers):
+            request = json.loads(body)
+            fields = request.get("variables", {}).get("input", {})
+            if "agentActivityCreate" in request["query"] and fields["id"] == row:
+                question = self.queue_interim("elicitation")
+                other.flush(only_id=question)
+                displayed.append(self.posted[-1])
+            return original(url, body, headers)
+        with patch.object(self.bridge.api, "transport", side_effect=receive):
+            await self.flush(row)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "action", "elicitation"])
+        self.assertEqual(self.posted[-1]["content"], displayed[0]["content"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], displayed[0]["signalMetadata"])
+        self.assertEqual(sum(p["id"] == row for p in self.posted), 1)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+
+    def action_budget(self, remaining):
+        api = self.bridge.api
+        api.budget = {"requests": {"limit": 5000, "remaining": remaining,
+            "reset": api.clock() + 3600, "at": api.clock()}}
+
+    async def late_action_budget_case(self, *, lost=False, defer_repair=False):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Working on your request.", kind="action", one_try=True)
+        initial = self.store.outbox_row(row)["payload"]["content"]
+        if lost:
+            self.lost.add(row)
+        state = {"live": False, "latest_activity": native.ACTIVITY, "turn_live": True}
+        original_transport = self.bridge.api.transport
+        original_enqueue = self.bridge.store.enqueue
+        requests, repairs = [], []
+        def enqueue(kind, payload, **kwargs):
+            identity = original_enqueue(kind, payload, **kwargs)
+            if payload.get("lifecycle_repair_of"):
+                repairs.append(identity)
+                if defer_repair:
+                    self.action_budget(100)
+            return identity
+        def receive(url, body, headers):
+            request = json.loads(body)
+            requests.append(request["query"])
+            fields = request.get("variables", {}).get("input", {})
+            if "agentActivityCreate" in request["query"] and fields["id"] == row:
+                state.update(live=True, latest_activity="newer-input")
+                try:
+                    return original_transport(url, body, headers)
+                finally:
+                    if not defer_repair:
+                        self.action_budget(100)
+            return original_transport(url, body, headers)
+        with patch.object(self.bridge, "native_conversation_state", side_effect=lambda payload: state), \
+                patch.object(self.bridge.api, "transport", side_effect=receive), \
+                patch.object(self.bridge.store, "enqueue", side_effect=enqueue):
+            await self.flush(row)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["action"])
+        self.assertEqual(self.store.outbox_row(row)["payload"]["content"], initial)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent" if repairs else "pending")
+        self.assertIs(self.store.outbox_row(row)["payload"]["write_started"], True)
+        pending = repairs[0] if repairs else row
+        if repairs:
+            self.assertIs(self.store.outbox_row(pending)["payload"]["optional_status_repair"], True)
+        self.make_due(pending)
+        before = len(requests)
+        with patch.object(self.bridge.api, "transport", side_effect=receive):
+            await self.flush(pending)
+        self.assertEqual(len(requests), before, "Deferred optional restoration must not consume reserve")
+        self.action_budget(4000)
+        self.lost.clear()
+        self.make_due(pending)
+        with patch.object(self.bridge, "native_conversation_state", side_effect=lambda payload: state):
+            await self.flush(pending)
+            await self.flush(row)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["action", "thought"])
+        self.assertEqual(sum(p["id"] == row for p in self.posted), 1)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+        self.assertEqual(self.store.outbox_row(row)["payload"]["content"], initial)
+
+    async def test_successful_action_budget_drop_defers_restoration_until_reserve_recovers(self):
+        await self.late_action_budget_case()
+
+    async def test_uncertain_action_budget_drop_stays_readback_only_then_restores_new_work(self):
+        await self.late_action_budget_case(lost=True)
+
+    async def test_deferred_action_repair_retains_optional_budget_on_next_flush(self):
+        await self.late_action_budget_case(defer_repair=True)
+
+    async def test_lost_ephemeral_action_is_read_back_without_reposting(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Checking the result", kind="action", one_try=True)
+        self.lost.add(row)
+        await self.flush(row)
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.store.outbox_row(row)["state"], "pending")
+        self.lost.clear()
+        self.make_due(row)
+        await self.flush(row)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+        self.assertEqual(len(self.posted), 1)
+
+    async def test_new_input_at_action_mutation_admission_prevents_transport(self):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Checking the old request", kind="action", one_try=True)
+        state = {"live": True, "latest_activity": native.ACTIVITY, "turn_live": True}
+        original = self.bridge.store.admit_mutation
+        def admit(identity, **kwargs):
+            result = original(identity, **kwargs)
+            if identity == row:
+                state["latest_activity"] = "new-input-before-ack"
+            return result
+        with patch.object(self.bridge, "native_conversation_state", side_effect=lambda payload: state), \
+                patch.object(self.bridge.store, "admit_mutation", side_effect=admit):
+            await self.flush(row)
+        self.assertEqual(state["latest_activity"], "new-input-before-ack")
+        self.assertEqual(self.posted, [])
+        self.assertIs(self.store.outbox_row(row)["payload"]["write_started"], False)
+
+    async def test_lost_action_readback_restores_the_exact_pending_question(self):
+        from tools import clarify_gateway as clarify
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Checking the result", kind="action", one_try=True)
+        self.lost.add(row)
+        await self.flush(row)
+        key = self.adapter._core_session_keys(self.messages[0].source)[0]
+        self.addCleanup(clarify.clear_session, key)
+        clarify.register(clarify_id="action-readback-question", session_key=key,
+            question="Which environment?", choices=["staging", "production"])
+        question = await self.adapter.send_clarify(native.ISSUE, "Which environment?",
+            ["staging", "production"], "action-readback-question", key,
+            metadata={"thread_id": native.SESSION})
+        self.assertTrue(question.success)
+        displayed = self.posted[-1]
+        self.lost.clear()
+        self.make_due(row)
+        await self.flush(row)
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["action", "elicitation", "elicitation"])
+        restored = self.posted[-1]
+        self.assertEqual(restored["content"], displayed["content"])
+        self.assertEqual(restored["signalMetadata"], displayed["signalMetadata"])
+        self.assertNotEqual(restored["id"], displayed["id"])
+        self.assertFalse(self.store.conversation_finished(native.ISSUE, native.SESSION, native.ACTIVITY))
 
     async def test_final_read_failure_after_admission_retries_without_duplicate(self):
         from hermes_fleet_linear_plugin.api import LinearError
@@ -225,6 +411,43 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             await self.flush(interim)
             self.assertEqual(len([p for p in self.posted if p["content"]["type"] == "response"]), 1)
             self.assertEqual(sum(p["id"] == interim for p in self.posted), 1)
+
+    async def expired_action_at_transport(self, *, after_admission):
+        await self.start_turn()
+        row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION,
+            native.ACTIVITY, "Expiring status", kind="action", one_try=True)
+        expiry = self.store.outbox_row(row)["payload"]["expires_at"]
+        if after_admission:
+            current_time = [self.bridge.clock()]
+            original = self.bridge.store.admit_mutation
+            def delayed(identity, **kwargs):
+                result = original(identity, **kwargs)
+                if identity == row:
+                    current_time[0] = expiry + 1
+                return result
+            with patch.object(self.bridge, "clock", side_effect=lambda: current_time[0]), \
+                    patch.object(self.bridge.store, "admit_mutation", side_effect=delayed):
+                await self.flush(row)
+            self.assertGreater(current_time[0], expiry)
+        else:
+            original = self.bridge._mutate_outbox
+            def delayed(*args, **kwargs):
+                with patch.object(self.bridge, "clock", return_value=expiry + 1):
+                    return original(*args, **kwargs)
+            with patch.object(self.bridge, "_mutate_outbox", side_effect=delayed):
+                await self.flush(row)
+        saved = self.store.outbox_row(row)
+        self.assertEqual(saved["state"], "failed")  # Definitively retired, never an uncertain HTTP attempt.
+        self.assertIs(saved["payload"]["write_started"], False)
+        self.assertEqual(self.posted, [])
+        await self.flush(row)
+        self.assertEqual(self.posted, [])
+
+    async def test_step_expiry_before_transport_admission_is_retired_without_write(self):
+        await self.expired_action_at_transport(after_admission=False)
+
+    async def test_step_expiry_after_transport_admission_is_retired_without_write(self):
+        await self.expired_action_at_transport(after_admission=True)
 
     async def test_response_queued_before_new_input_is_thought_when_delivered(self):
         await self.start_turn()

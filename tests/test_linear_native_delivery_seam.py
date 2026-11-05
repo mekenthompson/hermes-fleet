@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from types import MethodType
+import time
+from types import MethodType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,121 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
     rows = seam.NativeInputSeamScenarios.rows
     final_reply_sent = seam.NativeInputSeamScenarios.final_reply_sent
     show_approval = seam.NativeInputSeamScenarios.show_approval
+
+    async def test_successful_old_action_during_new_core_commit(self):
+        from gateway.session_authority import SessionAuthority
+        started, release = asyncio.Event(), asyncio.Event()
+        at_commit, allow_commit, committed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        self.addCleanup(allow_commit.set)
+        async def model(event):
+            started.set()
+            await release.wait()
+            return None
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        await self.deliver('first', 'Investigate the first question.')
+        await asyncio.wait_for(started.wait(), 10)
+        await self.until(lambda: self.inbox_row('first')[2] == 'imported')
+        row = self.native_input.queue_reply(self.bridge, self.ISSUE, self.SESSION, 'first',
+            'Working on your request.', kind='action', one_try=True)
+        original_admit = self.authority._admit_native_write
+        original_transport = self.bridge.api.transport
+        remote_kinds = []
+        def delayed_admit(**kwargs):
+            if kwargs['request_id'] == 'second':
+                at_commit.set()
+                if not allow_commit.wait(15):
+                    raise TimeoutError('test did not allow the second commit')
+            result = original_admit(**kwargs)
+            if kwargs['request_id'] == 'second':
+                committed.set()
+            return result
+        def transport(url, body, headers):
+            request = json.loads(body)
+            if 'agentActivityCreate' in request['query']:
+                fields = request['variables']['input']
+                if fields['id'] == row:
+                    allow_commit.set()
+                    if not committed.wait(15):
+                        raise TimeoutError('second Core commit did not finish during transport')
+                remote_kinds.append(fields['content']['type'])
+            return original_transport(url, body, headers)
+        with patch.object(self.authority, '_admit_native_write', side_effect=delayed_admit), \
+                patch.object(self.bridge.api, 'transport', side_effect=transport):
+            await self.deliver('second', 'Stop investigating; summarize instead.')
+            await self.until(at_commit.is_set)
+            await asyncio.to_thread(self.bridge.flush, only_id=row)
+            await self.until(lambda: self.inbox_row('second')[2] == 'imported')
+        self.assertTrue(committed.is_set())
+        self.assertEqual([x['status'] for x in self.rows()], ['started', 'queued'])
+        self.assertEqual(self.bridge.store.outbox_row(row)['state'], 'sent')
+        self.assertEqual(remote_kinds[-1], 'thought', 'A successful stale action must reconcile the current working state')
+
+    async def test_status_phrase_stays_with_its_executing_producer(self):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from gateway.run_turn_runner import TurnRunner
+        from agent.display import build_status_phrase
+        tools = {"first": "read_file", "second": "terminal"}
+        started = {name: asyncio.Event() for name in ("first", "second")}
+        release = {name: asyncio.Event() for name in started}
+        for event in release.values():
+            self.addCleanup(event.set)
+        captured = {}
+        original = type(self.adapter).status_metadata_for_turn
+        def capture(adapter, chat, anchor, metadata):
+            result = original(adapter, chat, anchor, metadata)
+            captured[anchor] = result
+            return result
+        async def model(event):
+            from gateway.platforms.helpers import typing_metadata_for_turn
+            name = event.message_id
+            # The finite model replaces run_turn_progress; use that path's real Core helper
+            # with the executing event, including when the authority drains a queued turn.
+            typing_metadata_for_turn(self.adapter, self.ISSUE, name, {"thread_id": self.SESSION})
+            runner = object.__new__(TurnRunner)
+            runner._ctx = SimpleNamespace(_live_status_adapter=self.adapter, _live_status_mode="full",
+                _run_still_current=lambda: True, source=event.source)
+            runner._progress_live_status("tool.started", tools[name],
+                {"path": "PRIVATE_CANARY", "command": "echo PRIVATE_CANARY"})
+            started[name].set()
+            await release[name].wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "Finished"}
+            return "Finished"
+        def actions():
+            with self.bridge.store._tx() as db:
+                return [json.loads(row[0]) for row in db.execute(
+                    "SELECT payload FROM outbox WHERE kind='activity' AND state='sent' "
+                    "AND json_extract(payload,'$.content.type')='action'")]
+        step_epoch = time.monotonic() + 10000
+        async def step(metadata, when):
+            with patch("hermes_fleet_linear_plugin.native_input.time.monotonic", return_value=step_epoch + when):
+                await self.adapter.send_typing(self.ISSUE, metadata=metadata)
+            await asyncio.gather(*list(self.adapter._step_tasks.values()))
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        with patch.object(type(self.adapter), "status_metadata_for_turn", capture):
+            await self.deliver("first", "Investigate the old issue")
+            await asyncio.wait_for(started["first"].wait(), 10)
+            await self.until(lambda: self.inbox_row("first")[2] == "imported")
+            self.assertEqual(captured["first"]["_linear_status_source"], "first")
+            await step(captured["first"], 1000)
+            self.assertEqual([(x["source_activity"], x["content"]["parameter"]) for x in actions()],
+                             [("first", build_status_phrase("read_file", None))])
+            await self.deliver("second", "Summarize instead")
+            await self.until(lambda: self.inbox_row("second")[2] == "imported")
+            self.assertEqual([row["status"] for row in self.rows()], ["started", "queued"])
+            await step(captured["first"], 2000)
+            await step({"thread_id": self.SESSION}, 2000)  # Event-less refresh cannot borrow the queue's anchor.
+            self.assertEqual(len(actions()), 1)
+            release["first"].set()
+            await asyncio.wait_for(started["second"].wait(), 10)
+            self.assertEqual(captured["second"]["_linear_status_source"], "second")
+            await step(captured["second"], 3000)
+            self.assertEqual([(x["source_activity"], x["content"]["parameter"]) for x in actions()],
+                             [("first", build_status_phrase("read_file", None)), ("second", build_status_phrase("terminal", None))],
+                             (self.adapter._inputs, self.adapter._step_closed, self.bridge.store.pending()))
 
     async def test_committed_input_before_receipt_projection(self):
         from gateway.session_authority import SessionAuthority

@@ -132,8 +132,11 @@ class Store:
                 and isinstance(payload.get("issue_id"), str) and bool(payload["issue_id"])
                 and isinstance(payload.get("session_id"), str) and bool(payload["session_id"])
                 and payload.get("requester_sessions") == {payload.get("issue_id"): payload["session_id"]}
-                and content.get("type") in ("response", "error", "thought", "elicitation")
-                and isinstance(content.get("body"), str))
+                and ((content.get("type") in ("response", "error", "thought", "elicitation")
+                      and isinstance(content.get("body"), str))
+                     or (content.get("type") == "action" and payload.get("ephemeral") is True
+                         and isinstance(content.get("action"), str) and isinstance(content.get("parameter"), str))))
+
     def normalize_conversation_reply(self, row_id: str) -> dict | None:
         """Recover old reply coordinates without changing its identity, content or attempt history."""
         with self._tx() as db:
@@ -209,6 +212,24 @@ class Store:
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        (self._conversation_input_key(issue_id, session_id), json.dumps(anchor)))
             return anchor
+
+    def conversation_step_superseded(self, row_id: str) -> bool:
+        """A delayed ephemeral line must not replace newer input, messages or questions."""
+        with self._tx() as db:
+            row = db.execute("SELECT payload FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if row is None:
+                return True
+            payload = json.loads(row["payload"])
+            current = self.conversation_input(payload["issue_id"], payload["session_id"])
+            if current is None or current["activity_id"] != payload.get("source_activity"):
+                return True
+            return db.execute(
+                "SELECT 1 FROM outbox old JOIN outbox newer ON newer.rowid > old.rowid "
+                "WHERE old.id=? AND newer.kind='activity' AND newer.state != 'failed' "
+                "AND COALESCE(json_extract(newer.payload, '$.applied'), 1) != 0 "
+                "AND json_extract(newer.payload, '$.issue_id')=json_extract(old.payload, '$.issue_id') "
+                "AND json_extract(newer.payload, '$.session_id')=json_extract(old.payload, '$.session_id') LIMIT 1",
+                (row_id,)).fetchone() is not None
 
     def conversation_finished(self, issue_id: str, session_id: str, source_activity: str,
                               source_cursor: int = 0) -> bool:
@@ -1456,6 +1477,18 @@ class Store:
             db.execute("UPDATE outbox SET state = 'sent', payload = json_set(payload, '$.applied', ?) WHERE id = ?",
                        (int(applied), row_id))
             return True
+    def retire_unattempted_action(self, row_id: str, content: dict) -> bool:
+        """Drop a disposable status only while its exact content is proven unattempted."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM outbox WHERE id=?", (row_id,)).fetchone()
+            if not row or row["state"] != "pending" or row["hold_reason"] is not None:
+                return False
+            payload = json.loads(row["payload"])
+            if (not self.conversation_reply(row["kind"], payload) or
+                    payload.get("write_started") is not False or payload.get("ephemeral") is not True or
+                    payload.get("content") != content or content.get("type") != "action"):
+                return False
+            return self.mark_sent(row_id, False)
     def note_reason(self, row_id: str, key: str, reason: str | None) -> None:
         """Keep a decision's closed reason code on the row, so it outlives log rotation."""
         if reason and key in ("outcome_reason", "failure_reason"):

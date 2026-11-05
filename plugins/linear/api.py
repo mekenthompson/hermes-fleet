@@ -352,6 +352,19 @@ class LinearAPI:
         try: yield
         finally: self._priority.level = previous
     @contextmanager
+    def optional_work(self):
+        """Cap every request in disposable work, even inside essential authorization helpers."""
+        previous = getattr(self._priority, "optional_work", False)
+        self._priority.optional_work = True
+        try:
+            if self.clock() < self._pause_state():
+                raise RateLimited(self.paused_until)
+            self._admit("query OptionalWorkBudget")
+            yield
+        finally:
+            self._priority.optional_work = previous
+
+    @contextmanager
     def deadline(self, seconds: float):
         """Requests made in this block (on this thread) must finish within ``seconds``: a request
         that could not finish in time (each may take REQUEST_TIMEOUT_SECONDS) is not started and
@@ -378,7 +391,8 @@ class LinearAPI:
                 fraction, reset = remaining / limit, until
         return fraction, reset
     def _admit(self, query: str) -> None:
-        level = getattr(self._priority, "level", None) or "normal"
+        level = ("optional" if getattr(self._priority, "optional_work", False)
+                 else getattr(self._priority, "level", None) or "normal")
         fraction, reset = self.budget_remaining()
         mutation = query.lstrip().startswith("mutation")
         if (level == "optional" and fraction < OPTIONAL_FLOOR) or (
@@ -776,6 +790,7 @@ class LinearAPI:
         query = ("query OutboundAgentActivity($id: String!) { agentActivity(id: $id) { id user { id } "
                  "agentSession { id } content { __typename ... on AgentActivityResponseContent { body } "
                  "... on AgentActivityThoughtContent { body } ... on AgentActivityElicitationContent { body } "
+                 "... on AgentActivityActionContent { action parameter result } "
                  "... on AgentActivityErrorContent { body } } } }")
         try:
             with self.expected_missing():
@@ -797,6 +812,11 @@ class LinearAPI:
                 (activity.get("agentSession") or {}).get("id") != session_id):
             raise LinearError("Outbound activity identity does not match this app and session", retryable=False)
         content = activity.get("content") or {}
+        if content.get("__typename") == "AgentActivityActionContent":
+            if not all(isinstance(content.get(key), str) for key in ("action", "parameter")):
+                raise LinearError("Outbound action content could not be verified", retryable=False)
+            return {"type": "action", "action": content["action"], "parameter": content["parameter"],
+                    **({"result": content["result"]} if content.get("result") is not None else {})}
         kind = {"AgentActivityResponseContent": "response", "AgentActivityThoughtContent": "thought",
                 "AgentActivityElicitationContent": "elicitation", "AgentActivityErrorContent": "error"}.get(content.get("__typename"))
         if kind is None or not isinstance(content.get("body"), str):
