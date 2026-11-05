@@ -310,59 +310,14 @@ class NativeBridgeScenarios(unittest.TestCase):
             return sorted((sub["task_id"], sub["platform"], sub["chat_id"], sub["thread_id"] or "")
                           for sub in self.board.kn.list_notify_subs(conn))
 
-    def test_relayed_linear_notify_subs_are_retired_once_without_losing_reports(self):
+    def test_new_work_gets_no_linear_notify_sub_and_events_still_reach_the_issue(self):
         task_id = self.create()
-        self.assertEqual(self.linear_notify_subs(), [])  # New work never gets one.
-        from hermes_cli import kanban_db_notify as kbn
-        with self.board.conn() as conn:
-            # The shape earlier releases created, which core's notifier could only hold and retry.
-            kbn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=ISSUE)
-            child = kb.create_task(conn, title="child", assignee="default", parents=[task_id])
-            # Session-bound Linear and other platforms' routes are not ours to retire.
-            kbn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=ISSUE, thread_id=SESSION,
-                               delivery_metadata={"reply_to": ACTIVITY})
-            kbn.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat-1")
-        self.assertIn((child, "linear", ISSUE, ""), self.linear_notify_subs())  # inherited from the parent
-        from hermes_fleet_linear_plugin import diag
-        diag.reset()  # Earlier tests in this process may have spent the hourly INFO cap.
-        bridge = self.make_bridge()
-        with self.assertLogs("hermes_plugins.linear", level="INFO") as logs:
-            bridge.recover()
-        self.assertEqual(self.linear_notify_subs(), sorted([
-            (task_id, "linear", ISSUE, SESSION), (task_id, "telegram", "chat-1", "")]))
-        retired = [line for line in logs.output if "action=notify.retire" in line]
-        self.assertEqual(len(retired), 2)
-        self.assertTrue(all("outcome=applied reason=bridge_relayed" in line for line in retired))
-        self.assertEqual(sorted(re.search(r"task=(t_[0-9a-f]+)", line).group(1) for line in retired),
-                         sorted([task_id, child]))
-        # Swept once per process: later ticks never repeat the sweep or its lines.
-        with patch.object(Kanban, "retire_relayed_notify_subs", side_effect=AssertionError("swept twice")):
-            bridge.recover()
-        # The bridge still relays the task's events to the issue itself.
+        self.assertEqual(self.linear_notify_subs(), [])
         with self.board.conn() as conn:
             kb.block_task(conn, task_id, reason="human decision required", kind="needs_input")
-        bridge.pump_kanban()
+        self.bridge.pump_kanban()
         self.assertTrue(any(row["kind"] == "activity" and row["payload"]["issue_id"] == ISSUE
-                            for row in bridge.store.pending()))
-
-    def test_failed_notify_sub_retirement_waits_and_retries(self):
-        task_id = self.create()
-        from hermes_cli import kanban_db_notify as kbn
-        with self.board.conn() as conn:
-            kbn.add_notify_sub(conn, task_id=task_id, platform="linear", chat_id=ISSUE)
-        now = [time.time()]
-        self.bridge.clock = lambda: now[0]
-        with patch.object(Kanban, "retire_relayed_notify_subs", side_effect=OSError("board locked")) as sweep:
-            with self.assertLogs("hermes_plugins.linear", level="WARNING") as held:
-                self.bridge._retire_relayed_notify_subs()
-            self.bridge._retire_relayed_notify_subs()  # inside the backoff: not attempted again
-        self.assertEqual(sweep.call_count, 1)
-        self.assertTrue(any("action=notify.retire outcome=held" in line for line in held.output))
-        self.assertFalse(any("board locked" in line for line in held.output))
-        self.assertEqual(self.linear_notify_subs(), [(task_id, "linear", ISSUE, "")])
-        now[0] += 7200
-        self.bridge._retire_relayed_notify_subs()
-        self.assertEqual(self.linear_notify_subs(), [])
+                            for row in self.bridge.store.pending()))
 
     def test_unlinked_tracker_reports_comments_and_passive_subscriptions(self):
         with self.board.conn() as conn:

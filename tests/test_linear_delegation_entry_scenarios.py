@@ -233,7 +233,13 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.history(task_id).count("unblocked"), 1)
         self.assertEqual(self.turns, [])  # answered as the same work; no model turn redoes it
         self.assertEqual(self.inbox_status(delivery), "imported")
-        self.assertIn("already started from chat", self.said("session-1")[-1])
+        # The session Linear opened now reports the chat-started work: a thought, never a closing response.
+        self.assertIn("Continuing the existing work on this issue, continued from chat", self.said("session-1")[-1])
+        kinds = [r["content"]["type"] for r in self.authority.activity_records
+                 if r["agentSessionId"] == "session-1"]
+        self.assertTrue(kinds)
+        self.assertEqual(set(kinds), {"thought"})  # admission ACK and adoption both keep it open
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-1")
 
     async def test_mention_question_stays_a_conversation_and_starts_nothing(self):
         question = "@agent how many directories does hermes-fleet have?"

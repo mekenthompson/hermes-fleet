@@ -266,8 +266,192 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [task_id])
         self.assertEqual((before.status, before.current_run_id), (after.status, after.current_run_id))
         answers = [record for record in self.authority.activity_records if record["agentSessionId"] == "echo-session"]
-        self.assertEqual(len(answers), 1)
-        self.assertIn("already started from chat", answers[0]["content"]["body"])
+        # The session now reports the work (the checkpoint read after it opened lands there too).
+        self.assertEqual([a["content"]["type"] for a in answers], ["thought", "thought"])  # a response would close it
+        self.assertIn("Continuing the existing work on this issue, continued from chat", answers[0]["content"]["body"])
+        self.assertEqual(answers[1]["content"]["body"], "Proxy deployed to staging.")
+
+    # -- HF-630: chat-started work adopts the Agent Session Linear opens for our delegate write --
+    def said(self, session_id):
+        return [record for record in self.authority.activity_records if record["agentSessionId"] == session_id]
+
+    def issue_comments(self, issue_id):
+        return [body for target, body in self.authority.comment_bodies if target == issue_id]
+
+    def native_event(self, task_id, kind, payload):
+        with self.board.conn() as conn:
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, kind, payload)
+
+    def checkpoint(self, task_id, body):
+        with self.board.conn() as conn:
+            if "human_checkpoint" in __import__("inspect").signature(kb.add_comment).parameters:
+                kb.add_comment(conn, task_id, "worker", body, human_checkpoint=True, request_id=str(uuid.uuid4()))
+            else:
+                with kb.write_txn(conn):
+                    comment = kb.add_comment(conn, task_id, "worker", body)
+                    kb._append_event(conn, task_id, "checkpoint", {"author": "worker", "body": body,
+                                                                 "comment_id": comment, "request_id": str(uuid.uuid4())})
+
+    def assert_reports_in_session(self, issue_id, task_id, session_id, *, done=True):
+        """Started, checkpoint, heartbeat and keepalive go to the session; no issue comments; Done is its only response."""
+        comments = len(self.issue_comments(issue_id))
+        self.claim(task_id)
+        self.native_event(task_id, "spawned", {"pid": 4242})
+        self.native_event(task_id, "heartbeat", {"note": "Reading the proxy config"})
+        self.checkpoint(task_id, "Proxy deployed to staging.")
+        self.flush()
+        contents = [record["content"] for record in self.said(session_id)]
+        self.assertIn(("action", "Started"), [(c["type"], c.get("action")) for c in contents])
+        self.assertIn("Reading the proxy config", [c.get("parameter") for c in contents if c["type"] == "action"])
+        self.assertTrue(any(r.get("ephemeral") for r in self.said(session_id) if r["content"].get("action") == "Working"))
+        self.assertIn("Proxy deployed to staging.", [c.get("body") for c in contents if c["type"] == "thought"])
+        # The keepalive beats Linear's 30-minute stale mark on the adopted session.
+        start = time.time()
+        self.bridge.clock = lambda: start + 26 * 60
+        self.bridge._recheck_row(self.bridge.store.get(issue_id))
+        self.bridge.flush()
+        self.assertIn("Still on this; nothing is needed from you",
+                      [r["content"].get("parameter") for r in self.said(session_id) if r.get("ephemeral")])
+        self.assertEqual(len(self.issue_comments(issue_id)), comments)  # progress never fell back to comments
+        self.assertNotIn("response", [c["type"] for c in contents])
+        if done:
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary="Proxy rolled out.", result="Proxy rolled out and checked live.")
+            for _ in range(3):
+                self.bridge.tick()
+            responses = [r for r in self.said(session_id) if r["content"]["type"] == "response"]
+            self.assertEqual(len(responses), 1)  # Done is the session's only response
+            self.assertIs(responses[0], self.said(session_id)[-1])
+            self.assertEqual(self.authority.state(issue_id), "Done")
+            self.assertEqual(len(self.issue_comments(issue_id)), comments)
+
+    def test_hf630_chat_work_adopts_the_echo_session_and_reports_there(self):
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()  # our delegate write lands; Linear opens a session for it
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "")
+        self.echo(NEW_ISSUE, "echo-session")
+        self.flush()
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "echo-session")
+        answers = self.said("echo-session")
+        self.assertEqual([a["content"]["type"] for a in answers], ["thought"])
+        self.assertIn("Continuing the existing work on this issue, continued from chat", answers[0]["content"]["body"])
+        self.assertEqual(self.tasks(), [task_id])
+        self.assert_reports_in_session(NEW_ISSUE, task_id, "echo-session")
+
+    def test_hf630_linked_board_work_adopts_the_session_on_the_existing_binding_branch(self):
+        issue = self.authority.issues[ISSUE]
+        existing = self.board.create(title="OPS-1: earlier chat task", created_by="chat",
+                                     body=f"Linear issue OPS-1: {issue['url']}\nContinue the rollout.")
+        self.assertTrue(self.ask({"action": "work_on", "issue": ISSUE})["ok"])
+        self.assertIsNone(self.bridge.store.native_intent(f"create:{ISSUE}"))  # no admission: existing_binding
+        self.flush()
+        self.echo(ISSUE, "echo-session")
+        self.flush()
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "echo-session")
+        self.assertEqual([a["content"]["type"] for a in self.said("echo-session")], ["thought"])
+        # Progress scope: native Done never closes the issue, so only progress is checked here.
+        self.assert_reports_in_session(ISSUE, existing.id, "echo-session", done=False)
+
+    def test_adopted_session_waits_for_pr_acceptance_before_its_only_response(self):
+        self.check_acceptance_session(adopt_before_completion=True)
+
+    def test_session_can_be_adopted_while_pr_acceptance_is_pending(self):
+        self.check_acceptance_session(adopt_before_completion=False)
+
+    def check_acceptance_session(self, *, adopt_before_completion):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        if adopt_before_completion:
+            self.echo(NEW_ISSUE, "echo-session")
+            self.flush()
+        self.claim(task_id)
+        self.authority.issues[NEW_ISSUE]["team"]["states"]["nodes"].append(
+            {"id": "state-review", "name": "In Review", "type": "started"})
+        receipt = {"ok": False, "classification": "pending", "head_sha": "a" * 40, "checks": []}
+        with patch.object(bridge_module, "pr_acceptance", lambda *a: receipt):
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary="Implementation finished; checks are running.",
+                                 result="https://github.com/example/project/pull/12")
+            self.flush()
+            if not adopt_before_completion:
+                self.echo(NEW_ISSUE, "echo-session")
+                self.flush()
+            self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "echo-session")
+            self.assertEqual(self.authority.state(NEW_ISSUE), "In Review")
+            self.assertNotIn("response", [r["content"]["type"] for r in self.said("echo-session")])
+            comments = len(self.issue_comments(NEW_ISSUE))
+            # Chat summaries must not close the same session while acceptance is outstanding.
+            message = native_input.queue_reply(self.bridge, NEW_ISSUE, "echo-session", "echo-session",
+                                               "The required checks are still running.")
+            self.bridge.flush(only_id=message)
+            self.assertEqual(self.said("echo-session")[-1]["content"]["type"], "thought")
+            start = time.time()
+            self.bridge.clock = lambda: start + 26 * 60
+            self.bridge._recheck_row(self.bridge.store.get(NEW_ISSUE))
+            self.bridge.flush()
+            self.assertTrue(any(r.get("ephemeral") and r["content"].get("action") == "Verifying"
+                                for r in self.said("echo-session")))
+            # A delayed keepalive must not reopen the session after acceptance is verified.
+            self.bridge.clock = lambda: start + 52 * 60
+            self.bridge._keepalive(self.bridge.store.get(NEW_ISSUE))
+            receipt.update(ok=True, classification="passed")
+            for _ in range(3):
+                self.bridge.tick()
+            self.assertEqual(self.authority.state(NEW_ISSUE), "Done")
+            responses = [r for r in self.said("echo-session") if r["content"]["type"] == "response"]
+            self.assertEqual(len(responses), 1)
+            self.assertIs(responses[0], self.said("echo-session")[-1])
+            self.assertEqual(sum(r["content"].get("action") == "Verifying" for r in self.said("echo-session")), 1)
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+
+    def test_a_second_session_never_takes_over_a_live_adopted_one(self):
+        reply = self.create(start_work=True)
+        self.flush()
+        self.echo(NEW_ISSUE, "session-1")
+        self.flush()
+        self.echo(NEW_ISSUE, "session-2")  # say, the delegate removed and added again
+        self.flush()
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "session-1")
+        self.assertEqual([a["content"]["type"] for a in self.said("session-2")], ["thought"])
+        self.assertIn("already started from chat", self.said("session-2")[0]["content"]["body"])
+        # Once that session has its final response (Linear closed it), a new one may report the work.
+        self.bridge._decline(NEW_ISSUE, "session-1", "Answered.")
+        self.flush()
+        self.echo(NEW_ISSUE, "session-3")
+        self.flush()
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "session-3")
+        self.assertEqual([a["content"]["type"] for a in self.said("session-3")], ["thought"])
+        self.assertEqual(self.tasks(), [reply["native"]["task_id"]])
+
+    def test_finished_chat_work_still_answers_a_new_session_with_a_response(self):
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        with self.board.conn() as conn:
+            kb.complete_task(conn, task_id, summary="Done.", result="Done and checked.")
+        self.flush()
+        self.echo(NEW_ISSUE, "late-session")
+        self.flush()
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "")
+        self.assertEqual([a["content"]["type"] for a in self.said("late-session")], ["response"])
+
+    def test_chat_work_that_never_gets_a_session_still_reports_as_comments(self):
+        reply = self.create(start_work=True)
+        task_id = reply["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.native_event(task_id, "spawned", {"pid": 4242})
+        self.checkpoint(task_id, "Proxy deployed to staging.")
+        self.flush()
+        comments = self.issue_comments(NEW_ISSUE)
+        self.assertTrue(any(body.startswith("Started") for body in comments), comments)
+        self.assertIn("Proxy deployed to staging.", comments)
+        self.assertFalse(any(r.get("agentSessionId") for r in self.authority.activity_records))
 
     def test_duplicate_request_and_repeated_echo_never_start_a_second_task(self):
         first = self.create(start_work=True)

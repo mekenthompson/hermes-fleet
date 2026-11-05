@@ -1414,6 +1414,20 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertFalse(self.store.scope_fenced(ISSUE))
         self.assertEqual(self.api.issue(ISSUE)["id"], ISSUE)
 
+    def test_sessionless_work_never_adopts_a_new_session_in_agent_session_scope(self):
+        # The owner session authorizes effects here, so a new session is never bound to work
+        # started without one: today's behaviour (a plain response) is kept.
+        self.kanban.tasks["task-1"] = SimpleNamespace(id="task-1", status="running", completion_contract=None, result="",
+                                                      title="OPS-1: task", current_run_id=1, assignee="synthetic")
+        self.kanban.histories["task-1"] = []
+        self.store.bind_native(ISSUE, "task-1", "synthetic", "default", owner_ref="", project_id=PROJECT, at=0)
+        self.bridge.handle_webhook(self.session_event())
+        self.assertEqual(self.store.get(ISSUE)["owner_ref"], "")
+        self.assertEqual(self.kanban.creates, [])
+        kinds = [row["payload"]["content"]["type"] for row in self.store.pending(ISSUE) if row["kind"] == "activity"]
+        self.assertNotIn("thought", kinds)
+        self.assertEqual(kinds, ["response"])
+
     def test_recheck_human_takeover_preserves_native_worker_and_requester_binding(self):
         task_id = LinearSpecialistAuthorizationTests.seed_kanban_work(self)
         before = self.store.get(ISSUE)

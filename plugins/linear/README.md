@@ -52,16 +52,20 @@ A longer outcome gets an issue with `start_work` (or `work_on` for an existing o
 request is the authority, as a delegation is for an assignment: the plugin creates the task
 parked under the shared `create:<issue>` intent and `linear:<issue>` retry key, links it,
 and admits it against its creation event token. The webhook from this app's own delegation
-finds that admission and is answered as the same work in its Agent Session; it starts no
-session or worker. Linear status comes from native execution (In Progress once a worker
+finds that admission and starts no second task or worker. Work bound with no Agent Session
+(started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
+opens for it: one thought says this is the work already running, then Started, checkpoints,
+heartbeats and the keepalive post there as activities and Done is its only response. A
+session the work already reports to is never replaced while it may still be open (it must
+have had its final response); the new one only gets a thought. Finished work, `record_done`
+and `requester_basis: agent_session` scope (whose owner session authorizes effects) keep the
+plain response. Work that never gets a session keeps reporting as issue comments. Linear status comes from native execution (In Progress once a worker
 claims it). The asking chat is a native notify subscriber built like core `kanban_create`
 auto-subscribe from host-captured context (messaging chats are woken in their thread,
 Desktop targets its native local conversation, TUI its session key), added after admission so
 it hears checkpoints and the result, not the admission itself. The issue itself is not a
 notify subscriber: the bridge reports the task's events there from its own cursor. Core's
-notifier cannot reply in Linear without an Agent Session, so on start the service removes the
-session-less `linear` subscriptions earlier releases created, inherited child copies included
-(one `action=notify.retire outcome=applied` line each). `record_done` never runs a
+notifier cannot reply in Linear without an Agent Session. `record_done` never runs a
 worker or re-runs work, even after a crash part-way through: recovery and the assignment
 echo never admit a record_done task, `work_on` is refused, and repeating the same
 `record_done` finishes it. A chat admission recovered after a crash is held if the issue

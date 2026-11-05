@@ -508,7 +508,10 @@ def _session_work_live(bridge, issue_id, session_id, *, strict=False) -> bool:
         return False
     if strict and getattr(task, "status", None) is None:
         raise LinearError("Tracked native work has no verified completion state")
-    return getattr(task, "status", None) not in (None, "done", "archived")
+    if getattr(task, "status", None) == "done":
+        waiting = bridge.store.acceptance_recheck(issue_id, row["task_id"])
+        return bool(waiting and waiting.get("kind") == "in_review")
+    return getattr(task, "status", None) not in (None, "archived")
 
 
 CHOICE_VALUE_PREFIX = "linear-choice:"
