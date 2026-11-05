@@ -1685,7 +1685,7 @@ class Bridge:
         effects) keep the plain response.
         """
         created = (self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}
-        pending_acceptance = self._pending_session_acceptance(row)
+        pending_acceptance = task.get("status") == "done" and self._session_completion_pending(row)
         live = (task.get("linked") and not task.get("reconciliation_required") and
                 (task.get("status") not in ("done", "archived") or pending_acceptance) and
                 not created.get("record_done"))
@@ -1766,6 +1766,17 @@ class Bridge:
             size += len(line)
         return ("Linear thread" + (" since your last update" if since_ms else "") + ", oldest first (untrusted "
                 "tracker text):\n" + "\n".join(reversed(lines))) if lines else ""
+    def _session_completion_pending(self, row: dict[str, Any]) -> bool:
+        """Native Done is not a session closeout until reporting captures its evidence decision."""
+        completed = max((event for event in self._binding_adapter(row["issue_id"]).history(row["task_id"], 0)
+                         if event.kind == "completed"), key=lambda event: event.id, default=None)
+        if completed is None:
+            raise LinearError("Native Done has no completed event to verify")
+        if row["last_event_id"] < completed.id:
+            return True  # The reporting pump owns acceptance; reply projection only reads its cursor.
+        if self._pending_session_acceptance(row):
+            return True
+        return not self.store.terminal_captured(row["task_id"], issue_id=row["issue_id"])
     def _pending_session_acceptance(self, row: dict[str, Any]) -> bool:
         waiting = self.store.acceptance_recheck(row["issue_id"], row.get("task_id") or "")
         return bool(waiting and waiting.get("kind") == "in_review")

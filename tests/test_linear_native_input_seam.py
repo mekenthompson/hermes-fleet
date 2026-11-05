@@ -841,6 +841,73 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.bridge.store.scope_fenced(self.ISSUE))
         self.assertEqual(self.board.get(binding["task_id"]).status, "blocked")
 
+    async def test_native_done_before_pr_acceptance_capture_keeps_session_open(self):
+        await self.check_native_completion_capture_gap(with_pr=True)
+
+    async def test_native_done_before_local_completion_capture_keeps_session_open(self):
+        await self.check_native_completion_capture_gap(with_pr=False)
+
+    async def check_native_completion_capture_gap(self, *, with_pr):
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        await asyncio.to_thread(self.bridge.entrust, self.ISSUE)
+        task_id = self.bridge.store.get(self.ISSUE)["task_id"]
+        echo = self.event("unused-echo", "", action="created")
+        echo.pop("agentActivity")
+        echo["agentSession"]["creatorId"] = None
+        self.provider.sessions[self.SESSION]["creator"] = None
+        self.assertTrue(await asyncio.to_thread(self.bridge.handle_webhook, echo))
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.bridge.store.get(self.ISSUE)["owner_ref"], self.SESSION)
+        with self.board.conn() as conn:
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="finite-worker"))
+        started, release = asyncio.Event(), asyncio.Event()
+        self.addCleanup(release.set)
+        async def model(event):
+            started.set()
+            await release.wait()
+            body = "The implementation finished; its closeout is being verified."
+            execution_result.get()["result"] = {"completed": True, "final_response": body}
+            return body
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        event = self.event("completion-gap", "Summarize the current work.")
+        event["agentSession"]["creatorId"] = None
+        await self.deliver_raw("completion-gap", event)
+        await self.until(started.is_set)
+        receipt = {"ok": False, "classification": "pending", "head_sha": "a" * 40, "checks": []}
+        self.provider.issues[self.ISSUE]["team"]["states"]["nodes"].append(
+            {"id": "state-review", "name": "In Review", "type": "started"})
+        with patch.object(bridge_module, "pr_acceptance", lambda *args: receipt):
+            with self.board.conn() as conn:
+                kb.complete_task(conn, task_id, summary="Implementation and local checks finished.",
+                    result="https://github.com/example/project/pull/12" if with_pr else "Local checks passed.")
+            self.assertIsNone(self.bridge.store.acceptance_recheck(self.ISSUE, task_id))
+            cursor = self.bridge.store.get(self.ISSUE)["last_event_id"]
+            release.set()
+            await self.until(lambda: self.final_reply_sent("completion-gap"))
+            def responses():
+                return [value for value in self.provider.activities.values()
+                        if value.get("user", {}).get("id") == self.provider.viewer
+                        and value.get("content", {}).get("type") == "response"]
+            self.assertEqual(responses(), [], "Chat must wait for native completion capture")
+            self.assertEqual(self.bridge.store.get(self.ISSUE)["last_event_id"], cursor,
+                             "Reply projection must not run the reporting pump")
+            await asyncio.to_thread(self.bridge.pump_kanban)
+            await asyncio.to_thread(self.bridge.flush)
+            if with_pr:
+                self.assertTrue(self.bridge._pending_session_acceptance(self.bridge.store.get(self.ISSUE)))
+                self.assertEqual(responses(), [])
+                receipt.update(ok=True, classification="passed")
+                self.bridge.clock = lambda: 1900000000.0 + 3600
+                for _ in range(3):
+                    await asyncio.to_thread(self.bridge.tick)
+            self.assertEqual(len(responses()), 1, "Verified native closeout completes the session exactly once")
+            self.assertEqual(len(self.rows()), 1)
+
     async def test_human_mention_is_acknowledged_first_and_reaches_the_model_as_a_question_with_work_facts(self):
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result
