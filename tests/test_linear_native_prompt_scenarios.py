@@ -604,6 +604,211 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(4)
         self.assertEqual(self.posted[-1]["content"]["type"], "action")
 
+    async def wait_for_step_condition(self, predicate):
+        async with asyncio.timeout(10):
+            while not predicate():
+                await asyncio.sleep(0.01)
+
+    async def test_real_clarify_timeout_retires_pause_and_restarts_owned_status(self):
+        from tools import clarify_gateway as clarify
+        from agent.display import build_status_phrase
+        key = self.session_key(await self.start_turn())
+        phrase = build_status_phrase("read_file", None)
+        self.owned_status(phrase)
+        with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+            result = await asyncio.to_thread(self.request_clarify, key)
+        self.assertFalse(result[1])
+        self.assertFalse(clarify.has_pending(key))
+        await self.until_posted(2)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+        await self.start_typing_refresh()
+        await self.until_posted(3)
+        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        self.assertEqual(self.posted[-1]["content"]["parameter"], phrase)
+
+    async def test_real_clarify_withdrawal_retires_pause_and_restores_work(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        waiter = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+        await self.until_posted(1)
+        self.assertEqual(clarify.clear_session(key), 1)
+        self.assertFalse((await self.answer_later(key, waiter, clarify.clear_session))[1])
+        await self.until_posted(2)
+        self.assertEqual(self.posted[-1]["content"]["type"], "thought")
+        await self.start_typing_refresh()
+        await self.until_posted(3)
+        self.assertEqual(self.posted[-1]["content"]["type"], "action")
+
+    async def test_clarify_timeout_preserves_another_live_question(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(clarify.clear_session, key)
+        waiting = threading.Event()
+        def long_timeout():
+            waiting.set()
+            return 3600
+        with patch.object(clarify, "get_clarify_timeout", side_effect=long_timeout):
+            first = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
+            await self.until_posted(1)
+            self.assertTrue(await asyncio.to_thread(waiting.wait, 5))
+        original = self.posted[0]
+        with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+            result = await asyncio.to_thread(self.request_clarify, key)
+        self.assertFalse(result[1])
+        await self.until_posted(3)
+        self.assertTrue(clarify.has_pending(key))
+        self.assertEqual(self.posted[-1]["content"], original["content"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], original["signalMetadata"])
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.15)
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertNotIn("action", [p["content"]["type"] for p in self.posted])
+        pending = clarify.get_pending_for_session(key, include_choice_prompts=True)
+        self.assertTrue(clarify.resolve_gateway_clarify(pending.clarify_id, "staging"))
+        self.assertEqual(await self.answer_later(key, first, clarify.clear_session), ("staging", True))
+        await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
+
+    async def test_clarify_timeout_preserves_a_live_approval(self):
+        from tools import clarify_gateway as clarify, approval
+        key = self.session_key(await self.start_turn())
+        self.addCleanup(approval.unregister_gateway_notify, key)
+        first = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
+        await self.until_posted(1)
+        original = self.posted[0]
+        with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+            result = await asyncio.to_thread(self.request_clarify, key)
+        self.assertFalse(result[1])
+        await self.until_posted(3)
+        self.assertEqual(self.posted[-1]["content"], original["content"])
+        self.assertEqual(self.posted[-1]["signalMetadata"], original["signalMetadata"])
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.15)
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertNotIn("action", [p["content"]["type"] for p in self.posted])
+        pending = approval.list_gateway_approvals(key)[0]["request_id"]
+        self.assertTrue(approval.withdraw_gateway_approval(key, pending, "Request withdrawn"))
+        self.assertEqual((await self.answer_later(key, first, approval.unregister_gateway_notify))["cancelled"], "Request withdrawn")
+        await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
+
+    async def test_clarify_retirement_queues_repair_before_provider_failure(self):
+        from tools import clarify_gateway as clarify
+        from hermes_fleet_linear_plugin.api import LinearError
+        key = self.session_key(await self.start_turn())
+        entered, release, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = self.adapter.retire_clarify_card
+        errors = []
+        async def retire(_adapter, *args):
+            entered.set()
+            await release.wait()
+            try:
+                await original(*args)
+            except LinearError as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        with patch.object(type(self.adapter), "retire_clarify_card", retire):
+            with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+                self.assertFalse((await asyncio.to_thread(self.request_clarify, key))[1])
+            await asyncio.wait_for(entered.wait(), 10)
+            with patch.object(self.bridge, "flush", side_effect=LinearError("provider unavailable")):
+                release.set()
+                await asyncio.wait_for(done.wait(), 10)
+        self.assertTrue(errors)
+        repairs = [r for r in self.bridge.store.pending() if r["payload"].get("lifecycle_repair_of")]
+        self.assertEqual(len(repairs), 1)
+        self.assertIs(repairs[0]["payload"]["write_started"], False)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought"])
+
+    async def test_clarify_retirement_uses_completed_core_turn_without_reopening_status(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        entered, release, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = self.adapter.retire_clarify_card
+        async def retire(_adapter, *args):
+            entered.set()
+            await release.wait()
+            try:
+                await original(*args)
+            finally:
+                done.set()
+        with patch.object(type(self.adapter), "retire_clarify_card", retire):
+            with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+                self.assertFalse((await asyncio.to_thread(self.request_clarify, key))[1])
+            await asyncio.wait_for(entered.wait(), 10)
+            with patch.object(self.bridge, "native_conversation_state", return_value={
+                    "live": False, "latest_activity": native.ACTIVITY, "turn_live": False}):
+                release.set()
+                await asyncio.wait_for(done.wait(), 10)
+                await self.start_typing_refresh()
+                await asyncio.sleep(0.15)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "response"])
+        self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
+
+    async def test_clarify_timeout_does_not_unpause_another_agent_session_question(self):
+        from tools import clarify_gateway as clarify
+        first_event = await self.start_turn()
+        first_key = self.session_key(first_event)
+        self.addCleanup(clarify.clear_session, first_key)
+        waiting = threading.Event()
+        def long_timeout():
+            waiting.set()
+            return 3600
+        with patch.object(clarify, "get_clarify_timeout", side_effect=long_timeout):
+            first = asyncio.create_task(asyncio.to_thread(self.request_clarify, first_key))
+            await self.until_posted(1)
+            self.assertTrue(await asyncio.to_thread(waiting.wait, 5))
+        session, activity = "session-second", "activity-second"
+        self.authority.sessions[session] = {**self.authority.sessions[native.SESSION], "id": session}
+        delivery = self.delivery(activity, "A separate request")
+        data = delivery.event()
+        data["agentSession"]["id"] = session
+        self.authority.activities[activity]["agentSession"]["id"] = session
+        await self.route(Delivery(data))
+        key = self.session_key(self.messages[-1])
+        runner = self.turn_runner(key)
+        runner._ctx._status_thread_metadata = {"thread_id": session}
+        with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+            self.assertFalse((await asyncio.to_thread(runner._ask_clarify_question, QUESTION, CHOICES, False))[1])
+        await self.until_posted(3)
+        self.assertFalse(clarify.has_pending(key))
+        self.assertTrue(clarify.has_pending(first_key))
+        self.assertIn(native.ISSUE, self.adapter._typing_paused)
+        self.assertIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
+        self.assertNotIn((native.ISSUE, session), self.adapter._step_paused)
+        await self.start_typing_refresh()
+        await asyncio.sleep(0.15)
+        self.assertNotIn("action", [p["content"]["type"] for p in self.posted])
+        pending = clarify.get_pending_for_session(first_key, include_choice_prompts=True)
+        self.assertTrue(clarify.resolve_gateway_clarify(pending.clarify_id, "staging"))
+        self.assertEqual(await self.answer_later(first_key, first, clarify.clear_session), ("staging", True))
+        await self.wait_for_step_condition(lambda: any(p["content"]["type"] == "action" for p in self.posted))
+
+    async def test_clarify_retirement_precedes_the_first_resumed_typing_action(self):
+        from tools import clarify_gateway as clarify
+        key = self.session_key(await self.start_turn())
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.bridge.store.enqueue
+        def enqueue(kind, payload, **kwargs):
+            if payload.get("retired_clarify_of"):
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("test did not release retirement enqueue")
+            return original(kind, payload, **kwargs)
+        with patch.object(self.bridge.store, "enqueue", side_effect=enqueue):
+            with patch.object(clarify, "get_clarify_timeout", return_value=0.01):
+                self.assertFalse((await asyncio.to_thread(self.request_clarify, key))[1])
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            await self.start_typing_refresh()
+            await asyncio.sleep(0.15)
+            self.assertIn(native.ISSUE, self.adapter._typing_paused)
+            self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation"])
+            release.set()
+            await self.until_posted(3)
+        self.assertEqual([p["content"]["type"] for p in self.posted], ["elicitation", "thought", "action"])
+
     async def test_real_clarify_resume_preserves_another_question(self):
         from tools import clarify_gateway as clarify
         key = self.session_key(await self.start_turn())

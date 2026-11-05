@@ -1450,6 +1450,42 @@ def create_adapter(config, running):
             return await self._post(bridge, chat_id, session_id, source, body, kind="elicitation",
                                     question=True, nonce=clarify_id, native_prompt=prompt, **reply)
 
+        async def retire_clarify_card(self, clarify_id, notice):
+            """Core retired this waiter without an answer; restore refresh and its visible state."""
+            from tools.clarify_gateway import get_pending
+            if get_pending(clarify_id) is not None:
+                return
+            with self._relay_lock:
+                sessions = list(self._step_session_keys)
+            def resume():
+                for chat_id in {chat for chat, _session in sessions}:
+                    self.resume_typing_for_chat(chat_id)  # Every remaining prompt still fences this.
+            bridge = running.get("bridge")
+            if bridge is None or not self._running:
+                resume()
+                return
+            def retire():
+                for chat_id, session_id in sessions:
+                    with bridge.lock(chat_id):
+                        questions = bridge.store.conversation_questions(chat_id, session_id)
+                        matching = [question for question in questions
+                                    if question.get("native_prompt", {}).get("kind") == "clarify"
+                                    and question["native_prompt"].get("clarify_id") == clarify_id]
+                        if not matching:
+                            continue
+                        row = bridge.store.outbox_row(matching[-1]["id"])
+                        if not row or row["state"] != "sent":
+                            continue  # An unknown create remains on the existing readback-only path.
+                        # Persist before any network read. The lifecycle sender replaces this
+                        # provisional thought with today's question/completion when appropriate.
+                        # A transient provider outage cannot lose the retirement intent.
+                        bridge._queue_conversation_lifecycle_repair(row, {
+                            "content": bridge._lifecycle_repair_content("thought")}, retire_clarify=True)
+            try:
+                await asyncio.to_thread(retire)
+            finally:
+                resume()  # The first refreshed step cannot race ahead of durable retirement.
+
         async def get_chat_info(self, chat_id):
             return {"name": str(chat_id), "type": "dm"}
 
