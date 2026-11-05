@@ -24,7 +24,8 @@ chat request is the authority, exactly as for ``work_on``.
 
 One proof hold is not waiting alone: a stopped Kanban attempt whose worker reported back after the
 gateway gave up on it is left ``unknown`` by core, and nothing in that gateway's lifetime settles
-it. When this flow's own pause holds on exactly that row, the owner asks core once to resolve it
+it. When a handover pause for the same agent holds on exactly that row (a row still ``started``
+is waited on), the owner asks core once to resolve it
 (``prompt.resolve_unknown``, the same fenced call as a person's Discard, which first re-runs core's
 process-stop cleanup), then proves again with the unchanged proof."""
 from __future__ import annotations
@@ -386,9 +387,12 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
             proof = {"quiescence_proven": False, "reason": "cleanup_evidence_unavailable"}
         if (proof.get("quiescence_proven") is not True and proof.get("reason") == "native_admission_not_settled"
                 and ours and not resolve_tried):
-            # Once per hand-off: settle our own stopped attempt's lost row, then prove again.
-            resolve_tried = True
-            if _resolve_lost_attempt(home, adapter, bound, task_id, stop_id, reason):
+            # Once per hand-off, counted only when core is actually asked: a row still ``started``
+            # (the worker's stop ack and loss note can take ~40 s) leaves the attempt for a later poll.
+            resolved = _resolve_lost_attempt(home, adapter, bound, task_id, stop_id, to)
+            if resolved is not None:
+                resolve_tried = True
+            if resolved:
                 continue
         if proof.get("quiescence_proven") is True:
             diag.evt("handoff.decision", "applied", "handed_off", task=task_id, evt=stop_id)
@@ -407,10 +411,12 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
     return _paused(held, owner, to, _fact(held))
 
 
-def _lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, reason: str) -> dict | None:
+def _lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, to: str) -> dict | None:
     """The stopped run's admission row when, and only when, core left it exactly ``unknown``
-    under this flow's own live pause: the task blocked with no current run, the live Stop is
-    ``stop_id`` with our reason and request id, and the row is that run's Kanban card attempt.
+    under this flow's live pause: the task blocked with no current run, the live Stop is
+    ``stop_id`` and is a guarded handover pause for ``to`` (from this request or an earlier one
+    for the same agent; a person's pause or another agent's never qualifies), and the row is that
+    run's Kanban card attempt.
     Any other row (``started``, terminal, foreign, missing) is None: nothing is resolved."""
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
@@ -421,7 +427,7 @@ def _lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, 
     events = adapter.history(task_id, 0)
     live = _live_stop(events)
     if (live is None or live.id != stop_id or live.kind != "blocked"
-            or (live.payload or {}).get("reason") != reason or (live.payload or {}).get("kind") != "needs_input"):
+            or _handover_to(live) != to or (live.payload or {}).get("kind") != "needs_input"):
         return None
     with adapter.read_conn() as conn:
         runs = [int(row["id"]) for row in conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id", (task_id,))]
@@ -457,22 +463,24 @@ async def _resolve_unknown(home: Path, row: dict) -> None:
                          execution_generation=row["execution_generation"])
 
 
-def _resolve_lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, reason: str) -> bool:
-    """Ask core once to settle our stopped attempt's ``unknown`` row: True when it was asked and
-    answered. Never raises. Core re-runs its process-stop cleanup first and refuses
-    (``process_stop_unknown``) when owned processes can't be proven gone; then the row stays
+def _resolve_lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, to: str) -> bool | None:
+    """Ask core to settle our stopped attempt's ``unknown`` row: True when it was asked and
+    answered, False when it was asked and refused (or unreachable), None when nothing was asked
+    (no such row yet, e.g. still ``started``, or unreadable evidence). Never raises. Core re-runs
+    its process-stop cleanup first and refuses (``process_stop_unknown``) when owned processes
+    can't be proven gone; then the row stays
     ``unknown``, the proof keeps holding and the work stays paused. The proof, not this answer,
     decides the handover: it still checks worker processes, the executor row, lineage, the Stop
     checkpoint and the scoped process checkpoint."""
     import asyncio
     try:
-        row = _lost_attempt(home, adapter, bound, task_id, stop_id, reason)
+        row = _lost_attempt(home, adapter, bound, task_id, stop_id, to)
     except Exception as exc:  # noqa: BLE001 - unreadable evidence: resolve nothing
         diag.evt("handoff.decision", "skipped", "native_attempt_unknown", task=task_id, evt=stop_id, exc=type(exc).__name__)
-        return False
+        return None
     if row is None:
         diag.evt("handoff.decision", "skipped", "native_attempt_unknown", task=task_id, evt=stop_id)
-        return False
+        return None
     diag.evt("handoff.decision", "started", "native_attempt_unknown", task=task_id, evt=stop_id)
     try:
         asyncio.run(_resolve_unknown(home, row))

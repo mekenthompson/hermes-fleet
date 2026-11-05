@@ -99,9 +99,10 @@ class Handoff(base.OriginScenarios):
             if resume:
                 return await asyncio.to_thread(handoff.resume, self.linear_state, issue, "default", metadata,
                                                to=to, request_id=request_id, owner_name="Atlas")
+            extra.setdefault("sleep", lambda seconds: None)
             return await asyncio.to_thread(handoff.hand_off, self.linear_state, issue, "default", self.settings,
                                            metadata, to=to, request_id=request_id, owner_name="Atlas",
-                                           wait_seconds=wait_seconds, sleep=lambda seconds: None, **extra)
+                                           wait_seconds=wait_seconds, **extra)
 
     async def inspected(self, issue, metadata, stop_id):
         from agent import runtime_session_store
@@ -257,7 +258,7 @@ class Handoff(base.OriginScenarios):
         # holds native_admission_not_settled until the wait ends and the owner stays paused.
         await self.lost_attempt_issue()
         self.lose_on_stop()
-        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: False):
+        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: None):
             result = await self.hand_off()
         self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
         self.assertEqual(self.admission_row()["status"], "unknown")
@@ -318,21 +319,35 @@ class Handoff(base.OriginScenarios):
         self.assertEqual(self.resolves(), [])
         self.assertEqual(self.admission_row()["status"], "unknown")
 
-    async def test_handoff_never_resolves_a_lost_attempt_under_an_earlier_request(self):
-        # Only the request whose own Stop is live may settle that run: a new request for the same
-        # agent proves the earlier pause but leaves its lost row to the request that stopped it.
+    async def test_handoff_settles_a_lost_attempt_under_an_earlier_request_for_the_same_agent(self):
+        # "Take over again" carries a new id: it proves the earlier pause for the same agent and
+        # settles the row the earlier request left unknown, instead of leaving it stuck until a restart.
         await self.lost_attempt_issue()
         self.lose_on_stop()
-        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: False):
+        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: None):
             first = await self.hand_off()
         self.assertEqual(first["state"], "paused", first)
-        later = await self.hand_off(request_id=R2)
-        self.assertEqual((later["state"], later["reason"]), ("paused", "proof_timeout"), later)
-        self.assertEqual(self.resolves(), [])
         self.assertEqual(self.admission_row()["status"], "unknown")
-        same = await self.hand_off()  # The request that stopped it, retried: settles and hands over.
-        self.assertTrue(same["handed_off"], same)
+        later = await self.hand_off(request_id=R2)
+        self.assertTrue(later["handed_off"], later)
+        self.assertEqual(len(self.resolves()), 1)
         self.assertEqual(self.admission_row()["outcome"], "interrupted")
+        self.assertEqual(len(self.delivered), 1)  # Never stopped twice.
+
+    async def test_handoff_settles_a_loss_that_lands_after_started_polls(self):
+        # Live timing: the row stays started for the gateway's stop ack (~30 s) plus the loss note
+        # wait before core marks it unknown. Polls that see it started must not spend the attempt.
+        import itertools
+        await self.lost_attempt_issue()
+        sleeps, ticks = itertools.count(), itertools.count()
+        def sleep(_seconds):
+            if next(sleeps) == 2:  # Two polls saw it started; the loss lands before the third.
+                asyncio.run_coroutine_threadsafe(self.lose_worker(), self.loop).result(timeout=30)
+        result = await self.hand_off(wait_seconds=30, sleep=sleep, clock=lambda: float(next(ticks)))
+        self.assertTrue(result["handed_off"], result)
+        self.assertEqual(len(self.resolves()), 1)
+        self.assertEqual((self.admission_row()["status"], self.admission_row()["outcome"]), ("terminal", "interrupted"))
+        self.assertIsNone(self.stop_lock())
 
     async def test_handoff_refuses_before_stopping_when_proof_cannot_hold(self):
         await self.running_issue(body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
