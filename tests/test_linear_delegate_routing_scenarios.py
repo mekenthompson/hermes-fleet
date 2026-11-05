@@ -126,7 +126,10 @@ class DelegateRoutingScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task).current_run_id, running.current_run_id)
         self.assertIsNone(self.bridge.store.native_intent("create:issue-1"))
         self.bridge.flush()
-        self.assertTrue(any("The agent is already working on this, so nothing new was started." in body for body in self.remote.bodies("issue-1")))
+        # The tracked work adopts the session Linear opened for our delegate write (HF-630).
+        self.assertEqual(self.bridge.store.get("issue-1")["owner_ref"], session)
+        self.assertTrue(any("This is the work already running on this issue, so nothing new was started." in body
+                            for body in self.remote.bodies("issue-1")))
         self.remote.set_delegate("issue-1", OTHER)
         activity = "revoked-stop"
         self.remote.activity_records[activity] = {"id": activity, "user": {"id": "human-1"},

@@ -47,7 +47,7 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
-    "session.admit", "cleanup.inspect", "notify.retire", "chat.guard", "pr_park.resume",
+    "session.admit", "cleanup.inspect", "chat.guard", "pr_park.resume",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -83,6 +83,7 @@ REASONS = frozenset({
     # delegation admission before the model turn (native_input.admit_delegation)
     "delegation_started", "delegation_linked", "admission_declined", "admission_held", "admission_failed",
     "mention_conversation", "delegated_awaiting_session", "session_turn", "same_session",
+    "session_adopted", "owner_session_live",
     "finished_work_conversation",
     # chat guard (guard.py): armed by which matcher rule, blocked after which allowance, released why
     "track_request", "linear_work_request", "issue_work_request", "grace_calls", "grace_time",
@@ -123,8 +124,6 @@ REASONS = frozenset({
     "authorization_unavailable", "native_scope_refused", "description_conflict",
     "context_or_service_unavailable", "delivery_uncertain", "project_required", "ambiguous_project",
     "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
-    # retired Linear notify subscriptions (the bridge relays those events itself)
-    "bridge_relayed",
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
     "acceptance_unverified", "acceptance_verified", "acceptance_failed", "acceptance_expired",
     "acceptance_head_moved",

@@ -684,6 +684,36 @@ class Store:
     def retired(self, issue_id: str | None = None) -> list[dict]:
         with self._tx() as db:
             return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
+    def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str) -> bool:
+        """Report this bound task's progress in a Linear Agent Session; reporting only, never execution.
+
+        Compare-and-set on the inspected owner (``""`` for work started from chat or by take_over),
+        so a concurrent rebind or another session's adoption wins and this one changes nothing.
+        Queued deliveries keep their original destination (earlier progress stays comments).
+        """
+        if not session_id or session_id == expected_owner:
+            raise ValueError("session adoption needs a new Agent Session")
+        with self._tx() as db:
+            if not self._admitted(db, issue_id):
+                return False
+            return bool(db.execute("UPDATE work SET owner_ref=?, linear_session_id=? WHERE issue_id=? AND "
+                                   "origin='native' AND task_id=? AND owner_ref=?",
+                                   (session_id, session_id, issue_id, task_id, expected_owner)).rowcount)
+    def session_answered(self, issue_id: str, session_id: str) -> bool:
+        """The session's latest activity from this app is a delivered response: Linear has closed it.
+
+        A later thought or action, a pending or possibly-landed write, or no activity at all reads
+        as live; writes that never reached Linear are ignored.
+        """
+        with self._tx() as db:
+            row = db.execute("SELECT state, payload FROM outbox WHERE kind = 'activity' AND hold_reason IS NULL AND "
+                             "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ? AND "
+                             "NOT (state = 'sent' AND COALESCE(json_extract(payload, '$.applied'), 1) = 0) AND "
+                             "NOT (state = 'failed' AND attempts = 0) ORDER BY json_extract(payload, '$.enqueued_at') DESC, rowid DESC LIMIT 1",
+                             (issue_id, session_id)).fetchone()
+        if not row or row["state"] != "sent":
+            return False
+        return (json.loads(row["payload"]).get("content") or {}).get("type") == "response"
     def put(self, issue_id: str, origin: str, owner_ref: str, *, task_id: str | None = None,
             project_id: str | None = None, last_updated_at: float = 0.0,
             run_generation: int | None = None) -> bool:
