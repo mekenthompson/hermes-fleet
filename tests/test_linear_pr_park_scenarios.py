@@ -26,6 +26,15 @@ PARKED = ("Paused after a restart while PR #7 is open. It resumes by itself when
           "ask the agent to resume if it should continue now.")
 
 
+def core_guard_wait():
+    """Core's open-PR park module, or None on a Core that predates it (the rows are then written as it would)."""
+    try:
+        from hermes_cli import kanban_db_guard_wait
+    except ImportError:
+        return None
+    return kanban_db_guard_wait
+
+
 class FakeGh:
     """``gh api`` for one pull request: open, merged, closed, refused or not answering."""
 
@@ -100,9 +109,15 @@ class PrParkScenarios(unittest.TestCase):
 
     def park(self, task):
         """What core's dispatcher does to that ready card while the PR comment is fresh."""
-        from hermes_cli import kanban_db_guard_wait as guard_wait
+        guard_wait = core_guard_wait()
         with self.board.conn() as db:
-            guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
+            if guard_wait:
+                guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
+            else:  # An older Core (CI's companion candidate) has no park: write the rows it writes.
+                with self.board.kb.write_txn(db):
+                    db.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
+                    self.board.kb._append_event(db, task, "blocked", {
+                        "reason": "waiting for PR #7 to merge", "kind": "needs_input", "source": "respawn_guard"})
         park = self.events(task)[-1]
         self.assertEqual((park.kind, park.payload.get("source"), self.board.get(task).status),
                          ("blocked", "respawn_guard", "blocked"))
@@ -215,11 +230,16 @@ class PrParkScenarios(unittest.TestCase):
         self.assertEqual(len(self.gh.calls), reads)
 
     def test_core_self_release_is_not_followed_by_a_second_unblock(self):
-        from hermes_cli import kanban_db_guard_wait as guard_wait
+        guard_wait = core_guard_wait()
         task, _ = self.parked()
         with self.board.conn() as db:  # The PR comment ages out of core's 24 h window ...
             db.execute("UPDATE task_comments SET created_at = created_at - 3 * 86400 WHERE task_id = ?", (task,))
-            self.assertEqual(guard_wait.release_parked(db), 1)  # ... and core releases the park itself.
+            if guard_wait:
+                self.assertEqual(guard_wait.release_parked(db), 1)  # ... and core releases the park itself.
+            else:  # Older Core: the release core would write.
+                with self.board.kb.write_txn(db):
+                    db.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task,))
+                    self.board.kb._append_event(db, task, "promoted", {"source": "respawn_guard"})
         self.assertEqual(self.events(task)[-1].kind, "promoted")
         self.gh.state, self.gh.merged = "closed", True
         reads = len(self.gh.calls)
