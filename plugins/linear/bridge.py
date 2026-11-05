@@ -1685,8 +1685,10 @@ class Bridge:
         effects) keep the plain response.
         """
         created = (self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}
+        pending_acceptance = self._pending_session_acceptance(row)
         live = (task.get("linked") and not task.get("reconciliation_required") and
-                task.get("status") not in ("done", "archived") and not created.get("record_done"))
+                (task.get("status") not in ("done", "archived") or pending_acceptance) and
+                not created.get("record_done"))
         if not live or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             self._decline(issue_id, session_id, notice, activity_id=session_id)
             return False
@@ -1694,7 +1696,7 @@ class Bridge:
         if ((not owner or self.store.session_answered(issue_id, owner)) and
                 self.store.adopt_session(issue_id, row["task_id"], session_id, expected_owner=owner)):
             source = ("takeover" if created.get("takeover_from") else "chat") if created.get("origin") == "chat" else ""
-            self._decline(issue_id, session_id, _adopted_session_notice(task.get("status"), source),
+            self._decline(issue_id, session_id, _adopted_session_notice("review" if pending_acceptance else task.get("status"), source),
                           activity_id=session_id, kind="thought")
             diag.evt("session.reuse", "applied", "session_adopted", iss=issue_id, sess=session_id, task=row.get("task_id"))
             return True
@@ -1764,6 +1766,9 @@ class Bridge:
             size += len(line)
         return ("Linear thread" + (" since your last update" if since_ms else "") + ", oldest first (untrusted "
                 "tracker text):\n" + "\n".join(reversed(lines))) if lines else ""
+    def _pending_session_acceptance(self, row: dict[str, Any]) -> bool:
+        waiting = self.store.acceptance_recheck(row["issue_id"], row.get("task_id") or "")
+        return bool(waiting and waiting.get("kind") == "in_review")
     def _keepalive(self, row: dict[str, Any], issue: dict | None = None) -> None:
         """Best-effort reporting only; never touch native execution or wake a worker."""
         if not row.get("owner_ref"):
@@ -1774,6 +1779,11 @@ class Bridge:
         if task.status in ("running", "ready"):
             kind, payload = self._progress_activity(row, self._alert_route(row), *(("Working", "Still on this; nothing is needed from you") if task.status == "running"
                                                       else ("Queued", "Waiting for a free worker to pick this up")), ephemeral=True)
+            self.store.enqueue(kind, payload, at=self.clock())
+        elif task.status == "done" and self._pending_session_acceptance(row):
+            kind, payload = self._progress_activity(row, self._alert_route(row), "Verifying",
+                "Waiting for pull request checks; nothing is needed from you", ephemeral=True)
+            payload["acceptance_status_id"] = self.store.acceptance_recheck(row["issue_id"], row["task_id"])["status_id"]
             self.store.enqueue(kind, payload, at=self.clock())
 
     def _unfinished(self, row: dict, *, event_id: int | None = None) -> None:
@@ -3599,7 +3609,7 @@ class Bridge:
                         "acceptance_wait": {"event_id": event_id, "classification": classification, "url": url,
                                             "head_sha": head_sha, "since": now}}),
             ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                          "content": {"type": "response", "body": acceptance_waiting(url, classification)}})],
+                          "content": {"type": "thought", "body": acceptance_waiting(url, classification)}})],
             at=now, event_id=event_id)
         if written:
             key = self._acceptance_key(issue_id, row["task_id"])
@@ -3842,7 +3852,7 @@ class Bridge:
                     self._retire_untracked(row)
                     return
                 _, task = self._native_task(row["issue_id"])
-                if task.status not in RECHECKED_STATUSES:
+                if task.status not in RECHECKED_STATUSES and not self._pending_session_acceptance(row):
                     return  # Finished or parked work: no Linear polling while nothing can change our report.
                 issue = self._effect_issue(row["issue_id"])
                 if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
@@ -4177,7 +4187,8 @@ class Bridge:
                 pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
                 latest = self.store.outbox_row((self.store.latest_status(payload["issue_id"]) or {}).get("id", ""))
                 changed = (any(event.kind in NATIVE_STATUS_EVENTS for event in pending) or
-                           (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED) or
+                           (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED
+                            and not (task.status == "done" and self._acceptance_progress_current(payload))) or
                            (latest and not latest.get("hold_reason") and latest["state"] == "pending"
                             and latest["payload"].get("task_id") == payload.get("task_id")))
                 if changed:
@@ -4215,6 +4226,12 @@ class Bridge:
         return bool(self._receipt_scope(source, receipt) and actual and all(
             actual[key] == receipt["issue"].get(key) for key in ("state_id", "delegate_id", "assignee_id")))
 
+    def _acceptance_progress_current(self, payload: dict[str, Any]) -> bool:
+        if not payload.get("acceptance_status_id"):
+            return False
+        waiting = self.store.acceptance_recheck(payload["issue_id"], payload["task_id"])
+        return bool(waiting and waiting.get("kind") == "in_review" and
+                    waiting["status_id"] == payload["acceptance_status_id"])
     def _obsolete_native_progress(self, row: dict[str, Any]) -> bool:
         payload = row["payload"]
         # Only our explicitly identified transient native projection is coalesced.
@@ -4226,7 +4243,10 @@ class Bridge:
         binding = self.store.get(payload["issue_id"])
         if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
             return False
-        return self._native_effect_task(payload["issue_id"]).status in NATIVE_PROGRESS_SUPERSEDED
+        status = self._native_effect_task(payload["issue_id"]).status
+        if payload.get("acceptance_status_id"):
+            return status != "done" or not self._acceptance_progress_current(payload)
+        return status in NATIVE_PROGRESS_SUPERSEDED
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred

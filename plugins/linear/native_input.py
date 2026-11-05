@@ -422,7 +422,10 @@ def _session_work_live(bridge, issue_id, session_id) -> bool:
         raise
     except Exception:
         return False
-    return getattr(task, "status", None) not in (None, "done", "archived")
+    if getattr(task, "status", None) == "done":
+        waiting = bridge.store.acceptance_recheck(issue_id, row["task_id"])
+        return bool(waiting and waiting.get("kind") == "in_review")
+    return getattr(task, "status", None) not in (None, "archived")
 
 
 def queue_reply(bridge, issue_id, session_id, message_id, body):
