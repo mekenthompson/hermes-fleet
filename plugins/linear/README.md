@@ -565,7 +565,15 @@ invalid entries are dropped and logged.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
-verified shows In Review (it awaits review, CI or merge; never Todo). Done comes only from
+verified shows In Review (it awaits review, CI or merge; never Todo). A task core's open-PR
+guard parked after a restart (blocked, its newest block, unblock or release event being the
+guard's own block) also shows In Review, with one plain sentence instead of "Waiting on you".
+Once that PR has merged or closed, the plugin lets the task run with one guarded core unblock
+of exactly that park, decided once per park; the PR is asked about on a persisted gap
+(2 minutes doubling to an hour, taken before asking). An open PR, GitHub refusing or not
+answering, or any newer event on the task leaves it parked; core's own release after 24 hours
+is not followed by another unblock. People's blocks, Stops and handoff pauses are never
+touched. Done comes only from
 verified completion. A PR named as evidence is verified by core's exact-head required-check
 verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
 token without `checks:read`), the same requirements are proved from exact-head GitHub Actions

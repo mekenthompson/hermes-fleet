@@ -47,7 +47,7 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
-    "session.admit", "cleanup.inspect", "notify.retire", "chat.guard",
+    "session.admit", "cleanup.inspect", "notify.retire", "chat.guard", "pr_park.resume",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
@@ -128,6 +128,8 @@ REASONS = frozenset({
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
     "acceptance_unverified", "acceptance_verified", "acceptance_failed", "acceptance_expired",
     "acceptance_head_moved",
+    # work core's open-PR guard parked, resumed once that PR merges or closes (_resume_pr_park)
+    "pr_park_resolved", "pr_park_resumed", "pr_park_changed", "pr_park_no_pr", "pr_open", "pr_unreadable",
 })
 _OPEN_REASON = re.compile(r"(?:native|graphql)_[a-z0-9_]{1,32}")
 
