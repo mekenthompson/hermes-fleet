@@ -62,6 +62,129 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
     def make_due(self, identity):
         self.store.defer(identity, self.bridge.clock() - 1)
 
+    async def test_final_read_failure_after_admission_retries_without_duplicate(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.start_turn()
+        final = self.queue_final(native.ACTIVITY)
+        original, failures = self.bridge._conversation_final_type, []
+        def read(payload, **kwargs):
+            if self.store.outbox_row(final)["payload"]["write_started"] is True and not failures:
+                failures.append(True)
+                raise LinearError("Transient final projection unavailable")
+            return original(payload, **kwargs)
+        before = len(self.posted)
+        with patch.object(self.bridge, "_conversation_final_type", side_effect=read):
+            await self.flush(final)
+        self.assertTrue(failures)
+        self.assertEqual(len(self.posted), before)
+        self.assertIs(self.store.outbox_row(final)["payload"]["write_started"], False)
+        self.make_due(final)
+        await self.flush(final)
+        await self.flush(final)
+        self.assertEqual(sum(p["id"] == final for p in self.posted), 1)
+
+    async def test_pretransport_cleanup_preserves_concurrent_unknown_final(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.start_turn()
+        final = self.queue_final(native.ACTIVITY)
+        original, failures = self.bridge._conversation_final_type, []
+        def read(payload, **kwargs):
+            if self.store.outbox_row(final)["payload"]["write_started"] is True and not failures:
+                failures.append(True)
+                # A second Store admits an unknown send after this guard admitted.
+                self.assertTrue(self.store.admit_mutation(final, conversation_attempt_id="other-sender"))
+                raise LinearError("Transient final projection unavailable")
+            return original(payload, **kwargs)
+        with patch.object(self.bridge, "_conversation_final_type", side_effect=read):
+            await self.flush(final)
+        self.assertTrue(failures)
+        self.assertIs(self.store.outbox_row(final)["payload"]["write_started"], True)
+        self.assertEqual(self.store.outbox_row(final)["payload"]["conversation_attempt_id"], "other-sender")
+        await self.deliver("newer-input", "Check the next part.")
+        before = len(self.posted)
+        self.make_due(final)
+        await self.flush(final)
+        self.assertEqual(len(self.posted), before)
+        self.assertEqual(self.store.outbox_row(final)["state"], "pending")
+
+    async def test_prior_unknown_final_keeps_marker_when_retry_fails_before_transport(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.start_turn()
+        final = self.queue_final(native.ACTIVITY)
+        self.absent.add(final)
+        await self.flush(final)  # Transport was entered, but no authoritative effect is visible.
+        self.assertIs(self.store.outbox_row(final)["payload"]["write_started"], True)
+        admit, read = self.bridge.store.admit_mutation, self.bridge._conversation_final_type
+        admitted, failures = [], []
+        def admission(row_id, **kwargs):
+            result = admit(row_id, **kwargs)
+            if row_id == final and result:
+                admitted.append(True)
+            return result
+        def projection(payload, **kwargs):
+            if admitted:
+                failures.append(True)
+                raise LinearError("Transient projection read after retry admission")
+            return read(payload, **kwargs)
+        before = len(self.posted)
+        self.make_due(final)
+        with patch.object(self.bridge.store, "admit_mutation", side_effect=admission), patch.object(
+                self.bridge, "_conversation_final_type", side_effect=projection):
+            await self.flush(final)
+        self.assertTrue(failures)
+        self.assertEqual(len(self.posted), before)
+        self.assertIs(self.store.outbox_row(final)["payload"]["write_started"], True)
+
+    async def test_repair_read_failure_after_admission_retries_same_presentation(self):
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.start_turn()
+        first = self.queue_final(native.ACTIVITY)
+        self.lost.add(first)
+        await self.flush(first)
+        await self.deliver("newer-input", "Check the next part.")
+        original, failures = self.bridge._conversation_repair_current, []
+        def read(payload):
+            row = self.store.outbox_row(payload["id"])
+            if row["payload"]["write_started"] is True and not failures:
+                failures.append(row["id"])
+                raise LinearError("Transient repair projection unavailable")
+            return original(payload)
+        self.make_due(first)
+        with patch.object(self.bridge, "_conversation_repair_current", side_effect=read):
+            await self.flush(first)
+        self.assertEqual(len(failures), 1)
+        repair = failures[0]
+        row = self.store.outbox_row(repair)
+        self.assertIs(row["payload"]["write_started"], False)
+        self.assertFalse(any(p["id"] == repair for p in self.posted))
+        self.make_due(repair)
+        await self.flush(repair)
+        await self.flush(repair)
+        self.assertEqual([p["content"] for p in self.posted if p["id"] == repair], [row["payload"]["content"]])
+
+    async def test_question_lock_failure_after_admission_retries_without_transport(self):
+        from contextlib import contextmanager
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.start_turn()
+        question = self.queue_interim("elicitation")
+        original, failures = self.bridge._question_publication_guard, []
+        @contextmanager
+        def lock(payload):
+            if self.store.outbox_row(question)["payload"]["write_started"] is True and not failures:
+                failures.append(True)
+                raise LinearError("Transient question authority read unavailable")
+            with original(payload):
+                yield
+        before = len(self.posted)
+        with patch.object(self.bridge, "_question_publication_guard", side_effect=lock):
+            await self.flush(question)
+        self.assertTrue(failures)
+        self.assertEqual(len(self.posted), before)
+        self.assertIs(self.store.outbox_row(question)["payload"]["write_started"], False)
+        self.make_due(question)
+        await self.flush(question)
+        self.assertEqual(sum(p["id"] == question for p in self.posted), 1)
+
     async def test_late_interim_cannot_close_while_captured_pr_is_unaccepted(self):
         from hermes_cli import kanban_db as kb
         from hermes_fleet_linear_plugin import bridge as bridge_module

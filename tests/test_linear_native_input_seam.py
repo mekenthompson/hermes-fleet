@@ -34,6 +34,58 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         return await self.adapter.send_exec_approval(self.ISSUE, entry.data["command"], key,
             request_id=entry.data["request_id"], metadata={"thread_id": self.SESSION})
 
+    async def test_clarify_read_failure_after_admission_retries_exact_question(self):
+        await self.check_question_read_failure_after_admission("clarify")
+
+    async def test_approval_read_failure_after_admission_retries_exact_question(self):
+        await self.check_question_read_failure_after_admission("approval")
+
+    async def check_question_read_failure_after_admission(self, kind):
+        from tools import clarify_gateway as clarify, approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+        from hermes_fleet_linear_plugin.api import LinearError
+        await self.deliver("initial", "Inspect the bounded task.")
+        await self.until(lambda: self.receipts and self.inbox_row("initial")[2] == "imported")
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        with patch.object(self.bridge, "flush", return_value=0):
+            if kind == "clarify":
+                pending = clarify.register("read-outage", key, "Choose an environment.", ["staging", "production"])
+                self.addCleanup(clarify.clear_session, key)
+                queued = await self.adapter.send_clarify(self.ISSUE, pending.question, pending.choices,
+                    pending.clarify_id, key, metadata={"thread_id": self.SESSION})
+            else:
+                pending = _ApprovalEntry({"command": "bounded-command"})
+                with approval._lock:
+                    approval._gateway_queues.setdefault(key, []).append(pending)
+                self.addCleanup(approval.unregister_gateway_notify, key)
+                queued = await self.show_approval(key, pending)
+        expected = self.bridge.store.outbox_row(queued.message_id)["payload"]
+        original_read, failed = self.bridge.native_conversation_state, []
+        def read(payload):
+            row = self.bridge.store.outbox_row(queued.message_id)
+            if row["payload"]["write_started"] is True and not failed:
+                failed.append(True)
+                raise LinearError("Transient native authority read failure")
+            return original_read(payload)
+        with patch.object(self.bridge, "native_conversation_state", side_effect=read):
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        self.assertTrue(failed)
+        self.assertNotIn(queued.message_id, self.provider.activities)
+        self.assertIs(self.bridge.store.outbox_row(queued.message_id)["payload"]["write_started"], False)
+        for _ in range(2):
+            self.bridge.store.defer(queued.message_id, self.bridge.clock() - 1)
+            await asyncio.to_thread(self.bridge.flush, only_id=queued.message_id)
+        row = self.bridge.store.outbox_row(queued.message_id)
+        self.assertIn(queued.message_id, self.provider.activities)
+        self.assertEqual(row["state"], "sent")
+        self.assertEqual(row["payload"]["content"], expected["content"])
+        self.assertEqual(row["payload"]["signal_metadata"], expected["signal_metadata"])
+        if kind == "clarify":
+            self.assertIs(clarify.get_pending(pending.clarify_id), pending)
+        else:
+            with approval._lock:
+                self.assertIn(pending, approval._gateway_queues[key])
+
     async def asyncSetUp(self):
         # Reuse Core's finite settings/agent boundary, never GatewayRunner.
         spec = importlib.util.spec_from_file_location("finite_native_retry_fixture",

@@ -4246,34 +4246,32 @@ class Bridge:
                 raise ProjectUpdateDeferred  # HTTP body is already encoded; reproject on the next pass.
             prior_started["value"] = payload.get("write_started")
             conversation = bool(row and self.store.conversation_reply(row["kind"], payload))
-            prior_started["attempt_id"] = uuid.uuid4().hex if conversation else None
-            options = ({"expected_content": expected_content, "conversation_attempt_id": prior_started["attempt_id"],
-                        "require_unattempted": prior_started["value"] is False} if conversation else {})
+            prior_started["attempt_id"] = uuid.uuid4().hex
+            options = {"mutation_attempt_id": prior_started["attempt_id"],
+                       "require_unattempted": prior_started["value"] is False}
+            if conversation:
+                options.update(expected_content=expected_content, conversation_attempt_id=prior_started["attempt_id"])
             if not self.store.admit_mutation(row_id, terminal=terminal, **options): raise ProjectUpdateDeferred
-            if interim_reply and self._conversation_interim_finished(payload):
-                self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
-                raise LinearError("Linear session already has its final reply", retryable=False)
-            if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
-                    or (repair_reply and not self._conversation_repair_current(payload))):
-                if prior_started["value"] is False:
-                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
-                raise ProjectUpdateDeferred  # Still before transport; no completion was published.
-            if (prior_started.get("value") is False and row["attempts"] == 0 and
-                    (payload.get("native_history") is True or payload.get("native_progress") is True)):
-                work, task = self._native_task(payload["issue_id"])
-                pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
-                latest = self.store.outbox_row((self.store.latest_status(payload["issue_id"]) or {}).get("id", ""))
-                changed = (any(event.kind in NATIVE_STATUS_EVENTS for event in pending) or
-                           (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED
-                            and not (task.status == "done" and self._acceptance_progress_current(payload))) or
-                           (latest and not latest.get("hold_reason") and latest["state"] == "pending"
-                            and latest["payload"].get("task_id") == payload.get("task_id")))
-                if changed:
-                    # Still before guard yield: this request has made no HTTP call.
-                    self.store.reject_native_message_before_transport(row_id, started_before=prior_started["value"])
-                    raise ProjectUpdateDeferred
             entered_transport = False
             try:
+                if interim_reply and self._conversation_interim_finished(payload):
+                    raise LinearError("Linear session already has its final reply", retryable=False)
+                if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
+                        or (repair_reply and not self._conversation_repair_current(payload))):
+                    raise ProjectUpdateDeferred  # Still before transport; no completion was published.
+                if (prior_started.get("value") is False and row["attempts"] == 0 and
+                        (payload.get("native_history") is True or payload.get("native_progress") is True)):
+                    work, task = self._native_task(payload["issue_id"])
+                    pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
+                    latest = self.store.outbox_row((self.store.latest_status(payload["issue_id"]) or {}).get("id", ""))
+                    changed = (any(event.kind in NATIVE_STATUS_EVENTS for event in pending) or
+                               (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED
+                                and not (task.status == "done" and self._acceptance_progress_current(payload))) or
+                               (latest and not latest.get("hold_reason") and latest["state"] == "pending"
+                                and latest["payload"].get("task_id") == payload.get("task_id")))
+                    if changed:
+                        # Still before guard yield: this request has made no HTTP call.
+                        raise ProjectUpdateDeferred
                 with self._question_publication_guard(payload) if question_reply else nullcontext():
                     if interim_reply and self._conversation_interim_finished(payload):
                         raise LinearError("Linear session already has its final reply", retryable=False)
@@ -4293,19 +4291,20 @@ class Bridge:
                     raise ProjectUpdateDeferred from exc  # Reconcile the expired repair on its next pass.
                 raise
             finally:
-                if (interim_reply or repair_reply) and not entered_transport and prior_started.get("value") is False:
-                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
+                if not entered_transport and prior_started.get("value") is False:
+                    self.store.mutation_not_attempted(row_id, prior_started["attempt_id"])
         if (self.store.outbox_row(row_id) or {}).get("kind") == "project_update":
             guard.rejected = lambda: self.store.project_not_applied(
-                row_id, known_rejection=True, started_before=prior_started.get("value"))
+                row_id, known_rejection=True, started_before=prior_started.get("value"),
+                attempt_id=prior_started.get("attempt_id"))
         elif (self.store.outbox_row(row_id) or {}).get("kind") == "delegate":
             guard.rejected = lambda: self.store.delegate_not_applied(
-                row_id, started_before=prior_started.get("value"))
+                row_id, started_before=prior_started.get("value"), attempt_id=prior_started.get("attempt_id"))
         elif self.store.conversation_reply((self.store.outbox_row(row_id) or {}).get("kind", ""),
                                            (self.store.outbox_row(row_id) or {}).get("payload", {})):
             def rejected():
                 if prior_started.get("value") is False:
-                    self.store.conversation_not_attempted(row_id, prior_started["attempt_id"])
+                    self.store.mutation_not_attempted(row_id, prior_started["attempt_id"])
             guard.rejected = rejected
         with self.api.guarded_mutation(guard):
             action()

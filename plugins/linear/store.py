@@ -445,7 +445,7 @@ class Store:
             yield self._effect_admitted(db, issue_id)
     def admit_mutation(self, row_id: str, *, terminal: bool = False,
                        expected_content: dict | None = None, conversation_attempt_id: str | None = None,
-                       require_unattempted: bool = False) -> bool:
+                       require_unattempted: bool = False, mutation_attempt_id: str | None = None) -> bool:
         """Persist a remote-send marker without using a Linear record as execution authority."""
         if getattr(self._local, "db", None) is not None:
             raise RuntimeError("mutation admission requires its own commit")
@@ -485,30 +485,33 @@ class Store:
             native_progress = (row["kind"] in ("comment", "activity") and
                                (payload.get("native_progress") is True or payload.get("native_history") is True)
                                and payload.get("task_id"))
-            if self.conversation_reply(row["kind"], payload) and conversation_attempt_id:
-                return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
-                    "'$.conversation_attempt_id',?) WHERE id=?", (conversation_attempt_id, row_id)).rowcount)
             if terminal or payload.get("terminal") and row["kind"] in ("comment", "activity") or native_progress or self.conversation_reply(row["kind"], payload) or row["kind"] in ("status", "description", "delegate", "project_update"):
-                return bool(db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('true')) "
-                                       "WHERE id=?", (row_id,)).rowcount)
-            return True
-    def reject_native_message_before_transport(self, row_id: str, *, started_before: bool | None) -> bool:
-        """Only the pre-yield guard's proved non-send can restore an unstarted marker."""
-        if started_before is not False:
-            return False
-        with self._tx() as db:
-            row = db.execute("SELECT kind,state,attempts,payload FROM outbox WHERE id=?", (row_id,)).fetchone()
-            if not row or row["state"] != "pending" or row["attempts"] != 0 or row["kind"] not in ("comment", "activity"):
-                return False
-            payload = json.loads(row["payload"])
-            if (payload.get("write_started") is not True or not payload.get("task_id") or
-                    not (payload.get("native_history") is True or payload.get("native_progress") is True)):
-                return False
-            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) WHERE id=?", (row_id,))
-            self._sequence_native_history(db, payload["issue_id"])
+                # Every sender replaces this token, including callers that only use
+                # the legacy admission API. An older guard cannot clear its marker.
+                attempt_id = mutation_attempt_id or uuid.uuid4().hex
+                if self.conversation_reply(row["kind"], payload) and conversation_attempt_id:
+                    return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
+                        "'$.mutation_attempt_id',?,'$.conversation_attempt_id',?) WHERE id=?",
+                        (attempt_id, conversation_attempt_id, row_id)).rowcount)
+                return bool(db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('true'), "
+                    "'$.mutation_attempt_id',?) WHERE id=?", (attempt_id, row_id)).rowcount)
             return True
 
-    def delegate_not_applied(self, row_id: str, *, started_before: bool | None) -> bool:
+    def mutation_not_attempted(self, row_id: str, attempt_id: str) -> bool:
+        """Restore only this sender's proven pre-transport state, never another attempt."""
+        with self._tx() as db:
+            row = self.outbox_row(row_id)
+            payload = (row or {}).get("payload", {})
+            if (not row or row["state"] != "pending" or payload.get("write_started") is not True
+                    or payload.get("mutation_attempt_id") != attempt_id):
+                return False
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.write_started',json('false')) WHERE id=?", (row_id,))
+            if payload.get("native_history") is True or payload.get("native_progress") is True:
+                self._sequence_native_history(db, payload["issue_id"])
+            return True
+
+    def delegate_not_applied(self, row_id: str, *, started_before: bool | None,
+                             attempt_id: str | None = None) -> bool:
         """Only an affirmative HTTP rejection can undo this attempt's send marker."""
         if started_before is not False:
             return False
@@ -517,6 +520,8 @@ class Store:
             if not row or row["kind"] != "delegate" or row["state"] != "pending":
                 return False
             payload = json.loads(row["payload"])
+            if attempt_id is not None and payload.get("mutation_attempt_id") != attempt_id:
+                return False
             if payload.get("delegate_routing_version") != 1 or payload.get("reconcile_required") or payload.get("delegate_receipt"):
                 return False
             db.execute("UPDATE outbox SET payload=json_set(payload, '$.write_started', json('false')) WHERE id=?", (row_id,))
@@ -1776,13 +1781,16 @@ class Store:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, 'project_update', ?, ?)",
                            (str(uuid.uuid4()), json.dumps({**payload, "enqueued_at": due}), due))
             return True
-    def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None) -> bool:
+    def project_not_applied(self, row_id: str, *, known_rejection: bool = False, started_before=None,
+                            attempt_id: str | None = None) -> bool:
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             row = db.execute("SELECT payload FROM outbox WHERE id=? AND kind='project_update' AND state='pending' AND hold_reason IS NULL", (row_id,)).fetchone()
             if not row:
                 return False
             payload = json.loads(row["payload"])
+            if attempt_id is not None and payload.get("mutation_attempt_id") != attempt_id:
+                return False
             if known_rejection:
                 prior = payload.get("write_started") if started_before is None else started_before
                 legacy_create = prior is None and payload.get("send_body") is not None

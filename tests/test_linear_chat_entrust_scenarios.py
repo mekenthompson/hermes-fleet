@@ -540,6 +540,53 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(sum(r["content"] == original for r in self.said("echo-session")), 1)
         self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
 
+    def test_checkpoint_read_failure_after_admission_routes_after_adoption(self):
+        self.check_checkpoint_failure_after_admission(concurrent=False)
+
+    def test_checkpoint_pretransport_cleanup_preserves_another_sender(self):
+        self.check_checkpoint_failure_after_admission(concurrent=True)
+
+    def check_checkpoint_failure_after_admission(self, *, concurrent):
+        from hermes_fleet_linear_plugin.api import LinearError
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        body = "Checkpoint with an admitted local read failure."
+        self.checkpoint(task_id, body)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("body") == body)
+        original, failed = self.bridge._native_task, []
+        def read(issue_id):
+            if self.bridge.store.outbox_row(source["id"])["payload"]["write_started"] is True and not failed:
+                failed.append(True)
+                if concurrent:
+                    other = Store(self.bridge.store.path)
+                    self.assertTrue(other.admit_mutation(source["id"]))
+                raise LinearError("Transient native read after admission")
+            return original(issue_id)
+        comments = len(self.issue_comments(NEW_ISSUE))
+        with patch.object(self.bridge, "_native_task", side_effect=read):
+            self.bridge.flush(only_id=source["id"])
+        self.assertTrue(failed)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertIs(self.bridge.store.outbox_row(source["id"])["payload"]["write_started"], concurrent)
+        self.echo(NEW_ISSUE, "echo-session")
+        retained = self.bridge.store.outbox_row(source["id"])
+        if concurrent:
+            self.assertEqual(retained["state"], "pending")
+            self.assertIs(retained["payload"]["write_started"], True)
+            self.assertFalse(any(r["kind"] == "activity" and r["payload"].get("content", {}).get("body") == body
+                                 for r in self.bridge.store.pending(NEW_ISSUE)))
+        else:
+            for _ in range(3):
+                self.flush()
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+            self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 1)
+            self.assertEqual(retained["state"], "sent")
+            self.assertEqual(retained["payload"]["applied"], False)
+
     def test_checkpoint_read_failure_before_transport_still_routes_after_adoption(self):
         self.check_checkpoint_read_failure_adoption(legacy=False, marker=False)
 
