@@ -592,6 +592,7 @@ def create_adapter(config, running):
             # (issue id, Agent Session id) -> core session keys of questions asked there. Only a
             # session that was asked something can answer a clarify or an approval.
             self._asked = {}
+            self._question_cursors = {}
             self._answered = set()  # provider inputs consumed as answers; a redelivery is not a new message
 
         async def connect(self, *, is_reconnect=False):
@@ -752,6 +753,9 @@ def create_adapter(config, running):
         def _asked_in(self, chat_id, session_id, session_key=""):
             with self._relay_lock:
                 keys = self._asked.setdefault((chat_id, session_id), [])
+                source = self._inputs.get((chat_id, session_id))
+                self._question_cursors[(chat_id, session_id)] = self._input_cursors.get(
+                    (chat_id, session_id, source), 0)
                 if session_key and session_key not in keys:
                     keys.append(session_key)
 
@@ -762,15 +766,16 @@ def create_adapter(config, running):
                 if (*key, projected.message_id) in self._answered:
                     return True
                 recorded = list(self._asked[key]) if key in self._asked else None
+                source_cursor = self._question_cursors.get(key, 0)
             if recorded is None:
                 return False
-            if await self._resolve_answer(bridge, projected, event, recorded):
+            if await self._resolve_answer(bridge, projected, event, recorded, source_cursor):
                 with self._relay_lock:
                     self._answered.add((*key, projected.message_id))
                 return True
             return False
 
-        async def _resolve_answer(self, bridge, projected, event, recorded):
+        async def _resolve_answer(self, bridge, projected, event, recorded, source_cursor):
             source = event.source
             if self._is_sender_authorized(projected.actor_id, source.chat_type, source.chat_id,
                                           thread_id=source.thread_id) is not True:
@@ -799,14 +804,16 @@ def create_adapter(config, running):
                 count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all, reason=reason)
                 if count:
                     await self._post(bridge, projected.issue_id, projected.session_id, projected.message_id,
-                                     _approval_confirmation(choice, count, reason), kind="thought")
+                                     _approval_confirmation(choice, count, reason), kind="thought", source_cursor=source_cursor)
                     return True
             return False
 
-        async def _post(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False, **reply):
+        async def _post(self, bridge, chat_id, session_id, source, content, *, kind=None, question=False,
+                        source_cursor=None, **reply):
             """Queue one reply on the outbox, publish it, and report what Linear has."""
             with self._relay_lock:
-                cursor = self._input_cursors.get((chat_id, session_id, source), 0)
+                cursor = (self._input_cursors.get((chat_id, session_id, source), 0)
+                          if source_cursor is None else source_cursor)
             try:
                 if kind is not None and await asyncio.to_thread(
                         bridge.store.conversation_finished, chat_id, session_id, source, cursor):

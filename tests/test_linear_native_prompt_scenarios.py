@@ -190,12 +190,22 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_text_approval_deny_resolves_it(self):
         await self.check_approval("/deny not on the shared host", "deny")
 
-    async def check_approval(self, reply, choice):
+    async def test_approval_confirmation_survives_a_previous_turns_final_response(self):
+        await self.check_approval("approve", "once", reopened=True)
+
+    async def check_approval(self, reply, choice, *, reopened=False):
         from tools import approval
         turn = await self.start_turn()
+        if reopened:
+            result = await self.adapter.send(native.ISSUE, "First check finished.", reply_to=native.ACTIVITY,
+                                             metadata={"thread_id": native.SESSION})
+            self.assertTrue(result.success, result.error)
+            await self.deliver("next-activity", "Now run the migration.")
+            turn = self.messages[-1]
         key = self.session_key(turn)
+        expected = len(self.posted) + 1
         waiter = asyncio.create_task(asyncio.to_thread(self.request_approval, key))
-        await self.until_posted(1)
+        await self.until_posted(expected)
         prompt = self.posted[-1]
         self.assertEqual(prompt["agentSessionId"], native.SESSION)
         self.assertEqual(prompt["content"]["type"], "elicitation")
@@ -207,7 +217,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         if choice == "deny":
             self.assertEqual(result["reason"], "not on the shared host")
         self.assertEqual(answer.acknowledged, 1)
-        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(len(self.messages), 2 if reopened else 1)
         self.assertEqual(self.posted[-1]["content"]["type"], "thought")  # the confirmation
 
     async def test_final_reply_is_unchanged_and_nothing_posts_after_it(self):
