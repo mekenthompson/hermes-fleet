@@ -128,7 +128,7 @@ class DelegateRoutingScenarios(unittest.TestCase):
         self.bridge.flush()
         # The tracked work adopts the session Linear opened for our delegate write (HF-630).
         self.assertEqual(self.bridge.store.get("issue-1")["owner_ref"], session)
-        self.assertTrue(any("This is the work already running on this issue, so nothing new was started." in body
+        self.assertTrue(any("Continuing the existing work on this issue." in body
                             for body in self.remote.bodies("issue-1")))
         self.remote.set_delegate("issue-1", OTHER)
         activity = "revoked-stop"

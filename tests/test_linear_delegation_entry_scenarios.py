@@ -234,7 +234,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.turns, [])  # answered as the same work; no model turn redoes it
         self.assertEqual(self.inbox_status(delivery), "imported")
         # The session Linear opened now reports the chat-started work: a thought, never a closing response.
-        self.assertIn("already running on this issue, continued from chat", self.said("session-1")[-1])
+        self.assertIn("Continuing the existing work on this issue, continued from chat", self.said("session-1")[-1])
         self.assertEqual([r["content"]["type"] for r in self.authority.activity_records
                           if r["agentSessionId"] == "session-1"], ["thought"])
         self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-1")
