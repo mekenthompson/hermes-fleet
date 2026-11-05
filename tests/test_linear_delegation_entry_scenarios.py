@@ -187,10 +187,11 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         # While the session turn runs, Linear shows In Progress: the agent is on it now.
         self.reconcile()
         self.assertEqual(self.authority.state(), "In Progress")
-        # The turn ends with the task still queued: Linear shows the native state again.
+        # The turn ends before the dispatcher's first claim: our own just-admitted work keeps
+        # In Progress (HF-629, no In Progress -> Todo -> In Progress flicker).
         await self.adapter.on_processing_complete(self.turns[0], None)
         self.reconcile()
-        self.assertEqual(self.authority.state(), "Todo")
+        self.assertEqual(self.authority.state(), "In Progress")
         # A worker picks it up: In Progress follows the work.
         with self.board.conn() as conn:
             self.assertIsNotNone(kb.claim_task(conn, task.id, claimer="native-test-worker"))
