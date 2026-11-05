@@ -35,9 +35,13 @@ def load_tests(loader, tests, pattern):
 
 
 class Handoff(base.OriginScenarios):
-    async def running_issue(self, *, settle=True, body=MARKER + "\nFinish the remaining checks", issue_id="issue-one"):
+    async def running_issue(self, *, settle=True, body=MARKER + "\nFinish the remaining checks", issue_id="issue-one",
+                            native_stop_getter=False):
         """A claimed, admitted native task bound to issue-one, still running; optionally its
-        attempt has already wound down natively (as after the Stop reached it)."""
+        attempt has already wound down natively (as after the Stop reached it).
+
+        ``native_stop_getter`` keeps core's own ``process_stop_pending`` (the stop lock that
+        ``record_process_stop`` writes) instead of the fixture's synthetic getter."""
         from hermes_cli import kanban_db as kb
         from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
@@ -66,6 +70,8 @@ class Handoff(base.OriginScenarios):
         self.linear_state = self.home / "linear" / "state.db"
         self.linear_store = Store(self.linear_state)
         self.assertTrue(self.linear_store.bind_native(issue_id, self.task_id, "default", "default", at=1))
+        if native_stop_getter:
+            return
         getter = patch.object(session_ancillary, "process_stop_pending",
             lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
         getter.start()
@@ -85,6 +91,8 @@ class Handoff(base.OriginScenarios):
         from hermes_cli import kanban_process_stop
         def delivered(conn, task_id, event_id):
             self.delivered.append((task_id, event_id))  # The owner's Stop reaches its worker.
+            if getattr(self, "on_stop", None):
+                self.on_stop()
         self.delivered = getattr(self, "delivered", [])
         with patch.object(runtime_session_store, "_worker_process", False), \
                 patch.object(kanban_process_stop, "request_native_stop", delivered):
@@ -177,6 +185,154 @@ class Handoff(base.OriginScenarios):
         self.assertNotIn("unblocked", kinds)
         self.assertEqual(len(self.delivered), 1)
         self.assertEqual(self.status(), "blocked")
+
+    # -- HF-629: the stopped worker reports back after the gateway gave up on it ------------------
+    def adopt_worker(self):
+        """The card attempt's managed worker, registered and adopted by core as at spawn."""
+        from hermes_state_runtime import register_worker_execution, adopt_worker_execution
+        self.executor = "admission-worker:" + self.admission
+        args = dict(epoch=self.authority.epoch, execution_id=self.executor, session_id=self.sid,
+                    generation=self.row["generation"])
+        register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-handoff")
+        adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-handoff")
+
+    async def lose_worker(self):
+        """Core's own "Managed worker lost: managed_worker_stopped" path once the worker missed
+        STOP_ACK_SECONDS: retain_failed_stop records the stop lock, _settle_lost marks the
+        attempt's admission ``unknown``. Nothing in this gateway lifetime settles it after that."""
+        from gateway.session_kanban_stop import retain_failed_stop
+        from gateway.session_managed_worker import _settle_lost
+        from gateway.session_policy import restore_policy
+        from hermes_state_local import local_receipt
+        policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+        await retain_failed_stop(self.authority, self.ref, self.row, policy)
+        await _settle_lost(self.authority, self.row, {"epoch": self.authority.epoch, "generation": self.row["generation"],
+                                                      "execution_id": self.executor}, None)
+
+    def lose_on_stop(self):
+        """The owner's Stop reaches the worker, which then winds down too slowly: the loss lands
+        before the owner's proof reads it."""
+        def lose():
+            asyncio.run_coroutine_threadsafe(self.lose_worker(), self.loop).result(timeout=30)
+        self.on_stop = lose
+
+    def admission_row(self):
+        from hermes_state_runtime import get_session_admission
+        return get_session_admission(self.authority.db, admission_id=self.admission)
+
+    def stop_lock(self):
+        from gateway.session_ancillary import process_stop_pending
+        return process_stop_pending(self.authority.db, self.sid)
+
+    def resolves(self):
+        return [params for method, params in self.calls if method == "prompt.resolve_unknown"]
+
+    async def lost_attempt_issue(self, **running):
+        await self.running_issue(settle=False, native_stop_getter=True, **running)
+        self.owner_methods = frozenset({"prompt.receipt", "prompt.resolve_unknown"})
+        self.adopt_worker()
+
+    async def test_handoff_settles_its_own_stopped_attempt_left_unknown_and_hands_over(self):
+        await self.lost_attempt_issue()
+        self.lose_on_stop()
+        result = await self.hand_off()
+        # Core left it exactly as the live HF-629 gateway did: unknown, stop lock held.
+        self.assertTrue(result["handed_off"], result)
+        self.assertEqual(result["state"], "handed_off")
+        self.assertTrue(result["stopped_here"])
+        self.assertEqual(self.resolves(), [{"session_id": self.sid, "admission_id": self.admission,
+                                            "execution_generation": self.row["generation"]}])
+        row = self.admission_row()
+        self.assertEqual((row["status"], row["outcome"]), ("terminal", "interrupted"))
+        self.assertIsNone(self.stop_lock())  # Core's resolve re-ran its process-stop cleanup first.
+        self.assertEqual(self.status(), "blocked")  # Never resumed here.
+        self.assertEqual(len(self.delivered), 1)
+        # A retry proves the same settled Stop and resolves nothing more.
+        again = await self.hand_off()
+        self.assertTrue(again["handed_off"], again)
+        self.assertEqual(len(self.resolves()), 1)
+
+    async def test_handoff_without_settling_its_lost_attempt_times_out_paused(self):
+        # The live bug, reproduced with core's own loss: without the resolve the unchanged proof
+        # holds native_admission_not_settled until the wait ends and the owner stays paused.
+        await self.lost_attempt_issue()
+        self.lose_on_stop()
+        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: False):
+            result = await self.hand_off()
+        self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
+        self.assertEqual(self.admission_row()["status"], "unknown")
+        self.assertIsNotNone(self.stop_lock())
+        held = await self.inspected("issue-one", META, [e for e in self.owner_events() if e.kind == "blocked"][-1].id)
+        self.assertEqual(held["reason"], "native_admission_not_settled")
+        self.assertEqual(self.resolves(), [])
+
+    async def test_handoff_never_resolves_a_started_attempt(self):
+        # The worker has not been lost: its row is still started. Nothing is resolved, and the
+        # proof holds until the wait ends.
+        await self.lost_attempt_issue()
+        result = await self.hand_off()
+        self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
+        self.assertEqual(self.resolves(), [])
+        self.assertEqual(self.admission_row()["status"], "started")
+        self.assertEqual(self.status(), "blocked")
+
+    async def test_handoff_lost_attempt_with_a_live_owned_process_stays_paused(self):
+        # A background process the attempt started may still be running (its checkpoint is not
+        # provably stopped): core refuses the resolve (process_stop_unknown) and nothing is handed over.
+        await self.lost_attempt_issue()
+        route = self.authority.sessions[self.sid].route
+        (self.home / "processes.json").write_text(json.dumps([{
+            "session_id": "proc_fixture", "session_key": route, "owner_task_id": self.sid, "pid": 99999997,
+            "host_start_time": 1, "pid_scope": "container", "command": "sleep 600"}]))
+        self.lose_on_stop()
+        result = await self.hand_off()
+        self.assertFalse(result["handed_off"], result)
+        self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
+        self.assertEqual(len(self.resolves()), 1)  # Asked once, refused by core.
+        self.assertEqual(self.admission_row()["status"], "unknown")
+        self.assertIsNotNone(self.stop_lock())
+        self.assertEqual(self.status(), "blocked")
+        retry = await self.hand_off()  # Still the same answer; never handed over.
+        self.assertEqual(retry["state"], "paused", retry)
+        self.assertEqual(self.admission_row()["status"], "unknown")
+
+    async def test_handoff_never_resolves_a_lost_attempt_under_a_persons_pause(self):
+        from hermes_cli import kanban_db as kb
+        await self.lost_attempt_issue()
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="A person's Stop",
+                                      expected_run_id=self.work_context["run_id"]))
+        await self.lose_worker()
+        result = await self.hand_off()
+        self.assertEqual((result["handed_off"], result["state"]), (False, "unchanged"), result)
+        self.assertEqual(self.resolves(), [])
+        self.assertEqual(self.admission_row()["status"], "unknown")
+
+    async def test_handoff_never_resolves_a_lost_attempt_paused_for_another_agent(self):
+        from hermes_cli import kanban_db as kb
+        await self.lost_attempt_issue()
+        self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input",
+                                      reason=handoff.handoff_reason("Vega", R2), expected_run_id=self.work_context["run_id"]))
+        await self.lose_worker()
+        result = await self.hand_off()
+        self.assertEqual((result["state"], result["reason"]), ("unchanged", "handover_in_progress"), result)
+        self.assertEqual(self.resolves(), [])
+        self.assertEqual(self.admission_row()["status"], "unknown")
+
+    async def test_handoff_never_resolves_a_lost_attempt_under_an_earlier_request(self):
+        # Only the request whose own Stop is live may settle that run: a new request for the same
+        # agent proves the earlier pause but leaves its lost row to the request that stopped it.
+        await self.lost_attempt_issue()
+        self.lose_on_stop()
+        with patch.object(handoff, "_resolve_lost_attempt", lambda *args: False):
+            first = await self.hand_off()
+        self.assertEqual(first["state"], "paused", first)
+        later = await self.hand_off(request_id=R2)
+        self.assertEqual((later["state"], later["reason"]), ("paused", "proof_timeout"), later)
+        self.assertEqual(self.resolves(), [])
+        self.assertEqual(self.admission_row()["status"], "unknown")
+        same = await self.hand_off()  # The request that stopped it, retried: settles and hands over.
+        self.assertTrue(same["handed_off"], same)
+        self.assertEqual(self.admission_row()["outcome"], "interrupted")
 
     async def test_handoff_refuses_before_stopping_when_proof_cannot_hold(self):
         await self.running_issue(body="Linear issue OTHER-2: https://linear.example/issue/OTHER-2")
@@ -346,7 +502,7 @@ class Handoff(base.OriginScenarios):
         self.assertEqual(self.status(), "blocked")  # And nothing resumed it.
 
     # -- the requester and the real owner hand-off together -------------------------------------
-    async def requester(self):
+    async def requester(self, **running):
         """Nova, a second agent with its own Kanban home and Linear state, reaching Atlas (this
         fixture's owner) only through the owner command. Here that command runs Atlas's real
         ``linear hand-off`` CLI entry in-process, against Atlas's own native board and receipts."""
@@ -362,7 +518,7 @@ class Handoff(base.OriginScenarios):
         self.ISSUE = ISSUE
         issue_meta = {"id": ISSUE, "identifier": "OPS-1", "url": "https://linear.example/issue/OPS-1"}
         await self.running_issue(body="Linear issue OPS-1: https://linear.example/issue/OPS-1\nFinish the checks",
-                                 issue_id=ISSUE)
+                                 issue_id=ISSUE, **running)
         self.nova_board = self.home / "nova-board"
         self.nova_kanban = patch.dict(os.environ, {"HERMES_KANBAN_HOME": str(self.nova_board)})
         self.authority_linear = ChatAuthority()
@@ -399,11 +555,14 @@ class Handoff(base.OriginScenarios):
                 return subprocess.CompletedProcess(argv, 255, "Connection to atlas closed by remote host.\n", "")
             return subprocess.CompletedProcess(argv, rc, "1Password: applied 3 secrets\n" + out.getvalue(), "")
         self.delivered = []
+        def delivered(conn, task_id, event_id):
+            self.delivered.append((task_id, event_id))
+            if getattr(self, "on_stop", None):
+                self.on_stop()
         def take_over(request_id=REQUEST, action="take_over"):
             with self.nova_kanban, patch.object(subprocess, "run", owner_cli), \
                     patch.object(runtime_session_store, "_worker_process", False), \
-                    patch.object(kanban_process_stop, "request_native_stop",
-                                 lambda conn, task_id, event_id: self.delivered.append((task_id, event_id))):
+                    patch.object(kanban_process_stop, "request_native_stop", delivered):
                 return json.loads(chat.handle(self.nova, {"action": action, "issue": ISSUE, "id": request_id},
                                               self.nova_context))
         self.take_over = take_over
@@ -437,6 +596,24 @@ class Handoff(base.OriginScenarios):
         with self.nova_kanban:
             self.nova.flush()
         self.assertEqual(self.authority_linear.issues[self.ISSUE]["delegate"]["id"], self.nova.api.viewer_id())
+
+    async def test_handoff_with_requester_real_owner_settles_its_lost_attempt_and_nova_runs_one_task(self):
+        # HF-629 end to end: Nova's take_over runs Atlas's real hand-off; Atlas's worker misses the
+        # gateway's stop ack, core leaves the attempt unknown, Atlas settles its own stopped attempt
+        # and proves it, and Nova runs the one task.
+        await self.requester(settle=False, native_stop_getter=True)
+        self.owner_methods = frozenset({"prompt.receipt", "prompt.resolve_unknown"})
+        self.adopt_worker()
+        self.lose_on_stop()
+        reply = await asyncio.to_thread(self.take_over)
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(reply["handover"], {"from": "Atlas", "state": "handed_off", "stopped_here": True})
+        self.assertEqual(len(self.resolves()), 1)
+        self.assertEqual((self.admission_row()["status"], self.admission_row()["outcome"]), ("terminal", "interrupted"))
+        self.assertIsNone(self.stop_lock())
+        self.assertEqual(self.status(), "blocked")
+        (task,) = self.nova_tasks()
+        self.assertIn(task["status"], ("ready", "running"))
 
     async def test_handoff_with_requester_failure_after_proof_leaves_the_real_owner_paused_until_resumed(self):
         from datetime import datetime, timedelta, timezone
