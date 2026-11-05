@@ -4434,6 +4434,12 @@ class Bridge:
                 if exc.retryable:
                     raise  # Unreadable Core state is not proof that its question expired.
         desired = self._conversation_final_type(payload, lifecycle=True) or "response"
+        if retired := payload.get("retired_clarify_of"):
+            original = self.store.outbox_row(retired)
+            if (original and self.store.conversation_reply(original["kind"], original["payload"])
+                    and original["payload"].get("native_prompt", {}).get("kind") == "clarify"
+                    and not self._conversation_interim_finished(original["payload"])):
+                desired = "thought"  # Retiring a waiter does not finish its still-running Core turn.
         if (payload.get("turn_final") is not True and not payload.get("lifecycle_repair_of")
                 and not self._conversation_interim_finished(payload)):
             if payload["content"]["type"] == "action":
@@ -4461,6 +4467,11 @@ class Bridge:
         target = self._conversation_lifecycle_target(payload)
         if self._same_lifecycle_presentation(payload, target):
             return
+        self._queue_conversation_lifecycle_repair(row, target)
+
+    def _queue_conversation_lifecycle_repair(self, row: dict[str, Any], target: dict, *, retire_clarify=False) -> None:
+        """Persist repair intent; the existing sender revalidates its target before any write."""
+        payload = row["payload"]
         presentation = {key: target[key] for key in ("content", "native_prompt", "signal", "signal_metadata")
                         if key in target}
         identity = stable_uuid4("native-lifecycle-repair", self.profile, row["id"],
@@ -4472,6 +4483,8 @@ class Bridge:
                       write_started=False, lifecycle_repair_of=row["id"])
         if self._optional_conversation_status(payload):
             repair["optional_status_repair"] = True  # Keep the originating step's reserve cap across retries.
+        if retire_clarify or payload.get("retired_clarify_of"):
+            repair["retired_clarify_of"] = payload.get("retired_clarify_of") or row["id"]
         queued = self.store.enqueue("activity", repair, at=self.clock())
         if not queued:
             raise LinearError("Conversation lifecycle repair could not be queued")

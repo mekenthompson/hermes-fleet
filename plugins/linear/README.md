@@ -824,8 +824,9 @@ and questions. The input boundary survives restart and older input redelivery; a
 step cannot reopen a session after its final reply. An accepted in-flight step also
 reconciles the current question, unfinished work or completion after transport. Any repair
 caused by a step keeps its optional budget cap on later retries. Answering a prompt or settling an
-approval by timeout or withdrawal resumes Core's typing refresh only once the chat has
-no other pending clarification or approval. Streaming and
+approval or clarification by timeout or withdrawal resumes Core's typing refresh only once the chat has
+no other pending clarification or approval. Expired clarifications retain a durable retirement
+repair that verifies their owning turn before restoring working or completed state. Streaming and
 tool-progress flags are unchanged; no editable-message or streaming capability is advertised.
 
 Creator-null assignment acknowledgment requires a verified durable admission or
