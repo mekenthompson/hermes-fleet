@@ -114,7 +114,9 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(self.bridge.flush)
             finals = [a for a in self.provider.activities.values() if a.get('content', {}).get('type') == 'response']
             self.assertEqual(len(finals), 1)
-            self.assertIn(summary, finals[0]['content']['body'])
+            self.assertEqual(len(self.provider.comment_records), 1)
+            self.assertIn(summary, next(iter(self.provider.comment_records.values()))['body'])
+            self.assertNotIn(summary, finals[0]['content']['body'])
             self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'response')
             self.assertEqual(self.bridge.store.outbox_row(identity)['state'], 'sent')
             self.assertFalse(self.bridge.store.unsettled_worker_action(self.ISSUE, self.SESSION))
@@ -225,7 +227,9 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
                 self.bridge.clock = lambda: wall + 420
                 await asyncio.to_thread(self.bridge.flush)
             self.assertEqual(len(finals()), 1, 'Worker-derived repair must never invent a second final publisher')
-            self.assertIn(summary, finals()[0]['content']['body'])
+            self.assertEqual(len(self.provider.comment_records), 1)
+            self.assertIn(summary, next(iter(self.provider.comment_records.values()))['body'])
+            self.assertNotIn(summary, finals()[0]['content']['body'])
             self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'response')
             settled = self.bridge.store.outbox_row(repair_id)
             self.assertEqual(settled['state'], 'sent')
@@ -239,3 +243,125 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncertain_worker_question_repair_lands_after_withdrawal_before_sole_closeout(self):
         await self.composed_repair(uncertain=True)
+
+    async def capture_completed_outcome(self):
+        task, _binding, _step = await self.held_worker()
+        summary = 'Delivered the bounded color check. Evidence: Blue and Green fixtures both passed. No work remains.'
+        with self.board.conn() as conn:
+            self.assertTrue(self.board.kb.complete_task(conn, task.id, summary=summary,
+                expected_run_id=task.current_run_id))
+        with patch.object(self.bridge, 'flush', return_value=0):
+            await asyncio.to_thread(self.bridge.pump_kanban)
+        comments = [r for r in self.bridge.store.pending() if r['payload'].get('native_outcome_comment')]
+        self.assertEqual(len(comments), 1)
+        return task, summary, comments[0]
+
+    async def test_regular_top_level_outcome_comment_precedes_short_session_pointer_and_reporter_retry(self):
+        from hermes_fleet_linear_plugin.store import Store
+        task, summary, comment = await self.capture_completed_outcome()
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(len(self.provider.comment_records), 1)
+        remote = self.provider.comment_records[comment['id']]
+        self.assertIsNone(remote['parent'])
+        self.assertEqual(remote['user']['id'], self.provider.viewer)
+        self.assertEqual(remote['issue']['id'], self.ISSUE)
+        self.assertIn(summary, remote['body'])
+        for heading in ('**Delivered**', '**Evidence**', '**Remaining**'):
+            self.assertIn(heading, remote['body'])
+        self.assertNotIn(task.id, remote['body'])
+        finals = [a for a in self.provider.activities.values() if a.get('content', {}).get('type') == 'response']
+        self.assertEqual(len(finals), 1)
+        self.assertNotIn(summary, finals[0]['content']['body'])
+        pointer = self.bridge.store.outbox_row(finals[0]['id'])
+        self.assertTrue(pointer['payload']['native_outcome_pointer'])
+        self.assertEqual(pointer['payload']['requires_comment_id'], comment['id'])
+        self.assertTrue(self.bridge.store.outcome_comment_applied(pointer['payload']))
+        self.bridge.store = Store(self.bridge.store.path)
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(len(self.provider.comment_records), 1)
+        self.assertEqual(sum(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()), 1)
+
+    async def test_lost_outcome_comment_reply_waits_for_readback_then_closes_without_duplicate(self):
+        from hermes_fleet_linear_plugin.store import Store
+        task, summary, comment = await self.capture_completed_outcome()
+        transport, retained = self.bridge.api.transport, []
+        def lose(url, body, headers):
+            if 'commentCreate' in json.loads(body)['query']:
+                retained.append((url, body, headers))
+                raise TimeoutError('provider still processing regular completion comment')
+            return transport(url, body, headers)
+        with patch.object(self.bridge.api, 'transport', side_effect=lose):
+            await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(self.board.get(task.id).status, 'done')
+        self.assertEqual(self.provider.comment_records, {})
+        self.assertFalse(any(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()))
+        attempted = self.bridge.store.outbox_row(comment['id'])
+        self.assertIs(attempted['payload']['write_started'], True)
+        await asyncio.to_thread(transport, *retained[0])
+        self.bridge.store = Store(self.bridge.store.path)
+        self.bridge.store.defer(comment['id'], self.bridge.clock() - 1)
+        with patch.object(self.bridge.api, 'create_comment', wraps=self.bridge.api.create_comment) as creates:
+            await asyncio.to_thread(self.bridge.flush)
+            # Pointer backoff is independently paced; make only its existing row due.
+            for row in self.bridge.store.pending():
+                if row['payload'].get('native_outcome_pointer'):
+                    self.bridge.store.defer(row['id'], self.bridge.clock() - 1)
+            await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(creates.call_count, 0, 'The original comment receipt settles without another create')
+        self.assertEqual(len(self.provider.comment_records), 1)
+        self.assertIn(summary, self.provider.comment_records[comment['id']]['body'])
+        self.assertEqual(sum(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()), 1)
+
+    async def test_native_stop_refuses_success_comment_and_pointer(self):
+        task, _binding, _step = await self.held_worker()
+        with self.board.conn() as conn:
+            self.assertTrue(self.board.kb.block_task(conn, task.id, reason='Stopped by requester',
+                kind='needs_input', expected_run_id=task.current_run_id))
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.provider.comment_records, {})
+        self.assertFalse(any('Completed. The result and checks' in a.get('content', {}).get('body', '')
+                             for a in self.provider.activities.values()))
+        self.assertFalse(any(r['payload'].get('native_outcome_pointer') for r in self.bridge.store.pending()))
+
+    async def test_revoked_actor_before_outcome_publication_refuses_comment_and_pointer(self):
+        _task, _summary, _comment = await self.capture_completed_outcome()
+        self.bridge.api.specialist_scope = {'allowed_team_ids': ['team-allowed'],
+            'allowed_project_ids': ['project-allowed'], 'allowed_requester_ids': ['revoked-human'],
+            'requester_basis': 'agent_session'}
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.provider.comment_records, {})
+        self.assertFalse(any(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()))
+
+    async def test_nested_or_foreign_closing_receipt_cannot_close_session(self):
+        _task, _summary, comment = await self.capture_completed_outcome()
+        transport = self.bridge.api.transport
+        def nested(url, body, headers):
+            result = transport(url, body, headers)
+            if 'commentCreate' in json.loads(body)['query']:
+                self.provider.comment_records[comment['id']]['parent'] = {'id': 'nested-activity-mirror'}
+            return result
+        with patch.object(self.bridge.api, 'transport', side_effect=nested):
+            await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(len(self.provider.comment_records), 1)
+        self.assertEqual(self.bridge.store.outbox_row(comment['id'])['state'], 'pending')
+        self.assertFalse(any(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()))
+        remote = self.provider.comment_records[comment['id']]
+        remote['parent'] = None
+        remote['user'] = {'id': 'foreign-app'}
+        self.assertFalse(await asyncio.to_thread(self.bridge.api.verify_completion_comment,
+            comment['id'], self.ISSUE, comment['payload']['body']))
+        remote['user'] = {'id': self.provider.viewer}
+        del remote['parent']
+        self.assertFalse(await asyncio.to_thread(self.bridge.api.verify_completion_comment,
+            comment['id'], self.ISSUE, comment['payload']['body']))
+        remote['parent'] = None
+        for row in self.bridge.store.pending():
+            self.bridge.store.defer(row['id'], self.bridge.clock() - 1)
+        with patch.object(self.bridge.api, 'create_comment', wraps=self.bridge.api.create_comment) as creates:
+            await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(creates.call_count, 0)
+        self.assertEqual(len(self.provider.comment_records), 1)
+        self.assertEqual(sum(a.get('content', {}).get('type') == 'response' for a in self.provider.activities.values()), 1)

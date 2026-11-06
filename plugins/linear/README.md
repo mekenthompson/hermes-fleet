@@ -55,7 +55,12 @@ and admits it against its creation event token. The webhook from this app's own 
 finds that admission and starts no second task or worker. Work bound with no Agent Session
 (started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
 opens for it: one thought says this is the work already running, then Started, checkpoints,
-heartbeats and the keepalive post there as activities and Done is its only response.
+heartbeats and the keepalive post there as activities. Completion posts one full,
+regular top-level issue comment with Delivered, Evidence and Remaining sections,
+then a short Agent Session response points to that comment. The session response
+waits for exact comment readback, including this app's author and no parent;
+reporter retries retain the same completion identity and comment UUID. Existing
+specialist assessment comments retain their full recommendation and deduplication.
 Queued fallback reports proven not yet attempted move to new session activities atomically
 with adoption; attempted or uncertain provider identities retain their original destination.
 Native event capture verifies that its selected reporting owner is still current before

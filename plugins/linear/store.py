@@ -480,6 +480,8 @@ class Store:
             if not self.delivery_allowed(row_id):
                 return False
             payload = json.loads(row["payload"])
+            if payload.get("native_outcome_pointer") and not self.outcome_comment_applied(payload):
+                return False  # Atomically order the sole terminal pointer behind its verified full comment.
             if expected_content is not None and payload.get("content") != expected_content:
                 return False
             if require_unattempted and payload.get("write_started") is not False:
@@ -1447,10 +1449,12 @@ class Store:
                 "AND json_type(payload,'$.failure_kind') IS NULL AND json_type(payload,'$.applied') IS NULL")
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
-                " AND (" + ADVISORY + " OR (o.kind='activity' AND json_extract(o.payload, '$.native_reply_version')=1) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
+                " AND (" + ADVISORY + " OR (o.kind='activity' AND (json_extract(o.payload, '$.native_reply_version')=1 "
+                "OR json_extract(o.payload,'$.native_outcome_pointer')=1)) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
                 # A worker-derived question repair keeps its optional reserve and cannot hold issue-state writes.
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
                 " AND NOT " + ADVISORY + " AND COALESCE(json_extract(p.payload,'$.worker_step_repair'),0)!=1 "
+                "AND COALESCE(json_extract(p.payload,'$.native_outcome_pointer'),0)!=1 "
                 "AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
                 ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
@@ -1492,6 +1496,15 @@ class Store:
             db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND hold_reason IS NULL AND next_at <= ? AND "
                        + ADVISORY + " AND NOT (COALESCE(json_type(payload,'$.worker_step')='object',0) AND "
                        "COALESCE(json_extract(payload,'$.write_started'),0)=1)", (row_id, now))
+
+    def outcome_comment_applied(self, payload: dict) -> bool:
+        """Closing publication depends on this completion's exact regular issue comment."""
+        comment = self.outbox_row(payload.get("requires_comment_id", ""))
+        return bool(comment and comment["kind"] == "comment" and comment["state"] == "sent" and
+                    comment.get("hold_reason") is None and comment["payload"].get("applied") == 1 and
+                    comment["payload"].get("issue_id") == payload.get("issue_id") and
+                    (comment["payload"].get("native_completion") == payload.get("native_completion") or
+                     payload.get("outcome_assessment") is True and comment["payload"].get("assessment") is True))
 
     def unsettled_worker_action(self, issue_id: str, session_id: str) -> bool:
         """Only this session's closing publication waits for its in-flight step or derived question repair."""

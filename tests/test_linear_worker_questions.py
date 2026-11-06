@@ -209,7 +209,21 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         responses = [item for item in fixture.provider.activities.values()
                      if item.get('content', {}).get('type') == 'response']
         self.assertEqual(len(responses), 1)
-        self.assertIn('Blue', responses[0]['content']['body'])
+        comments = list(fixture.provider.comment_records.values())
+        self.assertEqual(len(comments), 1)
+        comment = comments[0]
+        self.assertIsNone(comment['parent'])
+        self.assertEqual(comment['user']['id'], fixture.provider.viewer)
+        self.assertEqual(comment['issue']['id'], fixture.ISSUE)
+        self.assertIn('Blue', comment['body'])
+        self.assertTrue(await asyncio.to_thread(fixture.bridge.api.verify_completion_comment,
+            comment['id'], fixture.ISSUE, comment['body']))
+        pointer = fixture.bridge.store.outbox_row(responses[0]['id'])['payload']
+        self.assertTrue(pointer['native_outcome_pointer'])
+        self.assertEqual(pointer['requires_comment_id'], comment['id'])
+        self.assertNotIn('Blue', responses[0]['content']['body'])
+        self.assertEqual(responses[0]['content']['body'],
+            'Completed. The result and checks are in the issue comment.')
 
 
 if __name__ == "__main__":
