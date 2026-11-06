@@ -56,6 +56,8 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         from tools.clarify_gateway import get_pending
 
         requests = []
+        worker_waiting, release_worker = threading.Event(), threading.Event()
+        self.addCleanup(release_worker.set)
         class Model(BaseHTTPRequestHandler):
             def log_message(self, *_args):
                 pass
@@ -64,6 +66,9 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
                 requests.append(body)
                 messages = body.get('messages') or []
                 tools = {item['function']['name'] for item in body.get('tools', [])}
+                if tools and not worker_waiting.is_set():
+                    worker_waiting.set()
+                    assert release_worker.wait(40), "follow-up coordinator did not release the worker"
                 returned = any(item.get('role') == 'tool' and 'Blue' in str(item.get('content')) for item in messages)
                 name = 'kanban_complete' if returned else 'clarify'
                 args = ({'summary': 'Confirmed Blue; no files or settings changed.'} if returned else
@@ -149,6 +154,19 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         fixture.authority._schedule = MethodType(SessionAuthority._schedule, fixture.authority)
         await fixture.authority.submit(actor, Submission('real-choice-worker', ref,
             {'text': f'work kanban task {task.id}', 'finite': True}, 'queue'))
+        self.assertTrue(await asyncio.to_thread(worker_waiting.wait, 25))
+        frozen_consumer = json.loads(policy.kanban_json)['prompt_consumer_admission_id']
+        async def coordinate_status(event):
+            from gateway.session_results import execution_result
+            execution_result.get()['result'] = {'completed': True, 'final_response': 'The worker is still working.'}
+            return 'The worker is still working.'
+        fixture.model = coordinate_status
+        await fixture.deliver('ordinary-status-before-question', 'What is the status?')
+        await fixture.until(lambda: fixture.inbox_row('ordinary-status-before-question')[2] == 'imported')
+        newest = fixture.bridge.store.conversation_input(fixture.ISSUE, fixture.SESSION)
+        self.assertNotEqual(newest['admission_id'], frozen_consumer)
+        self.assertEqual(fixture.board.get(task_id).current_run_id, task.current_run_id)
+        release_worker.set()
         try:
             await fixture.until(lambda: any(row.get('native_prompt', {}).get('producer')
                 for row in fixture.bridge.store.conversation_questions(fixture.ISSUE, fixture.SESSION)))
