@@ -3154,7 +3154,7 @@ class Bridge:
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
-                for step in (self._recheck_acceptance, self._resume_pr_park, self._reconcile_status,
+                for step in (self._worker_progress, self._recheck_acceptance, self._resume_pr_park, self._reconcile_status,
                              self._recover_binding_delegate) if caught_up else ():
                     # These steps read Linear; a refusal or error waits (15 s doubling to 1 h, persisted)
                     # instead of repeating the same reads every tick.
@@ -3174,6 +3174,9 @@ class Bridge:
                                   exc=type(exc).__name__, next_s=until - self.clock())
                     else:
                         self.store.backoff_clear(backoff)
+    def _worker_progress(self, row: dict | None, adapter) -> None:
+        from .worker_progress import queue
+        queue(self, row, adapter)
     def _recover_binding_delegate(self, row: dict | None, adapter) -> None:
         """Route this app as delegate for an already linked, undelegated issue.
 
@@ -4076,12 +4079,14 @@ class Bridge:
     @contextmanager
     def _optional_action_budget(self, row):
         payload = row["payload"]
-        if not (self.store.conversation_reply(row["kind"], payload) and
-                self._optional_conversation_status(payload)):
+        worker_step = bool(payload.get("worker_step"))
+        if not (worker_step or (self.store.conversation_reply(row["kind"], payload) and
+                self._optional_conversation_status(payload))):
             yield True
             return
         if payload.get("content", {}).get("type") == "action" and payload.get("write_started") is False:
-            if self._conversation_step_expired(payload) or not self._conversation_step_safe(payload):
+            if ((self.clock() >= payload.get("step_expires_at", 0) if worker_step else self._conversation_step_expired(payload))
+                    or not self._conversation_step_safe(payload)):
                 self.store.retire_unattempted_action(row["id"], payload["content"])
                 yield False
                 return
@@ -4219,6 +4224,10 @@ class Bridge:
                     raise
             if row and self._obsolete_native_progress(row):
                 raise NativeProgressSuperseded
+            if payload.get("worker_step"):
+                from .worker_progress import current_payload
+                if not current_payload(self, payload):
+                    raise NativeProgressSuperseded
             if payload.get("native_history") is True:
                 if payload.get("write_started") is False and row["attempts"] == 0:
                     work, task = self._native_task(payload["issue_id"])
@@ -4795,6 +4804,9 @@ class Bridge:
             if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True
                     or payload.get("lifecycle_repair_of") or payload["content"]["type"] in ("thought", "elicitation", "action")):
                 self._reconcile_conversation_lifecycle(row)
+            if payload.get("worker_step"):
+                from .worker_progress import reconcile_after_send
+                reconcile_after_send(self, row)
             return True
         elif kind == "project_update":
             return self._send_project_update(row["id"])

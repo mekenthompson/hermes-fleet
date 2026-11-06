@@ -1377,6 +1377,13 @@ class Store:
                         ("issue_id", "body", "expected_description", "id", "session_key", "work_owner") if k in payload or k != "work_owner"):
                     return row_id
                 raise ValueError("outbox id reused with conflicting content")
+            # Foreground chat and its delegated worker share one Linear session.
+            # Reserve the existing one-minute cap atomically in the outbox itself,
+            # including failed attempts, so replacement adapters cannot reset it.
+            if kind == "activity" and payload.get("ephemeral") and payload.get("content", {}).get("type") == "action":
+                last = self.latest_session_action(payload["issue_id"], payload["session_id"])
+                if last and now - last["enqueued_at"] < 60:
+                    return ""
             targets = self._targets(payload)
             if payload.get("content_action"):
                 if (not self.conversation_reply(kind, payload) and not self._admitted(db, *targets)) or (not self.independent_message(kind, payload) and
@@ -1453,6 +1460,14 @@ class Store:
                              "json_extract(payload, '$.issue_id') = ? AND json_extract(payload, '$.session_id') = ?",
                              (issue_id, session_id)).fetchone()
         return float(row[0] or 0)
+    def latest_session_action(self, issue_id: str, session_id: str) -> dict | None:
+        """The latest optional action reservation, across foreground and worker producers."""
+        with self._tx() as db:
+            row = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND "
+                "json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? AND "
+                "json_extract(payload, '$.ephemeral')=1 AND json_extract(payload, '$.content.type')='action' "
+                "ORDER BY rowid DESC LIMIT 1", (issue_id, session_id)).fetchone()
+        return json.loads(row[0]) if row else None
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND hold_reason IS NULL AND NOT " + ADVISORY + " AND "
@@ -1484,7 +1499,7 @@ class Store:
             if not row or row["state"] != "pending" or row["hold_reason"] is not None:
                 return False
             payload = json.loads(row["payload"])
-            if (not self.conversation_reply(row["kind"], payload) or
+            if (not (self.conversation_reply(row["kind"], payload) or payload.get("worker_step")) or
                     payload.get("write_started") is not False or payload.get("ephemeral") is not True or
                     payload.get("content") != content or content.get("type") != "action"):
                 return False

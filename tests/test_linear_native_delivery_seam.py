@@ -136,7 +136,9 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
                     "SELECT payload FROM outbox WHERE kind='activity' AND state='sent' "
                     "AND json_extract(payload,'$.content.type')='action'")]
         step_epoch = time.monotonic() + 10000
+        wall_epoch = self.bridge.clock()
         async def step(metadata, when):
+            self.bridge.clock = lambda: wall_epoch + when
             with patch("hermes_fleet_linear_plugin.native_input.time.monotonic", return_value=step_epoch + when):
                 await self.adapter.send_typing(self.ISSUE, metadata=metadata)
             await asyncio.gather(*list(self.adapter._step_tasks.values()))
