@@ -997,6 +997,29 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({row["id"] for row in self.posted}), 3)
 
     @requires_status_metadata
+    async def test_new_turn_gets_same_generic_step_without_waiting_ten_minutes(self):
+        await self.start_turn()
+        await self.step(at=1000)
+        old_metadata = self.status_metadata()
+        result = await self.adapter.send(native.ISSUE, "First turn complete.",
+            reply_to=native.ACTIVITY, metadata={"thread_id": native.SESSION})
+        self.assertTrue(result.success, result.error)
+        await self.deliver("next-generic-step", "Do the next read-only check.")
+        await self.step(at=1059)
+        self.assertEqual(len(self.posted), 2)  # Keep the session-wide one-minute cap.
+        await self.step(at=1060)
+        self.assertEqual([p["content"]["type"] for p in self.posted],
+                         ["action", "response", "action"])
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+        await self.step(at=1659)
+        self.assertEqual(len(self.posted), 3)  # Same turn still has the ten-minute keepalive.
+        with patch.object(self.native_input.time, "monotonic", return_value=1660):
+            await self.adapter.send_typing(native.ISSUE, metadata=old_metadata)
+        self.assertEqual(len(self.posted), 3)  # An old producer cannot borrow the new turn.
+        await self.step(at=1660)
+        self.assertEqual(len(self.posted), 4)
+
+    @requires_status_metadata
     async def test_live_step_hook_does_not_wait_for_network_and_only_one_is_in_flight(self):
         await self.start_turn()
         entered, release = asyncio.Event(), asyncio.Event()

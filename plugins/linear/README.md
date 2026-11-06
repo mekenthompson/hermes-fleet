@@ -812,7 +812,9 @@ Delivered questions retain their exact pending Core prompt identity across adapt
 A closed turn or a different, undelivered prompt cannot borrow that question's answer routing.
 
 The typing hook publishes a known Core tool verb without its arguments as an ephemeral `action`, at most
-once per minute when it changes, or once every ten minutes while unchanged. A phrase stays
+once per minute when it changes, or once every ten minutes while unchanged within the same
+turn. A new admitted turn can publish the same phrase after the one-minute session cap;
+the previous turn's keepalive delay does not hide its status. A phrase stays
 with its producing session and turn; callbacks without a verified source use a generic
 working message. Unknown tool labels also use that generic message. Every request needed
 to queue, authorize, send and read back a step yields at the optional API budget reserve,

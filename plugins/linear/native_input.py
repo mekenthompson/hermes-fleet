@@ -1344,11 +1344,15 @@ def create_adapter(config, running):
                 phrase = self._step_phrases.get((*key, source)) or "Working on your request."
             now = time.monotonic()
             last = self._step_attempts.get(key)
-            if last and (now - last[0] < 60 or (phrase == last[1] and now - last[0] < 600)):
+            if last and (now - last[0] < 60 or
+                         (source == last[2] and phrase == last[1] and now - last[0] < 600)):
                 return
             # Reserve at scheduling time, including failures: a network outage must not turn
             # Core's two-second typing refresh into API retries. One task per session at a time.
-            self._step_attempts[key] = (now, phrase)
+            # A prior turn's reply replaces its ephemeral activity. The next turn
+            # needs its own status even when it starts with the same generic text.
+            # Keep the one-minute cap across turns; the keepalive belongs to one source.
+            self._step_attempts[key] = (now, phrase, source)
             generation = self._step_generation.get(key, 0)
             async def publish():
                 try:
