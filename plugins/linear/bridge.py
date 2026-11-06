@@ -4501,11 +4501,19 @@ class Bridge:
                     "requester_sessions", "requester_activities"))
 
     def _conversation_repair_current(self, payload: dict) -> bool:
+        if payload.get("worker_step_repair"):
+            from .worker_progress import current_question
+            target = current_question(self, payload)
+            return target is not None and self._same_lifecycle_presentation(payload, target)
         return self._same_lifecycle_presentation(payload, self._conversation_lifecycle_target(payload))
 
     def _reconcile_conversation_lifecycle(self, row: dict[str, Any]) -> None:
         """An accepted late effect keeps its bytes; a separate scoped Activity restores current state."""
         payload = row["payload"]
+        if payload.get("worker_step_repair"):
+            from .worker_progress import reconcile_after_send
+            reconcile_after_send(self, row)
+            return
         target = self._conversation_lifecycle_target(payload)
         if self._same_lifecycle_presentation(payload, target):
             return
@@ -4514,6 +4522,9 @@ class Bridge:
     def _queue_conversation_lifecycle_repair(self, row: dict[str, Any], target: dict, *, retire_clarify=False) -> None:
         """Persist repair intent; the existing sender revalidates its target before any write."""
         payload = row["payload"]
+        worker_derived = bool(payload.get("worker_step") or payload.get("worker_step_repair"))
+        if worker_derived and target["content"]["type"] != "elicitation":
+            return  # Only the native completion projector owns the worker's closing response.
         presentation = {key: target[key] for key in ("content", "native_prompt", "signal", "signal_metadata")
                         if key in target}
         identity = stable_uuid4("native-lifecycle-repair", self.profile, row["id"],
@@ -4523,6 +4534,8 @@ class Bridge:
                    "turn_activity", "requester_sessions", "requester_activities") if key in scope}
         repair.update(presentation, id=identity, content_action=True, unlinked_content=True, native_reply_version=1,
                       write_started=False, lifecycle_repair_of=row["id"])
+        if worker_derived:
+            repair["worker_step_repair"] = True  # Existing outbox correlation; never a terminal publisher.
         if self._optional_conversation_status(payload):
             repair["optional_status_repair"] = True  # Keep the originating step's reserve cap across retries.
         if retire_clarify or payload.get("retired_clarify_of"):

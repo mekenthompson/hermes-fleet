@@ -1448,8 +1448,10 @@ class Store:
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
                 " AND (" + ADVISORY + " OR (o.kind='activity' AND json_extract(o.payload, '$.native_reply_version')=1) OR o.rowid = ("  # thoughts never wait for, or hold, issue writes
+                # A worker-derived question repair keeps its optional reserve and cannot hold issue-state writes.
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
-                " AND NOT " + ADVISORY + " AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
+                " AND NOT " + ADVISORY + " AND COALESCE(json_extract(p.payload,'$.worker_step_repair'),0)!=1 "
+                "AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
                 ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
     def pending(self, issue_id: str | None = None) -> list[dict[str, Any]]:
@@ -1492,10 +1494,11 @@ class Store:
                        "COALESCE(json_extract(payload,'$.write_started'),0)=1)", (row_id, now))
 
     def unsettled_worker_action(self, issue_id: str, session_id: str) -> bool:
-        """Only this session's closing publication waits for its earlier in-flight action."""
+        """Only this session's closing publication waits for its in-flight step or derived question repair."""
         with self._tx() as db:
             return db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND state IN ('pending','failed') AND "
-                "json_type(payload,'$.worker_step')='object' AND json_extract(payload,'$.write_started')=1 AND "
+                "(json_type(payload,'$.worker_step')='object' OR json_extract(payload,'$.worker_step_repair')=1) "
+                "AND json_extract(payload,'$.write_started')=1 AND "
                 "json_type(payload,'$.applied') IS NULL AND json_extract(payload,'$.issue_id')=? AND "
                 "json_extract(payload,'$.session_id')=? LIMIT 1", (issue_id, session_id)).fetchone() is not None
     def mark(self, row_id: str, state: str, error: str | None = None) -> None:

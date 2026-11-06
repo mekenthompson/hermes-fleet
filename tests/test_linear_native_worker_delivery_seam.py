@@ -153,3 +153,89 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             with patch.object(self.bridge.api, 'transport', side_effect=reject):
                 await asyncio.to_thread(self.bridge.flush)
         self.assertFalse(self.bridge.store.unsettled_worker_action(self.ISSUE, self.SESSION))
+
+    async def composed_repair(self, *, uncertain):
+        """Real Core prompt and provider receipts, with reserve exhaustion or lost reply."""
+        from tools import clarify_gateway as clarify
+        from hermes_fleet_linear_plugin import worker_progress
+        from hermes_fleet_linear_plugin.store import Store
+        task, binding, step = await self.held_worker()
+        phase, wall = [step], self.bridge.clock()
+        with patch.object(worker_progress, 'current', side_effect=lambda *_a: phase[0]):
+            identity, transport, delayed = await self.lose_step(binding)
+            key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+            self.addCleanup(clarify.clear_session, key)
+            shown = clarify.register('withdrawn-worker-choice', key, 'Choose a color.', ['Blue', 'Green'])
+            phase[0] = None
+            self.bridge.clock = lambda: wall + 20
+            sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices,
+                shown.clarify_id, key, metadata={'thread_id': self.SESSION})
+            self.assertTrue(sent.success, sent.error)
+            original_question = self.bridge.store.outbox_row(sent.message_id)['payload']
+            await asyncio.to_thread(transport, *delayed[0])
+            repairs, retained, held = [], [], [False]
+            enqueue = self.bridge.store.enqueue
+            budget = self.bridge.api.budget_remaining
+            def reserve(kind, payload, **kwargs):
+                result = enqueue(kind, payload, **kwargs)
+                if payload.get('lifecycle_repair_of'):
+                    repairs.append(result)
+                    held[0] = not uncertain
+                return result
+            def lose_repair(url, body, headers):
+                fields = json.loads(body).get('variables', {}).get('input', {})
+                if fields.get('content', {}).get('type') == 'elicitation':
+                    retained.append((url, body, headers))
+                    raise TimeoutError('provider still processing question repair')
+                return transport(url, body, headers)
+            self.bridge.clock = lambda: wall + 120
+            with patch.object(self.bridge.store, 'enqueue', side_effect=reserve), \
+                 patch.object(self.bridge.api, 'budget_remaining', side_effect=lambda: (.1, wall + 3600) if held[0] else budget()), \
+                 patch.object(self.bridge.api, 'transport', side_effect=lose_repair):
+                await asyncio.to_thread(self.bridge.flush, only_id=identity)
+            self.assertEqual(len(repairs), 1)
+            repair_id = repairs[0]
+            repair = self.bridge.store.outbox_row(repair_id)
+            self.assertEqual(repair['state'], 'pending')
+            self.assertIs(repair['payload']['write_started'], uncertain)
+            for field in ('content', 'native_prompt', 'signal', 'signal_metadata', 'requester_activities'):
+                self.assertEqual(repair['payload'].get(field), original_question.get(field))
+            self.assertEqual(len(retained), int(uncertain))
+            clarify.clear_session(key)  # Withdraw the actual Core question before completion.
+            summary = 'Completed the delegated verification. Evidence: bounded check passed. Nothing remains.'
+            with self.board.conn() as conn:
+                self.assertTrue(self.board.kb.complete_task(conn, task.id, summary=summary,
+                    expected_run_id=task.current_run_id))
+            self.bridge.store = Store(self.bridge.store.path)  # Restart-safe persisted provenance/fence.
+            self.bridge.clock = lambda: wall + 180
+            self.bridge.store.defer(repair_id, wall + 179)
+            await asyncio.to_thread(self.bridge.pump_kanban)
+            await asyncio.to_thread(self.bridge.flush)
+            self.assertEqual(self.board.get(task.id).status, 'done')
+            self.assertEqual(self.provider.issues[self.ISSUE]['state']['type'], 'completed')
+            finals = lambda: [a for a in self.provider.activities.values()
+                              if a.get('content', {}).get('type') in ('response', 'error')]
+            if uncertain:
+                self.assertEqual(finals(), [], 'Only the same closing publication waits for the uncertain repair')
+                self.assertTrue(self.bridge.store.unsettled_worker_action(self.ISSUE, self.SESSION))
+                await asyncio.to_thread(transport, *retained[0])
+                self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'elicitation')
+                self.bridge.clock = lambda: wall + 300
+                await asyncio.to_thread(self.bridge.flush)
+                self.bridge.clock = lambda: wall + 420
+                await asyncio.to_thread(self.bridge.flush)
+            self.assertEqual(len(finals()), 1, 'Worker-derived repair must never invent a second final publisher')
+            self.assertIn(summary, finals()[0]['content']['body'])
+            self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'response')
+            settled = self.bridge.store.outbox_row(repair_id)
+            self.assertEqual(settled['state'], 'sent')
+            self.assertEqual(settled['payload']['applied'], int(uncertain))
+            self.assertFalse(self.bridge.store.unsettled_worker_action(self.ISSUE, self.SESSION))
+            self.assertEqual(len([r for r in self.bridge.store.pending() if
+                                  r['payload'].get('worker_step_repair')]), 0)
+
+    async def test_optional_budget_held_worker_question_repair_withdrawn_then_native_completes(self):
+        await self.composed_repair(uncertain=False)
+
+    async def test_uncertain_worker_question_repair_lands_after_withdrawal_before_sole_closeout(self):
+        await self.composed_repair(uncertain=True)
