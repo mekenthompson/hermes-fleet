@@ -460,6 +460,53 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def work_inspected(self, ref):
         return await asyncio.to_thread(work.inspect, ref, self.settings)
 
+    async def test_delegated_worker_progress_reads_actual_owner_frames_without_replay_or_attachment(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import worker_progress
+        await self.kanban()
+        task = kb.get_task(self.board, self.task_id)
+        events = [kb.Event.from_row(row) for row in self.board.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task.id,))]
+        adapter = SimpleNamespace(profile_home=self.home, board="default", history=lambda *args: events)
+        self.owner_methods = frozenset({"prompt.receipt", "session.info"})
+        generation = self.row["generation"]
+        self.authority.publish_execution(self.sid, generation, "tool.start", {
+            "tool_id": "held-command", "name": "terminal", "args": {"command": "SECRET_ARGUMENT_SENTINEL"}})
+        step = await asyncio.to_thread(worker_progress.current, adapter, task)
+        try:
+            from gateway.session_execution_progress import execution_progress
+        except ImportError:
+            self.assertIsNone(step, "Old Core refuses the optional execution-only projection")
+            return
+        self.assertIsNotNone(step)
+        self.assertEqual(step["worker_session_id"], self.sid)
+        self.assertEqual(step["run_id"], task.current_run_id)
+        self.assertEqual(step["execution_generation"], generation)
+        from agent.display import build_status_phrase
+        self.assertEqual(step["phrase"], build_status_phrase("terminal", None))
+        self.assertNotIn("SECRET_ARGUMENT_SENTINEL", json.dumps(step))
+        self.assertTrue(any(method == "session.info" and fields.get("execution_only") is True
+                            for method, fields in self.calls))
+        self.assertEqual(set(method for method, _ in self.calls), {"prompt.receipt", "session.info"})
+        # Finishing the real call clears the safe projection while the same
+        # delegated execution and Kanban attempt remain running.
+        self.authority.publish_execution(self.sid, generation, "tool.complete", {"tool_id": "held-command"})
+        self.assertIsNone(await asyncio.to_thread(worker_progress.current, adapter, task))
+        self.assertEqual(kb.get_task(self.board, task.id).status, "running")
+        self.assertIsNone(execution_progress(self.authority, self.ref))
+
+    async def test_delegated_worker_progress_refuses_wrong_attempt_before_owner_rpc(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_fleet_linear_plugin import worker_progress
+        await self.kanban()
+        task = kb.get_task(self.board, self.task_id)
+        events = [kb.Event.from_row(row) for row in self.board.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task.id,))]
+        adapter = SimpleNamespace(profile_home=self.home, board="default", history=lambda *args: events)
+        task.current_run_id += 1
+        self.assertIsNone(await asyncio.to_thread(worker_progress.current, adapter, task))
+        self.assertEqual(self.calls, [])
+
     def process_witness(self, start):
         from gateway.drain_control import current_instantiation_epoch
         return f"{current_instantiation_epoch()}|{start}"

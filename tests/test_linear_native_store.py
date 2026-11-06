@@ -24,6 +24,38 @@ class NativeStoreTests(unittest.TestCase):
     def bind(self, issue="issue-1", task="task-1"):
         return self.store.bind_native(issue, task, "alpha", "default", at=100)
 
+    def test_worker_and_foreground_share_durable_atomic_action_cap(self):
+        self.bind()
+        def step(at, worker=False, store=None):
+            return (store or self.store).enqueue("activity", {
+                "issue_id": "issue-1", "session_id": "session-1", "task_id": "task-1",
+                "ephemeral": True, "write_started": False,
+                "content": {"type": "action", "action": "Working", "parameter": "Working on your request."},
+                **({"worker_step": {"run_id": 1}} if worker else {})}, at=at)
+        first = step(100)
+        self.assertTrue(first)
+        replacement = Store(self.path)
+        self.assertEqual(step(159, True, replacement), "")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda worker: step(160, worker, Store(self.path)), (True, False)))
+        self.assertEqual(sum(bool(row) for row in results), 1)
+        winner = next(row for row in results if row)
+        # A failed attempt still reserves the cap; replacement cannot storm Linear.
+        self.store.mark(winner, "failed")
+        self.assertEqual(step(161), "")
+        self.assertTrue(step(220, True))
+
+    def test_expired_worker_step_retires_only_its_unattempted_content(self):
+        self.bind()
+        content = {"type": "action", "action": "Working", "parameter": "Working on your request."}
+        row = self.store.enqueue("activity", {"issue_id": "issue-1", "session_id": "session-1",
+            "task_id": "task-1", "worker_step": {"run_id": 1}, "write_started": False,
+            "ephemeral": True, "content": content}, at=100)
+        self.assertFalse(self.store.retire_unattempted_action(row, {**content, "parameter": "different"}))
+        self.assertTrue(self.store.retire_unattempted_action(row, content))
+        self.assertEqual(self.store.outbox_row(row)["state"], "sent")
+        self.assertFalse(self.store.outbox_row(row)["payload"]["applied"])
+
     def test_project_merge_retains_original_activity_and_legacy_evidence_per_member(self):
         self.bind("issue-1", "task-1")
         self.bind("issue-2", "task-2")
