@@ -213,12 +213,12 @@ class FakeKanban:
             require_task_issue_scope(self.require_task(task_id), issue)
         self.subscriptions.append((task_id, issue_id))
 
-    def comment(self, task_id, body, *, marker="", issue=None):
+    def comment(self, task_id, body, *, marker="", issue=None, paused_event_id=None):
         if issue is not None:
             from hermes_fleet_linear_plugin.bridge import require_task_issue_scope
             task = self.require_task(task_id)
             require_task_issue_scope(task, issue)
-            if task.status not in ("running", "ready", "review"):
+            if task.status not in (("blocked", "triage") if paused_event_id is not None else ("running", "ready", "review")):
                 raise LinearError("Native work stopped or ended before follow-up delivery", retryable=False)
         self.comments.append((task_id, body))
         self._comment_receipts.append((task_id, body.strip(), marker, len(self.comments)))
@@ -1844,7 +1844,7 @@ class SessionRequesterTests(unittest.TestCase):
         before = self.store.get(ISSUE)
         self.bridge.handle_webhook(self.session_event("prompted"))
         self.assertEqual(task.status, "blocked")
-        self.assertEqual(self.kanban.comments, [])
+        self.assertEqual(len(self.kanban.comments), 1)
         self.assertEqual(self.store.get(ISSUE), before)
         self.assertEqual(len(self.kanban.creates), 1)
 

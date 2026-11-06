@@ -525,6 +525,24 @@ class NativeFrontdoorTests(unittest.TestCase):
         self.assertEqual(self.board.get(task.id).status, task.status)
         self.assertEqual(self.bridge.store.pending(), [])
 
+    def test_followup_saves_paused_note_but_does_not_report_unsaved_ended_note_as_success(self):
+        self.bind_api()
+        task = self.board.create(title="Existing work")
+        self.assertTrue(self.call({"action": "track", "issue": "ABC-1", "task_id": task.id})["ok"])
+        with self.board.conn() as conn:
+            self.board.kb.block_task(conn, task.id, reason="Choose a color", kind="needs_input")
+        saved = self.call({"action": "followup", "issue": "ABC-1", "body": "Blue", "id": str(uuid.uuid4())})
+        self.assertTrue(saved["ok"], saved)
+        self.assertTrue(saved["native"]["saved"])
+        self.assertEqual(self.board.get(task.id).status, "blocked")
+        with self.board.conn() as conn:
+            self.board.kb.archive_task(conn, task.id)
+        refused = self.call({"action": "followup", "issue": "ABC-1", "body": "Green", "id": str(uuid.uuid4())})
+        self.assertFalse(refused["ok"], refused)
+        self.assertFalse(refused["native"]["saved"])
+        with self.board.conn() as conn:
+            self.assertEqual([item.body for item in self.board.kb.list_comments(conn, task.id)], ["Blue"])
+
     def test_native_delegated_child_guard_survives_registered_handler_rpc(self):
         from agent.delegation_context import delegated_child_context
         self.bind_api()
