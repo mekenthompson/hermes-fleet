@@ -154,7 +154,8 @@ How to work this task:
 2. Finish with kanban_complete and put the evidence in the result: the PR URL (also as
    metadata.published_pr), the merged commit, the deploy check, or the findings link. A run without
    evidence is reported to Linear as unfinished.
-3. If you need a human decision, kanban_block with kind needs_input and say exactly what you need.
+3. If you need a human decision, use clarify when available and wait for the actual answer.
+   If the question cannot be delivered, kanban_block with kind needs_input and say exactly what you need.
 4. Keep the people following this issue informed without noise. At each meaningful milestone or blocker, call
    kanban_comment on this task with human_checkpoint=true and a new stable request_id (reuse it on
    retry). Write it for a person: a few complete sentences in Linear Markdown saying what changed,
@@ -163,6 +164,9 @@ How to work this task:
 5. Your kanban_complete summary is the closing note people read in Linear. Write it in Linear Markdown
    with three short sections: **Delivered** (what changed, in plain words), **Evidence** (PR, CI,
    deploy and live check links or results) and **Remaining** (what is left, or "Nothing").
+   Include the requested results and what the checks proved; omit raw commands, logs and internal
+   bookkeeping unless the person requested them. The existing completion projection publishes this
+   as the issue comment; do not create a second closing comment yourself.
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 
