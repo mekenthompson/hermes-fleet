@@ -52,6 +52,13 @@ class NativeWorkJourneyTests(unittest.TestCase):
         self.assertEqual(result["native_task_count"], 1)
         self.assertEqual(result["owner_admissions"], 1)
 
+    def test_paused_answer_is_saved_before_resume_and_real_worker_finishes_without_reblocking(self):
+        result = self.journey("paused-answer")
+        self.assertTrue(result["paused_answer_preserved"])
+        self.assertTrue(result["followup_consumed_same_run"])
+        self.assertEqual(result["task_status"], "done")
+        self.assertEqual(result["native_task_count"], 1)
+
     def test_linear_stop_reaps_owned_worker_and_prevents_later_tool_effect(self):
         result = self.journey("stop")
         self.assertEqual(result["task_status"], "blocked")
@@ -130,13 +137,13 @@ def _child(mode):
                     assert self.server.release.wait(70), "coordinator did not release model boundary"
                     name, args = (("write_file", {"path": str(forbidden), "content": "must-not-exist"})
                                   if mode in ("stop", "handoff") else ("read_file", {"path": str(first)}))
-                elif mode in ("complete", "reuse") and not followup.exists():
+                elif mode in ("complete", "reuse", "paused-answer") and not followup.exists():
                     if "FOLLOWUP_NATIVE_SENTINEL" in wire:
                         self.server.saw_followup = True
                         name, args = "write_file", {"path": str(followup), "content": "followup-was-consumed"}
                     else:
                         name, args = "read_file", {"path": str(first)}
-                elif mode in ("complete", "reuse"):
+                elif mode in ("complete", "reuse", "paused-answer"):
                     name, args = "kanban_complete", {"summary": "Both isolated file effects verified; native operator follow-up applied."}
             message = {"role": "assistant", "content": "Owned journey complete"}
             finish = "stop"
@@ -206,6 +213,22 @@ def _child(mode):
         worker_bridge.handle_webhook(event)
         task_id = store.get(ISSUE)["task_id"]
     assert board.get(task_id).status == "ready"
+    if mode == "paused-answer":
+        with board.conn() as initial_conn:
+            kb.block_task(initial_conn, task_id, reason="Choose Blue or Green", kind="needs_input")
+        saved = worker_bridge.followup(ISSUE,
+            "FOLLOWUP_NATIVE_SENTINEL: Blue. Preserve phase A and write the requested phase B result.",
+            "paused-color-answer")
+        assert saved["saved"] and board.get(task_id).status == "blocked"
+        # A bridge restart or retry never starts work; the ordinary native
+        # operator control is the only resume in this disposable journey.
+        saved_again = bridge().followup(ISSUE,
+            "FOLLOWUP_NATIVE_SENTINEL: Blue. Preserve phase A and write the requested phase B result.",
+            "paused-color-answer")
+        assert saved_again["saved"] and board.get(task_id).status == "blocked"
+        with board.conn() as initial_conn:
+            kb.unblock_task(initial_conn, task_id)
+        receipt["paused_answer_preserved"] = True
     dispatch._resolve_hermes_argv = lambda: [sys.executable, "-m", "hermes_cli.main"]
     clients = []
     original_popen = subprocess.Popen
@@ -242,9 +265,10 @@ def _child(mode):
                     assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
                     assert store.native_intent(f"create:{ISSUE}") is None
                 receipt["plugin_recovery_kept_same_run"] = current.current_run_id == run_id and current.claim_lock == task.claim_lock
-                if mode in ("complete", "reuse"):
-                    restarted_bridge.followup(ISSUE, "FOLLOWUP_NATIVE_SENTINEL: preserve phase A and write the requested phase B result.",
-                                               "isolated-followup-one")
+                if mode in ("complete", "reuse", "paused-answer"):
+                    if mode != "paused-answer":
+                        restarted_bridge.followup(ISSUE, "FOLLOWUP_NATIVE_SENTINEL: preserve phase A and write the requested phase B result.",
+                                                   "isolated-followup-one")
                     # Keep the existing native six-second comment-poll contract real.
                     time.sleep(6.2)
                     peer.release.set()

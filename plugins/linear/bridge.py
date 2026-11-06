@@ -554,6 +554,8 @@ def _plain_notice(body: str) -> str:
     return body
 def _followup_notice(result: dict) -> str:
     message, status = str(result.get("message") or ""), result.get("status")
+    if result.get("saved") and status in ("blocked", "triage"):
+        return "Your note is saved for this work. It stays paused until you ask the agent to resume it."
     if message.startswith(("Instruction saved", "Instruction already saved")):
         return "Got it. Your note was passed to the agent working on this; it picks it up at its next step."
     if status in ("done", "archived"):
@@ -1114,14 +1116,21 @@ class Kanban:
                             break
         return stopped
 
-    def comment(self, task_id: str, body: str, *, marker: str = "", issue: dict | None = None) -> int:
+    def comment(self, task_id: str, body: str, *, marker: str = "", issue: dict | None = None,
+                paused_event_id: int | None = None) -> int:
         # The integration author is provenance, never a human credential.
         author = "linear:" + hashlib.sha256(marker.encode()).hexdigest() if marker else "linear"
-        with self.conn() as conn:
-            task = self.require_task(task_id)
+        with self.conn() as conn, self.kb.write_txn(conn):
+            self.kb._require_task(conn, task_id)
+            task = self.task_from_row(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
             if issue is not None:
                 require_task_issue_scope(task, issue)
-                if task.status not in ("running", "ready", "review"):
+                paused = paused_event_id is not None
+                if paused:
+                    latest = conn.execute("SELECT max(id) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+                    if task.status not in ("blocked", "triage") or latest != paused_event_id:
+                        raise LinearError("Native controls changed before paused follow-up delivery", retryable=False)
+                if not paused and task.status not in ("running", "ready", "review"):
                     raise LinearError("Native work stopped or ended before follow-up delivery; inspect current controls", retryable=False)
             return self.kb.add_comment(conn, task_id, author, body)
     def find_comment(self, task_id: str, body: str, marker: str) -> list:
@@ -2929,9 +2938,9 @@ class Bridge:
                 raise LinearError("Issue was closed or reassigned; follow-up held", retryable=False)
             require_task_issue_scope(task, issue)
             if task.status in ("done", "archived"):
-                return {"task_id": task.id, "status": task.status, "message": "Work has ended. Review history or explicitly create a new native increment."}
-            if task.status not in ("running", "ready", "review"):
-                return {"task_id": task.id, "status": task.status, "message": "Work is stopped or waiting. Use an authorized native task control to resume; no automatic resume was attempted."}
+                return {"saved": False, "task_id": task.id, "status": task.status, "message": "Work has ended. Review history or explicitly create a new native increment."}
+            if task.status not in ("running", "ready", "review", "blocked", "triage"):
+                return {"saved": False, "task_id": task.id, "status": task.status, "message": "Work is stopped or waiting. Use an authorized native task control to resume; no automatic resume was attempted."}
             marker = f"{issue_id}:{request_id}"
             intent_key = f"comment:{marker}"
             if source_ms is not None and self.store.native_intent(intent_key) is None:
@@ -2941,13 +2950,13 @@ class Bridge:
                 initial = (getattr(adapter, "guarded_controls", False) and
                            self._instruction_follows_initial_admission(issue_id, task.id, adapter, source_ms, events))
                 if not initial and any(source_ms // 1000 <= event.created_at for event in controls):
-                    return {"task_id": task.id, "status": task.status,
+                    return {"saved": False, "task_id": task.id, "status": task.status,
                             "message": "Follow-up ordering is stale or unverifiable. Inspect native task history and send a current native instruction."}
             payload = {"kind": "comment", "issue_id": issue_id, "task_id": task.id, "body": body.strip(),
                        "profile": adapter.executor_profile, "board": adapter.board or "default", "marker": marker}
             saved, first = self.store.native_intent_prepare(intent_key, payload)
             if saved.get("state") == "applied":
-                return {"task_id": task.id, "status": task.status, "message": "Instruction already saved on the existing native task."}
+                return {"saved": True, "task_id": task.id, "status": task.status, "message": "Instruction already saved on the existing native task."}
             if not first:
                 comments = adapter.find_comment(task.id, body, marker)
                 if len(comments) != 1:
@@ -2956,9 +2965,13 @@ class Bridge:
                 comment_id = comments[0].id
             else:
                 require_task_issue_scope(adapter.require_task(task.id), issue)
-                comment_id = adapter.comment(task.id, body, marker=marker, issue=issue)
+                paused = {}
+                if task.status in ("blocked", "triage"):
+                    events = adapter.history(task.id, 0)
+                    paused = {"paused_event_id": events[-1].id if events else None}
+                comment_id = adapter.comment(task.id, body, marker=marker, issue=issue, **paused)
             self.store.native_intent_settle(intent_key, {"state": "applied", "comment_id": comment_id})
-            return {"task_id": task.id, "status": task.status, "message": "Instruction saved on the existing native task."}
+            return {"saved": True, "task_id": task.id, "status": task.status, "message": "Instruction saved on the existing native task."}
     def _stop(self, row: dict | None, session_id: str, who: str, stamp: float, activity_id: str = "") -> bool:
         if not row or row.get("origin") != "native" or not activity_id:
             return diag.because("not_native")

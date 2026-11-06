@@ -223,6 +223,42 @@ class NativeBridgeScenarios(unittest.TestCase):
                          (after.current_run_id, after.claim_lock, after.assignee))
         self.assertEqual(len(steers), 1)
 
+    def test_paused_answer_survives_restart_and_is_in_next_native_worker_context(self):
+        task_id = self.create()
+        with self.board.conn() as conn:
+            kb.claim_task(conn, task_id, claimer="native-test-worker")
+            kb.block_task(conn, task_id, reason="Choose Blue or Green", kind="needs_input")
+        before = self.board.get(task_id)
+        result = self.bridge.followup(ISSUE, "Blue", "color-answer")
+        self.assertTrue(result["saved"])
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        repeated = self.make_bridge().followup(ISSUE, "Blue", "color-answer")
+        self.assertTrue(repeated["saved"])
+        self.assertEqual(len(self.comments(task_id)), 1)
+        self.assertEqual(self.board.get(task_id).current_run_id, before.current_run_id)
+        # Only the native operator resumes; the answer is already in the next
+        # worker's real context, preventing the missing-answer block recurrence.
+        with self.board.conn() as conn:
+            kb.unblock_task(conn, task_id)
+            kb.claim_task(conn, task_id, claimer="native-test-worker")
+            context = kb.build_worker_context(conn, task_id)
+        self.assertIn("Blue", str(context))
+        self.assertFalse(any(event.kind == "block_loop_detected" for event in self.board.history(task_id, 0)))
+
+    def test_newer_event_holds_paused_answer_at_final_native_write(self):
+        task_id = self.create()
+        with self.board.conn() as conn:
+            kb.block_task(conn, task_id, reason="Choose Blue or Green", kind="needs_input")
+        comment = self.board.comment
+        def changed(*args, **kwargs):
+            with self.board.conn() as conn:
+                kb.add_comment(conn, task_id, "operator", "A newer control boundary")
+            return comment(*args, **kwargs)
+        with patch.object(self.board, "comment", side_effect=changed), self.assertRaises(LinearError):
+            self.bridge.followup(ISSUE, "Blue", "late-color-answer")
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual([item.body for item in self.comments(task_id)], ["A newer control boundary"])
+
     def test_lost_followup_response_reconciles_actual_comment_and_dedupes(self):
         task_id = self.create()
         original = self.board.comment
