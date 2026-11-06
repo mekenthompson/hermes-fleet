@@ -22,6 +22,7 @@ STATUS_METADATA_TESTS = {
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_live_step_stops_at_final_and_reopens_only_for_new_input',
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_live_step_throttles_changed_phrases_and_keeps_chat_alive',
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_new_input_supersedes_queued_step_after_store_and_bridge_restart',
+    'test_linear_native_prompt_scenarios.NativePromptScenarios.test_new_turn_gets_same_generic_step_without_waiting_ten_minutes',
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_optional_status_obeys_reserve',
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_private_argument_not_published',
     'test_linear_native_prompt_scenarios.NativePromptScenarios.test_question_invalidates_scheduled_live_step',
