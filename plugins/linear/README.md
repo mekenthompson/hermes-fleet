@@ -843,6 +843,13 @@ again after the one-minute cap. Queued worker steps expire after a
 minute and verify the same run, generation and open tool before publication.
 Completion, Stop and pending Core questions suppress these steps; the ordinary
 completion projection retains its readable outcome and evidence.
+If an action's HTTP reply is lost, the existing outbox retains its immutable
+activity identity for readback only, even after expiry or Stop. A later receipt
+restores a genuine pending question when needed. Native completion and issue
+status still proceed; only that session's closing response waits for the
+uncertain action to settle, so the existing closeout remains the sole final
+response and readable issue comment. A definite provider rejection creates no
+such uncertainty fence.
 
 Creator-null assignment acknowledgment requires a verified durable admission or
 known original supersession from the existing native dispatcher. Held scope and
