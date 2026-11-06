@@ -2,16 +2,13 @@
 import json
 
 
-
 def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note, assessment_id=None):
     """One full issue comment per native completion; a session carries only its pointer."""
-    from .bridge import stable_uuid4
+    from .bridge import _done_body, stable_uuid4
     comment_id = assessment_id or stable_uuid4("native-outcome-comment", issue_id,
         json.dumps(completion, sort_keys=True, separators=(",", ":")))
     if not assessment_id:
-        proof = "\n".join(f"- {url}" for url in dict.fromkeys(evidence)) or "See the findings above."
-        summary = summary or "Completed the agreed issue outcome."
-        body = f"**Delivered**\n\n{summary}{head_note}\n\n**Evidence**\n\n{proof}\n\n**Remaining**\n\nNone reported."
+        body = _done_body(summary, evidence) + head_note
         writes.insert(1, ("comment", dict(id=comment_id, issue_id=issue_id, task_id=completion["task_id"],
             body=body, native_completion=completion, native_outcome_comment=True)))
     result = []
