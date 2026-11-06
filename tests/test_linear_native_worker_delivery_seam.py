@@ -246,7 +246,9 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def capture_completed_outcome(self):
         task, _binding, _step = await self.held_worker()
-        summary = 'Delivered the bounded color check. Evidence: Blue and Green fixtures both passed. No work remains.'
+        summary = ('**Delivered**\n\nCompleted the bounded color check.\n\n'
+                   '**Evidence**\n\nBlue and Green fixtures both passed.\n\n'
+                   '**Remaining**\n\nMonitor the next scheduled check; no settings were changed.')
         with self.board.conn() as conn:
             self.assertTrue(self.board.kb.complete_task(conn, task.id, summary=summary,
                 expected_run_id=task.current_run_id))
@@ -265,9 +267,9 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(remote['parent'])
         self.assertEqual(remote['user']['id'], self.provider.viewer)
         self.assertEqual(remote['issue']['id'], self.ISSUE)
-        self.assertIn(summary, remote['body'])
+        self.assertEqual(remote['body'], 'Done.\n\n' + summary)
         for heading in ('**Delivered**', '**Evidence**', '**Remaining**'):
-            self.assertIn(heading, remote['body'])
+            self.assertEqual(remote['body'].count(heading), 1)
         self.assertNotIn(task.id, remote['body'])
         finals = [a for a in self.provider.activities.values() if a.get('content', {}).get('type') == 'response']
         self.assertEqual(len(finals), 1)

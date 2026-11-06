@@ -56,8 +56,8 @@ finds that admission and starts no second task or worker. Work bound with no Age
 (started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
 opens for it: one thought says this is the work already running, then Started, checkpoints,
 heartbeats and the keepalive post there as activities. Completion posts one full,
-regular top-level issue comment with Delivered, Evidence and Remaining sections,
-then a short Agent Session response points to that comment. The session response
+regular top-level issue comment preserving the worker's supplied result, evidence
+and remaining work, then a short Agent Session response points to that comment. The session response
 waits for exact comment readback, including this app's author and no parent;
 reporter retries retain the same completion identity and comment UUID. Existing
 specialist assessment comments retain their full recommendation and deduplication.
