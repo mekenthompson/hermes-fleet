@@ -120,25 +120,29 @@ def current_payload(bridge, payload):
     return current(adapter, task) == payload["worker_step"]
 
 
-def reconcile_after_send(bridge, row):
-    """Restore an actual question that appeared during the optional API call.
-
-    The native completion projector owns closeout (and its single readable issue
-    comment). It shares this sender's issue lock, so its completion follows the
-    accepted step; this path never invents a second completion response.
-    """
-    payload = row["payload"]
+def current_question(bridge, payload):
+    """Return only a genuine, current prompt under the existing exact actor/run guard."""
     for question in bridge.store.conversation_question_candidates(payload["issue_id"], payload["session_id"]):
         try:
             with bridge._question_publication_guard(question):
                 if not bridge._conversation_interim_finished(question):
-                    bridge._queue_conversation_lifecycle_repair(row, question)
-                    return
+                    return question
         except LinearError as exc:
             if exc.retryable:
                 raise
-    if not current_payload(bridge, payload):
-        bridge._mark_dirty(payload["issue_id"])  # Existing paced status/closeout recheck owns the repair.
+    return None
+
+
+def reconcile_after_send(bridge, row):
+    """Restore a current question; the native projector alone owns readable closeout."""
+    payload = row["payload"]
+    question = current_question(bridge, payload)
+    if question is not None:
+        if not bridge._same_lifecycle_presentation(payload, question):
+            bridge._queue_conversation_lifecycle_repair(row, question)
+        return
+    if payload.get("worker_step_repair") or not current_payload(bridge, payload):
+        bridge._mark_dirty(payload["issue_id"])
 
 
 def reconcile_uncertain(bridge, row):
