@@ -51,6 +51,8 @@ class SourceSelectionTests(unittest.TestCase):
     def test_native_journey_requires_non_skipping_runtime_proof(self):
         self.assertTrue(self.select('tests/test_linear_native_work_journey.py')['runtime'])
         self.assertTrue(self.select('tests/test_linear_native_work_journey.py')['journey'])
+        self.assertTrue(self.select('tests/test_linear_worker_questions.py')['runtime'])
+        self.assertTrue(self.select('tests/test_linear_worker_questions.py')['journey'])
 
     def test_candidate_fixture_is_not_lost(self):
         plan = self.select('tests/candidate_hf578.py')
