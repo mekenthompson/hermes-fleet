@@ -445,6 +445,58 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.inbox_row("live-input")[2] == "imported")
         await self.until(lambda: bool(self.receipts))
 
+    async def test_worker_action_returns_after_genuine_question_with_same_admission_and_phrase(self):
+        from tools import clarify_gateway as clarify
+        from hermes_fleet_linear_plugin import worker_progress
+        from agent.display import build_status_phrase
+        await self.start_live_for_delivery()
+        self.adapter.set_authorization_check(lambda actor, *_a, **_k: actor == self.USER)
+        issue = self.provider.issues[self.ISSUE]
+        task = self.board.create(title="Bounded delegated continuation",
+            body=f"Linear issue {self.ISSUE}: {issue['url']}", created_by=self.board.executor_profile)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.bridge.clock() - 2):
+            task = self.board.kb.claim_task(conn, task.id)
+        self.assertTrue(self.bridge.store.bind_native(self.ISSUE, task.id, "default", self.board.board,
+            owner_ref=self.SESSION, at=self.bridge.clock()))
+        binding = self.bridge.store.get(self.ISSUE)
+        step = {"worker_session_id": "actual-delegated-owner", "execution_generation": 1,
+                "admission_id": "same-native-worker-admission", "run_id": task.current_run_id,
+                "phrase": build_status_phrase("terminal", None)}
+        phase = [step]
+        wall = self.bridge.clock()
+        async def publish(at):
+            self.bridge.clock = lambda: wall + at
+            await asyncio.to_thread(worker_progress.queue, self.bridge, binding, self.board)
+            await asyncio.to_thread(self.bridge.flush)
+        def worker_actions():
+            with self.bridge.store._tx() as db:
+                return [json.loads(row[0]) for row in db.execute(
+                    "SELECT payload FROM outbox WHERE json_type(payload,'$.worker_step')='object' AND state='sent' "
+                    "AND COALESCE(json_extract(payload,'$.applied'),1)=1")]
+        with patch.object(worker_progress, "current", side_effect=lambda *_a: phase[0]):
+            await publish(0)
+            self.assertEqual(len(worker_actions()), 1)
+            key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+            self.addCleanup(clarify.clear_session, key)
+            shown = clarify.register("worker-color-choice", key, "Choose a color.", ["Blue", "Green"])
+            phase[0] = None
+            self.bridge.clock = lambda: wall + 20
+            sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices,
+                shown.clarify_id, key, metadata={"thread_id": self.SESSION})
+            self.assertTrue(sent.success, sent.error)
+            self.assertFalse(self.bridge.store.latest_session_action(self.ISSUE, self.SESSION)["_presentation_current"])
+            self.bridge.clock = lambda: wall + 30
+            await self.deliver("worker-color-answer", "Blue")
+            await self.until(lambda: self.inbox_row("worker-color-answer")[2] == "imported")
+            self.assertEqual(shown.response, "Blue")
+            phase[0] = step  # Same native admission resumes another terminal call.
+            await publish(59)
+            self.assertEqual(len(worker_actions()), 1, "A question cannot widen the one-minute cap")
+            await publish(61)
+            self.assertEqual(len(worker_actions()), 2, "The question replaced the previous ephemeral action")
+            self.assertEqual(worker_actions()[0]["worker_step"], worker_actions()[1]["worker_step"])
+            self.assertEqual(self.board.get(task.id).current_run_id, task.current_run_id)
+
     async def test_definitively_rejected_rate_limit_retries_the_exact_question(self):
         from tools import clarify_gateway as clarify
         await self.start_live_for_delivery()
