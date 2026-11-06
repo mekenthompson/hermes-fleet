@@ -507,6 +507,25 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await asyncio.to_thread(worker_progress.current, adapter, task))
         self.assertEqual(self.calls, [])
 
+    async def test_delegated_worker_progress_cannot_borrow_later_unrelated_admission(self):
+        from hermes_cli import kanban_db as kb
+        from hermes_state_runtime import settle_session_input, admit_session_input
+        from hermes_fleet_linear_plugin import worker_progress
+        await self.kanban()
+        task = kb.get_task(self.board, self.task_id)
+        events = [kb.Event.from_row(row) for row in self.board.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task.id,))]
+        adapter = SimpleNamespace(profile_home=self.home, board="default", history=lambda *args: events)
+        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+            generation=self.row["generation"], outcome="completed")
+        admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            principal_id=self.conn.actor.subject, session_id=self.sid, request_id="unrelated-later-input",
+            payload={"text": "An unrelated local conversation"}, intent="queue")
+        self.claim()
+        self.assertIsNone(await asyncio.to_thread(worker_progress.current, adapter, task))
+        self.assertTrue(self.calls)
+        self.assertEqual(set(method for method, _ in self.calls), {"prompt.receipt"})
+
     def process_witness(self, start):
         from gateway.drain_control import current_instantiation_epoch
         return f"{current_instantiation_epoch()}|{start}"
