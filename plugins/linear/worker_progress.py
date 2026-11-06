@@ -18,6 +18,7 @@ from .transport import Unavailable
 async def _read(home, adapter, task, session_id):
     from hermes_state import SessionDB
     from hermes_state_local import local_receipt
+    from hermes_state_keys import local_identity
     from gateway.session_policy import restore_policy
     from .origin_state import stop_evidence
     with SessionDB(home / "state.db", read_only=True) as db:
@@ -27,13 +28,17 @@ async def _read(home, adapter, task, session_id):
     request = "kanban:" + json.dumps([adapter.board, task.id, task.current_run_id], separators=(",", ":"))
     if (policy.source != "kanban" or not isinstance(frozen, dict)
             or saved["profile_id"] != str(home) or saved["request_id"] != request
+            or session_id != local_identity(str(home), saved["principal_id"], request)
             or any(frozen.get(k) != v for k, v in {
                 "board": adapter.board, "task_id": task.id, "run_id": task.current_run_id,
                 "claim_lock": task.claim_lock, "profile": task.assignee}.items())):
         return None
     async with origin._client(home) as (client, endpoint):
         before, current = await origin._snapshot(client, home, session_id)
-        if endpoint.authority_epoch != current["authority_epoch"]:
+        if (endpoint.authority_epoch != current["authority_epoch"] or current["input_id"] != request
+                or current["admission_header"]["request_id"] != request
+                or current["admission_header"]["principal_id"] != saved["principal_id"]
+                or current["admission_header"]["target_session_id"] != before["session_id"]):
             return None
         await asyncio.to_thread(stop_evidence, home, session_id)
         info = await client.rpc("session.info", session_id=session_id, execution_only=True)
