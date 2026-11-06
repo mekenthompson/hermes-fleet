@@ -92,6 +92,8 @@ def queue(bridge, row, adapter):
     last = bridge.store.latest_session_action(row["issue_id"], row["owner_ref"])
     if last and now - last["enqueued_at"] < 60:
         return
+    if bridge.store.unsettled_worker_action(row['issue_id'], row['owner_ref']):
+        return  # Keep one uncertain optional status; questions and real closeout retain their own paths.
     with bridge.api.optional_work():
         task = bridge._native_effect_task(row["issue_id"])
         step = current(adapter, task)
@@ -137,3 +139,15 @@ def reconcile_after_send(bridge, row):
                 raise
     if not current_payload(bridge, payload):
         bridge._mark_dirty(payload["issue_id"])  # Existing paced status/closeout recheck owns the repair.
+
+
+def reconcile_uncertain(bridge, row):
+    """Read the frozen activity receipt; an uncertain optional write is never sent again."""
+    payload = row['payload']
+    actual = bridge.api.outbound_activity(row['id'], payload['session_id'], payload['issue_id'])
+    if actual is None:
+        raise LinearError('Worker activity outcome is uncertain; waiting for authoritative readback')
+    if actual != payload['content']:
+        raise LinearError('Worker activity receipt differs from its frozen content', retryable=False)
+    reconcile_after_send(bridge, row)
+    return True

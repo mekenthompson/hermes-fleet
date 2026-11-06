@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
 """
 # Final replies keep normal delivery even when projected as thoughts. Unattempted one-try
 # notes can retire, but an attempted native message retains readback and lifecycle repair.
+# Worker actions stay optional/nonblocking in this classification; their uncertain
+# send marker is protected separately by retire_advisory for readback-only recovery.
 ADVISORY = ("(kind = 'activity' AND ((json_extract(payload, '$.content.type') IN ('thought', 'action') AND "
             "json_extract(payload, '$.native_reply_version') IS NULL) OR "
             "(COALESCE(json_extract(payload, '$.one_try'), 0) = 1 AND NOT "
@@ -482,6 +484,9 @@ class Store:
                 return False
             if require_unattempted and payload.get("write_started") is not False:
                 return False  # Another sender started after this caller read the fresh row.
+            if (row['kind'] == 'activity' and payload.get('content', {}).get('type') in ('response', 'error') and
+                    self.unsettled_worker_action(payload['issue_id'], payload['session_id'])):
+                return False  # Same transaction as the closing publication's send marker.
             if (payload.get("native_history") is True or payload.get("native_progress") is True) and payload.get("requires_status_id"):
                 dependency = self.outbox_row(payload["requires_status_id"])
                 if not self.history_status_settled(dependency):
@@ -1436,8 +1441,9 @@ class Store:
             # Older versions retired one-try native messages even after an uncertain send.
             # Recover only that undecided state for readback; explicit refusals remain failed.
             db.execute("UPDATE outbox SET state='pending' WHERE state='failed' AND kind='activity' "
-                "AND hold_reason IS NULL AND json_extract(payload,'$.native_reply_version')=1 "
-                "AND json_extract(payload,'$.one_try')=1 AND json_extract(payload,'$.write_started')=1 "
+                "AND hold_reason IS NULL AND ((json_extract(payload,'$.native_reply_version')=1 "
+                "AND json_extract(payload,'$.one_try')=1) OR json_type(payload,'$.worker_step')='object') "
+                "AND json_extract(payload,'$.write_started')=1 "
                 "AND json_type(payload,'$.failure_kind') IS NULL AND json_type(payload,'$.applied') IS NULL")
             rows = db.execute(
                 "SELECT o.* FROM outbox o WHERE o.state = 'pending' AND " + eligible("o") +
@@ -1482,7 +1488,16 @@ class Store:
         """Retire a due, unsent thought; one a quota pause deferred keeps its place. It changes no issue: no fence applies."""
         with self._tx() as db:
             db.execute("UPDATE outbox SET state = 'failed' WHERE id = ? AND state = 'pending' AND hold_reason IS NULL AND next_at <= ? AND "
-                       + ADVISORY, (row_id, now))
+                       + ADVISORY + " AND NOT (COALESCE(json_type(payload,'$.worker_step')='object',0) AND "
+                       "COALESCE(json_extract(payload,'$.write_started'),0)=1)", (row_id, now))
+
+    def unsettled_worker_action(self, issue_id: str, session_id: str) -> bool:
+        """Only this session's closing publication waits for its earlier in-flight action."""
+        with self._tx() as db:
+            return db.execute("SELECT 1 FROM outbox WHERE kind='activity' AND state IN ('pending','failed') AND "
+                "json_type(payload,'$.worker_step')='object' AND json_extract(payload,'$.write_started')=1 AND "
+                "json_type(payload,'$.applied') IS NULL AND json_extract(payload,'$.issue_id')=? AND "
+                "json_extract(payload,'$.session_id')=? LIMIT 1", (issue_id, session_id)).fetchone() is not None
     def mark(self, row_id: str, state: str, error: str | None = None) -> None:
         with self._tx() as db:
             if not self._row_admitted(db, row_id): return

@@ -4124,7 +4124,10 @@ class Bridge:
                         continue
                     with self.lock(row["payload"]["issue_id"]), self._outbox_requester_scope(row), self._one_try(row):
                         if not self._authorize_outbox_effect(row):
-                            if advisory(row): continue
+                            if advisory(row):
+                                if row['payload'].get('worker_step') and row['payload'].get('write_started') is True:
+                                    self.store.defer_guarded(row['id'], self.clock())
+                                continue
                             payload = row["payload"]
                             missing = ((getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"
                                        and any(not (payload.get("requester_sessions") or {}).get(issue_id)
@@ -4166,12 +4169,13 @@ class Bridge:
                             continue
                         except RateLimited as exc:
                             self.store.defer(row["id"], exc.until)
-                            if (self.store.conversation_reply(row["kind"], row["payload"]) and
-                                    self._optional_conversation_status(row["payload"])):
+                            if (row['payload'].get('worker_step') or
+                                    (self.store.conversation_reply(row["kind"], row["payload"]) and
+                                     self._optional_conversation_status(row["payload"]))):
                                 continue  # Disposable status cannot hold an essential reply in this batch.
                             return sent
                         except LinearError as exc:
-                            if self.store.conversation_reply(row["kind"], row["payload"]):
+                            if self.store.conversation_reply(row["kind"], row["payload"]) or row['payload'].get('worker_step'):
                                 row.update(self.store.outbox_row(row["id"]) or {})  # The mutation guard persisted its attempt.
                             if isinstance(getattr(exc, "__cause__", None), ReauthorizationRequired):
                                 self._alert_reauthorization()
@@ -4183,7 +4187,8 @@ class Bridge:
                                 if not denied and targets:
                                     self._fence_scope_denial(targets[0], exc)
                                 continue
-                            if advisory(row):
+                            if advisory(row) and not (row['payload'].get('worker_step') and
+                                                      row['payload'].get('write_started') is True):
                                 diag.outbox_failure(row, exc, advisory=True)
                                 progress = True
                             elif not exc.retryable:
@@ -4310,6 +4315,9 @@ class Bridge:
                     pass
             if expected_content is not None and payload.get("content") != expected_content:
                 raise ProjectUpdateDeferred  # Another sender changed the encoded request's projection.
+            if (row and row['kind'] == 'activity' and payload.get('content', {}).get('type') in ('response', 'error')
+                    and self.store.unsettled_worker_action(payload['issue_id'], payload['session_id'])):
+                raise ProjectUpdateDeferred
             if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
                     or (repair_reply and not self._conversation_repair_current(payload))):
                 raise ProjectUpdateDeferred  # HTTP body is already encoded; reproject on the next pass.
@@ -4320,6 +4328,8 @@ class Bridge:
                        "require_unattempted": prior_started["value"] is False}
             if conversation:
                 options.update(expected_content=expected_content, conversation_attempt_id=prior_started["attempt_id"])
+            elif payload.get('worker_step'):
+                options.update(expected_content=expected_content)
             if not self.store.admit_mutation(row_id, terminal=terminal, **options): raise ProjectUpdateDeferred
             entered_transport = False
             try:
@@ -4358,7 +4368,7 @@ class Bridge:
                     if interim_reply and payload["content"]["type"] == "action":
                         if not self._conversation_step_safe(payload):
                             raise LinearError("Linear live status has an unsupported phrase", retryable=False)
-                    if conversation and self._optional_conversation_status(payload):
+                    if (conversation or payload.get('worker_step')) and self._optional_conversation_status(payload):
                         with self.api.optional_work():
                             pass  # Authorization reads may have consumed the optional reserve.
                     entered_transport = True
@@ -4377,8 +4387,9 @@ class Bridge:
         elif (self.store.outbox_row(row_id) or {}).get("kind") == "delegate":
             guard.rejected = lambda: self.store.delegate_not_applied(
                 row_id, started_before=prior_started.get("value"), attempt_id=prior_started.get("attempt_id"))
-        elif self.store.conversation_reply((self.store.outbox_row(row_id) or {}).get("kind", ""),
-                                           (self.store.outbox_row(row_id) or {}).get("payload", {})):
+        elif ((self.store.outbox_row(row_id) or {}).get('payload', {}).get('worker_step') or
+              self.store.conversation_reply((self.store.outbox_row(row_id) or {}).get("kind", ""),
+                                           (self.store.outbox_row(row_id) or {}).get("payload", {}))):
             def rejected():
                 if prior_started.get("value") is False:
                     self.store.mutation_not_attempted(row_id, prior_started["attempt_id"])
@@ -4630,6 +4641,9 @@ class Bridge:
                 raise ProjectUpdateDeferred
             row.update(current)
         payload, kind = row["payload"], row["kind"]
+        if payload.get('worker_step') and payload.get('write_started') is True:
+            from .worker_progress import reconcile_uncertain
+            return reconcile_uncertain(self, row)
         if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True or payload.get("lifecycle_repair_of")):
             settled = (self._prepare_lifecycle_repair(row) if payload.get("lifecycle_repair_of")
                        else self._prepare_conversation_final(row))
@@ -4646,6 +4660,9 @@ class Bridge:
                 raise LinearError("Linear session already has its final reply", retryable=False)
             with self._question_publication_guard(payload):
                 pass
+        if (kind == 'activity' and payload.get('content', {}).get('type') in ('response', 'error') and
+                self.store.unsettled_worker_action(payload['issue_id'], payload['session_id'])):
+            raise ProjectUpdateDeferred
         if self.store.conversation_reply(kind, payload) and self._conversation_step_expired(payload):
             return diag.because("obsolete_progress")
         attempted_progress = ((payload.get("native_progress") is True or payload.get("native_history") is True) and
@@ -4809,7 +4826,8 @@ class Bridge:
                 row["id"], payload["session_id"], payload["content"], issue_id=payload["issue_id"],
                 ephemeral=bool(payload.get("ephemeral")),
                 **({"signal": payload["signal"], "signal_metadata": payload.get("signal_metadata")} if payload.get("signal") else {})),
-                expected_content=copy.deepcopy(payload["content"]) if self.store.conversation_reply(kind, payload) else None)
+                expected_content=copy.deepcopy(payload["content"]) if (
+                    self.store.conversation_reply(kind, payload) or payload.get('worker_step')) else None)
             if self.store.conversation_reply(kind, payload) and (payload.get("turn_final") is True
                     or payload.get("lifecycle_repair_of") or payload["content"]["type"] in ("thought", "elicitation", "action")):
                 self._reconcile_conversation_lifecycle(row)

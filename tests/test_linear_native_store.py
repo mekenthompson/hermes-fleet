@@ -56,6 +56,24 @@ class NativeStoreTests(unittest.TestCase):
         self.assertEqual(self.store.outbox_row(row)["state"], "sent")
         self.assertFalse(self.store.outbox_row(row)["payload"]["applied"])
 
+    def test_uncertain_worker_receipt_fences_only_its_session_and_survives_old_retirement(self):
+        self.bind()
+        content = {"type": "action", "action": "Working", "parameter": "Working on your request."}
+        identity = self.store.enqueue('activity', {'issue_id': 'issue-1', 'session_id': 'session-1',
+            'task_id': 'task-1', 'worker_step': {'run_id': 1}, 'write_started': True,
+            'ephemeral': True, 'content': content}, at=100)
+        self.store.retire_advisory(identity, 101)
+        self.assertEqual(self.store.outbox_row(identity)['state'], 'pending')
+        self.assertTrue(self.store.unsettled_worker_action('issue-1', 'session-1'))
+        self.assertFalse(self.store.unsettled_worker_action('issue-1', 'another-session'))
+        self.assertFalse(self.store.unsettled_worker_action('another-issue', 'session-1'))
+        # Recover the precise old-version disposable retirement for readback only.
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET state='failed' WHERE id=?", (identity,))
+        self.assertTrue(any(row['id'] == identity for row in Store(self.path).due(200)))
+        self.store.mark_sent(identity, True)
+        self.assertFalse(self.store.unsettled_worker_action('issue-1', 'session-1'))
+
     def test_project_merge_retains_original_activity_and_legacy_evidence_per_member(self):
         self.bind("issue-1", "task-1")
         self.bind("issue-2", "task-2")
