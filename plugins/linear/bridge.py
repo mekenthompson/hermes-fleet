@@ -2704,6 +2704,8 @@ class Bridge:
         if payload.get("task_id"):
             for issue_id in selected:
                 self._native_effect_task(issue_id)
+        if payload.get("native_outcome_comment") or payload.get("native_outcome_pointer"):
+            self._require_completion_report(payload)
         if payload.get("native_history") is True:
             return  # History does not imply completion; closed-issue delivery checks its own receipt.
         if row["kind"] == "status":
@@ -3656,6 +3658,10 @@ class Bridge:
                     "id": comment_id, "issue_id": issue_id, "body": assessment, "assessment": True,
                     "task_id": row["task_id"], "native_completion": completion,
                     **({"completion_reconcile_request_id": reconcile_request_id} if reconcile_request_id else {})}))
+        from .outcome import prepare
+        writes = prepare(writes, issue_id=issue_id, owner=row.get("owner_ref"), completion=completion,
+                         summary=summary, evidence=evidence, head_note=head_note,
+                         assessment_id=(prior_id or comment_id) if assessment else None)
         if not self.authorize_specialist_effect(issue_id): return
         return self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
                                      for kind, payload in writes], at=self.clock(), event_id=event_id,
@@ -4318,6 +4324,12 @@ class Bridge:
             if (row and row['kind'] == 'activity' and payload.get('content', {}).get('type') in ('response', 'error')
                     and self.store.unsettled_worker_action(payload['issue_id'], payload['session_id'])):
                 raise ProjectUpdateDeferred
+            if payload.get("native_outcome_pointer"):
+                if not self.store.outcome_comment_applied(payload):
+                    raise ProjectUpdateDeferred
+                comment = self.store.outbox_row(payload["requires_comment_id"])
+                if not self.api.verify_completion_comment(comment["id"], payload["issue_id"], comment["payload"]["body"]):
+                    raise ProjectUpdateDeferred
             if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
                     or (repair_reply and not self._conversation_repair_current(payload))):
                 raise ProjectUpdateDeferred  # HTTP body is already encoded; reproject on the next pass.
@@ -4387,7 +4399,9 @@ class Bridge:
         elif (self.store.outbox_row(row_id) or {}).get("kind") == "delegate":
             guard.rejected = lambda: self.store.delegate_not_applied(
                 row_id, started_before=prior_started.get("value"), attempt_id=prior_started.get("attempt_id"))
-        elif ((self.store.outbox_row(row_id) or {}).get('payload', {}).get('worker_step') or
+        elif ((self.store.outbox_row(row_id) or {}).get('payload', {}).get('native_outcome_comment') or
+              (self.store.outbox_row(row_id) or {}).get('payload', {}).get('assessment') or
+              (self.store.outbox_row(row_id) or {}).get('payload', {}).get('worker_step') or
               self.store.conversation_reply((self.store.outbox_row(row_id) or {}).get("kind", ""),
                                            (self.store.outbox_row(row_id) or {}).get("payload", {}))):
             def rejected():
@@ -4737,6 +4751,11 @@ class Bridge:
                                        content["body"].replace("Done.", "Finished locally.", 1))
                 payload["superseded_receipt"] = True
                 self.store.rewrite(row["id"], payload, row["next_at"])
+        if payload.get("native_outcome_pointer"):
+            from .outcome import pointer_ready
+            if not pointer_ready(self, row):
+                raise ProjectUpdateDeferred
+            payload = row["payload"]
         if kind != "project_update" and payload.get("terminal") and not payload.get("admission_id"):
             owner_issue_id = payload.get("owner_issue_id") or payload["issue_id"]
             issue = self._effect_issue(owner_issue_id)
@@ -4817,10 +4836,13 @@ class Bridge:
                         work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
                         work.get("stop_requested_at")):
                     return diag.because("content_owner_changed")
+            closing = bool(payload.get("native_outcome_comment") or payload.get("assessment"))
+            verify = getattr(self.api, "verify_completion_comment" if closing else "verify_comment", None)
+            if closing and payload.get("write_started") is True and callable(verify) and verify(row["id"], payload["issue_id"], payload["body"]):
+                return True  # The original stable-id comment landed; a reporter retry only reads it.
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
-            verify = getattr(self.api, "verify_comment", None)
-            if (payload.get("content_action") or attempted_progress) and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
+            if (closing or payload.get("content_action") or attempted_progress) and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
                 raise LinearError("Comment target/body readback did not match; reconcile before retrying")
             return True
         elif kind == "description":

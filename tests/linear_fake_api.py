@@ -207,7 +207,8 @@ class FakeLinear:
         if "comment(" in query:
             comment = next((item for item in self.comments if item["id"] == variables["id"]), None)
             return 200, {"data": {"comment": ({"id": comment["id"], "body": comment["body"],
-                                              "issue": {"id": comment["issueId"]}} if comment else None)}}
+                                              "issue": {"id": comment["issueId"]}, "parent": None,
+                                              "user": {"id": SELF}} if comment else None)}}
         if "issueUpdate" in query:
             issue = self.issues[variables["id"]]
             before = dict(issue)

@@ -368,6 +368,10 @@ class BoundLinearAPI(LinearAPI):
         self._mutation_issue(issue_id)
         with self._permit_specialist_operation():
             return super().verify_comment(comment_id, issue_id, body)
+    def verify_completion_comment(self, comment_id, issue_id, body):
+        self._mutation_issue(issue_id)
+        with self._permit_specialist_operation():
+            return super().verify_completion_comment(comment_id, issue_id, body)
     def outbound_activity(self, activity_id, session_id, issue_id):
         self._mutation_issue(issue_id)
         with self._permit_specialist_operation():

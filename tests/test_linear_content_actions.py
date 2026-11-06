@@ -44,7 +44,7 @@ class ContentRemote(FakeLinear):
         if 'CommentReadback' in query:
             found = next((c for c in self.comments if c['id'] == variables['id']), None)
             return 200, {'data': {'comment': ({'id': found['id'], 'body': found['body'],
-                'issue': {'id': found['issueId']}} if found else None)}}
+                'issue': {'id': found['issueId']}, 'parent': None, 'user': {'id': SELF}} if found else None)}}
         if 'projectCreate' in query:
             self.created_project = dict(variables['input'])
             return 200, {'data': {'projectCreate': {'success': True}}}

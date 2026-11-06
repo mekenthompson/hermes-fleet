@@ -110,7 +110,7 @@ class Authority:
             data = {name: self.activities.get(variables[name]) for name in ("question", "answer")}
         elif "query AgentActivityAuthorization" in query:
             data = {"agentActivity": self.activities.get(variables["id"])}
-        elif "query CommentReadback(" in query:
+        elif "query CommentReadback(" in query or "query CompletionCommentReadback(" in query:
             data = {"comment": self.comment_records.get(variables["id"])}
         elif "query IssueThread(" in query or "query IssueProgress(" in query:
             issue = self.issues.get(variables["id"])
@@ -141,7 +141,8 @@ class Authority:
                     "agentSession": {"id": fields["agentSessionId"]}})
             if field == "commentCreate":
                 fields = variables["input"]
-                self.comment_records[fields["id"]] = {"id": fields["id"], "body": fields["body"], "issue": {"id": fields["issueId"]}}
+                self.comment_records.setdefault(fields["id"], {"id": fields["id"], "body": fields["body"],
+                    "issue": {"id": fields["issueId"]}, "parent": None, "user": {"id": self.viewer}})
             if field == "issueUpdate" and "description" in variables.get("input", {}):
                 self.issues[variables["id"]]["description"] = variables["input"]["description"]
             data = {field: {"success": True}} if field else {}

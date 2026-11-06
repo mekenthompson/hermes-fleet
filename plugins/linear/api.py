@@ -754,6 +754,17 @@ class LinearAPI:
         return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
                     markdown_matches(comment.get("body"), body) and isinstance(comment.get("issue"), dict) and
                     comment["issue"].get("id") == issue_id)
+    def verify_completion_comment(self, comment_id: str, issue_id: str, body: str) -> bool:
+        """Closing proof must be an ordinary top-level comment written by this app."""
+        data = self.graphql("query CompletionCommentReadback($id: String!) { comment(id: $id) { "
+                            "id body parent { id } user { id } issue { id } } }", {"id": comment_id})
+        comment = data.get("comment")
+        return bool(isinstance(comment, dict) and comment.get("id") == comment_id and
+                    markdown_matches(comment.get("body"), body) and isinstance(comment.get("issue"), dict) and
+                    comment["issue"].get("id") == issue_id and
+                    "parent" in comment and comment["parent"] is None and
+                    isinstance(comment.get("user"), dict) and comment["user"].get("id") == self.viewer_id())
+
     def _create(self, mutation: str, input_type: str, fields: dict[str, Any]) -> bool:
         try:
             data = self.graphql(f"mutation Create($input: {input_type}!) {{ {mutation}(input: $input) {{ success }} }}",

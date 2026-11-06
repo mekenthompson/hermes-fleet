@@ -102,5 +102,7 @@ class WorkerProgressScenarios(unittest.TestCase):
         self.assertEqual(finished, [True])
         finals = [activity for activity in self.remote.activities if activity["content"]["type"] == "response"]
         self.assertEqual(len(finals), 1, "Only the existing outcome projector completes the session")
-        self.assertIn(summary, finals[0]["content"]["body"])
+        self.assertEqual(len(self.remote.comments), 1)
+        self.assertIn(summary, self.remote.comments[0]["body"])
+        self.assertNotIn(summary, finals[0]["content"]["body"])
         self.assertNotIn(task.id, finals[0]["content"]["body"])
