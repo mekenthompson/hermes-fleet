@@ -262,7 +262,7 @@ def _admission_note(row, task, started: bool) -> str:
 
 
 def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
-    """Start a delegated issue as one tracked native task before any model turn.
+    """Stage a delegated issue before its real native conversation input commits.
 
     Uses the same guarded assignment admission as a creator-null delegation (the
     shared create intent and retry key that work_on and the self-delegation echo
@@ -288,7 +288,7 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
                 bridge.session_notices.pop(key, None)
                 diag.evt("session.admit", "skipped", "finished_work_conversation", task=row.get("task_id"), **fields)
                 return True, "", False
-        accepted = bridge.handle_webhook(original)
+        accepted = bridge.handle_webhook(original, consumer_input_pending=True)
     except Exception as error:
         if not bridge.session_notices.pop(key, False):  # a decline already said what is needed
             _wait_notice(bridge, projected, isinstance(error, RateLimited))
@@ -304,7 +304,8 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
         activation = bridge.store.native_intent(f"activate:{issue_id}:{row['task_id']}")
         created = bridge.store.native_intent(f"create:{issue_id}") or {}
         linked = activation is None and created.get("task_id") != row["task_id"]
-        if linked or (activation or {}).get("accepted"):
+        staged = created.get("payload", {}).get("requires_native_input")
+        if staged or linked or (activation or {}).get("accepted"):
             try:
                 row, task = bridge._native_task(issue_id)
             except LinearError as error:
@@ -312,6 +313,10 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
                 diag.warn("session.admit", "held", "admission_failed", exc=type(error).__name__,
                           task=row.get("task_id"), **fields)
                 raise
+            if staged:
+                return True, (f"Tracked delegated work is staged as task {task.id}. Its initial native activation "
+                    "waits for this input's committed receipt. Do not perform the issue work in this conversation "
+                    "or create another task; its native worker owns execution and the user decision prompts."), True
             started = not linked
             diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
                      task=task.id, state=task.status, **fields)
@@ -408,6 +413,37 @@ def project_input(bridge, event) -> NativeInput | None:
 
 
 
+def worker_prompt_state(adapter, bridge, prompt):
+    from tools.clarify_gateway import get_pending
+    from gateway.session_authorities import authority_for_home, require_serving
+    from hermes_state_runtime import get_session_admission
+    pending = get_pending(prompt.get("clarify_id"))
+    if not _clarify_prompt_matches(prompt, pending):
+        return False
+    producer = getattr(pending, "producer", None)
+    if not producer:
+        return False
+    runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
+    authority = authority_for_home(runner, bridge.profile_home)
+    require_serving(authority)
+    row = get_session_admission(authority.db, admission_id=producer["admission_id"])
+    live = authority.sessions.get(producer["session_id"])
+    if live is None:
+        return False
+    from gateway.session_policy import policy_for_source
+    policy = policy_for_source(runner, live.source)
+    context = json.loads(policy.kanban_json or "{}") if policy else {}
+    if context.get("prompt_consumer_admission_id") != producer["consumer_admission_id"]:
+        return False
+    card = {key: context[key] for key in ("board", "task_id", "run_id", "db")}
+    if adapter.kanban_prompt_consumer(card) != producer["consumer_admission_id"]:
+        return False
+    return (row is not None and row["target_session_id"] == producer["session_id"]
+            and row["status"] == "started" and row["generation"] == producer["generation"]
+            and row["owner_epoch"] == authority.epoch
+            and authority.executing.get(producer["session_id"]) == producer["generation"])
+
+
 def committed_conversation_state(adapter, bridge, payload) -> dict:
     """Read Core's committed order and outcomes, before or after its provider ACK hook.
 
@@ -416,6 +452,9 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
     """
     if adapter is None or not adapter._running:
         raise LinearError("Native conversation state is unavailable")
+    if payload.get("native_prompt", {}).get("producer"):
+        live = worker_prompt_state(adapter, bridge, payload["native_prompt"])
+        return {"live": live, "latest_activity": payload.get("source_activity"), "turn_live": live}
     runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
     if runner is None:
         raise LinearError("Native conversation owner is unavailable")
@@ -522,6 +561,8 @@ def _question_request_identity(prompt) -> str:
     """One Core decision, shared by every faithful presentation of that request."""
     identity = {key: prompt.get(key) for key in ("kind", "session_key", "request_id", "clarify_id",
                                                "question", "choices", "multi_select")}
+    if "producer" in prompt:
+        identity["producer"] = prompt["producer"]
     return stable_uuid4("linear-core-question", json.dumps(identity, sort_keys=True, separators=(",", ":")))
 
 
@@ -568,7 +609,8 @@ def _clarify_prompt_matches(prompt, pending) -> bool:
     return (pending is not None and pending.session_key == prompt.get("session_key")
             and pending.question == prompt.get("question")
             and list(pending.choices or []) == prompt.get("choices")
-            and pending.multi_select == prompt.get("multi_select"))
+            and pending.multi_select == prompt.get("multi_select")
+            and getattr(pending, "producer", None) == prompt.get("producer"))
 
 
 @contextmanager
@@ -837,6 +879,35 @@ def create_adapter(config, running):
                     running.get("native_adapter"), bridge, payload)
             return True
 
+        def kanban_prompt_consumer(self, card):
+            """Only a verified linked task can ask into its admitted provider conversation."""
+            bridge = running.get("bridge")
+            if bridge is None or not self._running:
+                return None
+            matches = []
+            for work in bridge.store.active(origin="native"):
+                binding = bridge.store.native_binding(work["issue_id"])
+                if not binding or binding["task_id"] != card["task_id"] or (binding.get("board") or "default") != card["board"]:
+                    continue
+                adapter = bridge._binding_adapter(work["issue_id"])
+                with adapter.read_conn() as native:
+                    database = next(row[2] for row in native.execute("PRAGMA database_list") if row[1] == "main")
+                if Path(database).resolve() != Path(card["db"]).resolve():
+                    return None
+                if not bridge.authorize_specialist_effect(work["issue_id"]):
+                    return None
+                _work, task = bridge._native_task(work["issue_id"])
+                if task.status != "running" or task.current_run_id != card["run_id"]:
+                    return None
+                session_id = work.get("owner_ref")
+                issue = bridge._effect_issue(work["issue_id"])
+                if (issue.get("delegate") or {}).get("id") != bridge.api.viewer_id():
+                    return None
+                anchor = bridge.store.conversation_input(work["issue_id"], session_id)
+                if anchor:
+                    matches.append(anchor["admission_id"])
+            return matches[0] if len(matches) == 1 else None
+
         async def disconnect(self):
             self._running = False
             await self.cancel_background_tasks()
@@ -958,10 +1029,15 @@ def create_adapter(config, running):
                     bridge = running["bridge"]
                     def remember_input():
                         with bridge.lock(projected.issue_id):
-                            return bridge.store.remember_conversation_input(
+                            anchor = bridge.store.remember_conversation_input(
                                 projected.issue_id, projected.session_id, projected.message_id,
                                 receipt.admission_id, receipt.sequence, receipt.status == "terminal",
                                 self._core_session_keys(event.source))
+                            if projected.source == "delegation":
+                                activity = projected.message_id if projected.message_id != projected.session_id else None
+                                with bridge.api.requester_session(projected.session_id, activity_id=activity):
+                                    bridge._assignment_activation(bridge.store.get(projected.issue_id))
+                            return anchor
                     anchor = await asyncio.to_thread(remember_input)
                     self._cache_input(projected.issue_id, projected.session_id, anchor)
                     with self._relay_lock:
@@ -1384,7 +1460,10 @@ def create_adapter(config, running):
                 cursor = (self._input_cursors.get((chat_id, session_id, source), 0)
                           if source_cursor is None else source_cursor)
             try:
-                if kind is not None and await asyncio.to_thread(
+                worker_prompt = reply.get("native_prompt", {}).get("producer")
+                if worker_prompt and not await asyncio.to_thread(worker_prompt_state, self, bridge, reply["native_prompt"]):
+                    return SendResult(success=False, error="Worker question is no longer current")
+                if kind is not None and not worker_prompt and await asyncio.to_thread(
                         bridge.store.conversation_finished, chat_id, session_id, turn_activity or source, cursor):
                     return SendResult(success=False, error="Linear session already has its final reply")
                 row_id = await asyncio.to_thread(queue_reply, bridge, chat_id, session_id, source, content,
@@ -1450,6 +1529,8 @@ def create_adapter(config, running):
                 mark_awaiting_text(clarify_id)  # Linear lets the person type an answer instead of picking.
             prompt = {"kind": "clarify", "clarify_id": clarify_id, "session_key": session_key,
                       "question": question, "choices": choices, "multi_select": multi}
+            if producer := getattr(get_pending(clarify_id), "producer", None):
+                prompt["producer"] = producer
             self._pause_steps(chat_id, session_id, session_key)
             return await self._post(bridge, chat_id, session_id, source, body, kind="elicitation",
                                     question=True, nonce=clarify_id, native_prompt=prompt, **reply)

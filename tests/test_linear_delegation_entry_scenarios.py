@@ -19,6 +19,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from linear_fake_api import load_plugin
@@ -111,7 +112,9 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.adapter = platform_registry.get("linear").adapter_factory(PlatformConfig(enabled=True, typing_indicator=False))
         self.turns = []
 
-        async def model_turn(event):  # the model turn: recorded, never run
+        async def model_turn(event):  # finite endpoint; real-ledger qualification is in worker_questions
+            await self.adapter.on_message_admitted(event, SimpleNamespace(admission_id=event.message_id,
+                sequence=len(self.turns) + 1, status="queued", control=None))
             self.turns.append(event)
         self.adapter.handle_message = model_turn
         self.inbox = IngressStore(self.home / "inbox.db")
@@ -175,9 +178,9 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         # The model turn runs once, after admission, told the work is already running as that task.
         self.assertEqual(len(self.turns), 1)
         context = self.turns[0].channel_context
-        self.assertIn("Tracked work already started", context)
+        self.assertIn("Tracked delegated work is staged", context)
         self.assertIn(task.id, context)
-        self.assertIn("Do not do the work in this conversation", context)
+        self.assertIn("Do not perform the issue work in this conversation", context)
         self.assertNotIn("@mention", context)
         said = self.said("session-1")
         self.assertIn("Got it. Checking the issue and any existing work now; updates will appear here.", said)
@@ -298,7 +301,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIn("It is history now", context)
         self.assertEqual(self.tasks(), [task_id])
         self.assertEqual(self.history(task_id).count("unblocked"), 1)
-        self.assertEqual(self.inbox_status(delivery), "pending")  # the committed-input hook acknowledges it
+        self.assertEqual(self.inbox_status(delivery), "imported")  # the finite endpoint invoked the committed-input hook
 
     async def test_retried_session_linked_to_existing_board_work_answers_once(self):
         issue = self.authority.issues[ISSUE]

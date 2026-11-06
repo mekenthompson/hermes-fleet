@@ -1582,20 +1582,20 @@ class Bridge:
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
         diag.warn("scope.fenced", "refused", "scope_refused", exc=type(exc).__name__)
-    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
         # A person is waiting on Agent Session events (a Stop, a question, a delegation): never deferred for budget.
         with self._priority("essential" if event.get("type") == "AgentSessionEvent" else "normal"):
-            return self._route_webhook(event, assignment_prompt=assignment_prompt)
-    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+            return self._route_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
+    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
                 activity_id = ((event.get("agentActivity") or {}).get("id") if event.get("action") == "prompted" else None)
                 with self.api.requester_session((event.get("agentSession") or {}).get("id"), activity_id=activity_id):
-                    return self._handle_webhook(event, assignment_prompt=assignment_prompt)
+                    return self._handle_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
             if event.get("type") == "Issue" and not self.store.get((event.get("data") or {}).get("id")):
                 return
-        return self._handle_webhook(event, assignment_prompt=assignment_prompt)
-    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+        return self._handle_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
+    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
@@ -1640,7 +1640,7 @@ class Bridge:
             if row and stamp < float(row["last_updated_at"]):
                 return diag.because("superseded", True)  # A newer reporting/admission observation superseded this input.
             if event.get("action") == "created":
-                return self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt)
+                return self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
                     self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
@@ -1659,7 +1659,7 @@ class Bridge:
                 self._prompted(event, issue, session_id, row, activity)
 
     def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
-                   *, assignment_prompt: str = "") -> bool:
+                   *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool:
         if row:
             if self._assignment_activation(row):
                 if row.get("owner_ref") != session_id:
@@ -1681,7 +1681,7 @@ class Bridge:
             if self._same_work_session(issue["id"], session_id, row, task, _existing_work_notice(task.get("status"))):
                 return True
             return diag.decision("session.start", diag.because("existing_binding", True, "refused"), iss=issue["id"], sess=session_id, task=row.get("task_id"))  # The original durable binding was verified; do not resume it.
-        return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt), iss=issue["id"], sess=session_id)
+        return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt, consumer_input_pending=consumer_input_pending), iss=issue["id"], sess=session_id)
     def _same_work_session(self, issue_id: str, session_id: str, row: dict, task: dict, notice: str) -> bool:
         """Answer a new Agent Session on work this profile already holds; True when it now reports there.
 
@@ -1850,7 +1850,7 @@ class Bridge:
         # Archived or cancelled with no outcome: nothing posts; _reconcile_status parks a
         # started state this app set back to Todo (no agent is working on it now).
         self._capture_native_event(issue_id, event_id, [], at=self.clock())
-    def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
+    def _start(self, event, issue, session_id, stamp, key, prompt: str = "", *, consumer_input_pending: bool = False) -> bool:
         issue_id = issue["id"]
         if self.store.get(issue_id):
             return True
@@ -1929,7 +1929,8 @@ class Bridge:
                    "title": f"{fresh.get('identifier') or issue_id}: {fresh.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only", "initial_status": "blocked",
-                   "activation": "native-event-guard-v1", "source_ms": stamp}
+                   "activation": "native-event-guard-v1", "source_ms": stamp,
+                   **({"requires_native_input": True} if consumer_input_pending else {})}
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
@@ -1975,6 +1976,8 @@ class Bridge:
         self.kanban.subscribe(task.id, issue_id, issue=fresh)
         if self._assignment_activation(self.store.get(issue_id)):
             return True
+        if payload.get("requires_native_input") and not self.store.conversation_input(issue_id, session_id):
+            return True  # Its actual Core input must commit before the initial guarded activation.
         unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
             self._decline(issue_id, session_id, "Stop arrived while the task was being created, so it was created paused. Nothing runs until someone asks the agent to resume.")
@@ -2011,6 +2014,8 @@ class Bridge:
             created = self.store.native_intent_settle(f"create:{issue_id}",
                                                       {"state": "applied", "task_id": row["task_id"]})
         if created.get("state") != "applied" or created.get("task_id") != row["task_id"]:
+            return False
+        if payload.get("requires_native_input") and not self.store.conversation_input(issue_id, row.get("owner_ref")):
             return False
         if payload.get("record_done"):
             # Work already finished in chat is never runnable: only _record_done settles it,
@@ -4545,7 +4550,7 @@ class Bridge:
         is_step = payload.get("content", {}).get("type") == "action"
         if is_step and self.store.conversation_step_superseded(payload["id"]):
             return True
-        if self.store.conversation_finished(payload["issue_id"], payload["session_id"],
+        if not payload.get("native_prompt", {}).get("producer") and self.store.conversation_finished(payload["issue_id"], payload["session_id"],
                 payload.get("turn_activity", payload.get("source_activity", "")), payload.get("source_cursor", 0)):
             return True
         read = getattr(self, "native_conversation_state", None)

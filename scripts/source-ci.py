@@ -101,7 +101,7 @@ def select(paths, full=False, reason='changed paths'):
                 lanes['acp'] = True
             if fnmatch.fnmatch(name, 'test_linear_native_*seam.py'):
                 lanes['input'] = True
-            if name == 'test_linear_native_work_journey.py':
+            if name in {'test_linear_native_work_journey.py', 'test_linear_worker_questions.py'}:
                 lanes['journey'] = True
     return {'tests': sorted(tests), **lanes,
             'runtime': any(lanes[k] for k in ('linear', 'acp', 'origin', 'input', 'journey')),

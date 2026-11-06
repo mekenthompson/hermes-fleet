@@ -1172,3 +1172,11 @@ The client keeps one pause and budget file per profile, `<state_database>.rate-l
   10 min), startup identity checks (doubling to 5 min) and OAuth refresh failures (1 min doubling to 15 min).
 - Issue webhooks for a tracked issue recheck only that issue, at most once per 30 s, and ignore
   echoes of this app's own writes. Finished or parked native work is not polled.
+
+
+Delegated workers with a verified native human conversation can invoke `clarify` directly.
+The actual worker request is rendered through the conversation's existing bound question flow;
+a reply resolves only that native request and generation. The initial task stays parked until
+its provider input has a committed native receipt, so a fast dispatcher cannot claim it before
+the question consumer exists. Stop and withdrawn receiver authorization still fence answers.
+Creatorless work retains finite card behavior. Approvals retain their finite policy throughout.

@@ -1061,14 +1061,16 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                                             "issueId": self.ISSUE}
         raw = await self.deliver_raw("human-delegation", event)
         await self.until(lambda: self.rows() and self.rows()[0]["status"] == "terminal")
+        await self.until(lambda: self.inbox_row("human-delegation")[2] == "imported")
         self.assertEqual(len(seen), 1)
         text, context, tasks, in_turn = seen[0]
         self.assertIn("was delegated to you", text)
         self.assertEqual(len(tasks), 1)
-        self.assertIn("Tracked work already started", context)
+        self.assertIn("Tracked delegated work is staged", context)
         self.assertIn(tasks[0], context)
         self.assertTrue(in_turn)
         self.assertEqual(self.board.require_task(tasks[0]).status, "ready")
+        await self.until(lambda: self.inbox_row("human-delegation")[2] == "imported")
         self.assertEqual(self.inbox_row("human-delegation"), ("default", raw, "imported", 1))
         await self.until(lambda: not self.bridge._session_turn_active(self.ISSUE))  # the turn ended
         # A redelivered delegation reuses the same task: no second create or admission.

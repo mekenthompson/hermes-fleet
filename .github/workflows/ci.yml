@@ -184,6 +184,8 @@ jobs:
             --out "$RUNNER_TEMP/journey-env" --group dev --group test --extra all --ci)
           "$RUNNER_TEMP/journey-env/bin/python" scripts/run-linear-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-source" --pattern test_linear_native_work_journey.py
+          "$RUNNER_TEMP/journey-env/bin/python" scripts/run-linear-scenarios.py \
+            --agent-source "$GITHUB_WORKSPACE/agent-source" --pattern test_linear_worker_questions.py
       - name: Guarded native origin evidence
         if: matrix.lane == 'origin' && needs.selection.outputs.origin == 'true'
         env:
