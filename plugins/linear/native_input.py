@@ -413,6 +413,33 @@ def project_input(bridge, event) -> NativeInput | None:
 
 
 
+def verified_consumer_anchor(adapter, bridge, issue_id, session_id, expected):
+    """The original admitted receiver survives newer inputs on the same conversation.
+
+    The frozen ID comes only from Core's private run policy. Read its real native
+    envelope and match the still-current provider binding; Core independently
+    reauthorizes that envelope's original actor, source route and task claim.
+    """
+    if expected is None:
+        anchor = bridge.store.conversation_input(issue_id, session_id)
+        return anchor["admission_id"] if anchor else None
+    from gateway.session_authorities import authority_for_home, require_serving
+    from hermes_state_runtime import get_session_admission
+    runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
+    authority = authority_for_home(runner, bridge.profile_home)
+    require_serving(authority)
+    row = get_session_admission(authority.db, admission_id=expected)
+    envelope = (row or {}).get("payload", {}).get("native_text_v1", {})
+    source = envelope.get("source", {})
+    if (row is None or row["status"] == "unknown" or envelope.get("event", {}).get("structured_control")
+            or source.get("platform") != "linear" or source.get("chat_id") != issue_id
+            or source.get("thread_id") != session_id or source.get("is_bot") is not False
+            or source.get("scope_id") != bridge.api.identity["organization_id"]
+            or not source.get("user_id") or source["user_id"] == bridge.api.identity["viewer_id"]):
+        return None
+    return expected
+
+
 def worker_prompt_state(adapter, bridge, prompt):
     from tools.clarify_gateway import get_pending
     from gateway.session_authorities import authority_for_home, require_serving
@@ -436,6 +463,7 @@ def worker_prompt_state(adapter, bridge, prompt):
     if context.get("prompt_consumer_admission_id") != producer["consumer_admission_id"]:
         return False
     card = {key: context[key] for key in ("board", "task_id", "run_id", "db")}
+    card["consumer_admission_id"] = producer["consumer_admission_id"]
     if adapter.kanban_prompt_consumer(card) != producer["consumer_admission_id"]:
         return False
     return (row is not None and row["target_session_id"] == producer["session_id"]
@@ -903,9 +931,10 @@ def create_adapter(config, running):
                 issue = bridge._effect_issue(work["issue_id"])
                 if (issue.get("delegate") or {}).get("id") != bridge.api.viewer_id():
                     return None
-                anchor = bridge.store.conversation_input(work["issue_id"], session_id)
+                anchor = verified_consumer_anchor(self, bridge, work["issue_id"], session_id,
+                                                  card.get("consumer_admission_id"))
                 if anchor:
-                    matches.append(anchor["admission_id"])
+                    matches.append(anchor)
             return matches[0] if len(matches) == 1 else None
 
         async def disconnect(self):
