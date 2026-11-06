@@ -1463,11 +1463,16 @@ class Store:
     def latest_session_action(self, issue_id: str, session_id: str) -> dict | None:
         """The latest optional action reservation, across foreground and worker producers."""
         with self._tx() as db:
-            row = db.execute("SELECT payload FROM outbox WHERE kind='activity' AND "
+            row = db.execute("SELECT rowid, payload FROM outbox WHERE kind='activity' AND "
                 "json_extract(payload, '$.issue_id')=? AND json_extract(payload, '$.session_id')=? AND "
                 "json_extract(payload, '$.ephemeral')=1 AND json_extract(payload, '$.content.type')='action' "
                 "ORDER BY rowid DESC LIMIT 1", (issue_id, session_id)).fetchone()
-        return json.loads(row[0]) if row else None
+            if row is None:
+                return None
+            replaced = db.execute("SELECT 1 FROM outbox WHERE rowid>? AND kind='activity' AND state='sent' AND "
+                "COALESCE(json_extract(payload,'$.applied'),1)=1 AND json_extract(payload,'$.issue_id')=? AND "
+                "json_extract(payload,'$.session_id')=? LIMIT 1", (row[0], issue_id, session_id)).fetchone()
+        return {**json.loads(row[1]), "_presentation_current": replaced is None}
     def unreported_failed(self) -> list[dict[str, Any]]:
         with self._tx() as db:
             rows = db.execute("SELECT * FROM outbox WHERE state = 'failed' AND hold_reason IS NULL AND NOT " + ADVISORY + " AND "

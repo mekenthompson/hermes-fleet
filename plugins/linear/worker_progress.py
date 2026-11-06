@@ -97,7 +97,7 @@ def queue(bridge, row, adapter):
         step = current(adapter, task)
         if not step:
             return
-        if (last and now - last["enqueued_at"] < 600
+        if (last and last["_presentation_current"] and now - last["enqueued_at"] < 600
                 and last.get("worker_step") == step):
             return
         kind, payload = bridge._progress_activity(row, bridge._alert_route(row), "Working", step["phrase"], ephemeral=True)

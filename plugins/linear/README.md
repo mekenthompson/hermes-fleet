@@ -837,7 +837,9 @@ its saved owner admission and reads Core's optional `session.info` execution-onl
 projection. It reads no event replay, arguments or tool output, and attaches no
 viewer or executor. Older Core simply omits this optional detail. Foreground and
 worker actions share the one-minute session cap in the existing durable outbox;
-an unchanged worker phrase waits ten minutes. Queued worker steps expire after a
+an unchanged worker phrase waits ten minutes while that action remains current.
+A question or reply that replaces it allows resumed work to show the same phrase
+again after the one-minute cap. Queued worker steps expire after a
 minute and verify the same run, generation and open tool before publication.
 Completion, Stop and pending Core questions suppress these steps; the ordinary
 completion projection retains its readable outcome and evidence.
