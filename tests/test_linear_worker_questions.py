@@ -31,7 +31,10 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
     async def isolated_flow(self, stop):
         if os.environ.get("HERMES_WORKER_QUESTION_CHILD"):
             return await self.flow(stop=stop)
-        environment = {key: os.environ[key] for key in ("PATH", "LANG", "TZ", "HERMES_AGENT_SRC") if key in os.environ}
+        environment = {key: os.environ[key] for key in (
+            "PATH", "LANG", "TZ", "HOME", "HERMES_HOME", "HERMES_RUNTIME_DIR",
+            "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "PYTHONDONTWRITEBYTECODE", "HERMES_AGENT_SRC",
+        ) if key in os.environ}
         environment["HERMES_WORKER_QUESTION_CHILD"] = "stop" if stop else "complete"
         name = "test_stop_retires_real_worker_question_without_accepting_late_choice" if stop else "test_real_worker_question_and_bound_reply_keep_one_run"
         result = await asyncio.to_thread(subprocess.run, [sys.executable, str(Path(__file__).resolve()),
@@ -48,7 +51,7 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(fixture.doCleanups)
         self.addAsyncCleanup(fixture.asyncTearDown)
         from hermes_cli import kanban_db as kb
-        from gateway.session_contract import Principal, Submission
+        from gateway.session_contract import SessionActor, Submission
         from gateway.session_authority import SessionAuthority
         from gateway.session_kanban import build_kanban_policy
         from gateway.session_kanban_prompts import bind_consumer
@@ -124,7 +127,7 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
             workspace = resolve_workspace(task, board=fixture.board.board)
             set_workspace_path(conn, task_id, workspace)
             task = kb.get_task(conn, task_id)
-        actor = Principal('owner', str(fixture.home), frozenset({'session:create', 'session:submit'}), 'test-owner')
+        actor = SessionActor('owner', str(fixture.home), frozenset({'session:create', 'session:submit'}), 'test-owner')
         connection = type('Connection', (), {'authority': fixture.authority, 'actor': actor, 'native_owner': True})()
         params = {'board': fixture.board.board or 'default', 'task_id': task.id,
                   'run_id': task.current_run_id, 'claim_lock': task.claim_lock}
