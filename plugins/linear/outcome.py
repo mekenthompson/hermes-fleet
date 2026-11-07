@@ -1,6 +1,8 @@
 """Readable native closeout through the existing issue-comment and Activity outbox."""
 import json
 
+POINTER_BODY = "Completed. The result and checks are in the issue comment."
+
 
 def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note, assessment_id=None):
     """One full issue comment per native completion; a session carries only its pointer."""
@@ -19,7 +21,7 @@ def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note
             payload = {**payload, "native_outcome_pointer": True, "requires_comment_id": comment_id,
                 "outcome_assessment": bool(assessment_id),
                 "native_completion": completion, "content": {"type": "response",
-                    "body": "Completed. The result and checks are in the issue comment."}}
+                    "body": POINTER_BODY}}
         result.append((kind, payload))
     return result
 

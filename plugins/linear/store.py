@@ -990,20 +990,36 @@ class Store:
                 source = db.execute("SELECT id,kind,state,attempts,payload FROM outbox WHERE hold_reason IS NULL "
                     "AND kind IN ('comment','activity') AND json_extract(payload,'$.requires_status_id')=? "
                     "AND json_extract(payload,'$.task_id')=? AND json_extract(payload,'$.terminal')=1 "
-                    "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid LIMIT 1",
-                    (closeout_status_id, task_id)).fetchone()
+                    "AND json_extract(payload,'$.issue_id')=? "
+                    "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 "
+                    "ORDER BY COALESCE(json_extract(payload,'$.native_outcome_pointer'),0) DESC,rowid LIMIT 1",
+                    (closeout_status_id, task_id, issue_id)).fetchone()
                 if source is None:
                     raise ValueError("Native closeout has no exact session presentation")
                 prior = json.loads(source["payload"])
                 status = self.outbox_row(closeout_status_id)["payload"]
                 payload = {key: value for key, value in prior.items() if key in
-                    ("issue_id", "task_id", "terminal", "owner_issue_id", "requires_status_id")}
+                    ("issue_id", "task_id", "terminal", "owner_issue_id", "requires_status_id",
+                     "native_outcome_pointer", "requires_comment_id", "native_completion", "outcome_assessment")}
+                regular_outcome = source["kind"] == "comment" and prior.get("native_outcome_comment") is True
+                if regular_outcome or prior.get("native_outcome_pointer"):
+                    if (status.get("state") != "done" or not status.get("native_completion")
+                            or prior.get("native_completion") != status["native_completion"]):
+                        raise ValueError("Native adopted closeout has a conflicting completion identity")
+                if regular_outcome:
+                    from .outcome import POINTER_BODY
+                    # This comment is the result, not a disposable no-session fallback.
+                    # Keep its exact stable identity/receipt and queue only its dependent pointer.
+                    body = POINTER_BODY
+                    payload.update(native_outcome_pointer=True, requires_comment_id=source["id"])
+                else:
+                    body = prior["body"] if source["kind"] == "comment" else prior["content"]["body"]
                 payload.update(session_id=session_id, content={"type": "response" if status["state"] == "done" else "error",
-                    "body": prior["body"] if source["kind"] == "comment" else prior["content"]["body"]})
+                    "body": body})
                 payload["write_started"] = False
                 if not self.enqueue("activity", payload, at=at):
                     raise ValueError("Native session closeout could not be queued")
-                if source["state"] == "pending" and prior.get("write_started") is False:
+                if not regular_outcome and source["state"] == "pending" and prior.get("write_started") is False:
                     # Preserve the original immutable body/destination, but never first
                     # publish its fallback after adoption. Admission races use this same tx.
                     db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?",
