@@ -290,17 +290,35 @@ class NativeBridgeScenarios(unittest.TestCase):
     def test_stopped_completed_and_legacy_records_do_not_resume_or_create_increment(self):
         task_id = self.create()
         with self.board.conn() as conn:
-            kb.block_task(conn, task_id, reason="native operator Stop", kind="needs_input")
+            claimed = kb.claim_task(conn, task_id, claimer="native-test-worker")
+            self.assertIsNotNone(claimed)
+            kb.block_task(conn, task_id, reason="native operator Stop", kind="needs_input",
+                          expected_run_id=claimed.current_run_id)
+            stopped_runs = [dict(row) for row in conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_id,))]
+        stopped = self.board.get(task_id)
+        stopped_event = self.board.history(task_id, 0)[-1].id
         result = self.bridge.followup(ISSUE, "continue", "stopped")
-        self.assertIn("stopped", result["message"])
+        self.assertIs(result["saved"], True)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("saved", result["message"].lower())
         self.make_bridge().recover()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
+        after = self.board.get(task_id)
+        self.assertEqual((after.status, after.current_run_id, after.claim_lock),
+                         (stopped.status, stopped.current_run_id, stopped.claim_lock))
+        self.assertEqual(after.status, "blocked")
+        with self.board.conn() as conn:
+            self.assertEqual([dict(row) for row in conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_id,))], stopped_runs)
+        notes = self.comments(task_id)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].body, "continue")
+        self.assertFalse(any(event.kind in {"claimed", "spawned", "unblocked"}
+                             for event in self.board.history(task_id, stopped_event)))
         with self.board.conn() as conn:
             kb.complete_task(conn, task_id, result="Verified bounded investigation is complete")
         self.bridge.handle_webhook(self.event("prompted"))
         self.assertEqual(len(self.tasks()), 1)
         self.assertEqual(self.board.get(task_id).status, "done")
-        self.assertEqual(self.comments(task_id), [])
+        self.assertEqual([note.body for note in self.comments(task_id)], ["continue"])
         self.store.put("legacy", "chat", "retained-session")
         status = self.bridge.native_status("legacy")
         self.assertFalse(status["linked"])
