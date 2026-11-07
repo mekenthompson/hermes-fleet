@@ -13,6 +13,7 @@ and the plugin's outbox are the real ones.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import threading
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.bridge, self.store, self.authority = self.fixture.bridge, self.fixture.store, self.fixture.authority
+        self._wall_origin = self.bridge.clock()
         self.posted = []
         original = self.bridge.api.transport
         def observe(url, body, headers):
@@ -206,9 +208,20 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             if not waiter.done():
                 cleanup(key)
 
+    @contextmanager
+    def elapsed_time(self, at, *, bridge=None):
+        """Advance adapter monotonic time and the outbox's persisted wall time together."""
+        self._wall_now = self._wall_origin + at - 1000
+        self.bridge.clock = lambda: self._wall_now
+        self.bridge.api.clock = self.bridge.clock
+        if bridge is not None:
+            bridge.clock = self.bridge.clock
+        with patch.object(self.native_input.time, "monotonic", return_value=at):
+            yield
+
     async def step(self, phrase=None, *, at=1000):
         self.owned_status(phrase)
-        with patch.object(self.native_input.time, "monotonic", return_value=at):
+        with self.elapsed_time(at):
             await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
         tasks = list(self.adapter._step_tasks.values())
         if tasks:
@@ -405,7 +418,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         for index, tool in enumerate(("terminal", "read_file", "PRIVATE_CANARY_TOOL")):
             self.owned_status(None, event, lambda: runner._progress_live_status("tool.started", tool,
                 {"command": "echo PRIVATE_CANARY", "path": "PRIVATE_CANARY"}))
-            with patch.object(self.native_input.time, "monotonic", return_value=1000 + index * 60):
+            with self.elapsed_time(1000 + index * 60):
                 await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
             await asyncio.gather(*list(self.adapter._step_tasks.values()))
             expected = "Working on your request." if index == 2 else build_status_phrase(tool, None)
@@ -436,8 +449,10 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(observed, [])
             self.assertEqual(len(self.posted), 1)
             self.budget(4000)
-            row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
-                build_status_phrase("terminal", None), kind="action", one_try=True)
+            with self.elapsed_time(1120):
+                row = self.native_input.queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                    build_status_phrase("terminal", None), kind="action", one_try=True)
+            self.assertTrue(row)
             self.budget(100)
             observed.clear()
             await asyncio.to_thread(self.bridge.flush, only_id=row)
@@ -531,16 +546,19 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         anchor = restarted.store.remember_conversation_input(native.ISSUE, native.SESSION, native.ACTIVITY,
             native.ACTIVITY, 1, False, [])
         self.assertEqual(anchor["activity_id"], "new-steering-input")  # Original Core sequence cannot promote old input.
-        late = queue_reply(restarted, native.ISSUE, native.SESSION, native.ACTIVITY,
-                           "Old investigation", kind="action", one_try=True, source_cursor=old_cursor)
+        with self.elapsed_time(1000, bridge=restarted):
+            late = queue_reply(restarted, native.ISSUE, native.SESSION, native.ACTIVITY,
+                               "Old investigation", kind="action", one_try=True, source_cursor=old_cursor)
         await asyncio.to_thread(restarted.flush, only_id=late)
         self.assertEqual(self.posted, [])
         anchor = restarted.store.remember_conversation_input(native.ISSUE, native.SESSION, "new-steering-input",
             "new-steering-input", 2, False)
         self.assertEqual(anchor["activity_id"], "new-steering-input")
         cursor = anchor["cursor"]
-        fresh = queue_reply(restarted, native.ISSUE, native.SESSION, "new-steering-input",
-                            "Working on your request.", kind="action", one_try=True, source_cursor=cursor)
+        with self.elapsed_time(1060, bridge=restarted):
+            fresh = queue_reply(restarted, native.ISSUE, native.SESSION, "new-steering-input",
+                                "Working on your request.", kind="action", one_try=True, source_cursor=cursor)
+        self.assertTrue(fresh)
         await asyncio.to_thread(restarted.flush, only_id=fresh)
         self.assertEqual([p["content"].get("parameter") for p in self.posted], ["Working on your request."])
 
@@ -946,7 +964,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             lambda runner=runner, tool=tool: runner._progress_live_status(
                 "tool.started", tool, {"command": "echo PRIVATE_CANARY", "path": "PRIVATE_CANARY"}))
             for runner, event, tool in zip(runners, (first, second), ("read_file", "terminal"))))
-        with patch.object(self.native_input.time, "monotonic", return_value=1000):
+        with self.elapsed_time(1000):
             await self.adapter.send_typing(native.ISSUE, metadata=first_meta)
             await self.adapter.send_typing(native.ISSUE, metadata=second_meta)
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
@@ -956,7 +974,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.owned_status(None, first, lambda: runners[0]._progress_live_status("tool.completed", "read_file", {}))
         self.assertEqual(self.adapter._step_phrases[(native.ISSUE, session, activity)],
                          build_status_phrase("terminal", None))
-        with patch.object(self.native_input.time, "monotonic", return_value=2000):
+        with self.elapsed_time(2000):
             await self.adapter.send_typing(native.ISSUE, metadata=first_meta)
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
         self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
@@ -1013,7 +1031,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
         await self.step(at=1659)
         self.assertEqual(len(self.posted), 3)  # Same turn still has the ten-minute keepalive.
-        with patch.object(self.native_input.time, "monotonic", return_value=1660):
+        with self.elapsed_time(1660):
             await self.adapter.send_typing(native.ISSUE, metadata=old_metadata)
         self.assertEqual(len(self.posted), 3)  # An old producer cannot borrow the new turn.
         await self.step(at=1660)
@@ -1054,8 +1072,10 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_queued_live_step_cannot_follow_native_final_or_expire_into_a_later_turn(self):
         from hermes_fleet_linear_plugin.native_input import queue_reply
         await self.start_turn()
-        pending = queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
-                              "Checking.", kind="action", one_try=True)
+        with self.elapsed_time(1000):
+            pending = queue_reply(self.bridge, native.ISSUE, native.SESSION, native.ACTIVITY,
+                                  "Checking.", kind="action", one_try=True)
+        self.assertTrue(pending)
         result = await self.adapter.send(native.ISSUE, "Finished.", reply_to=native.ACTIVITY,
                                          metadata={"thread_id": native.SESSION})
         self.assertTrue(result.success)
@@ -1063,8 +1083,10 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["content"]["type"] for p in self.posted], ["response"])
         await self.deliver("fresh-step-input", "Check the next issue.")
         cursor = self.store.conversation_cursor(native.ISSUE, native.SESSION)
-        expired = queue_reply(self.bridge, native.ISSUE, native.SESSION, "fresh-step-input",
-                              "Old phrase", kind="action", one_try=True, source_cursor=cursor)
+        with self.elapsed_time(1060):
+            expired = queue_reply(self.bridge, native.ISSUE, native.SESSION, "fresh-step-input",
+                                  "Old phrase", kind="action", one_try=True, source_cursor=cursor)
+        self.assertTrue(expired)
         row = self.store.outbox_row(expired)
         self.store.rewrite(expired, {**row["payload"], "expires_at": self.bridge.clock() - 1}, self.bridge.clock())
         await asyncio.to_thread(self.bridge.flush, only_id=expired)
