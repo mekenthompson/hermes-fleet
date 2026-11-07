@@ -166,7 +166,17 @@ class FinishedThroughTheBridgeTests(unittest.TestCase):
         self.assertIn("\n  2. 1330.1 MiB", update["body"])
         self.assertIs(update["isDiffHidden"], True)
         self.assertNotIn("health", update)
-        self.assertEqual(self.sent()["agentActivityCreate"]["content"]["body"], "Done.\n\n" + HF_612_READABLE)
+        closing = self.sent()["commentCreate"]
+        self.assertEqual(closing["body"], "Done.\n\n" + HF_612_READABLE)
+        self.assertNotIn("parentId", closing)
+        receipt = self.authority.comment_records[closing["id"]]
+        self.assertIsNone(receipt["parent"])
+        self.assertEqual(receipt["user"]["id"], VIEWER)
+        self.assertEqual(self.sent()["agentActivityCreate"]["content"]["body"],
+                         "Completed. The result and checks are in the issue comment.")
+        mutations = self.authority.mutations
+        self.assertLess(next(i for i, query in enumerate(mutations) if "commentCreate" in query),
+                        next(i for i, query in enumerate(mutations) if "agentActivityCreate" in query))
 
     def test_a_genuine_summary_about_internal_files_still_completes(self):
         summary = "Renamed `native_input.py` to `native_relay.py`; tests pass."

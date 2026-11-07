@@ -479,8 +479,16 @@ class DurableCloseoutTests(unittest.TestCase):
             responses = [row['payload']['content'] for row in store.pending(ISSUE)
                          if row['kind'] == 'activity']
             self.assertEqual(responses[0]['type'], 'response')
-            self.assertIn(summary, responses[0]['body'])
-            self.assertNotIn('/private/', responses[0]['body'])
+            comments = [row for row in store.pending(ISSUE)
+                        if row['kind'] == 'comment' and row['payload'].get('native_outcome_comment')]
+            self.assertEqual(len(comments), 1)
+            self.assertIn(summary, comments[0]['payload']['body'])
+            self.assertNotIn('/private/', comments[0]['payload']['body'])
+            pointer = next(row for row in store.pending(ISSUE) if row['kind'] == 'activity')
+            self.assertTrue(pointer['payload']['native_outcome_pointer'])
+            self.assertEqual(pointer['payload']['requires_comment_id'], comments[0]['id'])
+            self.assertEqual(pointer['payload']['native_completion'], comments[0]['payload']['native_completion'])
+            self.assertEqual(responses[0]['body'], 'Completed. The result and checks are in the issue comment.')
 
     def test_local_completion_requires_minimum_safe_summary_or_evidence(self):
         cases = (
@@ -527,7 +535,19 @@ class DurableCloseoutTests(unittest.TestCase):
                 status = next(row['payload']['state'] for row in pending if row['kind'] == 'status')
                 self.assertEqual(status, 'done' if done else 'blocked')
                 self.assertEqual(any(row['kind'] == 'project_update' for row in pending), done)
-                body = next(row['payload']['content']['body'] for row in pending if row['kind'] == 'activity')
+                response = next(row for row in pending if row['kind'] == 'activity')
+                comments = [row for row in pending if row['kind'] == 'comment'
+                            and row['payload'].get('native_outcome_comment')]
+                self.assertEqual(len(comments), int(done))
+                if done:
+                    body = comments[0]['payload']['body']
+                    self.assertTrue(response['payload']['native_outcome_pointer'])
+                    self.assertEqual(response['payload']['requires_comment_id'], comments[0]['id'])
+                    self.assertEqual(response['payload']['native_completion'], comments[0]['payload']['native_completion'])
+                    self.assertEqual(response['payload']['content']['body'],
+                                     'Completed. The result and checks are in the issue comment.')
+                else:
+                    body = response['payload']['content']['body']
                 if expected:
                     self.assertIn(expected, body)
                 self.assertNotIn('/private/', body)

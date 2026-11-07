@@ -30,7 +30,7 @@ class SourceSelectionTests(unittest.TestCase):
                            ('test_linear_active_recovery_scenarios.py', 'linear'),
                            ('test_claude_acp_context.py', 'acp'),
                            ('test_linear_origin_mapping_native.py', 'origin'),
-                           ('test_linear_native_delivery_seam.py', 'input')]:
+                           ('test_linear_native_worker_delivery_seam.py', 'input')]:
             with self.subTest(name=name):
                 plan = self.select('tests/' + name)
                 self.assertEqual(plan['tests'], ['tests/' + name])
@@ -43,6 +43,8 @@ class SourceSelectionTests(unittest.TestCase):
         for path, consumer in (
             ('tests/test_linear_specialist_authorization.py', 'tests/test_linear_native_input_seam.py'),
             ('tests/test_linear_native_input_seam.py', 'tests/test_linear_native_delivery_seam.py'),
+            ('tests/test_linear_native_delivery_seam.py', 'tests/test_linear_native_worker_delivery_seam.py'),
+            ('tests/test_linear_status_follows_work_scenarios.py', 'tests/test_linear_worker_progress_scenarios.py'),
             ('tests/test_linear_content_actions.py', 'tests/test_linear_native_frontdoor_scenarios.py'),
             ('tests/test_claude_acp_connector_hydration.py', 'tests/test_claude_acp_wire.py'),
         ):
