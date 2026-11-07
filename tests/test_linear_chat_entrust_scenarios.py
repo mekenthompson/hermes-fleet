@@ -329,7 +329,7 @@ class ChatEntrustScenarios(unittest.TestCase):
                                                                  "comment_id": comment, "request_id": str(uuid.uuid4())})
 
     def assert_reports_in_session(self, issue_id, task_id, session_id, *, done=True):
-        """Progress stays in the session; closeout adds one full comment and one short pointer."""
+        """Live session activity stays intact; milestones and closeout also reach the issue."""
         comments = list(self.issue_comments(issue_id))
         self.claim(task_id)
         self.native_event(task_id, "spawned", {"pid": 4242})
@@ -348,7 +348,11 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertIn("Still on this; nothing is needed from you",
                       [r["content"].get("parameter") for r in self.said(session_id) if r.get("ephemeral")])
-        self.assertEqual(self.issue_comments(issue_id), comments)  # progress never fell back to comments
+        milestones = self.issue_comments(issue_id)[len(comments):]
+        self.assertEqual(milestones.count("Proxy deployed to staging."), 1)
+        self.assertEqual(sum(c.startswith("Started:") for c in milestones), 1)
+        self.assertFalse(any("Reading the proxy config" in c for c in milestones))
+        comments = list(self.issue_comments(issue_id))  # Completion adds only its own full result.
         self.assertNotIn("response", [c["type"] for c in contents])
         if done:
             with self.board.conn() as conn:
@@ -562,7 +566,7 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertFalse(any(body in r["content"].get("body", "") for r in said),
                              "The full result belongs to the regular comment, not a duplicate session response")
         else:
-            self.assertEqual(self.issue_comments(NEW_ISSUE), comments)
+            self.assertEqual(self.issue_comments(NEW_ISSUE), comments + [body])
             self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
         self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
         self.assertEqual(self.tasks(), [task_id])

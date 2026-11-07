@@ -158,7 +158,9 @@ How to work this task:
    If the question cannot be delivered, kanban_block with kind needs_input and say exactly what you need.
 4. Keep the people following this issue informed without noise. At each meaningful milestone or blocker, call
    kanban_comment on this task with human_checkpoint=true and a new stable request_id (reuse it on
-   retry). Write it for a person: a few complete sentences in Linear Markdown saying what changed,
+   retry with the same body). These become regular issue comments, including while an Agent Session
+   is running. Keep tool activity and heartbeats in that session, not in checkpoints. Write each
+   checkpoint for a person: a few complete sentences in Linear Markdown saying what changed,
    what is next and any blocker. Never post reasoning, tool output, logs, process IDs or raw errors,
    and keep task ids, board names, run numbers and internal states (fences, quiescence) out of Linear.
 5. Your kanban_complete summary is the closing note people read in Linear. Write it in Linear Markdown
@@ -3425,8 +3427,15 @@ class Bridge:
         route = self._alert_route(row)
         def message(kind: str, body: str) -> tuple[str, dict[str, Any]]:
             return "activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "content": {"type": kind, "body": body}, **route}
+        def issue_note(body: str, states=None) -> tuple[str, dict[str, Any]]:
+            payload = {"issue_id": issue_id, "body": body, **route}
+            if states is not None:
+                payload.update(native_progress=True, native_progress_states=sorted(states))
+            return "comment", payload
+        milestone_states = {task_status}
         if event.kind in ("blocked", "block_loop_detected") and str(payload.get("reason") or "").startswith(OWN):
-            pass  # Our own Stop: the chat that asked already has the answer.
+            # Record the control on the issue too; this does not claim effects have settled.
+            writes = [issue_note("Stop requested. This issue remains unfinished.", milestone_states)]
         elif (event.kind == "blocked" and payload.get("reason") == "initial_status"
               and getattr(self._binding_adapter(issue_id), "guarded_controls", False)
               and self._binding_adapter(issue_id).initial_activation_event(row["task_id"]) == event.id):
@@ -3453,12 +3462,15 @@ class Bridge:
                 "descendant_invalidated": ({"todo"}, "Waiting for a dependency", None, "work cannot continue"),
             }[event.kind]
             if task_status in allowed:
+                milestone_states = allowed
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
                 writes = [message("thought", _sentence(f"{label}: {detail or fallback}"))]
         elif (event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED
               and not self.store.progress_reported(issue_id, row["task_id"], "Started")):
             # Started is said once per binding; retries and restarts spawn again silently.
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
+            if row.get("owner_ref"):
+                writes.append(issue_note("Started: Work has begun. I’m checking the ticket and existing work.", {"running"}))
         elif event.kind == "heartbeat" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             note = _progress_text(payload.get("note"))
             if note:
@@ -3466,12 +3478,19 @@ class Bridge:
         elif event.kind == "checkpoint":
             if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
                     and payload["request_id"] and (body := _readable(payload["body"]))):
-                writes = [message("thought", body)]
+                writes = [issue_note(body)]
+                if row.get("owner_ref"):
+                    writes.append(message("thought", body))
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
         if activity and event.kind != "checkpoint" and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
             if captured.get(key, 0):
                 captured[key] -= 1; writes = []
+        if (writes and activity and row.get("owner_ref") and event.kind in {
+                "blocked", "block_loop_detected", "gave_up", "review_requested", "changes_requested",
+                "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"}
+                and not (event.kind == "blocked" and payload.get("reason") == "initial_status")):
+            writes.append(issue_note(activity["body"], milestone_states))
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
                 (event.kind == "block_loop_detected" and task_status != "triage")): writes = []
         writes = self._report_writes(row, writes)
@@ -4356,8 +4375,7 @@ class Bridge:
                     pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
                     latest = self.store.outbox_row((self.store.latest_status(payload["issue_id"]) or {}).get("id", ""))
                     changed = (any(event.kind in NATIVE_STATUS_EVENTS for event in pending) or
-                               (payload.get("native_progress") is True and task.status in NATIVE_PROGRESS_SUPERSEDED
-                                and not (task.status == "done" and self._acceptance_progress_current(payload))) or
+                               self._obsolete_native_progress(row) or
                                (latest and not latest.get("hold_reason") and latest["state"] == "pending"
                                 and latest["payload"].get("task_id") == payload.get("task_id")))
                     if changed:
@@ -4452,6 +4470,8 @@ class Bridge:
         status = self._native_effect_task(payload["issue_id"]).status
         if payload.get("acceptance_status_id"):
             return status != "done" or not self._acceptance_progress_current(payload)
+        if payload.get("native_progress_states"):
+            return status not in payload["native_progress_states"]
         return status in NATIVE_PROGRESS_SUPERSEDED
     def _conversation_final_type(self, payload: dict, *, lifecycle: bool = False) -> str | None:
         from .native_input import _session_work_live
@@ -4842,7 +4862,7 @@ class Bridge:
                 return True  # The original stable-id comment landed; a reporter retry only reads it.
             self._mutate_outbox(row["id"], lambda: self.api.create_comment(
                 row["id"], payload["issue_id"], payload["body"]))
-            if (closing or payload.get("content_action") or attempted_progress) and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
+            if (closing or payload.get("content_action") or payload.get("native_history") or attempted_progress) and (not callable(verify) or not verify(row["id"], payload["issue_id"], payload["body"])):
                 raise LinearError("Comment target/body readback did not match; reconcile before retrying")
             return True
         elif kind == "description":

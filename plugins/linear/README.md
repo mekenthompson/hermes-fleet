@@ -263,9 +263,21 @@ finishes or is archived, obsolete Started and heartbeat messages are omitted. Qu
 explicitly identified as native progress recheck the current phase immediately before
 publication. Native comments, current wait/review milestones, partial-stage summaries and
 uncertain sends remain intact; status reporting still preserves later human edits and ownership changes.
-Ordinary native comments and heartbeat notes stay internal. Only an explicit native human
-checkpoint with a stable request ID is projected to an issue comment, preserving its authored
-Markdown. Agent Session keepalives remain ephemeral session activities. Only progress durably
+Ordinary native comments and heartbeat notes stay internal. An explicit native human
+checkpoint with a stable request ID is always projected to a regular top-level issue comment,
+preserving its authored Markdown, including when an Agent Session is running. Workers explain
+what changed, what is next and any blocker or decision needed, using the same request ID and
+body on retry. Checkpoints are meaningful milestones, not periodic heartbeat messages.
+
+The issue also receives a concise start note and meaningful native review, wait and blocker
+milestones. The session keeps its existing checkpoints, live steps, heartbeats, questions and lifecycle updates.
+Each checkpoint has one regular issue comment and retains its existing session note; retries
+do not create another comment or another session note.
+Unattempted lifecycle comments recheck their native phase before publication; obsolete progress
+is omitted, while authored checkpoints and uncertain sends retain their history and stable IDs.
+Merge and deployment claims require evidence from the worker, never inference from a tool name.
+Completion retains one full issue result followed by its confirmed short session pointer.
+Agent Session keepalives remain ephemeral session activities. Only progress durably
 recorded as unstarted is omitted. Publication admission records an
 attempt before HTTP, and an attempted comment keeps its UUID and requires exact readback
 on retry; a missing historical attempt marker never proves that a message was unsent.
