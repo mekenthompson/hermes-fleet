@@ -88,6 +88,14 @@ def current(adapter, task):
 def queue(bridge, row, adapter):
     if not row or not row.get("owner_ref") or row.get("stop_requested_at"):
         return
+    if not bridge.store.backoff_ready(f"_reconcile_status:{row['issue_id']}", bridge.clock()):
+        return  # Optional status shares the reporting binding's persisted refusal pause.
+    if not bridge.store.effect_admitted(row["issue_id"]):
+        return  # A held native closeout must not spend optional provider reads.
+    task = adapter.get(row.get("task_id"))
+    if task is None or task.status != "running" or task.current_run_id is None:
+        return
+    claim = (task.id, task.current_run_id, getattr(task, "claim_lock", None))
     now = bridge.clock()
     last = bridge.store.latest_session_action(row["issue_id"], row["owner_ref"])
     if last and now - last["enqueued_at"] < 60:
@@ -95,12 +103,15 @@ def queue(bridge, row, adapter):
     if bridge.store.unsettled_worker_action(row['issue_id'], row['owner_ref']):
         return  # Keep one uncertain optional status; questions and real closeout retain their own paths.
     with bridge.api.optional_work():
-        task = bridge._native_effect_task(row["issue_id"])
         step = current(adapter, task)
         if not step:
-            return
+            return  # No actual admitted tool means no Linear scope read is needed.
         if (last and last["_presentation_current"] and now - last["enqueued_at"] < 600
                 and last.get("worker_step") == step):
+            return
+        verified = bridge._native_effect_task(row["issue_id"])
+        if (verified.status != "running" or
+                (verified.id, verified.current_run_id, getattr(verified, "claim_lock", None)) != claim):
             return
         kind, payload = bridge._progress_activity(row, bridge._alert_route(row), "Working", step["phrase"], ephemeral=True)
         payload.update(worker_step=step, step_expires_at=now + 60)

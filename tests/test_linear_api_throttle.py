@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from linear_fake_api import Clock, load_plugin
 
@@ -406,6 +407,57 @@ class BridgeLoopTests(unittest.TestCase):
                 clock.now += 2
             self.assertGreater(len(authority.requests) - before, 0)
             self.assertLess(len(authority.requests) - before, 12)  # 15 s doubling to 1 h, not every tick
+
+    def test_running_worker_without_current_tool_does_not_poll_linear(self):
+        """A running native task with no current owner tool cannot spend a provider read per tick."""
+        from hermes_fleet_linear_plugin import worker_progress
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, store, kanban = self.bridge(directory, clock)
+            issue = authority.issues[ISSUE]
+            task = kanban.create(title="OPS-1", body=f"Linear issue {ISSUE}: {issue['url']}")
+            task.status, task.current_run_id = "running", 1
+            store.bind_native(ISSUE, task.id, "synthetic", "default", owner_ref=SESSION, at=0)
+            before = len(authority.requests)
+            with patch.object(worker_progress, "current", return_value=None), \
+                    patch.object(bridge, "_native_effect_task", wraps=bridge._native_effect_task) as scope_read:
+                for _ in range(1800):
+                    worker_progress.queue(bridge, store.get(ISSUE), kanban)
+                    clock.now += 2
+            self.assertEqual(scope_read.call_count, 0)
+            self.assertEqual(len(authority.requests) - before, 0)
+            self.assertFalse(any(row['payload'].get('worker_step') for row in store.pending()))
+
+    def test_running_current_tool_keeps_status_backoff_across_reporter_replacement(self):
+        """A valid worker waits on the existing reporting pause before any scope/provider read."""
+        from hermes_fleet_linear_plugin import worker_progress
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            bridge, authority, store, kanban = self.bridge(directory, clock)
+            issue = authority.issues[ISSUE]
+            task = kanban.create(title="OPS-1", body=f"Linear issue {issue['identifier']}: {issue['url']}")
+            task.status, task.current_run_id = "running", 1
+            store.bind_native(ISSUE, task.id, "synthetic", "default", owner_ref=SESSION, at=0)
+            step = dict(worker_session_id='actual-worker', execution_generation=1,
+                        admission_id='worker-admission', run_id=1, phrase='Running a command')
+            until = store.backoff_fail(f"_reconcile_status:{ISSUE}", clock())
+            before = len(authority.requests)
+            with patch.object(worker_progress, "current", return_value=step) as current, \
+                    patch.object(bridge, "_native_effect_task", wraps=bridge._native_effect_task) as scope_read:
+                for _ in range(5):
+                    worker_progress.queue(bridge, bridge.store.get(ISSUE), kanban)
+                    clock.now += 2
+                bridge.store = Store(store.path)
+                clock.now = until - 1
+                worker_progress.queue(bridge, bridge.store.get(ISSUE), kanban)
+                self.assertEqual(current.call_count, 0)
+                self.assertEqual(scope_read.call_count, 0)
+                self.assertEqual(len(authority.requests) - before, 0)
+                clock.now = until + 1
+                worker_progress.queue(bridge, bridge.store.get(ISSUE), kanban)
+                self.assertEqual(current.call_count, 1)
+                self.assertEqual(scope_read.call_count, 1)
+            self.assertEqual(len([row for row in bridge.store.pending() if row['payload'].get('worker_step')]), 1)
 
     def test_spent_budget_defers_reads_but_queued_writes_still_go_out(self):
         with tempfile.TemporaryDirectory() as directory:
