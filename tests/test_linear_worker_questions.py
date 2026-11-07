@@ -155,6 +155,26 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         await fixture.authority.submit(actor, Submission('real-choice-worker', ref,
             {'text': f'work kanban task {task.id}', 'finite': True}, 'queue'))
         self.assertTrue(await asyncio.to_thread(worker_waiting.wait, 25))
+        # Inspect the complete request received by the provider before the scripted
+        # model supplies clarify. A forced tool call alone cannot prove that a
+        # genuinely bound Linear worker was told it may ask its human a question.
+        worker_requests = [body for body in requests if body.get('tools')]
+        self.assertTrue(worker_requests)
+        for body in worker_requests:
+            system_messages = [item for item in body['messages']
+                               if item.get('role') in ('system', 'developer')]
+            self.assertTrue(system_messages)
+            system_prompt = '\n'.join(
+                item['content'] if isinstance(item['content'], str) else
+                '\n'.join(block['text'] for block in item['content'] if block.get('type') == 'text')
+                for item in system_messages)
+            self.assertIn('Kanban task execution protocol', system_prompt)
+            self.assertIn('trusted human conversation for `clarify`', system_prompt)
+            self.assertIn('use `clarify` to ask the human in this task\'s bound conversation and wait', system_prompt)
+            self.assertIn('Continue this same task after the answer', system_prompt)
+            self.assertNotIn('Do not call `clarify`', system_prompt)
+            self.assertNotIn('there is no live user to answer', system_prompt)
+            self.assertNotIn('Block on genuine ambiguity', system_prompt)
         frozen_consumer = json.loads(policy.kanban_json)['prompt_consumer_admission_id']
         async def coordinate_status(event):
             from gateway.session_results import execution_result
