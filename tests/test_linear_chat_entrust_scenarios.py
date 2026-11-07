@@ -407,25 +407,42 @@ class ChatEntrustScenarios(unittest.TestCase):
             receipt.update(ok=False, classification='pending')
             self.bridge.flush(only_id=status['id'])
             self.assertEqual(self.bridge.store.outbox_row(status['id'])['state'], 'pending')
-            comments = len(self.issue_comments(NEW_ISSUE))
+            comments = list(self.issue_comments(NEW_ISSUE))
+            captured = next(row for row in self.bridge.store.pending(NEW_ISSUE)
+                            if row['payload'].get('native_outcome_comment'))
             self.echo(NEW_ISSUE, 'echo-session')
             self.bridge.flush()
             effects = [r['content'] for r in self.said('echo-session')]
             self.assertNotIn('response', [p['type'] for p in effects])
+            self.assertEqual(self.issue_comments(NEW_ISSUE), comments)
+            retained = self.bridge.store.outbox_row(captured['id'])
+            self.assertEqual(retained['state'], 'pending')
+            self.assertNotIn('applied', retained['payload'])
+            self.assertEqual(retained['payload']['native_completion'], captured['payload']['native_completion'])
             self.assertEqual(self.bridge.store.get(NEW_ISSUE)['owner_ref'], 'echo-session')
             receipt.update(ok=True, classification="passed")
             self.bridge.store.defer(status["id"], self.bridge.clock() - 1)
+            self.bridge.flush(only_id=status['id'])
+            pointer = next(row for row in self.bridge.store.pending(NEW_ISSUE)
+                           if row['payload'].get('native_outcome_pointer'))
+            self.bridge.flush(only_id=pointer['id'])
+            self.assertFalse(any(r['content']['type'] == 'response' for r in self.said('echo-session')))
+            self.assertEqual(self.issue_comments(NEW_ISSUE), comments,
+                             'Accepted status alone cannot replace the verified normal-comment receipt')
             for _ in range(4):
                 self.flush()
             responses = [r for r in self.said("echo-session") if r["content"]["type"] == "response"]
             self.assertEqual(len(responses), 1)
             self.assertEqual(self.said("echo-session")[-1], responses[0])
-            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments,
-                             "Unattempted fallback closeout must not publish after adoption")
+            self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments,
+                                        "Implementation and local checks finished.")
+            self.assertEqual(self.authority.comment_records[captured['id']]['body'], captured['payload']['body'])
             self.echo(NEW_ISSUE, "echo-session")
             for _ in range(3):
                 self.flush()
-            self.assertEqual(len([r for r in self.said("echo-session") if r["content"]["type"] == "response"]), 1)
+            self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments,
+                                        "Implementation and local checks finished.")
+            self.assertEqual(self.tasks(), [task_id])
 
     def test_completion_capture_between_adoption_inspection_and_commit_routes_final_to_session(self):
         from hermes_fleet_linear_plugin import bridge as bridge_module
@@ -435,10 +452,12 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.claim(task_id)
         with self.board.conn() as conn:
             kb.complete_task(conn, task_id, summary="Investigation and checks finished.", result="Local checks passed.")
-        comments = len(self.issue_comments(NEW_ISSUE))
-        adopt = self.bridge.store.adopt_session
+        comments = list(self.issue_comments(NEW_ISSUE))
+        adopt, captured = self.bridge.store.adopt_session, []
         def capture_before_adoption(*args, **kwargs):
             self.bridge.pump_kanban()
+            captured.append(next(row for row in self.bridge.store.pending(NEW_ISSUE)
+                                 if row['payload'].get('native_outcome_comment')))
             return adopt(*args, **kwargs)
         with patch.object(self.bridge.store, "adopt_session", side_effect=capture_before_adoption):
             self.echo(NEW_ISSUE, "echo-session")
@@ -446,7 +465,61 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.flush()
         said = self.said("echo-session")
         self.assertEqual([r["content"]["type"] for r in said], ["thought", "response"])
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments,
+                                    "Investigation and checks finished.")
+        self.assertEqual(self.authority.comment_records[captured[0]['id']]['body'], captured[0]['payload']['body'])
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_completed_adoption_preserves_existing_pointer_and_regular_comment(self):
+        task_id = self.create(start_work=True)['native']['task_id']
+        self.flush()
+        self.echo(NEW_ISSUE, 'first-session')
+        self.flush()
+        self.claim(task_id)
+        with self.board.conn() as conn:
+            kb.complete_task(conn, task_id, summary='Proxy rollout verified.', result='Local checks passed.')
+        for _ in range(3):
+            self.flush()
+        original = [record for record in self.authority.comment_records.values()
+                    if record['issue']['id'] == NEW_ISSUE]
+        self.assertEqual(len(original), 1)
+        closing = self.bridge.store.outbox_row(original[0]['id'])
+        self.assertTrue(self.bridge.store.session_answered(NEW_ISSUE, 'first-session'))
+        # Exercise the same reporting-only CAS with a previous answered owner;
+        # the regular comment sorts before its existing marked pointer.
+        self.assertTrue(self.bridge.store.adopt_session(NEW_ISSUE, task_id, 'next-session',
+                        expected_owner='first-session', at=self.bridge.clock()))
+        for _ in range(3):
+            self.flush()
+        self.assertEqual(list(self.authority.comment_records.values()), original)
+        self.assertEqual(self.bridge.store.outbox_row(closing['id']), closing)
+        responses = [row for row in self.said('next-session') if row['content']['type'] == 'response']
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0]['content']['body'], 'Completed. The result and checks are in the issue comment.')
+        pointer = self.bridge.store.outbox_row(responses[0]['id'])
+        self.assertTrue(pointer['payload']['native_outcome_pointer'])
+        self.assertEqual(pointer['payload']['requires_comment_id'], closing['id'])
+        self.assertEqual(pointer['payload']['native_completion'], closing['payload']['native_completion'])
+        self.assertEqual(self.tasks(), [task_id])
+
+    def test_adoption_refuses_conflicting_regular_completion_identity(self):
+        task_id = self.create(start_work=True)['native']['task_id']
+        self.flush()
+        self.claim(task_id)
+        with self.board.conn() as conn:
+            kb.complete_task(conn, task_id, summary='Proxy rollout verified.', result='Local checks passed.')
+        self.bridge.pump_kanban()
+        closing = next(row for row in self.bridge.store.pending(NEW_ISSUE)
+                       if row['payload'].get('native_outcome_comment'))
+        with self.bridge.store._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.native_completion.event_id',-1) WHERE id=?",
+                       (closing['id'],))
+        with self.assertRaisesRegex(ValueError, 'conflicting completion identity'):
+            self.bridge.store.adopt_session(NEW_ISSUE, task_id, 'echo-session', expected_owner='', at=self.bridge.clock())
+        self.assertEqual(self.bridge.store.get(NEW_ISSUE)['owner_ref'], '')
+        self.assertEqual(self.issue_comments(NEW_ISSUE), [])
+        self.assertEqual(self.said('echo-session'), [])
+        self.assertEqual(self.tasks(), [task_id])
 
     def test_adoption_during_terminal_capture_retries_with_current_owner(self):
         self.check_adoption_during_capture(terminal=True)
