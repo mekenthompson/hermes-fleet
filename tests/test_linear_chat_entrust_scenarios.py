@@ -53,6 +53,7 @@ class ChatAuthority(Authority):
         super().__init__()
         self.activity_records: list[dict] = []
         self.comment_bodies: list[tuple[str, str]] = []
+        self.closeout_effects: list[tuple[str, str]] = []
         self.issues[ISSUE]["updatedAt"] = now_iso()
 
     def transport(self, url, body, headers):
@@ -85,8 +86,10 @@ class ChatAuthority(Authority):
             return reply({"issueCreate": {"success": True}})
         if "agentActivityCreate" in query:
             self.activity_records.append(dict(variables["input"]))
+            self.closeout_effects.append(("activity", variables["input"]["id"]))
         if "commentCreate" in query:
             self.comment_bodies.append((variables["input"]["issueId"], variables["input"]["body"]))
+            self.closeout_effects.append(("comment", variables["input"]["id"]))
         if "issueUpdate" in query and "delegateId" in (variables.get("input") or {}):
             issue = self.issues[variables["id"]]
             before = (issue.get("delegate") or {}).get("id")
@@ -278,6 +281,38 @@ class ChatEntrustScenarios(unittest.TestCase):
     def issue_comments(self, issue_id):
         return [body for target, body in self.authority.comment_bodies if target == issue_id]
 
+    def assert_normal_closeout(self, issue_id, task_id, session_id, prior_comments, summary):
+        """A full top-level app result precedes the session's sole short pointer."""
+        comments = self.issue_comments(issue_id)
+        self.assertEqual(comments[:-1], prior_comments, 'No progress noise or duplicate closing comment')
+        self.assertEqual(len(comments), len(prior_comments) + 1)
+        self.assertIn(summary, comments[-1])
+        receipts = [record for record in self.authority.comment_records.values()
+                    if record['issue']['id'] == issue_id and record['body'] == comments[-1]]
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertIsNone(receipt['parent'])
+        self.assertEqual(receipt['user']['id'], VIEWER)
+        closing = self.bridge.store.outbox_row(receipt['id'])
+        self.assertTrue(closing['payload']['native_outcome_comment'])
+        self.assertEqual((closing['state'], closing['payload']['applied']), ('sent', 1))
+        completion = closing['payload']['native_completion']
+        self.assertEqual(completion['task_id'], task_id)
+        completed = next(event for event in reversed(self.board.history(task_id, 0)) if event.kind == 'completed')
+        self.assertEqual((completion['event_id'], completion['run_id']), (completed.id, completed.run_id))
+        responses = [record for record in self.said(session_id) if record['content']['type'] == 'response']
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertEqual(response['content']['body'], 'Completed. The result and checks are in the issue comment.')
+        self.assertNotEqual(response['content']['body'], receipt['body'])
+        pointer = self.bridge.store.outbox_row(response['id'])
+        self.assertTrue(pointer['payload']['native_outcome_pointer'])
+        self.assertEqual(pointer['payload']['requires_comment_id'], receipt['id'])
+        self.assertEqual(pointer['payload']['native_completion'], completion)
+        self.assertEqual((pointer['state'], pointer['payload']['applied']), ('sent', 1))
+        self.assertLess(self.authority.closeout_effects.index(('comment', receipt['id'])),
+                        self.authority.closeout_effects.index(('activity', response['id'])))
+
     def native_event(self, task_id, kind, payload):
         with self.board.conn() as conn:
             with kb.write_txn(conn):
@@ -294,8 +329,8 @@ class ChatEntrustScenarios(unittest.TestCase):
                                                                  "comment_id": comment, "request_id": str(uuid.uuid4())})
 
     def assert_reports_in_session(self, issue_id, task_id, session_id, *, done=True):
-        """Started, checkpoint, heartbeat and keepalive go to the session; no issue comments; Done is its only response."""
-        comments = len(self.issue_comments(issue_id))
+        """Progress stays in the session; closeout adds one full comment and one short pointer."""
+        comments = list(self.issue_comments(issue_id))
         self.claim(task_id)
         self.native_event(task_id, "spawned", {"pid": 4242})
         self.native_event(task_id, "heartbeat", {"note": "Reading the proxy config"})
@@ -313,7 +348,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.flush()
         self.assertIn("Still on this; nothing is needed from you",
                       [r["content"].get("parameter") for r in self.said(session_id) if r.get("ephemeral")])
-        self.assertEqual(len(self.issue_comments(issue_id)), comments)  # progress never fell back to comments
+        self.assertEqual(self.issue_comments(issue_id), comments)  # progress never fell back to comments
         self.assertNotIn("response", [c["type"] for c in contents])
         if done:
             with self.board.conn() as conn:
@@ -324,7 +359,7 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertEqual(len(responses), 1)  # Done is the session's only response
             self.assertIs(responses[0], self.said(session_id)[-1])
             self.assertEqual(self.authority.state(issue_id), "Done")
-            self.assertEqual(len(self.issue_comments(issue_id)), comments)
+            self.assert_normal_closeout(issue_id, task_id, session_id, comments, "Proxy rolled out.")
 
     def test_hf630_chat_work_adopts_the_echo_session_and_reports_there(self):
         reply = self.create(start_work=True)
@@ -431,7 +466,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         else:
             self.checkpoint(task_id, body)
         prior_cursor = self.bridge.store.get(NEW_ISSUE)["last_event_id"]
-        comments = len(self.issue_comments(NEW_ISSUE))
+        comments = list(self.issue_comments(NEW_ISSUE))
         other = Bridge(Store(self.bridge.store.path), self.authority.api(scope=None), self.board, profile="default")
         other.profile_home = self.home
         capture, raced = self.bridge.store.capture_event, []
@@ -449,8 +484,13 @@ class ChatEntrustScenarios(unittest.TestCase):
         for _ in range(3):
             self.flush()
         said = self.said("echo-session")
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
-        self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
+        if terminal:
+            self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments, body)
+            self.assertFalse(any(body in r["content"].get("body", "") for r in said),
+                             "The full result belongs to the regular comment, not a duplicate session response")
+        else:
+            self.assertEqual(self.issue_comments(NEW_ISSUE), comments)
+            self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
         self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
         self.assertEqual(self.tasks(), [task_id])
 
@@ -726,7 +766,7 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertEqual(self.bridge.store.get(NEW_ISSUE)["owner_ref"], "echo-session")
             self.assertEqual(self.authority.state(NEW_ISSUE), "In Review")
             self.assertNotIn("response", [r["content"]["type"] for r in self.said("echo-session")])
-            comments = len(self.issue_comments(NEW_ISSUE))
+            comments = list(self.issue_comments(NEW_ISSUE))
             # Chat summaries must not close the same session while acceptance is outstanding.
             message = native_input.queue_reply(self.bridge, NEW_ISSUE, "echo-session", "echo-session",
                                                "The required checks are still running.")
@@ -749,7 +789,8 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertEqual(len(responses), 1)
             self.assertIs(responses[0], self.said("echo-session")[-1])
             self.assertEqual(sum(r["content"].get("action") == "Verifying" for r in self.said("echo-session")), 1)
-            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+            self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments,
+                                        "Implementation finished; checks are running.")
 
     def test_a_second_session_never_takes_over_a_live_adopted_one(self):
         reply = self.create(start_work=True)
