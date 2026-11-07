@@ -1095,6 +1095,11 @@ class Store:
                     str(payload["id"]) if kind == "comment" and payload.get("id") else str(uuid.uuid4()))
                 if kind != "status":
                     payload = {**payload, "requires_status_id": status_id}
+                if kind == "comment" and payload.get("native_outcome_comment"):
+                    from .outcome import reuse_comment
+                    status = next((value for key, value in writes if key == "status"), {})
+                    if reuse_comment(self, db, row_id, payload, status=status, status_id=status_id, at=at):
+                        continue
                 if kind == "project_update":
                     # Project batches have their own queue: an older coalesced batch
                     # may depend on a newer status without blocking that status.

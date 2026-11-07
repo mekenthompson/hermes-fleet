@@ -331,6 +331,7 @@ class CompletionScopeTests(unittest.TestCase):
         self.track()
         self.complete()
         original = next(row for row in self.store.pending() if row['kind'] == 'status')
+        closing = next(row for row in self.store.pending() if row['payload'].get('native_outcome_comment'))
         self.human_edit(1800000100)
         self.bridge.clock = lambda: 1800000300
         self.bridge.flush()
@@ -354,6 +355,55 @@ class CompletionScopeTests(unittest.TestCase):
         self.assertEqual(self.store.get(ISSUE)['last_event_id'], cursor)
         self.assertEqual(self.kanban.histories[self.task.id], native_history)
         self.assertEqual(len(self.kanban.creates), 1)
+        repaired_comment = self.store.outbox_row(closing['id'])
+        self.assertEqual((repaired_comment['state'], repaired_comment['payload']['applied']), ('sent', 1))
+        self.assertEqual(repaired_comment['payload']['body'], closing['payload']['body'])
+        self.assertEqual(repaired_comment['payload']['requires_status_id'], request['request_id'])
+        self.assertEqual(list(self.authority.comment_records), [closing['id']])
+        self.assertIsNone(self.authority.comment_records[closing['id']]['parent'])
+        self.assertEqual(sum('commentCreate' in query for query in self.authority.mutations), 1)
+
+    def test_fresh_status_repair_preserves_applied_or_uncertain_comment_receipt(self):
+        for disposition in ('applied', 'uncertain'):
+            with self.subTest(disposition=disposition):
+                self.setUp()
+                self.track()
+                self.complete()
+                status = next(row for row in self.store.pending() if row['kind'] == 'status')
+                closing = next(row for row in self.store.pending() if row['payload'].get('native_outcome_comment'))
+                self.bridge.flush(only_id=status['id'])
+                if disposition == 'applied':
+                    self.bridge.flush(only_id=closing['id'])
+                else:
+                    # Crash after mutation admission: transmission may have occurred.
+                    self.assertTrue(self.store.admit_mutation(closing['id'], terminal=True))
+                receipt = self.store.outbox_row(closing['id'])
+                self.human_edit(1800000100)
+                self.bridge.clock = lambda: 1800000300
+                self.track(replace=True, completion_scope='outcome', reconcile_complete=True,
+                           expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
+                self.assertEqual(self.store.outbox_row(closing['id']), receipt)
+                with self.store._tx() as db:
+                    count = db.execute("SELECT COUNT(*) FROM outbox WHERE json_extract(payload,'$.native_outcome_comment')=1").fetchone()[0]
+                self.assertEqual(count, 1)
+                self.assertEqual(len(self.authority.comment_records), int(disposition == 'applied'))
+
+    def test_repair_rejects_stable_comment_identity_with_conflicting_body(self):
+        self.track()
+        self.complete()
+        closing = next(row for row in self.store.pending() if row['payload'].get('native_outcome_comment'))
+        self.human_edit(1800000100)
+        self.bridge.clock = lambda: 1800000300
+        self.bridge.flush()
+        with self.store._tx() as db:
+            db.execute("UPDATE outbox SET payload=json_set(payload,'$.body','Conflicting retained result') WHERE id=?", (closing['id'],))
+        request_id = str(uuid.uuid4())
+        with self.assertRaisesRegex(ValueError, 'Native outcome comment identity conflicts'):
+            self.track(replace=True, completion_scope='outcome', reconcile_complete=True,
+                       expected_revision=self.store.binding_revision(ISSUE), request_id=request_id)
+        self.assertIsNone(self.store.outbox_row(request_id))
+        self.assertEqual(self.authority.comment_records, {})
+        self.assertNotEqual(self.authority.issues[ISSUE]['state']['type'], 'completed')
 
     def test_same_proof_pending_unknown_and_applied_reports_prevent_duplicate_repair(self):
         from hermes_fleet_linear_plugin.api import LinearError

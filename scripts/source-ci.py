@@ -47,10 +47,12 @@ SHARED_TESTS = {
     'test_linear_event_data_scenarios.py',
     'test_linear_existing_work_scenarios.py', 'test_linear_isolation_scenarios.py',
     'test_linear_namespace_dispositions.py', 'test_linear_native_bridge_scenarios.py',
-    'test_linear_native_input_seam.py', 'test_linear_native_prompt_scenarios.py',
+    'test_linear_native_input_seam.py', 'test_linear_native_delivery_seam.py',
+    'test_linear_native_prompt_scenarios.py',
     'test_linear_native_frontdoor_scenarios.py', 'test_linear_origin_native.py',
     'test_linear_origin_provider_native.py', 'test_linear_plugin.py',
     'test_linear_scope_effect_scenarios.py', 'test_linear_specialist_authorization.py',
+    'test_linear_status_follows_work_scenarios.py',
     'test_claude_acp_connector_hydration.py',
 }
 

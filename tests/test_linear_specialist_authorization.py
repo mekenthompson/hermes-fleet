@@ -1634,7 +1634,15 @@ class SessionRequesterTests(unittest.TestCase):
         bridge = Bridge(Store(self.store.path), self.authority.api(scope={**SCOPE, "requester_basis": "agent_session"}),
                         self.kanban, profile="synthetic")
         self.assertGreater(bridge.flush(), 0)
-        self.assertEqual(len(self.authority.mutations), 3)
+        self.assertEqual(len(self.authority.mutations), 4)
+        self.assertEqual(sum('commentCreate' in query for query in self.authority.mutations), 1)
+        self.assertEqual(sum('agentActivityCreate' in query for query in self.authority.mutations), 1)
+        comment = next(iter(self.authority.comment_records.values()))
+        self.assertIsNone(comment['parent'])
+        self.assertEqual(comment['user']['id'], VIEWER)
+        self.assertIn('https://example.test/findings', comment['body'])
+        self.assertLess(next(i for i, query in enumerate(self.authority.mutations) if 'commentCreate' in query),
+                        next(i for i, query in enumerate(self.authority.mutations) if 'agentActivityCreate' in query))
         self.assertEqual(bridge.store.pending(), [])
 
     def test_401_retry_rechecks_requester(self):
