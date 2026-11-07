@@ -244,10 +244,12 @@ jobs:
           python-version: '3.14.7'
       # Test-only companion source. The source-checks manifest lane remains the
       # only release compatibility claim; this checkout proves the candidate pair.
+      # Includes the reviewed wake/drain ownership fix (#201); retain every
+      # checkpoint/origin test instead of retrying its older racy fixture.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           repository: mekenthompson/hermes-agent
-          ref: 769d1be0a24dd28d44d27894094cc77e9359dbea
+          ref: a4ea122cc09134a7d79edb1467cb534a820c6689
           path: agent-candidate
           persist-credentials: false
           fetch-depth: 1
@@ -261,7 +263,7 @@ jobs:
           import os
           from pathlib import Path
           candidate = dict(json.loads(Path('release/agent-image-manifest.json').read_text()))
-          candidate['revision'] = '769d1be0a24dd28d44d27894094cc77e9359dbea'
+          candidate['revision'] = 'a4ea122cc09134a7d79edb1467cb534a820c6689'
           Path(os.environ['RUNNER_TEMP'], 'hf578-candidate-test-only.json').write_text(json.dumps(candidate))
           PY
           echo 'Candidate evidence only: temporary revision selector is not a release manifest.'
