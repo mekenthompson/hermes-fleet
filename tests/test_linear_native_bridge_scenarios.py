@@ -920,6 +920,57 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.flush()
         return clock, remote, reporter, task_id
 
+    def test_live_session_keeps_pm_milestones_on_issue_without_heartbeat_noise(self):
+        import uuid
+        clock, remote, reporter, task_id = self.session_reporting_fixture("pm-milestones")
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(sum(c["body"].startswith("Started:") for c in remote.comments), 1)
+        self.assertTrue(any(a["content"].get("action") == "Started" for a in remote.activities))
+        self.assertTrue(any(a.get("ephemeral") for a in remote.activities))
+        self.assertFalse(any("Checkpoint B remains absent" in c["body"] for c in remote.comments))
+
+        body = "**Progress**\n\nFound the cause and corrected the reply routing.\n\nNext: independent review. No decision is needed."
+        request_id = str(uuid.uuid4())
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            comment_id = kb.add_comment(conn, task_id, "worker", body, human_checkpoint=True, request_id=request_id)
+            self.assertEqual(kb.add_comment(conn, task_id, "worker", body, human_checkpoint=True,
+                                            request_id=request_id), comment_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(sum(c["body"] == body for c in remote.comments), 1)
+        self.assertEqual(sum(a["content"].get("body") == body for a in remote.activities), 1)
+        task = self.board.get(task_id)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.request_review(conn, task_id, summary="Implementation and checks are ready",
+                                             reviewer="default", expected_run_id=task.current_run_id))
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(sum("Review requested" in c["body"] for c in remote.comments), 1, reporter.store.pending())
+        self.assertNotEqual(remote.state(ISSUE), "Done")
+        before = self.board.get(task_id), self.board.history(task_id, 0)
+        restarted = Bridge(Store(self.home / "pm-milestones.db"), reporter.api, self.board,
+                           profile="default", clock=clock)
+        restarted.recover()
+        restarted.flush()
+        self.assertEqual(sum(c["body"] == body for c in remote.comments), 1)
+        self.assertEqual(sum("Review requested" in c["body"] for c in remote.comments), 1)
+        self.assertEqual((self.board.get(task_id), self.board.history(task_id, 0)), before)
+
+    def test_pending_issue_started_comment_is_omitted_after_native_stop(self):
+        clock, remote, reporter, task_id = self.session_reporting_fixture("pm-stopped")
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()  # Capture real progress, but do not publish it yet.
+        self.halt_reported_task(clock, task_id, "blocked")
+        before = self.board.get(task_id), self.board.history(task_id, 0)
+        reporter.recover()
+        reporter.flush()
+        self.assertFalse(any(c["body"].startswith("Started:") for c in remote.comments))
+        self.assertEqual(remote.state(ISSUE), "Blocked")
+        self.assertTrue(remote.comments, reporter.store.pending())  # The current blocker is visible on the issue.
+        self.assertEqual((self.board.get(task_id), self.board.history(task_id, 0)), before)
+
     def test_authenticated_agent_session_history_uses_current_state_first(self):
         for state in ("blocked", "done", "archived"):
             for captured in (False, True):
@@ -943,13 +994,16 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.flush()
                     self.assertEqual(remote.state(ISSUE), {"done": "Done", "blocked": "Blocked"}.get(
                         state, "Todo"))  # archived without an outcome parks the app's In Progress at Todo
-                    self.assertEqual(sum("Authenticated session ordinary history" in body for body in remote.bodies(ISSUE)), 1)
-                    self.assertTrue(any(item["content"].get("body") == "Authenticated session ordinary history" for item in remote.activities))
+                    self.assertEqual(sum("Authenticated session ordinary history" in body for body in remote.bodies(ISSUE)), 2)
+                    comments = [item for item in remote.comments if item["body"] == "Authenticated session ordinary history"]
+                    self.assertEqual(len(comments), 1)
+                    self.assertIsNone(comments[0].get("parentId"))
+                    self.assertEqual(sum(item["content"].get("body") == "Authenticated session ordinary history" for item in remote.activities), 1)
                     self.assertFalse(any("Reading the ticket" in body or "Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
                     self.assertEqual(self.board.get(task_id), native)
                     self.assertEqual(self.board.history(task_id, 0), history)
 
-    def test_unknown_agent_session_history_activity_stays_unknown_without_replay(self):
+    def test_session_checkpoint_lost_response_reconciles_exact_comment_without_duplicate(self):
         clock, remote, reporter, task_id = self.session_reporting_fixture("session-unknown-history")
         clock.now += 1
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
@@ -957,18 +1011,21 @@ class NativeBridgeScenarios(unittest.TestCase):
             self.checkpoint(conn, task_id, "worker", "Session history whose HTTP response is lost")
         reporter.pump_kanban()
         self.deliver_status(reporter)
-        row = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
+        row = next(row for row in reporter.store.pending() if row["kind"] == "comment" and row["payload"].get("native_history"))
         remote.lose_next_response = True
         reporter.flush()
         unknown = reporter.store.outbox_row(row["id"])
         self.assertIs(unknown["payload"].get("write_started"), True)
         self.assertNotIn("applied", unknown["payload"])
         self.halt_reported_task(clock, task_id, "blocked")
+        clock.now = max(clock(), unknown["next_at"]) + 1  # Honor the existing transport retry deadline.
         reporter.recover()
         reporter.flush()
         retained = reporter.store.outbox_row(row["id"])
-        self.assertNotIn("applied", retained["payload"])
-        self.assertEqual(sum(item["id"] == row["id"] for item in remote.activities), 1)
+        self.assertEqual(retained["state"], "sent", {**retained, "clock": clock()})
+        self.assertEqual(retained["payload"].get("applied"), 1)
+        self.assertEqual(sum(item["id"] == row["id"] for item in remote.comments), 1)
+        self.assertFalse(any(item["id"] == row["id"] for item in remote.activities))
         self.assertEqual(remote.state(ISSUE), "Blocked")
 
     def test_own_done_history_rechecks_human_takeover_at_http_boundary(self):
@@ -1023,21 +1080,25 @@ class NativeBridgeScenarios(unittest.TestCase):
             kb.claim_task(conn, task_id, claimer="session-http-worker")
             self.checkpoint(conn, task_id, "worker", "Session checkpoint preserved across deferred native halt")
         reporter.pump_kanban()
-        ordinary = next(row for row in reporter.store.pending() if row["payload"].get("native_history"))
-        create = reporter.api.create_activity
+        ordinary = next(row for row in reporter.store.pending() if row["kind"] == "activity" and row["payload"].get("native_history"))
+        create, raced = reporter.api.create_activity, []
         def halt_before_http(*args, **kwargs):
-            self.halt_reported_task(clock, task_id, "blocked")
+            if not raced and args[2].get("body") == "Session checkpoint preserved across deferred native halt":
+                raced.append(True)
+                self.halt_reported_task(clock, task_id, "blocked")
             return create(*args, **kwargs)
         with patch.object(reporter.api, "create_activity", side_effect=halt_before_http):
             reporter.flush()
+        self.assertTrue(raced)
         deferred = reporter.store.outbox_row(ordinary["id"])
         self.assertEqual(deferred["state"], "pending")
         self.assertIs(deferred["payload"].get("write_started"), False)
-        self.assertEqual(remote.activities, [])
+        self.assertFalse(any("Session checkpoint preserved" in a["content"].get("body", "") for a in remote.activities))
         reporter.recover()
         reporter.flush()
         self.assertEqual(remote.state(ISSUE), "Blocked")
-        self.assertEqual(sum("Session checkpoint preserved" in body for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(sum("Session checkpoint preserved" in c["body"] for c in remote.comments), 1)
+        self.assertEqual(sum("Session checkpoint preserved" in a["content"].get("body", "") for a in remote.activities), 1)
 
     def test_history_dependency_is_rechecked_inside_mutation_admission(self):
         clock, remote, reporter, task_id = self.reporting_fixture("history-admit-race")
@@ -1086,22 +1147,28 @@ class NativeBridgeScenarios(unittest.TestCase):
                     self.checkpoint(conn, task_id, "worker", "Preserved ordinary history during native Stop")
                 reporter.pump_kanban()
                 method = "create_activity" if session_route else "create_comment"
-                create = getattr(reporter.api, method)
+                create, raced = getattr(reporter.api, method), []
                 def resume_before_http(*args, **kwargs):
-                    clock.now += 1
-                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
-                        self.assertTrue(kb.unblock_task(conn, task_id))
-                        self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-resume-worker"))
-                    clock.now += 1
+                    body = args[2].get("body") if isinstance(args[2], dict) else args[2]
+                    if not raced and body == "Preserved ordinary history during native Stop":
+                        raced.append(True)
+                        clock.now += 1
+                        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                            self.assertTrue(kb.unblock_task(conn, task_id))
+                            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-resume-worker"))
+                        clock.now += 1
                     return create(*args, **kwargs)
                 with patch.object(reporter.api, method, side_effect=resume_before_http):
                     reporter.flush()
-                self.assertFalse(any("Preserved ordinary history during native Stop" in body for body in remote.bodies(ISSUE)))
+                self.assertTrue(raced)
+                guarded = remote.activities if session_route else remote.comments
+                self.assertFalse(any("Preserved ordinary history during native Stop" in (entry.get("content", entry).get("body") or "") for entry in guarded))
                 reporter.recover()
                 reporter.flush()
                 self.assertEqual(self.board.get(task_id).status, "running")
                 self.assertEqual(remote.state(ISSUE), "In Progress")
-                self.assertEqual(sum("Preserved ordinary history during native Stop" in body for body in remote.bodies(ISSUE)), 1)
+                self.assertEqual(sum("Preserved ordinary history during native Stop" in c["body"] for c in remote.comments), 1)
+                self.assertEqual(sum("Preserved ordinary history during native Stop" in a["content"].get("body", "") for a in remote.activities), int(session_route))
 
     def test_uncaptured_halt_at_final_admission_never_reaches_transport(self):
         for session_route in (False, True):
@@ -1140,7 +1207,8 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.recover()
                     reporter.flush()
                     self.assertEqual(remote.state(ISSUE), "Blocked")
-                    self.assertEqual(sum("Ordinary history retained" in body for body in remote.bodies(ISSUE)), int(not progress))
+                    self.assertEqual(sum("Ordinary history retained" in c["body"] for c in remote.comments), int(not progress))
+                    self.assertEqual(sum("Ordinary history retained" in a["content"].get("body", "") for a in remote.activities), int(session_route and not progress))
 
     def test_known_unstarted_legacy_progress_waits_for_resume_status_without_deadlock(self):
         clock, remote, reporter, task_id = self.reporting_fixture("legacy-progress-resume")
