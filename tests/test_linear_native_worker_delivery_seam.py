@@ -1,7 +1,9 @@
 """Lost delegated status replies retain readback and order the single closeout."""
 import asyncio
 import json
+import inspect
 import unittest
+import uuid
 from unittest.mock import patch
 
 import test_linear_native_delivery_seam as delivery
@@ -21,13 +23,15 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
     final_reply_sent = delivery.FinalDeliveryAdmissionScenarios.final_reply_sent
     start_live_for_delivery = delivery.FinalDeliveryAdmissionScenarios.start_live_for_delivery
 
-    async def held_worker(self):
+    async def held_worker(self, *, before_claim_checkpoint=None):
         from agent.display import build_status_phrase
         await self.start_live_for_delivery()
         self.adapter.set_authorization_check(lambda actor, *_a, **_k: actor == self.USER)
         issue = self.provider.issues[self.ISSUE]
         task = self.board.create(title='Bounded delegated continuation',
             body=f"Linear issue {self.ISSUE}: {issue['url']}", created_by=self.board.executor_profile)
+        if before_claim_checkpoint is not None:
+            await self.checkpoint(task, before_claim_checkpoint, capture=False)
         with self.board.conn() as conn, patch('hermes_cli.kanban_db.time.time', return_value=self.bridge.clock() - 2):
             task = self.board.kb.claim_task(conn, task.id)
         self.assertTrue(self.bridge.store.bind_native(self.ISSUE, task.id, 'default', self.board.board,
@@ -37,6 +41,149 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
                 'admission_id': 'same-native-worker-admission', 'run_id': task.current_run_id,
                 'phrase': build_status_phrase('terminal', None)}
         return task, self.bridge.store.get(self.ISSUE), step
+
+    async def checkpoint(self, task, body, *, capture=True):
+        with self.board.conn() as conn:
+            request = str(uuid.uuid4())
+            if 'human_checkpoint' in inspect.signature(self.board.kb.add_comment).parameters:
+                self.board.kb.add_comment(conn, task.id, 'worker', body,
+                    human_checkpoint=True, request_id=request)
+            else:  # The retained notification-contract fixture predates the explicit producer.
+                with self.board.kb.write_txn(conn):
+                    comment = self.board.kb.add_comment(conn, task.id, 'worker', body)
+                    self.board.kb._append_event(conn, task.id, 'checkpoint',
+                        {'author':'worker', 'body':body, 'comment_id':comment, 'request_id':request})
+        if capture:
+            await asyncio.to_thread(self.bridge.pump_kanban)
+
+    def checkpoint_row(self, body):
+        return next(row for row in self.bridge.store.pending(self.ISSUE)
+            if row['kind'] == 'activity' and row['payload'].get('native_history') is True
+            and row['payload'].get('content', {}).get('body') == body)
+
+    async def question(self, name):
+        from tools import clarify_gateway as clarify
+        key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
+        self.addCleanup(clarify.clear_session, key)
+        shown = clarify.register(name, key, 'Choose a color.', ['Blue', 'Green'])
+        sent = await self.adapter.send_clarify(self.ISSUE, shown.question, shown.choices,
+            shown.clarify_id, key, metadata={'thread_id': self.SESSION})
+        return key, shown, sent
+
+    async def test_direct_question_waits_for_delayed_checkpoint_thought_across_restart(self):
+        await self.check_question_history_order(capture=True)
+
+    async def test_direct_question_waits_for_checkpoint_not_yet_captured(self):
+        await self.check_question_history_order(capture=False)
+
+    async def test_uncaptured_gate_does_not_replay_pre_binding_historical_checkpoint(self):
+        task, _, _ = await self.held_worker(before_claim_checkpoint='Earlier work before this reporting binding.')
+        _, shown, sent = await self.question('historical-checkpoint-question')
+        self.assertTrue(sent.success, sent.error)
+        self.assertEqual(self.bridge.store.get(self.ISSUE)['last_event_id'], 0)
+        self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'elicitation')
+        self.assertIsNone(shown.response)
+        self.assertEqual(self.board.get(task.id).status, 'running')
+
+    async def check_question_history_order(self, *, capture):
+        from hermes_fleet_linear_plugin.store import Store
+        task, _, _ = await self.held_worker()
+        wall = self.bridge.clock()
+        body = 'Completed the first bounded check; next is a color decision.'
+        await self.checkpoint(task, body, capture=capture)
+        if capture:
+            self.bridge.store.defer(self.checkpoint_row(body)['id'], wall + 30)
+        _, shown, sent = await self.question('checkpoint-order-' + str(capture))
+        self.assertFalse(sent.success)
+        self.assertTrue(sent.retryable)
+        self.assertTrue(sent.raw_response['ambiguous'], 'Core must retain the real queued question')
+        question = self.bridge.store.outbox_row(sent.message_id)
+        self.assertEqual(question['state'], 'pending')
+        self.assertIs(question['payload']['write_started'], False)
+        self.assertFalse(any(a['content']['type'] == 'elicitation'
+            for a in self.provider.activities.values() if 'content' in a))
+        self.assertIsNone(shown.response)
+        self.assertEqual(self.board.get(task.id).status, 'running')
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        self.bridge.store = Store(self.bridge.store.path)
+        self.bridge.clock = lambda: wall + 60
+        await asyncio.to_thread(self.bridge.flush)
+        self.bridge.clock = lambda: wall + 120
+        await asyncio.to_thread(self.bridge.flush)
+        activities = [a['content'] for a in self.provider.activities.values() if 'content' in a]
+        checkpoint = next(i for i, a in enumerate(activities) if a.get('body') == body)
+        question = next(i for i, a in enumerate(activities) if a['type'] == 'elicitation')
+        self.assertLess(checkpoint, question)
+        self.assertEqual(activities[-1]['type'], 'elicitation')
+        self.assertEqual(sum(a.get('body') == body for a in activities), 1)
+        self.assertEqual(self.bridge.store.outbox_row(sent.message_id)['state'], 'sent')
+        self.assertIsNone(shown.response)
+
+    async def test_shown_question_holds_late_history_but_not_its_issue_comment(self):
+        from tools import clarify_gateway as clarify
+        task, _, _ = await self.held_worker()
+        wall = self.bridge.clock()
+        key, shown, sent = await self.question('checkpoint-after-shown-question')
+        self.assertTrue(sent.success, sent.error)
+        body = 'Retained checkpoint from the earlier work.'
+        await self.checkpoint(task, body)
+        history = self.checkpoint_row(body)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'pending')
+        self.assertIs(self.bridge.store.outbox_row(history['id'])['payload']['write_started'], False)
+        self.assertTrue(any(c['body'] == body for c in self.provider.comment_records.values()))
+        self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'elicitation')
+        self.assertIsNone(shown.response)
+        clarify.clear_session(key)
+        self.bridge.clock = lambda: wall + 60
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'sent')
+
+    async def test_unknown_checkpoint_effect_holds_question_without_replaying_history(self):
+        task, _, _ = await self.held_worker()
+        body = 'A checkpoint whose publication is uncertain.'
+        await self.checkpoint(task, body)
+        history = self.checkpoint_row(body)
+        self.bridge.store.defer(history['id'], self.bridge.clock() + 30)
+        await asyncio.to_thread(self.bridge.flush)  # Confirm its native status prerequisite first.
+        self.assertTrue(self.bridge.store.admit_mutation(history['id']))
+        self.bridge.store.mark(history['id'], 'failed', 'Unknown remote effect')
+        self.bridge.store.report(history['id'])
+        _, shown, sent = await self.question('unknown-checkpoint-question')
+        self.assertFalse(sent.success)
+        self.assertTrue(sent.raw_response['ambiguous'])
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'failed')
+        self.assertIs(self.bridge.store.outbox_row(history['id'])['payload']['write_started'], True)
+        self.assertFalse(any(a['content']['type'] == 'elicitation' or a['content'].get('body') == body
+            for a in self.provider.activities.values() if 'content' in a))
+        self.assertTrue(any(c['body'] == body for c in self.provider.comment_records.values()))
+        self.assertIsNone(shown.response)
+
+    async def test_native_closing_pointer_follows_retained_checkpoint_thought(self):
+        task, _, _ = await self.held_worker()
+        wall = self.bridge.clock()
+        body = 'The bounded stage is verified.'
+        await self.checkpoint(task, body)
+        history = self.checkpoint_row(body)
+        self.bridge.store.defer(history['id'], wall + 30)
+        summary = 'Completed the bounded verification; no work remains.'
+        with self.board.conn() as conn:
+            self.assertTrue(self.board.kb.complete_task(conn, task.id, summary=summary,
+                expected_run_id=task.current_run_id))
+        await asyncio.to_thread(self.bridge.pump_kanban)
+        await asyncio.to_thread(self.bridge.flush)
+        self.assertFalse(any(a['content']['type'] == 'response'
+            for a in self.provider.activities.values() if 'content' in a))
+        self.assertTrue(any(summary in c['body'] for c in self.provider.comment_records.values()))
+        self.bridge.clock = lambda: wall + 60
+        await asyncio.to_thread(self.bridge.flush)
+        self.bridge.clock = lambda: wall + 120
+        await asyncio.to_thread(self.bridge.flush)
+        activities = [a['content'] for a in self.provider.activities.values() if 'content' in a]
+        self.assertEqual(activities[-1]['type'], 'response')
+        self.assertEqual(sum(a['type'] == 'response' for a in activities), 1)
+        self.assertLess(next(i for i,a in enumerate(activities) if a.get('body') == body), len(activities)-1)
 
     async def lose_step(self, binding):
         from hermes_fleet_linear_plugin import worker_progress

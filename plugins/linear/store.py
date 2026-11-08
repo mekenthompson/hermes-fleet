@@ -482,6 +482,9 @@ class Store:
             payload = json.loads(row["payload"])
             if payload.get("native_outcome_pointer") and not self.outcome_comment_applied(payload):
                 return False  # Atomically order the sole terminal pointer behind its verified full comment.
+            if (self.after_native_session_history(row['kind'], payload) and
+                    self.unsettled_native_session_history(payload['issue_id'], payload['session_id'])):
+                return False  # A later question/final must not be reopened by retained session history.
             if expected_content is not None and payload.get("content") != expected_content:
                 return False
             if require_unattempted and payload.get("write_started") is not False:
@@ -1480,6 +1483,7 @@ class Store:
                 " SELECT MIN(p.rowid) FROM outbox p WHERE p.state = 'pending' AND " + eligible("p") +
                 " AND NOT " + ADVISORY + " AND COALESCE(json_extract(p.payload,'$.worker_step_repair'),0)!=1 "
                 "AND COALESCE(json_extract(p.payload,'$.native_outcome_pointer'),0)!=1 "
+                "AND NOT (p.kind='activity' AND COALESCE(json_extract(p.payload,'$.native_reply_version'),0)=1) "
                 "AND json_extract(p.payload, '$.issue_id') IS json_extract(o.payload, '$.issue_id')"
                 ")) AND o.next_at <= ? ORDER BY COALESCE(json_extract(o.payload, '$.initial_ack'), 0) DESC, o.rowid", (now,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
@@ -1530,6 +1534,31 @@ class Store:
                     comment["payload"].get("issue_id") == payload.get("issue_id") and
                     (comment["payload"].get("native_completion") == payload.get("native_completion") or
                      payload.get("outcome_assessment") is True and comment["payload"].get("assessment") is True))
+
+    @classmethod
+    def after_native_session_history(cls, kind: str, payload: dict) -> bool:
+        """Only visible decision/closing replies depend on this session's retained history."""
+        return (kind == 'activity' and bool(payload.get('session_id')) and
+                (payload.get('native_outcome_pointer') is True or
+                 cls.conversation_reply(kind, payload) and
+                 (payload.get('turn_final') is True or payload['content']['type'] == 'elicitation')))
+
+    def unsettled_native_session_history(self, issue_id: str, session_id: str) -> bool:
+        """Retained notes order this session's lifecycle, never its ordinary issue comments."""
+        with self._tx() as db:
+            rows = db.execute("SELECT state,attempts,hold_reason,payload FROM outbox WHERE kind='activity' "
+                "AND state IN ('pending','failed') AND json_extract(payload,'$.native_history')=1 "
+                "AND COALESCE(json_extract(payload,'$.ephemeral'),0)!=1 "
+                "AND json_type(payload,'$.applied') IS NULL AND json_extract(payload,'$.issue_id')=? "
+                "AND json_extract(payload,'$.session_id')=?", (issue_id, session_id)).fetchall()
+            for row in rows:
+                payload = json.loads(row['payload'])
+                attempted = (payload.get('write_started') is True or
+                             'write_started' not in payload and row['attempts'] > 0)
+                if attempted or (row['hold_reason'] is None and (
+                        row['state'] == 'pending' or payload.get('failure_kind') != 'rejected')):
+                    return True  # Possible late effects and retryable history retain their exact identity.
+            return False
 
     def unsettled_worker_action(self, issue_id: str, session_id: str) -> bool:
         """Only this session's closing publication waits for its in-flight step or derived question repair."""

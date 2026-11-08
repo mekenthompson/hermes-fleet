@@ -709,6 +709,12 @@ when source ordering is verifiable, including initial queued work; conflicting c
 visible for native reconciliation. A blocked task or Stop acknowledgement is
 not proof that an external process or effect ended; inspect native process/effect state.
 
+Within one Agent Session, retained native notes precede a later question or closing reply.
+A queued question remains pending while its preceding notes await delivery; it does not ask the
+worker to fall back to a manual blocker. If a question was already displayed, a delayed note
+waits for its answer instead of changing the session back to Active. Ordinary issue comments
+remain independent of those session notes, and uncertain effects still require reconciliation.
+
 Before status mutations/retries the bridge re-reads Linear so human reassignment/closure wins.
 This revalidation does not provide remote compare-and-swap; conflicting or unverifiable
 mutation responses remain subject to reconciliation.
