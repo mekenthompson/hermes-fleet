@@ -32,9 +32,9 @@ COPY release/honcho-sdk-requirements.txt release/honcho-requirements.txt /tmp/ho
 RUN cd /opt/hermes \
     && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
     && test -x "$UV" \
-    && "$UV" pip install --exclude-newer 2026-10-03T23:59:59Z --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-11-01T00:00:00Z --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
     && "$UV" venv --python /opt/hermes/.venv/bin/python /opt/honcho-cli \
-    && "$UV" pip install --exclude-newer 2026-10-25T00:00:00Z --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-11-01T00:00:00Z --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
     && ln -s /opt/honcho-cli/bin/honcho /usr/local/bin/honcho \
     && rm -rf /tmp/honcho-locks
 COPY --chmod=0755 scripts/verify-honcho-runtime.py /opt/hermes-fleet/bin/verify-honcho-runtime.py
