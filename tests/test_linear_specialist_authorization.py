@@ -1367,8 +1367,10 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         # The blocker sentence is captured with the event; the state is reconciled after the batch
         # and delivered first (the sentence waits on it).
         rows = self.store.pending(ISSUE)
-        self.assertEqual([row["kind"] for row in rows], ["activity", "status"])
-        self.assertEqual(rows[0]["payload"]["requires_status_id"], rows[1]["id"])
+        self.assertEqual([row["kind"] for row in rows], ["activity", "comment", "status"])
+        self.assertEqual(rows[0]["payload"]["requires_status_id"], rows[2]["id"])
+        self.assertEqual(rows[1]["payload"]["requires_status_id"], rows[2]["id"])
+        self.assertIs(rows[1]["payload"]["native_issue_comment"], True)
 
     def test_all_specialist_effects_recheck_the_authoritative_resource_before_mutation(self):
         for name, action in (
