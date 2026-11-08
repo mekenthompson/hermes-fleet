@@ -36,7 +36,8 @@ done
 
 class FetchPinnedReleaseAssetTests(unittest.TestCase):
     def run_helper(self, body: str, *, sha256: str | None = None, size: int | None = None,
-                   fallback: str = FALLBACK, token: str | None = "workflow-token"):
+                   fallback: str = FALLBACK, token: str | None = "workflow-token",
+                   failing_mv: bool = False):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
             bindir = tmpdir / "bin"
@@ -46,6 +47,10 @@ class FetchPinnedReleaseAssetTests(unittest.TestCase):
             curl = bindir / "curl"
             curl.write_text(CURL + body, encoding="utf-8")
             curl.chmod(0o755)
+            if failing_mv:
+                mv = bindir / "mv"
+                mv.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                mv.chmod(0o755)
             calls = tmpdir / "calls"
             out = tmpdir / "asset.tar.gz"
             env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_API_URL"}}
@@ -114,6 +119,16 @@ class FetchPinnedReleaseAssetTests(unittest.TestCase):
         self.assertFalse(exists)
         self.assertEqual(len(calls), 2)
         self.assertIn("either route", proc.stderr)
+
+    def test_failed_move_of_a_verified_download_is_a_hard_failure(self) -> None:
+        proc, _, exists, partial, calls = self.run_helper('cp "$SRC" "$out"\n', failing_mv=True)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertFalse(exists)
+        self.assertFalse(partial)
+        self.assertNotIn("Fetched", proc.stdout + proc.stderr)
+        self.assertIn("Could not move", proc.stderr)
+        # A local filesystem fault is not retried through the fallback route.
+        self.assertEqual(len(calls), 1)
 
     def test_rejects_fallback_outside_the_pinned_repository(self) -> None:
         proc, _, exists, _, calls = self.run_helper(

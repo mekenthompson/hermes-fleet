@@ -54,7 +54,20 @@ fetch() {
        --connect-timeout 20 --max-time 600 \
        --output "$partial" "$@"; then
     if verify "$label"; then
-      mv "$partial" "$output"
+      # fetch runs as an && condition, so errexit is off here: check every step.
+      # A local filesystem fault is not fixed by downloading again, so it is a
+      # hard failure, not a reason to try the next route.
+      if ! mv -f -- "$partial" "$output"; then
+        echo "::error::Could not move the verified $repo asset $asset_id to $output" >&2
+        rm -f -- "$partial" "$output"
+        exit 1
+      fi
+      if [ ! -f "$output" ] || [ "$(stat -c %s "$output")" != "$size" ] \
+         || [ "$(sha256sum "$output" | awk '{print $1}')" != "$sha256" ]; then
+        echo "::error::$output does not hold the verified $repo asset $asset_id after the move" >&2
+        rm -f -- "$partial" "$output"
+        exit 1
+      fi
       echo "Fetched $repo asset $asset_id via $label: $size bytes, sha256 $sha256"
       return 0
     fi
