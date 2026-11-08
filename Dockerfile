@@ -7,6 +7,7 @@ USER root
 
 ARG GH_VERSION=2.103.3
 ARG GH_LINUX_AMD64_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_LINUX_AMD64_ASSET_ID=679195621
 ARG CLAUDE_CODE_VERSION=2.1.316
 ARG CLAUDE_AGENT_ACP_VERSION=0.99.1
 ARG CODEX_VERSION=0.166.0
@@ -17,9 +18,36 @@ ENV DISABLE_AUTOUPDATER=1
 
 COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op
 RUN test "$(/usr/local/bin/op --version)" = "2.41.1"
-RUN set -eux; \
+# Same pinned archive by two official GitHub routes: the REST asset API and the
+# release download URL, which returned HTTP 503/504 for long stretches on
+# 2026-11-08. CI passes its workflow token as the optional BuildKit secret
+# github_token (mounted for this step only, never written to a layer) so the API
+# route is not subject to the shared unauthenticated rate limit; local builds
+# without it still work. A route counts only when its bytes match the pinned
+# sha256, and the final check below is unconditional.
+RUN --mount=type=secret,id=github_token,required=false set -eu; \
     archive="gh_${GH_VERSION}_linux_amd64.tar.gz"; \
-    curl -fsSL --retry 3 "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o "/tmp/${archive}"; \
+    curl_auth=""; \
+    if [ -s /run/secrets/github_token ]; then \
+        curl_auth="/tmp/gh-api-auth.curl"; \
+        (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$(cat /run/secrets/github_token)" > "$curl_auth"); \
+    fi; \
+    set -x; \
+    api_ok=0; \
+    rm -f "/tmp/${archive}"; \
+    if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+           ${curl_auth:+--config "$curl_auth"} \
+           -H 'Accept: application/octet-stream' -H 'X-GitHub-Api-Version: 2022-11-28' \
+           "https://api.github.com/repos/cli/cli/releases/assets/${GH_LINUX_AMD64_ASSET_ID}" -o "/tmp/${archive}" \
+       && printf '%s  %s\n' "${GH_LINUX_AMD64_SHA256}" "/tmp/${archive}" | sha256sum -c -; then \
+        api_ok=1; \
+    fi; \
+    rm -f /tmp/gh-api-auth.curl; \
+    if [ "$api_ok" != 1 ]; then \
+        rm -f "/tmp/${archive}"; \
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o "/tmp/${archive}"; \
+    fi; \
     printf '%s  %s\n' "${GH_LINUX_AMD64_SHA256}" "/tmp/${archive}" | sha256sum -c -; \
     tar -xzf "/tmp/${archive}" -C /tmp; \
     install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \

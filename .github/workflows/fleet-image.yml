@@ -220,6 +220,10 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
+          # route) and never written to a layer, build arg or provenance.
+          secrets: |
+            github_token=${{ github.token }}
 
       - name: Verify inherited runtime and provenance
         env:
@@ -587,6 +591,10 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
+          # route) and never written to a layer, build arg or provenance.
+          secrets: |
+            github_token=${{ github.token }}
 
       - name: Verify exact scanned candidate runtime and provenance
         env:
