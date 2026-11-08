@@ -40,6 +40,26 @@ class PublicFattenContractTests(unittest.TestCase):
             text,
         )
         self.assertIn("curl -fsSL", text)
+        # REST asset API first, release URL second; the pinned sha256 decides whether the
+        # API route counts and is checked again unconditionally after either route.
+        self.assertIn("ARG GH_LINUX_AMD64_ASSET_ID=679195621", text)
+        self.assertIn("https://api.github.com/repos/cli/cli/releases/assets/${GH_LINUX_AMD64_ASSET_ID}", text)
+        self.assertLess(text.index("api.github.com/repos/cli/cli"), text.index("github.com/cli/cli/releases/download"))
+        self.assertEqual(text.count('"${GH_LINUX_AMD64_SHA256}" "/tmp/${archive}" | sha256sum -c -'), 2)
+        gh_step = text[text.index("RUN --mount=type=secret,id=github_token"):text.index("Honcho tooling")]
+        # The token is an optional BuildKit secret for this step only: never an ARG/ENV,
+        # never echoed (xtrace starts after the curl config is written), removed before
+        # the step ends, and not forwarded to the release-download fallback.
+        self.assertIn("RUN --mount=type=secret,id=github_token,required=false set -eu;", text)
+        self.assertNotRegex(text, r"(?m)^(ARG|ENV) .*TOKEN")
+        self.assertLess(gh_step.index("/run/secrets/github_token"), gh_step.index("set -x"))
+        self.assertIn("(umask 077;", gh_step)
+        self.assertLess(gh_step.index("rm -f /tmp/gh-api-auth.curl"), gh_step.index("releases/download"))
+        fallback = gh_step[gh_step.index('if [ "$api_ok" != 1 ]'):]
+        self.assertNotIn("curl_auth", fallback)
+        workflow = (ROOT / ".github/workflows/fleet-image.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow.count("github_token=${{ github.token }}"), 2)
+        self.assertNotIn("GITHUB_TOKEN=", workflow.split("build-args:", 1)[1].split("secrets:", 1)[0])
         self.assertIn('test "$(gh --version | awk \'NR==1{print $3}\')" = "${GH_VERSION}"', text)
         self.assertNotIn("4c5f90f0198e28652d2c111e5c529e2a9901a7b2f20808b1cbd3a64d2a93a8d6", text)
 

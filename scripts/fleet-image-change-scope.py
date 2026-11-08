@@ -44,6 +44,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "scripts/compact-spdx-sbom.py",
         "scripts/emit-fleet-image-manifest.py",
         "scripts/extract-pushed-image-digest.py",
+        "scripts/fetch-pinned-release-asset.sh",
         "scripts/fleet-image-change-scope.py",
         "scripts/image_ref.py",
         "scripts/read-agent-image-manifest.py",

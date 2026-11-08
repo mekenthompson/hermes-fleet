@@ -128,9 +128,14 @@ jobs:
 
       - name: Install pinned Trivy
         # setup-trivy's installer downloads from get.trivy.dev, which returns NXDOMAIN
-        # (2026-11-04). Install the exact GitHub release asset and verify its pinned
-        # sha256 instead; bump TRIVY_SHA256 together with TRIVY_VERSION.
+        # (2026-11-04), and github.com/.../releases/download returned HTTP 504 for long
+        # stretches (2026-11-08). Fetch the exact release asset through GitHub's REST asset
+        # API (release URL as fallback) and use it only after its pinned size and sha256
+        # match; bump the asset ID, size and TRIVY_SHA256 together with TRIVY_VERSION.
         env:
+          GH_TOKEN: ${{ github.token }}
+          TRIVY_ASSET_ID: "398381981"
+          TRIVY_SIZE: "47748408"
           TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
         run: |
           set -euo pipefail
@@ -141,18 +146,42 @@ jobs:
           fi
           dir="$RUNNER_TEMP/trivy-bin"
           mkdir -p "$dir"
-          curl --fail --location --silent --show-error --retry 3 -o "$RUNNER_TEMP/trivy.tgz" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"
+          bash scripts/fetch-pinned-release-asset.sh \
+            aquasecurity/trivy "$TRIVY_ASSET_ID" "$TRIVY_SIZE" "$TRIVY_SHA256" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz" \
+            "$RUNNER_TEMP/trivy.tgz"
           echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/trivy" --version
 
       - name: Install pinned Syft
+        # The same Syft archive anchore/sbom-action/download-syft v0.24.2 installed, fetched
+        # the same way as Trivy above and verified against its pinned size and sha256.
         id: syft
-        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
-        with:
-          syft-version: ${{ env.SYFT_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYFT_ASSET_ID: "532610151"
+          SYFT_SIZE: "29203595"
+          SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+        run: |
+          set -euo pipefail
+          version="${SYFT_VERSION#v}"
+          if [ "$version" != "1.51.1" ]; then
+            echo "SYFT_SHA256 is pinned for 1.51.1; update it with SYFT_VERSION" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/syft-bin"
+          mkdir -p "$dir"
+          bash scripts/fetch-pinned-release-asset.sh \
+            anchore/syft "$SYFT_ASSET_ID" "$SYFT_SIZE" "$SYFT_SHA256" \
+            "https://github.com/anchore/syft/releases/download/v${version}/syft_${version}_linux_amd64.tar.gz" \
+            "$RUNNER_TEMP/syft.tgz"
+          echo "${SYFT_SHA256}  $RUNNER_TEMP/syft.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft.tgz" -C "$dir" syft
+          chmod 0755 "$dir/syft"
+          "$dir/syft" version
+          echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"
 
       - name: Pull exact Agent parent and prefetch scan tooling
         # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
@@ -191,6 +220,10 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
+          # route) and never written to a layer, build arg or provenance.
+          secrets: |
+            github_token=${{ github.token }}
 
       - name: Verify inherited runtime and provenance
         env:
@@ -466,9 +499,14 @@ jobs:
 
       - name: Install pinned Trivy
         # setup-trivy's installer downloads from get.trivy.dev, which returns NXDOMAIN
-        # (2026-11-04). Install the exact GitHub release asset and verify its pinned
-        # sha256 instead; bump TRIVY_SHA256 together with TRIVY_VERSION.
+        # (2026-11-04), and github.com/.../releases/download returned HTTP 504 for long
+        # stretches (2026-11-08). Fetch the exact release asset through GitHub's REST asset
+        # API (release URL as fallback) and use it only after its pinned size and sha256
+        # match; bump the asset ID, size and TRIVY_SHA256 together with TRIVY_VERSION.
         env:
+          GH_TOKEN: ${{ github.token }}
+          TRIVY_ASSET_ID: "398381981"
+          TRIVY_SIZE: "47748408"
           TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
         run: |
           set -euo pipefail
@@ -479,18 +517,42 @@ jobs:
           fi
           dir="$RUNNER_TEMP/trivy-bin"
           mkdir -p "$dir"
-          curl --fail --location --silent --show-error --retry 3 -o "$RUNNER_TEMP/trivy.tgz" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"
+          bash scripts/fetch-pinned-release-asset.sh \
+            aquasecurity/trivy "$TRIVY_ASSET_ID" "$TRIVY_SIZE" "$TRIVY_SHA256" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz" \
+            "$RUNNER_TEMP/trivy.tgz"
           echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/trivy" --version
 
       - name: Install pinned Syft
+        # The same Syft archive anchore/sbom-action/download-syft v0.24.2 installed, fetched
+        # the same way as Trivy above and verified against its pinned size and sha256.
         id: syft
-        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
-        with:
-          syft-version: ${{ env.SYFT_VERSION }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYFT_ASSET_ID: "532610151"
+          SYFT_SIZE: "29203595"
+          SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+        run: |
+          set -euo pipefail
+          version="${SYFT_VERSION#v}"
+          if [ "$version" != "1.51.1" ]; then
+            echo "SYFT_SHA256 is pinned for 1.51.1; update it with SYFT_VERSION" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/syft-bin"
+          mkdir -p "$dir"
+          bash scripts/fetch-pinned-release-asset.sh \
+            anchore/syft "$SYFT_ASSET_ID" "$SYFT_SIZE" "$SYFT_SHA256" \
+            "https://github.com/anchore/syft/releases/download/v${version}/syft_${version}_linux_amd64.tar.gz" \
+            "$RUNNER_TEMP/syft.tgz"
+          echo "${SYFT_SHA256}  $RUNNER_TEMP/syft.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft.tgz" -C "$dir" syft
+          chmod 0755 "$dir/syft"
+          "$dir/syft" version
+          echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"
 
       - name: Pull exact Agent parent and prefetch scan tooling
         # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
@@ -529,6 +591,10 @@ jobs:
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
+          # route) and never written to a layer, build arg or provenance.
+          secrets: |
+            github_token=${{ github.token }}
 
       - name: Verify exact scanned candidate runtime and provenance
         env:

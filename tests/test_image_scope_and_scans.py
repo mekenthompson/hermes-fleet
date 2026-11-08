@@ -406,11 +406,18 @@ class ScanHelperTests(unittest.TestCase):
                 self.assertEqual(runs.count("wait-sbom"), 1)
                 self.assertNotIn("anchore/sbom-action@", json.dumps(steps))
                 uses = [step.get("uses", "") for step in steps]
-                self.assertTrue(any(u.startswith("anchore/sbom-action/download-syft@") for u in uses))
-                install = steps[names.index("Install pinned Trivy")]
-                self.assertNotIn("uses", install)
-                self.assertRegex(install["env"]["TRIVY_SHA256"], r"^[0-9a-f]{64}$")
-                self.assertIn('sha256sum --check --strict', install["run"])
+                self.assertFalse(any(u.startswith("anchore/sbom-action/download-syft@") for u in uses))
+                for tool in ("Trivy", "Syft"):
+                    install = steps[names.index(f"Install pinned {tool}")]
+                    self.assertNotIn("uses", install)
+                    self.assertRegex(install["env"][f"{tool.upper()}_SHA256"], r"^[0-9a-f]{64}$")
+                    self.assertRegex(install["env"][f"{tool.upper()}_ASSET_ID"], r"^[0-9]+$")
+                    self.assertEqual(install["env"]["GH_TOKEN"], "${{ github.token }}")
+                    self.assertIn("scripts/fetch-pinned-release-asset.sh", install["run"])
+                    self.assertIn('sha256sum --check --strict', install["run"])
+                syft = steps[names.index("Install pinned Syft")]
+                self.assertEqual(syft["id"], "syft")
+                self.assertIn('echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"', syft["run"])
                 self.assertLess(names.index("Install pinned Trivy"), trivy)
         self.assertIn("SYFT_VERSION: v1.51.1", text)
         self.assertIn("TRIVY_VERSION: v0.70.0", text)

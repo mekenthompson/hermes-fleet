@@ -523,8 +523,12 @@ class FleetImageReleaseTests(unittest.TestCase):
         # get.trivy.dev download host stopped resolving on 2026-11-04).
         self.assertNotIn("aquasecurity/setup-trivy@", text)
         self.assertEqual(text.count("releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"), 2)
-        self.assertEqual(text.count('sha256sum --check --strict'), text.count("TRIVY_SHA256: "))
+        self.assertEqual(text.count('sha256sum --check --strict'),
+                         text.count("TRIVY_SHA256: ") + text.count("SYFT_SHA256: "))
         self.assertEqual(text.count("TRIVY_SHA256: "), 2)
+        self.assertEqual(text.count("SYFT_SHA256: "), 2)
+        self.assertEqual(text.count("bash scripts/fetch-pinned-release-asset.sh"), 4)
+        self.assertNotIn("anchore/sbom-action/download-syft@", text)
         self.assertEqual(text.count("scripts/scan-fleet-image.py trivy"), 2)
         self.assertNotIn("aquasecurity/trivy-action@", text)
         scanner = (ROOT / "scripts/scan-fleet-image.py").read_text(encoding="utf-8")
