@@ -71,6 +71,8 @@ STATE_TYPES = {"todo": "unstarted", "in_progress": "started", "done": "completed
 NATIVE_PROGRESS_SUPERSEDED = frozenset({"todo", "scheduled", "blocked", "triage", "review", "done", "archived"})
 NATIVE_STATUS_EVENTS = frozenset({"blocked", "block_loop_detected", "gave_up", "unblocked", "changes_requested",
                                   "promoted", "scheduled", "dependency_wait", "descendant_invalidated", "completed", "archived"})
+NATIVE_PHASE_EVENTS = NATIVE_STATUS_EVENTS | frozenset({"review_requested", "review_reopened", "status",
+    "assigned", "reclaimed", "stale", "timed_out", "crashed", "spawn_failed", "rate_limited"})
 URL = re.compile(r"https?://[^\s)>\]\"']+")
 PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*\Z")
 OTHER_PR_PATHS = ("/pull/", "/pulls/", "/pullrequest/", "/pull-request/", "/pull-requests/",
@@ -3493,6 +3495,11 @@ class Bridge:
             writes.append(issue_note(activity["body"], milestone_states))
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
                 (event.kind == "block_loop_detected" and task_status != "triage")): writes = []
+        for _, report in writes:
+            if report.get("native_progress_states"):
+                report["native_history_event_id"] = event.id
+        writes = [(kind, report) for kind, report in writes if not (report.get("native_progress_states") and
+                  self._obsolete_native_progress({"kind": kind, "payload": {**report, "write_started": False}, "attempts": 0}))]
         writes = self._report_writes(row, writes)
         self._capture_native_event(issue_id, event.id, writes, at=self.clock(), forget=False)
     @staticmethod
@@ -4472,9 +4479,19 @@ class Bridge:
         status = self._native_effect_task(payload["issue_id"]).status
         if payload.get("acceptance_status_id"):
             return status != "done" or not self._acceptance_progress_current(payload)
-        if payload.get("native_progress_states"):
-            return status not in payload["native_progress_states"]
-        return status in NATIVE_PROGRESS_SUPERSEDED
+        states = payload.get("native_progress_states")
+        if states:
+            if status not in states:
+                return True
+        elif status in NATIVE_PROGRESS_SUPERSEDED:
+            return True
+        source = payload.get("native_history_event_id")
+        if type(source) is not int:
+            return bool(states)  # A new lifecycle comment needs its actual producing event.
+        # A phase can leave and return to the same status, including review -> implementation.
+        # Only unattempted generated progress is coalesced; authored checkpoints keep history.
+        return any(event.id > source and event.kind in NATIVE_PHASE_EVENTS
+                   for event in self._binding_adapter(payload["issue_id"]).history(payload["task_id"], source))
     def _conversation_final_type(self, payload: dict, *, lifecycle: bool = False) -> str | None:
         from .native_input import _session_work_live
         native_live = _session_work_live(self, payload["issue_id"], payload["session_id"], strict=True)
