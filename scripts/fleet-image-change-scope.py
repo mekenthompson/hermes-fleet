@@ -34,6 +34,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "release/honcho-requirements.in",
         "release/honcho-requirements.txt",
         "release/honcho-sdk-requirements.txt",
+        "scripts/patch-honcho-gateway-turn-filter.py",
         "scripts/verify-honcho-runtime.py",
         "release/spdx-2.3-schema.json",
         "release/spdx-validation-requirements.txt",

@@ -50,6 +50,11 @@ RUN set -eux; \
     rm -rf "$archive" /tmp/honcho-plugin; \
     test -f /opt/hermes/plugins/memory/honcho/__init__.py; \
     /opt/hermes/.venv/bin/python -c "from pathlib import Path; text=Path('/opt/hermes/plugins/memory/honcho/__init__.py').read_text(); assert 'MemoryProvider' in text or 'register_memory_provider' in text"
+# HF-657: machine-generated gateway turns must never sync as the human's messages.
+COPY scripts/patch-honcho-gateway-turn-filter.py /tmp/patch-honcho-gateway-turn-filter.py
+RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-gateway-turn-filter.py /opt/hermes/plugins/memory/honcho/__init__.py \
+    && /opt/hermes/.venv/bin/python -c "import py_compile; py_compile.compile('/opt/hermes/plugins/memory/honcho/__init__.py', doraise=True)" \
+    && rm -f /tmp/patch-honcho-gateway-turn-filter.py
 COPY package.json package-lock.json /opt/coding-clis/
 RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no-fund \
     && node /opt/coding-clis/node_modules/@anthropic-ai/claude-code/install.cjs \
