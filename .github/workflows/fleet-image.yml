@@ -271,7 +271,7 @@ jobs:
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.103.3"
-          assert metadata.version("honcho-ai") == "2.5.1"
+          assert metadata.version("honcho-ai") == "2.8.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           assert shutil.which("codex")
           assert shutil.which("grok")
@@ -609,7 +609,7 @@ jobs:
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
           assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.103.3"
-          assert metadata.version("honcho-ai") == "2.5.1"
+          assert metadata.version("honcho-ai") == "2.8.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           assert shutil.which("codex")
           assert shutil.which("grok")

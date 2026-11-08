@@ -11,7 +11,7 @@ def main():
     from packaging.requirements import Requirement
     from packaging.markers import default_environment
 
-    assert version('honcho-ai') == '2.5.1'
+    assert version('honcho-ai') == '2.8.0'
     assert callable(honcho.Honcho)
     # The SDK deliberately reuses Agent dependencies: fail on any incompatible
     # requirement rather than upgrading unrelated Agent packages implicitly.
@@ -26,10 +26,10 @@ def main():
         '/opt/honcho-cli/bin/python', '-c',
         "import json; from importlib.metadata import version; print(json.dumps({p:version(p) for p in ['honcho-ai','honcho-cli']}))"
     ], text=True))
-    assert versions == {'honcho-ai': '2.5.1', 'honcho-cli': '0.2.0'}, versions
+    assert versions == {'honcho-ai': '2.8.0', 'honcho-cli': '0.4.0'}, versions
     assert Path('/usr/local/bin/honcho').resolve() == Path('/opt/honcho-cli/bin/honcho')
     subprocess.run(['/usr/local/bin/honcho', '--help'], check=True, capture_output=True, text=True)
-    print('Honcho runtime SDK 2.5.1; CLI 0.2.0 with SDK 2.5.1: passed')
+    print('Honcho runtime SDK 2.8.0; CLI 0.4.0 with SDK 2.8.0: passed')
 
 
 if __name__ == '__main__':
