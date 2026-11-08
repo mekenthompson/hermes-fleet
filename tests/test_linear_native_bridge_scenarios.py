@@ -958,6 +958,98 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertEqual(sum("Review requested" in c["body"] for c in remote.comments), 1)
         self.assertEqual((self.board.get(task_id), self.board.history(task_id, 0)), before)
 
+    def test_issue_review_note_rechecks_native_phase_across_reopen_and_implementation_claim(self):
+        for boundary in ("capture", "restart", "http", "unknown"):
+            with self.subTest(boundary=boundary):
+                clock, remote, reporter, task_id = self.session_reporting_fixture("pm-review-phase-" + boundary)
+                self.native_progress(clock, task_id)
+                reporter.pump_kanban()
+                reporter.flush()
+                checkpoint = "Implementation A was checked; next is independent review."
+                clock.now += 1
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    self.checkpoint(conn, task_id, "worker", checkpoint)
+                    task = self.board.get(task_id)
+                    self.assertTrue(kb.request_review(conn, task_id, summary="Awaiting review of implementation A",
+                                                     reviewer="default", expected_run_id=task.current_run_id))
+                def reopen():
+                    clock.now += 1
+                    with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                        self.assertTrue(kb.reopen_review_task(conn, task_id))
+                        self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="implementation-B"))
+                if boundary == "capture":
+                    reopen()
+                    reporter.pump_kanban()
+                else:
+                    reporter.pump_kanban()
+                notes = [r for r in reporter.store.pending() if r["kind"] == "comment"
+                         and r["payload"].get("body", "").startswith("Review requested:")]
+                if boundary == "capture":
+                    self.assertEqual(notes, [])
+                elif boundary == "http":
+                    create, raced = reporter.api.create_comment, []
+                    def reopen_before_http(*args, **kwargs):
+                        if not raced and args[0] == notes[0]["id"]:
+                            raced.append(True)
+                            reopen()
+                        return create(*args, **kwargs)
+                    with patch.object(reporter.api, "create_comment", side_effect=reopen_before_http):
+                        reporter.flush()
+                    self.assertTrue(raced)
+                else:
+                    self.assertEqual(len(notes), 1)
+                    if boundary == "unknown":
+                        self.deliver_status(reporter)
+                        for prior in reporter.store.pending():
+                            if prior["id"] == notes[0]["id"]:
+                                break
+                            reporter.flush(only_id=prior["id"])
+                        remote.lose_next_response = True
+                        reporter.flush(only_id=notes[0]["id"])
+                        uncertain = reporter.store.outbox_row(notes[0]["id"])
+                        self.assertIs(uncertain["payload"].get("write_started"), True, {"row": uncertain, "history": [(e.id, e.kind) for e in self.board.history(task_id, 0)]})
+                        clock.now = max(clock(), uncertain["next_at"]) + 1
+                    reopen()
+                before = self.board.get(task_id), self.board.history(task_id, 0)
+                restarted = Bridge(Store(reporter.store.path), reporter.api, self.board, profile="default", clock=clock)
+                restarted.recover()
+                restarted.flush()
+                old = [c for c in remote.comments if c["body"].startswith("Review requested:")]
+                self.assertEqual(len(old), int(boundary == "unknown"))
+                if boundary == "unknown":
+                    self.assertEqual(old[0]["id"], notes[0]["id"])
+                    retained = restarted.store.outbox_row(notes[0]["id"])
+                    self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
+                self.assertEqual(sum(c["body"] == checkpoint for c in remote.comments), 1)
+                self.assertEqual(sum(c["body"].startswith("Review reopened:") for c in remote.comments), 1)
+                self.assertEqual((self.board.get(task_id), self.board.history(task_id, 0)), before)
+
+    def test_old_blocker_note_is_omitted_after_resume_and_another_block(self):
+        clock, remote, reporter, task_id = self.session_reporting_fixture("pm-block-phase-cycle")
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        self.halt_reported_task(clock, task_id, "blocked")
+        reporter.pump_kanban()
+        old = [r for r in reporter.store.pending() if r["kind"] == "comment"
+               and r["payload"].get("native_progress_states") == ["blocked"]]
+        self.assertEqual(len(old), 1)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.unblock_task(conn, task_id))
+            resumed = kb.claim_task(conn, task_id, claimer="resumed-implementation")
+            self.assertIsNotNone(resumed)
+            self.assertTrue(kb.block_task(conn, task_id, reason="Please choose Blue or Green", kind="needs_input",
+                                         expected_run_id=resumed.current_run_id))
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        before = self.board.get(task_id), self.board.history(task_id, 0)
+        reporter.recover()
+        reporter.flush()
+        self.assertFalse(any(c["id"] == old[0]["id"] for c in remote.comments))
+        self.assertEqual(reporter.store.outbox_row(old[0]["id"])["payload"].get("applied"), 0)
+        self.assertEqual(sum("Please choose Blue or Green" in c["body"] for c in remote.comments), 1)
+        self.assertEqual((self.board.get(task_id), self.board.history(task_id, 0)), before)
+
     def test_pending_issue_started_comment_is_omitted_after_native_stop(self):
         clock, remote, reporter, task_id = self.session_reporting_fixture("pm-stopped")
         self.native_progress(clock, task_id)
