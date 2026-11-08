@@ -323,7 +323,16 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
                 kind='needs_input', expected_run_id=task.current_run_id))
         await asyncio.to_thread(self.bridge.pump_kanban)
         await asyncio.to_thread(self.bridge.flush)
-        self.assertEqual(self.provider.comment_records, {})
+        self.assertEqual(self.board.get(task.id).status, 'blocked')
+        self.assertEqual(len(self.provider.comment_records), 1)
+        stopped = next(iter(self.provider.comment_records.values()))
+        self.assertEqual(stopped['body'], 'Stopped by requester. It stays stopped until someone asks the agent to resume.')
+        self.assertIsNone(stopped['parent'])
+        self.assertEqual(stopped['user']['id'], self.provider.viewer)
+        self.assertEqual(stopped['issue']['id'], self.ISSUE)
+        with self.bridge.store._tx() as db:
+            reports = [json.loads(row[0]) for row in db.execute('SELECT payload FROM outbox')]
+        self.assertFalse(any(p.get('native_outcome_comment') or p.get('native_outcome_pointer') for p in reports))
         self.assertFalse(any('Completed. The result and checks' in a.get('content', {}).get('body', '')
                              for a in self.provider.activities.values()))
         self.assertFalse(any(r['payload'].get('native_outcome_pointer') for r in self.bridge.store.pending()))
