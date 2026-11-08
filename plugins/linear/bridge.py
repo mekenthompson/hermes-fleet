@@ -4279,6 +4279,8 @@ class Bridge:
                     raise
             if row and self._obsolete_native_progress(row):
                 raise NativeProgressSuperseded
+            if row:
+                self._require_native_session_history_order(row)
             if payload.get("worker_step"):
                 from .worker_progress import current_payload
                 if not current_payload(self, payload):
@@ -4397,6 +4399,8 @@ class Bridge:
                     if changed:
                         # Still before guard yield: this request has made no HTTP call.
                         raise ProjectUpdateDeferred
+                if row:
+                    self._require_native_session_history_order(row)
                 with self._question_publication_guard(payload) if question_reply else nullcontext():
                     if interim_reply and self._conversation_interim_finished(payload):
                         raise LinearError("Linear session already has its final reply", retryable=False)
@@ -4444,6 +4448,37 @@ class Bridge:
             guard.rejected = rejected
         with self.api.guarded_mutation(guard):
             action()
+
+    def _require_native_session_history_order(self, row: dict) -> None:
+        payload = row['payload']
+        if self.store.after_native_session_history(row['kind'], payload):
+            work = self.store.get(payload['issue_id'])
+            if (work and work.get('origin') == 'native' and work.get('owner_ref') == payload['session_id']):
+                # A question can be queued before the reporter catches up. Use the existing
+                # cursor, not outbox row order, so capture after enqueue cannot skip a checkpoint.
+                adapter = self._binding_adapter(payload['issue_id'])
+                claim = self._current_claim(adapter, adapter.require_task(work['task_id']))
+                if claim and any(event.kind == 'checkpoint' for event in
+                       adapter.history(work['task_id'], max(work['last_event_id'], claim.id))):
+                    raise ProjectUpdateDeferred
+            if self.store.unsettled_native_session_history(payload['issue_id'], payload['session_id']):
+                raise ProjectUpdateDeferred
+        elif (row['kind'] == 'activity' and payload.get('native_history') is True
+              and not payload.get('ephemeral') and payload.get('write_started') is False):
+            # An older build may already have shown the question before queuing its note.
+            # Retain that note for after the answer; posting it now would reopen Active.
+            from .worker_progress import current_question
+            try:
+                question = current_question(self, payload)
+            except RateLimited:
+                raise
+            except LinearError:
+                raise ProjectUpdateDeferred from None  # Unreadable state cannot retire retained history.
+            pending = self.store.outbox_row(question['id']) if question else None
+            if pending and (pending['payload'].get('write_started') is True or
+                            pending['state'] == 'sent' and pending['payload'].get('applied') == 1):
+                raise ProjectUpdateDeferred
+
     def _history_receipt_allows(self, payload: dict, issue: dict) -> bool:
         if payload.get("native_history") is not True or (issue.get("state") or {}).get("type") == "canceled":
             return False
