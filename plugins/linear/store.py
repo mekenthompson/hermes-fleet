@@ -944,15 +944,19 @@ class Store:
             "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid", (issue_id, task_id)).fetchall()
         for row in rows:
             prior = json.loads(row["payload"])
+            permanent = prior.get("native_issue_comment") is True
+            if permanent and not prior.get("native_report_content"):
+                continue  # An issue milestone never becomes a disposable session fallback.
             content = prior.get("native_report_content") or {"type": "thought", "body": prior["body"]}
             payload = {key: value for key, value in prior.items() if key not in
-                       ("id", "body", "session_key", "work_owner", "enqueued_at", "native_report_content")}
+                       ("id", "body", "session_key", "work_owner", "enqueued_at", "native_report_content", "native_issue_comment")}
             payload.update(session_id=session_id, content=content, native_report_owner=session_id)
             if not self.enqueue("activity", payload, at=at):
                 raise ValueError("Adopted native progress could not be queued")
             # This transaction also serializes transport admission: an already-attempted
             # identity never qualifies, and an unattempted sender cannot publish after retirement.
-            db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
+            if not permanent:
+                db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
 
     def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str,
                       notice: dict | None = None, at: float | None = None) -> bool:

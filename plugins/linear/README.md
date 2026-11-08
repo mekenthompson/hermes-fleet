@@ -272,7 +272,9 @@ body on retry. Checkpoints are meaningful milestones, not periodic heartbeat mes
 The issue also receives a concise start note and meaningful native review, wait and blocker
 milestones. The session keeps its existing checkpoints, live steps, heartbeats, questions and lifecycle updates.
 Each checkpoint has one regular issue comment and retains its existing session note; retries
-do not create another comment or another session note.
+do not create another comment or another session note. A checkpoint captured before
+a session opens keeps its original issue-comment identity when the session adopts the work;
+adoption does not replay that earlier checkpoint into the new session.
 Unattempted lifecycle comments recheck their native phase before publication; obsolete progress
 is omitted, while authored checkpoints and uncertain sends retain their history and stable IDs.
 Merge and deployment claims require evidence from the worker, never inference from a tool name.

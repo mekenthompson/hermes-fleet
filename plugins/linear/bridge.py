@@ -3428,7 +3428,7 @@ class Bridge:
         def message(kind: str, body: str) -> tuple[str, dict[str, Any]]:
             return "activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "content": {"type": kind, "body": body}, **route}
         def issue_note(body: str, states=None) -> tuple[str, dict[str, Any]]:
-            payload = {"issue_id": issue_id, "body": body, **route}
+            payload = {"issue_id": issue_id, "body": body, "native_issue_comment": True, **route}
             if states is not None:
                 payload.update(native_progress=True, native_progress_states=sorted(states))
             return "comment", payload
@@ -3509,6 +3509,8 @@ class Bridge:
                 else:
                     # Retain the exact native presentation for adoption of a still-unattempted fallback.
                     content = payload.get("content") or {}
+                    if payload.get("native_progress") and content.get("action") == "Started":
+                        payload["native_issue_comment"] = True
                     payload = {**{k: v for k, v in payload.items() if k not in {"content", "session_id"}},
                                "body": _visible_activity(content), "native_report_content": content}
                     kind = "comment"
