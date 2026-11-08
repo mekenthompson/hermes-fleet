@@ -3488,11 +3488,18 @@ class Bridge:
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
             if captured.get(key, 0):
                 captured[key] -= 1; writes = []
-        if (writes and activity and row.get("owner_ref") and event.kind in {
+        if (writes and activity and event.kind in {
                 "blocked", "block_loop_detected", "gave_up", "review_requested", "changes_requested",
                 "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"}
                 and not (event.kind == "blocked" and payload.get("reason") == "initial_status")):
-            writes.append(issue_note(activity["body"], milestone_states))
+            if row.get("owner_ref"):
+                writes.append(issue_note(activity["body"], milestone_states))
+            else:
+                # The activity becomes the issue comment when no session owns reporting.
+                for kind, report in writes:
+                    if kind == "activity":
+                        report.update(native_issue_comment=True, native_progress=True,
+                                      native_progress_states=sorted(milestone_states))
         if ((event.kind in ("blocked", "gave_up") and task_status != "blocked") or
                 (event.kind == "block_loop_detected" and task_status != "triage")): writes = []
         for _, report in writes:
@@ -4277,7 +4284,7 @@ class Bridge:
                 if not current_payload(self, payload):
                     raise NativeProgressSuperseded
             if payload.get("native_history") is True:
-                if payload.get("write_started") is False and row["attempts"] == 0:
+                if payload.get("write_started") is False:
                     work, task = self._native_task(payload["issue_id"])
                     pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
                     if any(event.kind in NATIVE_STATUS_EVENTS for event in pending):
@@ -4378,7 +4385,7 @@ class Bridge:
                 if ((final_reply and self._conversation_final_type(payload) != payload["content"]["type"])
                         or (repair_reply and not self._conversation_repair_current(payload))):
                     raise ProjectUpdateDeferred  # Still before transport; no completion was published.
-                if (prior_started.get("value") is False and row["attempts"] == 0 and
+                if (prior_started.get("value") is False and
                         (payload.get("native_history") is True or payload.get("native_progress") is True)):
                     work, task = self._native_task(payload["issue_id"])
                     pending = self._binding_adapter(payload["issue_id"]).history(task.id, work["last_event_id"])
@@ -4469,9 +4476,10 @@ class Bridge:
         payload = row["payload"]
         # Only our explicitly identified transient native projection is coalesced.
         # User comments, finished-stage summaries and uncertain sends retain history.
+        # A failed preflight read can increment attempts without starting transport.
         if (row["kind"] not in ("activity", "comment") or payload.get("native_progress") is not True or
                 not payload.get("task_id") or payload.get("terminal") or
-                payload.get("write_started") is not False or row["attempts"]):
+                payload.get("write_started") is not False):
             return False
         binding = self.store.get(payload["issue_id"])
         if not binding or binding.get("origin") != "native" or binding.get("task_id") != payload["task_id"]:
