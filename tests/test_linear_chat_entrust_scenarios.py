@@ -571,7 +571,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
         self.assertEqual(self.tasks(), [task_id])
 
-    def test_queued_checkpoint_moves_to_session_atomically_with_adoption_and_restart(self):
+    def test_queued_issue_checkpoint_keeps_identity_during_session_adoption_and_restart(self):
         task_id = self.create(start_work=True)["native"]["task_id"]
         self.flush()
         self.claim(task_id)
@@ -588,18 +588,18 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.profile_home = self.home
         for _ in range(3):
             self.flush()
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
-        checkpoint = [r for r in self.said("echo-session") if r["content"].get("body") == body]
-        self.assertEqual(len(checkpoint), 1)
-        self.assertEqual(checkpoint[0]["content"]["type"], "thought")
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + 1)
+        self.assertEqual(self.issue_comments(NEW_ISSUE).count(body), 1)
+        self.assertFalse(any(r["content"].get("body") == body for r in self.said("echo-session")),
+                         "Adoption does not replay a checkpoint captured before the session existed")
         retained = self.bridge.store.outbox_row(source["id"])
         self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
-        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 0))
+        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
     def test_checkpoint_publication_admitted_before_adoption_keeps_original_identity(self):
         self.check_checkpoint_adoption_at_transport(after_admission=True)
 
-    def test_adoption_before_checkpoint_transport_admission_blocks_old_comment(self):
+    def test_adoption_before_transport_keeps_the_original_issue_checkpoint(self):
         self.check_checkpoint_adoption_at_transport(after_admission=False)
 
     def check_checkpoint_adoption_at_transport(self, *, after_admission):
@@ -632,12 +632,11 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.flush()
         retained = self.bridge.store.outbox_row(source["id"])
         self.assertEqual((retained["kind"], retained["payload"]["body"]), ("comment", body))
-        self.assertIs(retained["payload"]["write_started"], after_admission)
-        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")),
-                         0 if after_admission else 1)
-        if not after_admission:
-            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
-            self.assertEqual(retained["payload"]["applied"], 0)
+        self.assertIs(retained["payload"]["write_started"], True)
+        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 0)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + 1)
+        self.assertEqual(self.issue_comments(NEW_ISSUE).count(body), 1)
+        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
     def test_queued_started_progress_preserves_native_action_when_adopted(self):
         task_id = self.create(start_work=True)["native"]["task_id"]
@@ -655,7 +654,9 @@ class ChatEntrustScenarios(unittest.TestCase):
         for _ in range(3):
             self.flush()
         self.assertEqual(sum(r["content"] == original for r in self.said("echo-session")), 1)
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + 1)
+        retained = self.bridge.store.outbox_row(source["id"])
+        self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
     def test_checkpoint_read_failure_after_admission_routes_after_adoption(self):
         self.check_checkpoint_failure_after_admission(concurrent=False)
@@ -697,12 +698,14 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertFalse(any(r["kind"] == "activity" and r["payload"].get("content", {}).get("body") == body
                                  for r in self.bridge.store.pending(NEW_ISSUE)))
         else:
+            self.bridge.store.defer(source["id"], self.bridge.clock() - 1)
             for _ in range(3):
                 self.flush()
-            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
-            self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 1)
-            self.assertEqual(retained["state"], "sent")
-            self.assertEqual(retained["payload"]["applied"], False)
+            self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + 1)
+            self.assertEqual(self.issue_comments(NEW_ISSUE).count(body), 1)
+            self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 0)
+            retained = self.bridge.store.outbox_row(source["id"])
+            self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
     def test_checkpoint_read_failure_before_transport_still_routes_after_adoption(self):
         self.check_checkpoint_read_failure_adoption(legacy=False, marker=False)
@@ -728,6 +731,7 @@ class ChatEntrustScenarios(unittest.TestCase):
         if legacy:
             payload.pop("native_report_content", None)
             payload.pop("native_report_owner", None)
+            payload.pop("native_issue_comment", None)
         if marker is None:
             payload.pop("write_started")
         self.bridge.store.rewrite(source["id"], payload, source["next_at"])
@@ -749,8 +753,11 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.store.defer(source["id"], self.bridge.clock() - 1)
         for _ in range(3):
             self.flush()
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments)
-        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), 1)
+        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + int(not legacy))
+        self.assertEqual(sum(r["content"].get("body") == body for r in self.said("echo-session")), int(legacy))
+        if not legacy:
+            retained = self.bridge.store.outbox_row(source["id"])
+            self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
     def test_adoption_rechecks_published_old_owner_progress_in_transaction(self):
         self.check_reopened_owner_during_adoption(publication="sent")
