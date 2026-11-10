@@ -9,6 +9,8 @@ from typing import Any
 from .store import Store, advisory
 
 RESOLVE = "Check the issue in Linear, then: hermes linear resolve {id} applied|not_applied --evidence \"<what you saw>\""
+PARKED = ("Fix the logged cause, then: hermes linear replay {id}. If Linear already shows its answer and a replay would "
+          "only repeat it: hermes linear dismiss {id} --evidence \"<what you saw>\"")
 def held(write: dict[str, str], cause: str = "") -> str:
     return (f"An earlier {write['kind']} write ({write['id']}) may or may not have reached Linear{f' ({cause})' if cause else ''}; "
             "it holds this issue until reconciled. " + RESOLVE.format(id=write["id"]) + ".")
@@ -32,16 +34,26 @@ def needs_resolution(row: Any, payload: dict[str, Any]) -> bool:
             (held_legacy or Store.uncertain(row, payload) and
              (row["state"] == "failed" or bool(payload.get("reconcile_required")))))
 
+def _dismissed(db: sqlite3.Connection) -> set[str]:
+    return {row["key"][len(Store.DISMISSED):] for row in
+            _rows(db, "SELECT key FROM metadata WHERE key LIKE ?", Store.DISMISSED + "%")}
+
 def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) -> list[dict[str, Any]]:
     """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
-    now, items = time.time() if now is None else now, []
+    now, items, dismissed = time.time() if now is None else now, [], set()
     def add(issue: str, ref: str, since: float, why: str, action: str, act: bool = False) -> None:
         items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why,
                       "action": action, "act": act})
     if state.is_file():
         with closing(_read(state)) as db:
             has_holds = any(row["name"] == "hold_reason" for row in _rows(db, "PRAGMA table_info(outbox)"))
-            rows = _rows(db, "SELECT * FROM outbox WHERE state != 'sent' ORDER BY rowid")
+            dismissed = _dismissed(db)
+            rows = _rows(db, "SELECT rowid AS seq, * FROM outbox WHERE state != 'sent' ORDER BY rowid")
+            # The newest delegate this app verifiably set on each issue (a receipt or a matching readback).
+            applied = {}
+            for row in _rows(db, "SELECT rowid AS seq, payload FROM outbox WHERE kind = 'delegate' AND state = 'sent'"):
+                sent = json.loads(row["payload"])
+                applied[(sent.get("issue_id"), sent.get("target_delegate_id"))] = row["seq"]
             for row in rows:
                 payload = json.loads(row["payload"])
                 since, issue = float(payload.get("enqueued_at") or row["next_at"]), payload.get("issue_id", "")
@@ -71,6 +83,10 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     late = now - since > 3600  # a send held this long is not settling by itself
                     add(issue, row["id"], since, f"{row['kind']} write is {'held unsent' if late else 'being sent'}; it holds "
                         "this issue", "Check the gateway log for what holds it." if late else "Settles on its next send.", late)
+                elif (row["kind"] == "delegate" and row["state"] == "failed" and not payload.get("reconciliation") and
+                      applied.get((issue, payload.get("target_delegate_id")), -1) > row["seq"] and now - since < 7 * 86_400):
+                    add(issue, row["id"], since, "delegate write was not delivered; a later write already set the same delegate",
+                        "Nothing to do.")
                 elif row["state"] == "failed" and not payload.get("reconciliation") and now - since < 7 * 86_400:
                     add(issue, row["id"], since, f"{row['kind']} write was not delivered",
                         "Retried after the next successful write." if row["attempts"] else "Not retried: redo the step.",
@@ -106,7 +122,7 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     "Inspect the actual native process/effect state. The retired plugin protocol will not retry it.", True)
     if ingress.is_file():
         with closing(_read(ingress)) as db:
-            for row in _rows(db, "SELECT delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
+            for row in _rows(db, "SELECT logical_agent, delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
                              "profile = ? AND (status = 'failed' OR (status = 'pending' AND attempts > 0)) "
                              "ORDER BY received_at", profile):
                 try:
@@ -115,9 +131,14 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 except (ValueError, TypeError, AttributeError):
                     issue = ""
                 parked = row["status"] == "failed"
+                if parked and f"{row['logical_agent']}:{row['delivery_id']}" in dismissed:
+                    add(issue or "", row["delivery_id"], row["received_at"],
+                        f"Linear delivery parked after {row['attempts']} failed attempt(s) was dismissed by an operator; "
+                        "its history is retained", "Use a new authorized request for any further change.")
+                    continue
                 add(issue or "", row["delivery_id"], row["received_at"],
                     f"Linear delivery {'parked' if parked else 'retrying'} after {row['attempts']} failed attempt(s)",
-                    f"Fix the logged cause, then: hermes linear replay {row['delivery_id']}" if parked
+                    PARKED.format(id=row["delivery_id"]) if parked
                     else "Backing off; a restart retries it at once.", parked)
     return sorted(items, key=lambda item: -item["age_s"])
 
@@ -130,13 +151,37 @@ def report(items: list[dict[str, Any]]) -> str:
                   f"{item['why']}", f"  {item['action']}"]
     return "\n".join(lines)
 
-def replay(ingress: Path, profile: str, delivery_id: str) -> bool:
-    """Give a parked delivery one more try; if it fails again it parks again, without a second alert."""
+def _parked(ingress: Path, profile: str, delivery_id: str) -> str:
+    """The inbox marker of this profile's parked delivery, or empty."""
     if not ingress.is_file():
+        return ""
+    with closing(_read(ingress)) as db:
+        row = db.execute("SELECT logical_agent FROM deliveries WHERE profile = ? AND delivery_id = ? AND status = 'failed'",
+                         (profile, delivery_id)).fetchone()
+    return f"{row['logical_agent']}:{delivery_id}" if row else ""
+
+def _was_dismissed(state: Path | None, marker: str) -> bool:
+    if not marker or state is None or not state.is_file():
+        return False
+    with closing(_read(state)) as db:
+        return marker in _dismissed(db)
+
+def replay(ingress: Path, profile: str, delivery_id: str, state: Path | None = None) -> bool:
+    """Give a parked delivery one more try; if it fails again it parks again, without a second alert.
+
+    A delivery an operator dismissed stays dismissed: replaying it would repeat its answered effect."""
+    if not ingress.is_file() or _was_dismissed(state, _parked(ingress, profile, delivery_id)):
         return False
     with closing(sqlite3.connect(ingress, timeout=10, isolation_level=None)) as db:
         return bool(db.execute("UPDATE deliveries SET status = 'pending', attempts = 0 WHERE profile = ? AND "
                                "delivery_id = ? AND status = 'failed'", (profile, delivery_id)).rowcount)
+
+def dismiss(state: Path, ingress: Path, profile: str, delivery_id: str, evidence: str, at: float | None = None) -> bool:
+    """Record that a parked delivery needs no replay (Linear already shows its answer) and retire its pending notice.
+
+    The inbox row is read, never changed; the record and the retired notice live in this profile's state."""
+    marker = _parked(ingress, profile, delivery_id)
+    return bool(marker) and Store(state).dismiss_parked(marker, evidence=evidence, at=time.time() if at is None else at)
 
 def setup(parser: Any) -> None:
     sub = parser.add_subparsers(dest="linear_command", required=True)
@@ -146,6 +191,9 @@ def setup(parser: Any) -> None:
     resolve.add_argument("outcome", choices=("applied", "not_applied"))
     resolve.add_argument("--evidence", required=True, help="What you checked in Linear")
     sub.add_parser("replay", help="Retry one parked Linear delivery").add_argument("delivery_id")
+    dismiss_cmd = sub.add_parser("dismiss", help="Record that one parked Linear delivery needs no replay and retire its notice")
+    dismiss_cmd.add_argument("delivery_id")
+    dismiss_cmd.add_argument("--evidence", required=True, help="What you checked in Linear")
     inspect_origin = sub.add_parser("inspect-origin", help="Inspect one current native origin inside its owning profile; grants no permissions")
     inspect_origin.add_argument("--reference-json", required=True, help="Complete origin_reference result's reference object")
     inspect_work = sub.add_parser("inspect-work", help="Inspect current dispatcher-owned work; original requester unknown, grants no permissions")
@@ -220,7 +268,12 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         print(f"Recorded {args.outcome} for {args.row_id}; retained execution history will not be replayed." if done else
               f"{args.row_id} does not need resolving now; see: hermes linear status")
         return 0 if done else 1
-    done = replay(ingress, profile, args.delivery_id)
+    if args.linear_command == "dismiss":
+        done = bool(args.evidence.strip()) and dismiss(state, ingress, profile, args.delivery_id, args.evidence)
+        print(f"Dismissed {args.delivery_id}; its history is kept and it will not be replayed." if done else
+              f"{args.delivery_id} is not a parked delivery for profile {profile} that needs dismissing; see: hermes linear status")
+        return 0 if done else 1
+    done = replay(ingress, profile, args.delivery_id, state)
     print(f"Delivery {args.delivery_id} will be retried on the next tick." if done else
           f"{args.delivery_id} is not a parked delivery for profile {profile}; see: hermes linear status")
     return 0 if done else 1

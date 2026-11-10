@@ -78,6 +78,7 @@ REASONS = frozenset({
     # session / claim / handoff
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
     "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
+    "closed_or_elsewhere",
     # chat entrust / record_done
     "record_done_parked", "not_started", "delegated_elsewhere", "contract_mismatch",
     # delegation admission before the model turn (native_input.admit_delegation)

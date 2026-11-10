@@ -110,7 +110,9 @@ class DurableCloseoutTests(unittest.TestCase):
             self.assertEqual(store.outbox_row(ack_id)['state'], 'sent')
             kanban = FakeKanban()
             bridge = Bridge(store, authority.api(), kanban, profile='synthetic', clock=lambda: 10)
-            self.assertFalse(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            # A refusal is a handled delivery (no retry), never a start.
+            self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+            self.assertIsNone(store.get(ISSUE))
             self.assertEqual(kanban.creates, [])
 
     def test_unverified_legacy_ack_never_reaches_mutation_boundary(self):
@@ -284,7 +286,10 @@ class DurableCloseoutTests(unittest.TestCase):
                     authority.issues[ISSUE]['completedAt'] = '2026-01-01T00:00:02Z'
                 store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
                 bridge = Bridge(store, authority.api(), kanban, profile='synthetic', clock=lambda: 10)
-                self.assertFalse(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+                # A refusal is a handled delivery: answered once, never retried, never a start.
+                self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+                self.assertTrue(bridge._start({}, authority.issues[ISSUE], SESSION, 1, 'synthetic-start'))
+                self.assertIsNone(store.get(ISSUE))
                 self.assertEqual(kanban.creates, [])
                 [reply] = [r for r in store.pending(ISSUE) if r['kind'] == 'activity']
                 self.assertEqual(reply['payload']['content']['type'], 'response')

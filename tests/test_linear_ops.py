@@ -109,6 +109,79 @@ class LinearOperatorTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("pending", 0))
         self.assertEqual(self.cli("replay", "parked-1")[0], 1)
 
+    def park(self, delivery, issue, attempts=104):
+        route = Route("default", "default", "/webhook/default", self.home / "unused", self.inbox)
+        event = {"type": "AgentSessionEvent", "action": "created", "agentSession": {"issue": {"id": issue}}}
+        IngressStore(self.inbox).enqueue(route, delivery, json.dumps(event).encode())
+        with closing(sqlite3.connect(self.inbox)) as db, db:
+            db.execute("UPDATE deliveries SET status = 'failed', attempts = ? WHERE delivery_id = ?", (attempts, delivery))
+        notice = self.store.enqueue_once("comment", {"issue_id": issue, "body": "Set aside; retry it."},
+                                         f"default:{delivery}", at=100)
+        self.store.delivery_allowed(notice)  # the gateway holds a notice for an issue with no task link
+        return notice
+
+    def inbox_rows(self):
+        with closing(sqlite3.connect(self.inbox)) as db:
+            return db.execute("SELECT delivery_id, payload, status, attempts FROM deliveries ORDER BY delivery_id").fetchall()
+
+    def test_parked_delivery_and_its_held_notice_are_dismissed_by_command_with_history_kept(self):
+        notice = self.park("parked-9", "issue-9")
+        before = self.inbox_rows()
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=200)}
+        self.assertTrue(items["parked-9"]["act"] and items[notice]["act"])
+        self.assertIn("hermes linear dismiss parked-9", items["parked-9"]["action"])
+        with self.assertRaises(SystemExit):  # evidence is required
+            self.cli("dismiss", "parked-9")
+        code, text = self.cli("dismiss", "parked-9", "--evidence", "Refusal already shown on the issue")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.cli("status")[0], 0)  # nothing needs an operator now
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=200)}
+        self.assertFalse(items["parked-9"]["act"])
+        self.assertFalse(items[notice]["act"])
+        self.assertEqual(self.inbox_rows(), before)  # the original delivery is kept untouched
+        saved = self.store.outbox_row(notice)
+        self.assertNotEqual(saved["state"], "sent")
+        self.assertEqual(saved["payload"]["body"], "Set aside; retry it.")
+        self.assertEqual(saved["payload"]["reconciliation"]["outcome"], "dismissed")
+        self.assertEqual(saved["payload"]["reconciliation"]["evidence"], "Refusal already shown on the issue")
+        self.assertEqual(self.store.due(10**12), [])  # the notice never posts
+        self.assertEqual(self.cli("replay", "parked-9")[0], 1)  # a dismissed refusal is not replayed
+        self.assertEqual(self.inbox_rows(), before)
+        self.assertEqual(self.cli("dismiss", "parked-9", "--evidence", "again")[0], 1)  # recorded once
+
+    def test_only_a_parked_delivery_of_this_profile_can_be_dismissed(self):
+        self.park("retrying-1", "issue-10", attempts=3)
+        with closing(sqlite3.connect(self.inbox)) as db, db:
+            db.execute("UPDATE deliveries SET status = 'pending' WHERE delivery_id = 'retrying-1'")
+        self.assertEqual(self.cli("dismiss", "retrying-1", "--evidence", "x")[0], 1)
+        self.assertEqual(self.cli("dismiss", "missing", "--evidence", "x")[0], 1)
+        self.park("parked-11", "issue-11")
+        self.assertFalse(ops.dismiss(self.state, self.inbox, "worker-a", "parked-11", "x"))
+        self.assertTrue(next(i for i in ops.stuck(self.state, self.inbox, "default") if i["ref"] == "parked-11")["act"])
+
+    def delegate(self, issue, target, *, state, receipt=False):
+        self.store.bind_native(issue, f"native-{issue}", "default", "default", at=0)
+        row = self.store.enqueue("delegate", {"id": str(uuid.uuid4()), "issue_id": issue, "content_action": True,
+                                              "delegate_routing_version": 1, "write_started": False,
+                                              "target_delegate_id": target, "task_id": f"native-{issue}"}, at=100)
+        if receipt:
+            saved = self.store.outbox_row(row)
+            self.store.rewrite(row, {**saved["payload"], "delegate_receipt": {"issue_id": issue, "delegate_id": target,
+                                                                              "updated_at": "2026-01-01T00:00:00Z"}}, 100)
+        self.store.mark(row, state)
+        return row
+
+    def test_refused_delegate_write_superseded_by_an_applied_one_needs_no_operator(self):
+        stale = self.delegate("issue-12", "app-1", state="failed")
+        self.delegate("issue-12", "app-1", state="sent", receipt=True)
+        other = self.delegate("issue-13", "app-1", state="failed")
+        self.delegate("issue-13", "app-2", state="sent", receipt=True)  # a different delegate does not settle it
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=200)}
+        self.assertFalse(items[stale]["act"])
+        self.assertIn("already", items[stale]["why"])
+        self.assertTrue(items[other]["act"])
+        self.assertIn("redo the step", items[other]["action"])
+
     def test_fences_and_undelivered_writes_explain_the_next_step(self):
         self.store.fence_scope("issue-3", "requester outside scope", at=50)
         refused = self.store.enqueue("comment", {"issue_id": "issue-4", "body": "evidence", "content_action": True, "unlinked_content": True}, at=100)
