@@ -724,9 +724,14 @@ The local outbox preserves UUIDs and uncertain external effects. Use the profile
 hermes linear status
 hermes linear resolve <row> applied|not_applied --evidence "verified remote outcome"
 hermes linear replay <delivery>
+hermes linear dismiss <delivery> --evidence "Linear already shows its answer"
 ```
 
-Resolution records inspected evidence; it does not mutate Linear. Do not infer cancellation or
+Resolution records inspected evidence; it does not mutate Linear. `dismiss` is for a parked
+delivery whose replay would only repeat an answer Linear already shows, such as a refusal: it
+records the evidence, keeps the inbox row unchanged, retires that delivery's unsent operator
+notice, and later blocks `replay` of it. A refusal to start is a final answer, so its delivery
+is consumed and a retried delivery never posts the same refusal twice. Do not infer cancellation or
 successful completion from a workflow label, an old comment or a lost response.
 
 ## Validation

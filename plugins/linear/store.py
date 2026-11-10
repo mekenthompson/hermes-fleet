@@ -578,6 +578,27 @@ class Store:
                                row["kind"] == "delegate" and outcome == "applied") else "failed"
             db.execute("UPDATE outbox SET payload=?, state=? WHERE id=?", (json.dumps(payload), state, row_id))
             return True
+    DISMISSED = "dismissed-delivery:"
+    def dismiss_parked(self, marker: str, *, evidence: str, at: float) -> bool:
+        """Record an operator's dismissal of one parked inbox delivery and retire its unsent notice.
+
+        Nothing is deleted or replayed: the inbox row stays as it is, and the notice keeps its body
+        with the recorded evidence. A notice whose send already started is left for resolution."""
+        if not marker or not evidence.strip():
+            raise ValueError("dismissal requires the parked delivery and the evidence checked")
+        record = {"outcome": "dismissed", "evidence": evidence.strip(), "at": at}
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM metadata WHERE key=?", (self.DISMISSED + marker,)).fetchone():
+                return False
+            db.execute("INSERT INTO metadata (key, value) VALUES (?, ?)", (self.DISMISSED + marker, json.dumps(record)))
+            for row in db.execute("SELECT id, payload FROM outbox WHERE state != 'sent' AND "
+                                  "json_extract(payload, '$.parked_delivery') = ?", (marker,)).fetchall():
+                payload = json.loads(row["payload"])
+                if payload.get("reconciliation") or payload.get("write_started"):
+                    continue
+                payload.update(reconciliation=record, reconcile_required=True, reported=1)
+                db.execute("UPDATE outbox SET payload=?, state='failed' WHERE id=?", (json.dumps(payload), row["id"]))
+            return True
     @staticmethod
     def _targets(payload: dict[str, Any]) -> set[str]:
         return {ident for ident in (payload.get("owner_issue_id"), payload.get("resolve"),

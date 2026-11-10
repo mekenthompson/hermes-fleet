@@ -121,7 +121,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.route = Route("agent", "default", "/unused", self.home / "unused-secret", self.home)
 
     # -- helpers ---------------------------------------------------------
-    def session_event(self, session_id, *, creator=USER, comment=None, action="created"):
+    def session_event(self, session_id, *, creator: str | None = USER, comment=None, action="created"):
         self.authority.sessions[session_id] = {"id": session_id, "issue": {"id": ISSUE},
                                                "creator": creator and {"id": creator}, "appUser": {"id": VIEWER}}
         stamp = time.time()
@@ -337,6 +337,29 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.turns, [])
         self.assertEqual(self.inbox_status(delivery), "imported")
         self.assertEqual(self.said("session-1")[-1], "Not starting: this issue is closed or assigned elsewhere.")
+
+    async def test_refused_creatorless_delegation_is_answered_once_and_not_retried(self):
+        # A refusal is a final answer: the delivery is consumed, not retried every 15 minutes
+        # for a day with another refusal each time.
+        self.authority.issues[ISSUE]["delegate"] = {"id": "another-agent"}
+        delivery = await self.ingest(self.session_event("session-2", creator=None), "refused-creatorless")
+        self.assertEqual(self.inbox_status(delivery), "imported")
+        self.assertEqual(self.tasks(), [])
+        self.assertEqual(self.turns, [])
+        self.assertEqual(self.said("session-2"), ["Not starting: this issue is closed or assigned elsewhere."])
+
+    async def test_failure_after_a_refusal_retries_without_posting_it_again(self):
+        self.authority.issues[ISSUE]["delegate"] = {"id": "another-agent"}
+        event = self.session_event("session-2", creator=None)
+        with patch.object(native_input.InboxDelivery, "acknowledge",
+                          side_effect=native_input.LinearError("finite inbox write failure")):
+            for _ in range(3):  # the same delivery, retried after a later step failed
+                with self.assertRaises(native_input.LinearError):
+                    await self.ingest(event, "refused-then-failed")
+                self.bridge.flush()
+        await self.ingest(event, "refused-then-failed")
+        self.assertEqual(self.inbox_status("refused-then-failed"), "imported")
+        self.assertEqual(self.said("session-2"), ["Not starting: this issue is closed or assigned elsewhere."])
 
     async def test_issue_delegated_to_this_app_logs_that_a_session_is_awaited(self):
         # HF-613: Linear sent the Issue create (delegate = this app) but never the Agent Session.

@@ -1867,8 +1867,9 @@ class Bridge:
         fresh = self._effect_issue(issue_id)
         me = self.api.viewer_id()
         if not me or (fresh.get("delegate") or {}).get("id") != me or (fresh.get("state") or {}).get("type") in CLOSED:
-            self._decline(issue_id, session_id, "Not starting: this issue is closed or assigned elsewhere.")
-            return False
+            # A final answer: the delivery is consumed, and a retry after a later failure posts it only once.
+            self._decline(issue_id, session_id, "Not starting: this issue is closed or assigned elsewhere.", activity_id=session_id)
+            return diag.because("closed_or_elsewhere", True, "refused")
         if not getattr(self.kanban, "executor_profile", None):
             raise LinearError("Native executor profile is unverified", retryable=False)
         # An interrupted creation belongs to its saved request, including its
@@ -1877,24 +1878,24 @@ class Bridge:
             try:
                 existing = self.kanban.discover(fresh)
             except LinearError as exc:
-                self._decline(issue_id, session_id, str(exc))
+                self._decline(issue_id, session_id, str(exc), activity_id=session_id)
                 return False
             if existing:
                 if len(existing) != 1:
-                    self._decline(issue_id, session_id, "More than one task already points at this issue, so no new one was started. An operator needs to decide which one continues.")
+                    self._decline(issue_id, session_id, "More than one task already points at this issue, so no new one was started. An operator needs to decide which one continues.", activity_id=session_id)
                     return False
                 adapter, task = existing[0]
                 try:
                     require_task_issue_scope(task, fresh)
                 except LinearError as exc:
-                    self._decline(issue_id, session_id, str(exc))
+                    self._decline(issue_id, session_id, str(exc), activity_id=session_id)
                     return False
                 if not task_issue_link(task, fresh):
                     message = "Native issue retry key collides with work without a verified issue link; inspect before binding or creating replacement work"
-                    self._decline(issue_id, session_id, message)
+                    self._decline(issue_id, session_id, message, activity_id=session_id)
                     raise LinearError(message, retryable=False)
                 if task.assignee != adapter.executor_profile:
-                    self._decline(issue_id, session_id, "Another agent already has work on this issue, so no new task was started. That work needs to finish or be handed over first.")
+                    self._decline(issue_id, session_id, "Another agent already has work on this issue, so no new task was started. That work needs to finish or be handed over first.", activity_id=session_id)
                     return False
                 if getattr(adapter, "history_only", False) or task.status == "archived":
                     completed = any(event.kind == "completed" for event in adapter.history(task.id, 0))
@@ -1909,11 +1910,11 @@ class Bridge:
                         (current.get("state") or {}).get("type") in CLOSED):
                     return False
                 if not task_issue_link(task, current):
-                    self._decline(issue_id, session_id, "The existing task changed while the agent was checking it, so nothing new was started. Please try again in a moment.")
+                    self._decline(issue_id, session_id, "The existing task changed while the agent was checking it, so nothing new was started. Please try again in a moment.", activity_id=session_id)
                     return False
                 contract = self.contracts.get((current.get("project") or {}).get("id"))
                 if contract and (task.completion_contract or "local-only") != contract:
-                    self._decline(issue_id, session_id, "Existing work on this issue was set up with a different definition of done, so nothing new was started and nothing was stopped. An operator needs to line the two up.")
+                    self._decline(issue_id, session_id, "Existing work on this issue was set up with a different definition of done, so nothing new was started and nothing was stopped. An operator needs to line the two up.", activity_id=session_id)
                     return False
                 if not self.store.bind_native(issue_id, task.id, adapter.executor_profile,
                         adapter.board or "default", owner_ref=session_id,
@@ -1952,7 +1953,7 @@ class Bridge:
                 unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
                 if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
                     self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "A newer Stop preceded native creation"})
-                    self._decline(issue_id, session_id, "Not started: a Stop came in while the task was being set up. Ask the agent to resume when ready.")
+                    self._decline(issue_id, session_id, "Not started: a Stop came in while the task was being set up. Ask the agent to resume when ready.", activity_id=session_id)
                     return False
                 current = self._effect_issue(issue_id)
                 if (current.get("delegate") or {}).get("id") != me or (current.get("state") or {}).get("type") in CLOSED:
@@ -1967,7 +1968,7 @@ class Bridge:
             tasks = self.kanban.find_created(key)
             if len(tasks) != 1:
                 self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native create outcome is ambiguous"})
-                self._decline(issue_id, session_id, "It isn't clear whether the task was created, so the agent won't try again on its own. An operator needs to check the agent's board.")
+                self._decline(issue_id, session_id, "It isn't clear whether the task was created, so the agent won't try again on its own. An operator needs to check the agent's board.", activity_id=session_id)
                 return False
             task = tasks[0]
         task = self.kanban.require_task(task.id)
@@ -1988,7 +1989,7 @@ class Bridge:
             return True  # Its actual Core input must commit before the initial guarded activation.
         unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
         if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
-            self._decline(issue_id, session_id, "Stop arrived while the task was being created, so it was created paused. Nothing runs until someone asks the agent to resume.")
+            self._decline(issue_id, session_id, "Stop arrived while the task was being created, so it was created paused. Nothing runs until someone asks the agent to resume.", activity_id=session_id)
         else:
             self.activity(issue_id, session_id, "thought", "Task created but not started yet. It starts once the agent's board activates it; no worker is running.")
         return True
