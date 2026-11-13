@@ -1,23 +1,23 @@
 ARG AGENT_IMAGE
-ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438
+ARG ONEPASSWORD_CLI_IMAGE=docker.io/1password/op@sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93
 FROM ${ONEPASSWORD_CLI_IMAGE} AS onepassword_cli
 FROM ${AGENT_IMAGE}
 
 USER root
 
-ARG GH_VERSION=2.103.3
-ARG GH_LINUX_AMD64_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
-ARG GH_LINUX_AMD64_ASSET_ID=679195621
-ARG CLAUDE_CODE_VERSION=2.1.322
-ARG CLAUDE_AGENT_ACP_VERSION=0.105.0
-ARG CODEX_VERSION=0.166.0
-ARG GROK_VERSION=1.0.70
+ARG GH_VERSION=2.104.0
+ARG GH_LINUX_AMD64_SHA256=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+ARG GH_LINUX_AMD64_ASSET_ID=740718892
+ARG CLAUDE_CODE_VERSION=2.1.323
+ARG CLAUDE_AGENT_ACP_VERSION=0.106.0
+ARG CODEX_VERSION=0.167.2
+ARG GROK_VERSION=1.0.77
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
 ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
 ENV DISABLE_AUTOUPDATER=1
 
 COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op
-RUN test "$(/usr/local/bin/op --version)" = "2.41.1"
+RUN test "$(/usr/local/bin/op --version)" = "2.42.0"
 # Same pinned archive by two official GitHub routes: the REST asset API and the
 # release download URL, which returned HTTP 503/504 for long stretches on
 # 2026-11-08. CI passes its workflow token as the optional BuildKit secret
@@ -60,22 +60,22 @@ COPY release/honcho-sdk-requirements.txt release/honcho-requirements.txt /tmp/ho
 RUN cd /opt/hermes \
     && UV="$(python3 -c 'import json; facts=json.load(open("/opt/hermes/tools/facts.json")); print("/opt/hermes/tools/"+facts["packages"]["uv"]["entry"]+"/uv")')" \
     && test -x "$UV" \
-    && "$UV" pip install --exclude-newer 2026-11-01T00:00:00Z --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-11-13T00:00:00Z --python /opt/hermes/.venv/bin/python --no-deps --require-hashes -r /tmp/honcho-locks/honcho-sdk-requirements.txt \
     && "$UV" venv --python /opt/hermes/.venv/bin/python /opt/honcho-cli \
-    && "$UV" pip install --exclude-newer 2026-11-01T00:00:00Z --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
+    && "$UV" pip install --exclude-newer 2026-11-13T00:00:00Z --python /opt/honcho-cli/bin/python --require-hashes -r /tmp/honcho-locks/honcho-requirements.txt \
     && ln -s /opt/honcho-cli/bin/honcho /usr/local/bin/honcho \
     && rm -rf /tmp/honcho-locks
 COPY --chmod=0755 scripts/verify-honcho-runtime.py /opt/hermes-fleet/bin/verify-honcho-runtime.py
 RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-runtime.py
 RUN set -eux; \
-    sha=f014a64306bac21f233f51a8e5cddf94a704f62d; \
+    sha=5c7d24b32d275bce38daedbe81feaebc31393587; \
     archive=/tmp/honcho-plugin.tar.gz; \
     curl -fsSL --retry 3 "https://github.com/plastic-labs/honcho/archive/${sha}.tar.gz" -o "$archive"; \
-    printf '%s  %s\n' "8694fbf31c8a158eb85d10c12fb161059d787421ee644848d492aa11cf4b12c0" "$archive" | sha256sum -c -; \
+    printf '%s  %s\n' "62193f2f98d8ae53b4fd7aab4162d312a918f27cdb214b1d7146884812c7b2d0" "$archive" | sha256sum -c -; \
     mkdir -p /tmp/honcho-plugin /opt/hermes/plugins/memory/honcho; \
     tar -xzf "$archive" -C /tmp/honcho-plugin; \
     cp -a "/tmp/honcho-plugin/honcho-${sha}/hermes-plugin-honcho/." /opt/hermes/plugins/memory/honcho/; \
-    rm -rf "$archive" /tmp/honcho-plugin; \
+    rm -rf "$archive" /tmp/honcho-plugin /opt/hermes/plugins/memory/honcho/tests; \
     test -f /opt/hermes/plugins/memory/honcho/__init__.py; \
     /opt/hermes/.venv/bin/python -c "from pathlib import Path; text=Path('/opt/hermes/plugins/memory/honcho/__init__.py').read_text(); assert 'MemoryProvider' in text or 'register_memory_provider' in text"
 # HF-657: machine-generated gateway turns must never sync as the human's messages.
@@ -83,6 +83,9 @@ COPY scripts/patch-honcho-gateway-turn-filter.py /tmp/patch-honcho-gateway-turn-
 RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-gateway-turn-filter.py /opt/hermes/plugins/memory/honcho/__init__.py \
     && /opt/hermes/.venv/bin/python -c "import py_compile; py_compile.compile('/opt/hermes/plugins/memory/honcho/__init__.py', doraise=True)" \
     && rm -f /tmp/patch-honcho-gateway-turn-filter.py
+# The plugin imports Agent core modules at load time; fail the bake if the parent Agent lacks one.
+COPY --chmod=0755 scripts/verify-honcho-plugin-core-seams.py /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py
+RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py /opt/hermes/plugins/memory/honcho /opt/hermes
 COPY package.json package-lock.json /opt/coding-clis/
 RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no-fund \
     && node /opt/coding-clis/node_modules/@anthropic-ai/claude-code/install.cjs \

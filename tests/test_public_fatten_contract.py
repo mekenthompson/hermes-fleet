@@ -13,14 +13,14 @@ PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
 SCOPE = ROOT / "scripts" / "fleet-image-change-scope.py"
 VERIFY = ROOT / "scripts" / "verify-public-tree.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "fleet-image.yml"
-GH_VERSION = "2.103.3"
+GH_VERSION = "2.104.0"
 GH_LINUX_AMD64_SHA256 = (
-    "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d"
+    "98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e"
 )
-HONCHO_AI_VERSION = "2.8.0"
+HONCHO_AI_VERSION = "2.9.0"
 EXTRA_CLIS = {
-    "@openai/codex": "0.166.0",
-    "@xai-official/grok": "1.0.70",
+    "@openai/codex": "0.167.2",
+    "@xai-official/grok": "1.0.77",
     "opencode-ai": "1.19.5",
 }
 
@@ -42,7 +42,7 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertIn("curl -fsSL", text)
         # REST asset API first, release URL second; the pinned sha256 decides whether the
         # API route counts and is checked again unconditionally after either route.
-        self.assertIn("ARG GH_LINUX_AMD64_ASSET_ID=679195621", text)
+        self.assertIn("ARG GH_LINUX_AMD64_ASSET_ID=740718892", text)
         self.assertIn("https://api.github.com/repos/cli/cli/releases/assets/${GH_LINUX_AMD64_ASSET_ID}", text)
         self.assertLess(text.index("api.github.com/repos/cli/cli"), text.index("github.com/cli/cli/releases/download"))
         self.assertEqual(text.count('"${GH_LINUX_AMD64_SHA256}" "/tmp/${archive}" | sha256sum -c -'), 2)
@@ -75,8 +75,8 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertIn("--no-deps --require-hashes", text)
         self.assertNotIn("\n    && uv export ", text)
         self.assertIn("verify-honcho-runtime.py", text)
-        self.assertIn("f014a64306bac21f233f51a8e5cddf94a704f62d", text)
-        self.assertIn("8694fbf31c8a158eb85d10c12fb161059d787421ee644848d492aa11cf4b12c0", text)
+        self.assertIn("5c7d24b32d275bce38daedbe81feaebc31393587", text)
+        self.assertIn("62193f2f98d8ae53b4fd7aab4162d312a918f27cdb214b1d7146884812c7b2d0", text)
         self.assertIn("/opt/hermes/plugins/memory/honcho", text)
         lowered = text.lower()
         for token in ("workspace_id", "switchroom", "kenthompson.com.au"):
