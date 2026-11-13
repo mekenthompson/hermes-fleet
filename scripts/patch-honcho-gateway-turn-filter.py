@@ -7,6 +7,11 @@ internal-notification turns were synced as the human's messages. This script
 replaces the plugin's regex and ``_is_internal_gateway_turn`` with the version
 below. It fails closed when the pinned plugin no longer has the expected block.
 
+Upstream (plastic-labs/honcho 18fe5dd1) later added its own ``[Group chat:`` /
+``[Discussion:`` harness alternative to the same regex. The replacement block keeps
+that alternative, so the result is a strict superset of both upstream's filter and
+the HF-657 wrapper set; the Bot Mode / hosted-room harness turn is dropped whole.
+
 No structural signal exists: the gateway injects these as plain role=user text
 and ``MemoryManager.sync_all`` forwards only ``turn_author`` (None for them), so
 detection is textual and start/end anchored. A human message that merely quotes
@@ -28,6 +33,7 @@ NEW_BLOCK = r'''_INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"\[Heartbeat\s*[\u2014\u2013-]\s*recurring instruction[^\]]*\]|"
     r"\[IMPORTANT: Background process \S+ (?:matched watch pattern|completed|exited|finished|failed|was killed)[^\n]*|"
     r"\[System: Continue now\.[^\]]*\]|"
+    r"\[(?:Group chat|Discussion):|"
     r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
     r"A background subagent you dispatched earlier has finished\."
     r")",

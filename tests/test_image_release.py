@@ -27,17 +27,17 @@ AGENT_DIGEST = _AGENT_MANIFEST_DATA["digest"]
 AGENT_REF = f"{AGENT_REPOSITORY}@{AGENT_DIGEST}"
 ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
-    "sha256:57c55add3f9c879a2002914634728dc194eeb01783203b6d1229630a5b6cf438"
+    "sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93"
 )
-CLAUDE_CODE_VERSION = "2.1.322"
-CLAUDE_CODE_INTEGRITY = "sha512-oP7oW4vM5DREWfL1jn4JSGlmLcrJ5QmppgADrVNJBUPiC1mQ5YvRrke0on+YZ/3QhKIaCJtdr6jPvehcAQIHLQ=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-0DoaNAXLWCYYIGachWBCkTUsS8dOOgvk4R2fFKdrLejO9XlRTwaWUMD9ONdDmv0csdpwxj4qLUN6zWMaG2Sz6g=="
-CODEX_VERSION = "0.166.0"
-CODEX_INTEGRITY = "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q=="
-GROK_VERSION = "1.0.70"
-GROK_INTEGRITY = "sha512-Q2Ncoez//mk1Z9CNhgvp9eAYfZJZmshDAPxs0XAhhGnilH3abGAyTwqOSvqVnsFCUjjzT9TCYZIgAH2A2XL6CQ=="
-CLAUDE_AGENT_ACP_VERSION = "0.105.0"
-CLAUDE_AGENT_ACP_INTEGRITY = "sha512-D5OS0g+9IdwJHJEnX0MURUHZh+zeMNguFVDIQBqheNACktmjiK2WbWQJ4hF4qot9gZelXP+OJ02PKJaQ4iXWtw=="
+CLAUDE_CODE_VERSION = "2.1.323"
+CLAUDE_CODE_INTEGRITY = "sha512-6YjP5aY9xKZfYsYOoUDZ/AKNbPCSOnjMvSI2vdfoBjBN5adCeQIZ3u/QkEFK21Z0PMdssQWOyw75a1IeS0B65g=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-cUAH9W7KrcfM5v7hWjvv1rurvAAgvOe+BVfOlk17sXH3Vqh9V+tVj0WZin6RiJ8MiZ7RpEtVfaVKPcgrY3x6Vw=="
+CODEX_VERSION = "0.167.2"
+CODEX_INTEGRITY = "sha512-6OFkr2ndzTdFb32OEiUlM9BgpeY8+wnMe8vRhuvt+22TnxVR39KnJ22Ghay98IY9OmEltoNgFN4GALUkxFQCOw=="
+GROK_VERSION = "1.0.77"
+GROK_INTEGRITY = "sha512-zNGi+PGXR/cxL3URtxEIHX91Lm06jOb28ra98FWEO9keIJOO83Pr67rpmLtwufp7A51NvMM4Nm0Kh77/9l9rQg=="
+CLAUDE_AGENT_ACP_VERSION = "0.106.0"
+CLAUDE_AGENT_ACP_INTEGRITY = "sha512-jfwcUc7J+KTIOqsPPSDzCgh4WI+QgvbPEACPtibMV1e41spmsR2Wb5xEeO1lh0el/kLxi7nF3zqZ1RYpdoVw7Q=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
 CLAUDE_ACP_PLUGIN_REVISION = "0526610a3945cc376ac517b63ca358a5b838a2fc"
 
@@ -121,7 +121,7 @@ class FleetImageReleaseTests(unittest.TestCase):
         for token in (
             f"ARG ONEPASSWORD_CLI_IMAGE={ONEPASSWORD_CLI_IMAGE}",
             "COPY --from=onepassword_cli --chmod=0755 /usr/local/bin/op /usr/local/bin/op",
-            'test "$(/usr/local/bin/op --version)" = "2.41.1"',
+            'test "$(/usr/local/bin/op --version)" = "2.42.0"',
             "ARG FLEET_GIT_SHA",
             "ARG FLEET_IMAGE_IDENTITY",
             "HERMES_FLEET_GIT_SHA=${FLEET_GIT_SHA}",
@@ -766,7 +766,7 @@ class FleetImageReleaseTests(unittest.TestCase):
             "no production deployment",
             "fleet-image-publish",
             "rollback",
-            "1password cli 2.41.1",
+            "1password cli 2.42.0",
             "official image digest",
             "contains no credentials",
         ):

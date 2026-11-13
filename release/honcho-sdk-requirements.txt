@@ -1,4 +1,4 @@
 # SDK dependencies are supplied by the Agent runtime.
-honcho-ai==2.8.0 \
-    --hash=sha256:74bf885b3d86c111b6a574e695d50b861a080e20f10beecfe60336eecfd9237e \
-    --hash=sha256:ec9b64be041cba94d152a85cfb55a6a70a885591d2ce004a9a9701102c47c037
+honcho-ai==2.9.0 \
+    --hash=sha256:4f211ad0ef15a23c231275fea23f98d36e9a12c779fc5a3af847ae3d995f67a7 \
+    --hash=sha256:7c0f405e67c58ee049f35413422599e049eee0285b0ad990d3b52065fc0d4962

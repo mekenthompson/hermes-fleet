@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = ROOT / "tests" / "fixtures" / "honcho_plugin_pre_hf657_excerpt.py"
+FIXTURE = ROOT / "tests" / "fixtures" / "honcho_plugin_5c7d24b_excerpt.py"
 
 _spec = importlib.util.spec_from_file_location(
     "patch_honcho_gateway_turn_filter", ROOT / "scripts" / "patch-honcho-gateway-turn-filter.py")
@@ -46,6 +46,8 @@ WRAPPERS = {
     "async_batch_emdash": "[ASYNC DELEGATION BATCH COMPLETE — deleg_6a93668b]\n3 results",
     "compaction": "[CONTEXT COMPACTION — earlier turns were summarized]",
     "fanout": "A background fan-out of 3 subagent(s) you dispatched earlier has finished.",
+    "group_chat_harness": "[Group chat: 3 participants]\nalice: hi\nbob: hello",
+    "hosted_discussion_harness": "[Discussion: weekly sync]\nalice: hi",
     "internal_footer_tail": "Process proc_1 finished with output: done\n\n" + FOOTER,
     "internal_footer_tail_trailing_ws": "Some wrapper body\n\n" + FOOTER + "\n",
 }
@@ -62,6 +64,7 @@ HUMAN = {
     "reply_quotes_wrapper": '[Replying to your previous message: "[Heartbeat — recurring instruction, fires every 3m]\n'
                             'Check work"]\n\nStop the heartbeat please.',
     "reply_quotes_footer": '[Replying to: "x\n\n' + FOOTER + '"]\n\nWhat was that about?',
+    "mentions_group_chat_mid": "Why does the log say [Group chat: 3 participants] on my turn?",
     "memory_context_then_human": "<memory-context>\nrecalled stuff\n</memory-context>\n\nHello there",
 }
 
@@ -93,6 +96,14 @@ class FilterBehaviour(unittest.TestCase):
         self.assertFalse(self.is_internal(""))
         self.assertFalse(self.is_internal(None))
 
+    def test_upstream_harness_filter_is_kept(self):
+        """Upstream 18fe5dd1 already drops group-chat/hosted-room harness turns; the patch must not lose that."""
+        old = _load(FIXTURE.read_text(encoding="utf-8"))
+        for name in ("group_chat_harness", "hosted_discussion_harness"):
+            with self.subTest(name):
+                self.assertTrue(old(WRAPPERS[name]), "fixture no longer carries upstream's harness filter")
+                self.assertTrue(self.is_internal(WRAPPERS[name]))
+
     def test_unpatched_plugin_missed_the_new_forms(self):
         """Guards the fixture: the pre-patch filter really had the HF-657 gap."""
         old = _load(FIXTURE.read_text(encoding="utf-8"))
@@ -111,6 +122,16 @@ class Patcher(unittest.TestCase):
     def test_fails_closed_when_block_missing(self):
         with self.assertRaises(SystemExit):
             patcher.patch_source("from agent.memory_manager import sanitize_context\nx = 1\n")
+
+    def test_fails_closed_when_sanitize_import_missing(self):
+        source = FIXTURE.read_text(encoding="utf-8").replace("from agent.memory_manager import sanitize_context\n", "")
+        with self.assertRaises(SystemExit):
+            patcher.patch_source(source)
+
+    def test_fails_closed_when_upstream_reshapes_the_helper(self):
+        source = FIXTURE.read_text(encoding="utf-8").replace("def _is_internal_gateway_turn(text: str) -> bool:", "def _is_internal_gateway_turn(text: str, *, strict: bool = False) -> bool:")
+        with self.assertRaises(SystemExit):
+            patcher.patch_source(source)
 
     def test_dockerfile_runs_patcher_after_plugin_install(self):
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
